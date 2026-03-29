@@ -444,6 +444,20 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             save_disqualified(dq_reasons, state_path)
             save_evaluated()
 
+            # ── Append score history (non-DQ scores only) ──
+            valid_scores = {
+                uid_str: kl for uid_str, kl in scores.items()
+                if uid_str not in dq_reasons and 0 < kl <= MAX_KL_THRESHOLD
+            }
+            if valid_scores:
+                append_score_history(
+                    block=current_block,
+                    timestamp=time.time(),
+                    scores=valid_scores,
+                    king_uid=winner_uid,
+                    state_dir=state_path,
+                )
+
             elapsed = time.time() - epoch_start
             print(f"\n[VALIDATOR] Epoch complete in {elapsed:.0f}s", flush=True)
 
