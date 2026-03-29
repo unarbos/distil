@@ -43,7 +43,7 @@ logger = logging.getLogger("distillation.validator")
 # ── Constants ──────────────────────────────────────────────────────────────
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 TEACHER_TOTAL_PARAMS_B = 35.0
-DEFAULT_MAX_PARAM_RATIO = 0.1  # Students ≤ 10% of teacher = 3.5B total
+DEFAULT_MAX_PARAM_RATIO = 0.15  # Students ≤ 15% of teacher ≈ 5.25B total
 MAX_KL_THRESHOLD = 2.0  # Quality floor — reject if KL above this (good distill ~0.1-0.5)
 EMA_ALPHA = 0.3
 MAX_EVAL_PER_EPOCH = 5  # Max new models to evaluate per epoch
