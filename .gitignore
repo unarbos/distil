@@ -14,3 +14,15 @@ venv/
 *.log
 wallets/
 dataset/
+
+# Secrets
+.env
+.env.*
+.env.local
+*.key
+*.pem
+*cookies*
+
+# Runtime cache
+state/api_cache/
+state/prompt_cache/
