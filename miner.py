@@ -26,7 +26,7 @@ logger = logging.getLogger("distillation.miner")
 
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 TEACHER_TOTAL_PARAMS_B = 35.0
-MAX_PARAM_RATIO = 0.1  # 3.5B max
+MAX_PARAM_RATIO = 0.15  # ~5.25B max
 
 
 @click.command()
