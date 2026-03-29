@@ -150,14 +150,26 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     continue
 
                 # Duplicate hash check — reject if same weights as another miner
+                # Earlier commitment (lower block number) wins
                 model_hash = compute_model_hash(model_repo, revision)
                 if model_hash:
                     original_uid = check_duplicate_hash(model_hash, uid, state_path)
                     if original_uid is not None:
-                        print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid} — same model weights", flush=True)
-                        scores[str(uid)] = MAX_KL_THRESHOLD + 1  # Permanent zero weight
-                        continue
-                    register_model_hash(model_hash, uid, state_path)
+                        # Check who committed first
+                        orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
+                        this_block = commit.get("block", float("inf"))
+                        if this_block >= orig_block:
+                            print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid} — same model weights", flush=True)
+                            scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                            continue
+                        else:
+                            # This miner committed earlier — they own the hash, disqualify the other
+                            print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier) — reassigning hash", flush=True)
+                            scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                            valid_models.pop(original_uid, None)
+                            register_model_hash(model_hash, uid, state_path)
+                    else:
+                        register_model_hash(model_hash, uid, state_path)
 
                 valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": check.get("params_b", 0)}
                 print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
