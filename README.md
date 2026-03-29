@@ -26,17 +26,16 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
 
 3. **Challenger detection** — Only models that haven't been evaluated yet are challengers. Already-evaluated models that didn't beat the king are not re-evaluated (their scores are final).
 
-4. **Head-to-head GPU eval** — The king and all challengers are scored together on the same 40 FineWeb prompts (block-seeded). The teacher generates 512-token continuations, then both teacher and student forward-pass the sequences for full-distribution KL on 248K vocab.
+4. **Head-to-head GPU eval** — The king and all new challengers are scored together on the **same 40 FineWeb prompts** (block-seeded). Both models see identical teacher continuations, making the comparison fair. The king is only put on GPU when there's a challenger — no wasted compute on idle re-evaluation.
 
 5. **Epsilon threshold (1%)** — A challenger must achieve KL divergence **more than 1% lower** than the king's to dethrone it. For example, if the king has KL=0.097, a challenger needs KL < 0.096 (= 0.097 × 0.99). This prevents noisy near-ties from flipping the winner every epoch and rewards meaningful improvements.
 
-6. **King re-validation** — Every 6 epochs, the king is re-evaluated with fresh prompts even if there are no challengers. This catches model integrity issues and confirms the score is stable.
-
-7. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
+6. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
 **Why this is better than evaluating all models every epoch:**
 - **2x more prompts per model** (40 vs 20) → tighter confidence intervals, lower variance
-- **GPU time spent only on potential winners** — evaluated models that already lost don't burn compute
+- **GPU only runs when needed** — no challengers means no GPU eval at all
+- **Fair comparison** — king and challenger scored on identical prompts in the same run
 - **Epsilon prevents flip-flopping** — the king holds unless clearly beaten
 - **Scales to many miners** — 100 miners with 1 new challenger = 2 models evaluated, not 100
 
