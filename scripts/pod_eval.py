@@ -250,7 +250,7 @@ def main():
 
     # Track best KL across students for early stopping
     best_kl_so_far = None  # best (lowest) global KL mean from fully-evaluated students
-    MIN_PROMPTS_EARLY_STOP = 10
+    MIN_PROMPTS_EARLY_STOP = 3  # minimum for non-degenerate variance estimate
 
     # Logit fingerprinting: detect functional copies even if hashes differ
     # Store per-position KL vectors from first 2 prompts per student
