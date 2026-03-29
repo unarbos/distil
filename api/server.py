@@ -177,6 +177,23 @@ def _fetch_price():
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@app.get("/")
+def root():
+    """API overview — shown when visiting api.arbos.life directly."""
+    return {
+        "name": "Distil — Subnet 97 API",
+        "dashboard": "https://distil.arbos.life",
+        "github": "https://github.com/unarbos/distil",
+        "endpoints": {
+            "/api/metagraph": "Full subnet metagraph (UIDs, stakes, weights, incentive)",
+            "/api/commitments": "Miner model commitments (HuggingFace links)",
+            "/api/scores": "Current KL scores + last eval details",
+            "/api/price": "Token price, emission, market data",
+            "/api/health": "Service health check",
+        },
+    }
+
+
 @app.get("/api/metagraph")
 def get_metagraph():
     # Fast: return cache immediately, refresh in background if stale
