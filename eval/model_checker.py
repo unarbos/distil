@@ -19,8 +19,9 @@ from huggingface_hub import hf_hub_download, model_info
 
 logger = logging.getLogger("distillation.model_checker")
 
-# Qwen3.5-35B-A3B: vocab_size=248044 (verified from tokenizer)
-BASELINE_VOCAB_SIZE = 248044
+# Qwen3.5-35B-A3B: vocab_size=248320 in config (text_config.vocab_size)
+# Note: tokenizer.vocab_size reports 248044 but model config uses 248320 (padded)
+BASELINE_VOCAB_SIZE = 248320
 STATE_DIR = Path("state")
 
 
@@ -35,9 +36,11 @@ def compute_moe_params(config: dict) -> dict:
         - num_experts: total experts per layer
         - num_active_experts: experts active per token
     """
-    hidden = config.get("hidden_size", 0)
-    layers = config.get("num_hidden_layers", 0)
-    vocab = config.get("vocab_size", 0)
+    # Support nested configs (e.g. text_config for multimodal models)
+    text_cfg = config.get("text_config", {})
+    hidden = config.get("hidden_size", 0) or text_cfg.get("hidden_size", 0)
+    layers = config.get("num_hidden_layers", 0) or text_cfg.get("num_hidden_layers", 0)
+    vocab = config.get("vocab_size", 0) or text_cfg.get("vocab_size", 0)
     intermediate = config.get("intermediate_size", hidden * 4)
     num_heads = config.get("num_attention_heads", 0)
     kv_heads = config.get("num_key_value_heads", num_heads)
@@ -262,8 +265,10 @@ def check_model_architecture(
                 "params_b": total_params_b,
             }
 
-        # 6. Check vocab size
+        # 6. Check vocab size (may be in text_config for multimodal/nested configs)
         vocab_size = config.get("vocab_size", 0)
+        if not vocab_size:
+            vocab_size = config.get("text_config", {}).get("vocab_size", 0)
         if vocab_size != BASELINE_VOCAB_SIZE:
             return {
                 "pass": False,
