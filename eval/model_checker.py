@@ -205,6 +205,79 @@ def verify_tokenizer(teacher_model: str, student_model: str) -> tuple[bool, str]
     return True, "ok"
 
 
+def verify_model_integrity(
+    model_repo: str,
+    revision: str = None,
+    expected_hash: Optional[str] = None,
+) -> dict:
+    """
+    Pre-weight-setting integrity check:
+    1. Model is still publicly accessible on HuggingFace
+    2. Model weights haven't changed since commitment (SHA256 match)
+
+    Returns dict with:
+      pass: bool
+      reason: str
+      current_hash: str or None
+    """
+    try:
+        # 1. Check model is still public (HEAD request to repo)
+        info = model_info(model_repo, revision=revision)
+        if info.private:
+            return {
+                "pass": False,
+                "reason": f"Model {model_repo} is now private — must be public for transparency",
+                "current_hash": None,
+            }
+        if info.disabled:
+            return {
+                "pass": False,
+                "reason": f"Model {model_repo} has been disabled on HuggingFace",
+                "current_hash": None,
+            }
+    except Exception as e:
+        err = str(e)
+        if "404" in err or "not found" in err.lower():
+            return {
+                "pass": False,
+                "reason": f"Model {model_repo} no longer exists on HuggingFace (404)",
+                "current_hash": None,
+            }
+        if "403" in err or "restricted" in err.lower():
+            return {
+                "pass": False,
+                "reason": f"Model {model_repo} is restricted/gated — must be publicly accessible",
+                "current_hash": None,
+            }
+        return {
+            "pass": False,
+            "reason": f"Cannot verify model accessibility: {err}",
+            "current_hash": None,
+        }
+
+    # 2. Verify weights haven't changed (SHA256 of first shard)
+    current_hash = compute_model_hash(model_repo, revision)
+    if not current_hash:
+        return {
+            "pass": False,
+            "reason": f"Cannot compute model hash — safetensors may have been removed",
+            "current_hash": None,
+        }
+
+    if expected_hash and current_hash != expected_hash:
+        return {
+            "pass": False,
+            "reason": f"Model weights changed since commitment! hash {current_hash[:16]}... ≠ expected {expected_hash[:16]}...",
+            "current_hash": current_hash,
+        }
+
+    return {
+        "pass": True,
+        "reason": "ok",
+        "current_hash": current_hash,
+    }
+
+
 def check_model_architecture(
     model_repo: str,
     revision: str = None,
