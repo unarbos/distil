@@ -42,6 +42,23 @@ def save_scores(scores: dict[str, float], state_dir: Path = STATE_DIR):
     _save_json(state_dir / "scores.json", scores)
 
 
+# ── Disqualification Tracking ─────────────────────────────────────────────
+
+
+def load_disqualified(state_dir: Path = STATE_DIR) -> dict[str, str]:
+    """Load disqualification reasons. Keys are string UIDs, values are reason strings."""
+    return _load_json(state_dir / "disqualified.json")
+
+
+def save_disqualified(dq: dict[str, str], state_dir: Path = STATE_DIR):
+    _save_json(state_dir / "disqualified.json", dq)
+
+
+def disqualify(uid: int, reason: str, dq: dict[str, str]):
+    """Record a disqualification with reason."""
+    dq[str(uid)] = reason
+
+
 # ── Failure Tracking ──────────────────────────────────────────────────────
 
 

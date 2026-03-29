@@ -1,8 +1,9 @@
-# Constantinople — SN97
+# Distil — SN97
 
 A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.5-35B-A3B** (35B total, 3B active MoE).
 
 **Dashboard**: [distil.arbos.life](https://distil.arbos.life)  
+**API**: [api.arbos.life](https://api.arbos.life)  
 **Subnet**: Finney netuid 97
 
 ## How It Works
@@ -11,21 +12,41 @@ A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.5-35B-A3B*
 
 **Validators** evaluate by computing full-distribution KL-divergence on GPU. Lower KL = better distillation = higher rewards. **Winner-take-all** — best miner gets 100% of emissions.
 
-### Evaluation Pipeline
+### King-of-the-Hill Evaluation
 
-1. **Prompt sampling** — 20 prompts sampled from FineWeb pretraining corpus, seeded by block number
-2. **Teacher continuation** — Teacher generates 512-token continuations per prompt
-3. **Full-distribution KL** — Both models forward-pass the sequence; KL computed on 248K vocab at each continuation position
-4. **EMA smoothing** — Scores smoothed with α=0.3 across epochs
-5. **Winner-take-all** — Lowest KL miner gets weight=1.0, everyone else gets 0.0
+The validator uses a **king-of-the-hill** architecture for efficient, high-confidence scoring:
+
+1. **Pre-checks (no GPU)** — Every epoch, all models are checked for:
+   - Architecture compliance (param count, vocab size, no quantization)
+   - **Duplicate detection** — SHA256 hash of safetensors weights via HF API; identical weights to an existing model → permanently blacklisted. Earlier commitment (by block number) wins.
+   - **Integrity** — Model must still be public and unchanged on HuggingFace
+2. **King identification** — The miner with the lowest KL score is the "king"
+3. **Challenger evaluation** — Only **new/unevaluated** models are scored head-to-head against the king on GPU
+4. **Higher confidence** — 40 prompts per evaluation (vs 20 in broad-sweep mode) for tighter confidence intervals
+5. **King re-validation** — The king is re-evaluated with fresh prompts every 6 epochs
+6. **Crown transfer** — If a challenger beats the king's KL, it becomes the new king
+7. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing.
+
+This means the validator spends GPU time only on models that could actually win, and gets 2x more samples per model for better point estimates.
+
+### Disqualification
+
+Models are permanently disqualified (KL=∞, $0 earnings) for:
+- **COPY** — Same safetensors weights as another miner (SHA256 match). First committer owns the hash.
+- **REMOVED** — Model deleted, made private, or weights changed after commitment
+- **INVALID** — Fails architecture checks (too large, wrong tokenizer, quantized, etc.)
+
+Disqualification reasons are shown on the dashboard and available via the API.
 
 ### Anti-Gaming
 
-- **Copy detection**: SHA256 of model weights (via HF API metadata)
-- **Integrity checks**: Models verified public + unchanged before every weight-set
-- **MoE-aware param counting**: Total params capped (not just active)
+- **SHA256 hash duplicate detection**: Model weight hashes tracked forever; copies permanently blacklisted
+- **Commitment block priority**: Earlier on-chain commitment wins hash ownership
+- **Integrity verification**: Models verified public + unchanged before every weight-set
+- **MoE-aware param counting**: Total params from safetensors metadata (not config estimates)
 - **Quantization rejected**: GPTQ/AWQ/FP8 all blocked — architecture distillation only
-- **Block-seeded prompts**: Unpredictable, reproducible selection
+- **Block-seeded prompts**: Deterministic from block number, unpredictable in advance
+- **Full-distribution KL**: Scored on all 248,320 tokens, not top-k
 
 ## Mining Guide
 
@@ -43,6 +64,7 @@ Your model must:
 - Be in **safetensors** format (bf16/fp16)
 - Be loadable via `AutoModelForCausalLM.from_pretrained()`
 - **No quantized models** (GPTQ/AWQ/GGUF rejected)
+- **Unique weights** — Cannot be identical to any previously committed model
 
 ### Submit Your Model
 
@@ -61,44 +83,54 @@ python miner.py \
 
 To change models, register a new hotkey.
 
-### Expected KL Ranges
+### KL Ranges (baseline, no distillation training)
 
-| Model | Params | KL (nats) | Quality |
-|-------|--------|-----------|---------|
-| Qwen3.5-4B | 4.66B | ~0.24 | Strong |
-| Qwen3.5-2B | 2.27B | ~0.35 | Good |
-| Qwen3.5-0.8B | 0.87B | ~0.58 | Moderate |
-| Random / broken | — | >5.0 | Rejected |
+| Model | Params | KL (nats) | Notes |
+|-------|--------|-----------|-------|
+| Qwen3.5-4B | 4.66B | ~0.10–0.15 | Strong baseline |
+| Qwen3.5-2B | 2.27B | ~0.12–0.16 | Competitive |
+| Qwen3.5-0.8B | 0.87B | ~0.17–0.21 | Moderate |
 
-Target: KL < 0.3 for competitive mining. Models with KL > 2.0 receive zero weight.
+These are *untrained baselines* — purpose-built distillations should do significantly better. Models with KL > 2.0 are disqualified.
 
 ## API
 
 Live data at `https://api.arbos.life`:
 
-- `GET /api/metagraph` — Full subnet metagraph
-- `GET /api/commitments` — Miner model commitments
-- `GET /api/scores` — Current KL scores + EMA
-- `GET /api/price` — Token price, emission, market data
-- `GET /api/health` — Service status
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | API overview |
+| `GET /api/metagraph` | Full subnet metagraph (UIDs, stakes, weights, incentive) |
+| `GET /api/commitments` | Miner model commitments (HF links + block numbers) |
+| `GET /api/scores` | Current KL scores, disqualification reasons, last eval details |
+| `GET /api/price` | Token price, emission, market data |
+| `GET /api/health` | Service status |
+
+All endpoints are public, no authentication required.
 
 ## Architecture
 
 ```
-├── validator.py              # Chi-pattern validator
 ├── miner.py                  # One-shot commitment script
 ├── eval/
 │   ├── kl_divergence.py      # Full-distribution KL on GPU
-│   ├── model_checker.py      # Param counting, integrity, hash
-│   ├── dataset.py            # FineWeb prompt loader
-│   └── scoring.py            # EMA + winner-take-all
+│   ├── model_checker.py      # Param counting, integrity, hash, duplicate detection
+│   ├── dataset.py            # FineWeb prompt loader (500 cached prompts)
+│   └── scoring.py            # Winner-take-all + disqualification tracking
 ├── api/
 │   └── server.py             # FastAPI dashboard backend
 ├── scripts/
-│   ├── pod_eval.py           # GPU eval runner
-│   └── remote_validator.py   # Split validator (Hetzner + Lium)
-└── state/                    # Persistent scores, caches
+│   ├── pod_eval.py           # GPU eval runner (runs on remote pod)
+│   ├── remote_validator.py   # King-of-the-hill validator (Hetzner + Lium GPU)
+│   └── run_validator.sh      # PM2 wrapper
+└── state/                    # Persistent scores, hashes, disqualifications
 ```
+
+### Split Validator Architecture
+
+- **Hetzner server** (secure): Wallet keys, chain access, weight setting
+- **Lium GPU pod** (remote): Teacher/student forward passes, KL computation
+- Wallet keys never leave the Hetzner server. The GPU pod has no chain access.
 
 ## License
 

@@ -67,6 +67,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     from eval.scoring import (
         load_scores, save_scores,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
+        load_disqualified, save_disqualified, disqualify,
         compute_winner_weights,
     )
     from eval.model_checker import (
@@ -105,6 +106,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     # ── Load state ──
     scores = load_scores(state_path)
     failures = load_failures(state_path)
+    dq_reasons = load_disqualified(state_path)
     epoch_count = 0
 
     # ── Track which UIDs have been evaluated ──
@@ -185,6 +187,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not check["pass"]:
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
+                    disqualify(uid, f"arch: {check['reason']}", dq_reasons)
                     disqualified.add(uid)
                     continue
 
@@ -196,13 +199,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                         orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
                         this_block = commit.get("block", float("inf"))
                         if this_block >= orig_block:
+                            orig_model = commitments.get(original_uid, {}).get("model", "?")
                             print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}", flush=True)
                             scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                            disqualify(uid, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}", dq_reasons)
                             disqualified.add(uid)
                             continue
                         else:
                             print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier)", flush=True)
                             scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                            disqualify(original_uid, f"copy: identical weights to UID {uid} ({model_repo}), committed later", dq_reasons)
                             valid_models.pop(original_uid, None)
                             disqualified.add(original_uid)
                             register_model_hash(model_hash, uid, state_path)
@@ -222,6 +228,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not integrity["pass"]:
                     print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(uid, f"integrity: {integrity['reason']}", dq_reasons)
                     disqualified.add(uid)
                     continue
                 if integrity["current_hash"]:
@@ -239,6 +246,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 print("[VALIDATOR] No valid models after pre-checks", flush=True)
                 save_scores(scores, state_path)
                 save_failures(failures, state_path)
+            save_disqualified(dq_reasons, state_path)
                 if once:
                     break
                 time.sleep(tempo)
@@ -275,6 +283,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
                 save_scores(scores, state_path)
                 save_failures(failures, state_path)
+            save_disqualified(dq_reasons, state_path)
                 elapsed = time.time() - epoch_start
                 print(f"[VALIDATOR] Epoch complete in {elapsed:.0f}s (no eval needed)", flush=True)
                 if once:
@@ -420,6 +429,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             # ── Persist state ──
             save_scores(scores, state_path)
             save_failures(failures, state_path)
+            save_disqualified(dq_reasons, state_path)
             save_evaluated()
 
             elapsed = time.time() - epoch_start
@@ -434,6 +444,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             logger.info("Shutting down")
             save_scores(scores, state_path)
             save_failures(failures, state_path)
+            save_disqualified(dq_reasons, state_path)
             save_evaluated()
             break
         except Exception as e:
@@ -442,6 +453,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             traceback.print_exc()
             save_scores(scores, state_path)
             save_failures(failures, state_path)
+            save_disqualified(dq_reasons, state_path)
             save_evaluated()
             if once:
                 break
