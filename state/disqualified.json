@@ -1,0 +1,5 @@
+{
+  "97": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7853985 vs 7852887",
+  "203": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7853997 vs 7852887",
+  "158": "arch: Model not found on HuggingFace (404)"
+}
