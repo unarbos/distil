@@ -1,4 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-python validator.py "$@"
+#!/bin/bash
+cd /home/openclaw/distillation
+source .env
+exec python3 scripts/remote_validator.py \
+  --lium-api-key "$LIUM_API_KEY" \
+  --lium-pod-name "overnight-train" \
+  --tempo 600
