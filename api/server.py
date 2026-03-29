@@ -17,7 +17,7 @@ app.add_middleware(
 
 NETUID = 97
 CACHE_TTL = 60
-TMC_KEY = "***REMOVED***"
+TMC_KEY = os.environ.get("TMC_API_KEY", "")
 TMC_BASE = "https://api.taomarketcap.com"
 TMC_HEADERS = {"Authorization": TMC_KEY}
 
