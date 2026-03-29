@@ -49,6 +49,8 @@ _mem = {
 def _get_cached(name: str, ttl: int):
     """Return cached data if fresh enough, from memory or disk."""
     now = time.time()
+    if name not in _mem:
+        _mem[name] = {"data": None, "ts": 0}
     mc = _mem[name]
     if mc["data"] and now - mc["ts"] < ttl:
         return mc["data"]
@@ -63,12 +65,16 @@ def _get_cached(name: str, ttl: int):
 def _set_cached(name: str, data: dict):
     now = time.time()
     data["_ts"] = now
+    if name not in _mem:
+        _mem[name] = {"data": None, "ts": 0}
     _mem[name]["data"] = data
     _mem[name]["ts"] = now
     _disk_write(name, data)
 
 def _get_stale(name: str):
     """Return ANY cached data, even stale — for fallback."""
+    if name not in _mem:
+        _mem[name] = {"data": None, "ts": 0}
     mc = _mem[name]
     if mc["data"]:
         return mc["data"]
@@ -190,6 +196,7 @@ def root():
             "/api/scores": "Current KL scores, disqualifications, last eval details",
             "/api/price": "Token price, emission, market data",
             "/api/model-info/{repo}": "HuggingFace model card info (params, MoE, tags, etc.)",
+            "/api/history": "Score history over time (for trendline chart)",
             "/api/health": "Service health check",
         },
     }
@@ -306,11 +313,10 @@ def get_model_info(model_path: str):
         except Exception:
             pass
 
+        card = info.card_data
         result = {
             "model": model_path,
             "author": info.author or model_path.split("/")[0],
-            "description": (info.card_data.get("description") if info.card_data else None)
-                or (getattr(info, "description", None)),
             "tags": list(info.tags) if info.tags else [],
             "downloads": info.downloads,
             "likes": info.likes,
@@ -321,8 +327,9 @@ def get_model_info(model_path: str):
             "is_moe": is_moe,
             "num_experts": num_experts,
             "num_active_experts": num_active_experts,
-            "license": (info.card_data.get("license") if info.card_data else None),
+            "license": getattr(card, "license", None) if card else None,
             "pipeline_tag": info.pipeline_tag,
+            "base_model": getattr(card, "base_model", None) if card else None,
         }
         _set_cached(cache_key, result)
         return result
@@ -338,6 +345,19 @@ def get_tmc_config():
         "sse_subnet_url": f"{TMC_BASE}/public/v1/sse/subnets/{NETUID}/",
         "netuid": NETUID,
     }
+
+
+@app.get("/api/history")
+def get_history():
+    """Return score history for trendline chart."""
+    history_path = os.path.join(STATE_DIR, "score_history.json")
+    if os.path.exists(history_path):
+        try:
+            with open(history_path) as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
 
 
 @app.get("/api/health")
