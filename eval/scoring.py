@@ -108,6 +108,50 @@ def commitment_changed(
 # ── Weight Computation ────────────────────────────────────────────────────
 
 
+# ── Score History ──────────────────────────────────────────────────────────
+
+
+def load_score_history(state_dir: Path = STATE_DIR) -> list[dict]:
+    """Load score history array from disk."""
+    path = state_dir / "score_history.json"
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def append_score_history(
+    block: int,
+    timestamp: float,
+    scores: dict[str, float],
+    king_uid: int | None,
+    state_dir: Path = STATE_DIR,
+    max_entries: int = 500,
+):
+    """Append a score snapshot to history, capping at max_entries."""
+    history = load_score_history(state_dir)
+    entry = {
+        "block": block,
+        "timestamp": timestamp,
+        "scores": {k: round(v, 6) for k, v in scores.items()},
+        "king_uid": king_uid,
+    }
+    history.append(entry)
+    if len(history) > max_entries:
+        history = history[-max_entries:]
+    path = state_dir / "score_history.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(history, indent=2))
+    logger.info(f"Score history: {len(history)} entries (block {block})")
+
+
+# ── Weight Computation ────────────────────────────────────────────────────
+
+
 def compute_winner_weights(
     scores: dict[str, float],
     failures: dict[str, int],

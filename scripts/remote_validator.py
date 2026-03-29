@@ -68,6 +68,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
         load_disqualified, save_disqualified, disqualify,
         compute_winner_weights,
+        append_score_history,
     )
     from eval.model_checker import (
         check_model_architecture, verify_model_integrity,
