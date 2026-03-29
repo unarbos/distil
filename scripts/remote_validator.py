@@ -336,18 +336,33 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
 
             # ── Write eval progress (for dashboard live display) ──
+            # Estimate: ~45s per prompt per model for teacher gen + student scoring
+            # Teacher gen is shared (~90s for 40 prompts), then ~30s per student per prompt
+            est_teacher_s = 90
+            est_per_student_s = 30 * n_prompts  # ~30s per prompt per student
+            est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
             progress_path = state_path / "eval_progress.json"
+            now = time.time()
+            # Build ordered eval list for display
+            eval_order = []
+            if king_uid is not None and king_uid in models_to_eval:
+                eval_order.append({"uid": king_uid, "model": models_to_eval[king_uid]["model"], "role": "king"})
+            for uid in challenger_uids_sorted:
+                eval_order.append({"uid": uid, "model": models_to_eval[uid]["model"], "role": "challenger"})
             progress = {
                 "active": True,
-                "phase": "preparing",
-                "models": {uid: info["model"] for uid, info in models_to_eval.items()},
+                "phase": "scoring",
+                "models": {str(uid): info["model"] for uid, info in models_to_eval.items()},
+                "eval_order": eval_order,
                 "students_total": len(models_to_eval),
                 "students_done": 0,
                 "prompts_total": n_prompts,
                 "prompts_done": 0,
                 "king_uid": king_uid,
                 "challenger_uids": list(challengers.keys()),
-                "started_at": time.time(),
+                "started_at": now,
+                "estimated_duration_s": est_total_s,
+                "estimated_completion": now + est_total_s,
             }
             with open(progress_path, "w") as f:
                 json.dump(progress, f)
