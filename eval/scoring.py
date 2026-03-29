@@ -18,7 +18,7 @@ logger = logging.getLogger("distillation.scoring")
 
 STATE_DIR = Path("state")
 DEFAULT_EMA_ALPHA = 0.3
-DEFAULT_MAX_KL = 10.0  # Quality floor — reject if KL above this
+DEFAULT_MAX_KL = 2.0  # Quality floor — reject if KL above this (good distill ~0.1-0.5)
 MIN_KL_FLOOR = 1e-6  # Prevents div-by-zero for near-perfect models
 
 

@@ -19,8 +19,8 @@ from huggingface_hub import hf_hub_download, model_info
 
 logger = logging.getLogger("distillation.model_checker")
 
-# Qwen3.5-35B-A3B: vocab_size=248320
-BASELINE_VOCAB_SIZE = 248320
+# Qwen3.5-35B-A3B: vocab_size=248044 (verified from tokenizer)
+BASELINE_VOCAB_SIZE = 248044
 STATE_DIR = Path("state")
 
 
@@ -248,7 +248,17 @@ def check_model_architecture(
                 "active_params_b": config_active_b,
             }
 
-        # 5. Check vocab size
+        # 5. Reject quantized models (GPTQ, AWQ, GGUF, etc.)
+        quant_config = config.get("quantization_config", {})
+        if quant_config:
+            quant_method = quant_config.get("quant_method", "unknown")
+            return {
+                "pass": False,
+                "reason": f"quantized_model:{quant_method} — subnet requires bf16/fp16 architecture distillation",
+                "params_b": total_params_b,
+            }
+
+        # 6. Check vocab size
         vocab_size = config.get("vocab_size", 0)
         if vocab_size != BASELINE_VOCAB_SIZE:
             return {

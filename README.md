@@ -108,11 +108,28 @@ distillation/
 
 **KL Divergence**: `KL(teacher || student) = Σ P_teacher(x) · log(P_teacher(x) / P_student(x))`
 
-Computed on full vocabulary (248K tokens) at each position of the teacher's generated continuation. This measures how well the student predicts what the teacher would generate — the gold standard for distillation quality.
+Computed on full vocabulary (248K tokens) at each position of the teacher's **generated continuation** (not just the prompt). This measures how well the student predicts what the teacher would generate — the gold standard for distillation quality.
 
-**Weight Formula**: `weight_i = (1/KL_i) / Σ(1/KL_j)` for all miners below the quality threshold.
+**Weight Formula**: `weight_i = (1/KL_i) / Σ(1/KL_j)` for all miners below the quality threshold (KL < 2.0).
 
 Lower KL → higher weight → more rewards. Continuous incentive to improve.
+
+### Expected KL Ranges (calibrated on real Qwen3.5 family)
+
+| Model | Params | KL (nats) | Quality |
+|-------|--------|-----------|---------|
+| Qwen3.5-4B | 4B dense | 0.29 | Good distillation |
+| Qwen3.5-0.8B | 0.8B dense | 0.57 | Moderate |
+| Random init / broken quant | — | >5.0 | Rejected |
+
+A well-trained 3B distilled model should achieve KL < 0.3. Miners with KL > 2.0 receive zero weight.
+
+### Requirements for Submitted Models
+
+- Must load via `transformers.AutoModelForCausalLM.from_pretrained()` in **bf16** (no special quantization libraries)
+- Must use the **exact same tokenizer** as the teacher (verified by encoding match)
+- Must be in **safetensors** format (for cheat-proof param counting)
+- No GPTQ/AWQ/GGUF quantized models — the subnet rewards **architecture distillation**, not compression
 
 ## License
 
