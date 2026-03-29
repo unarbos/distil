@@ -433,12 +433,35 @@ def main():
         print(f"  Timings: load={load_time:.1f}s, scoring={scoring_time:.1f}s", flush=True)
         print(f"  VRAM after scoring: {gpu_mem_str()}", flush=True)
 
+        # Benchmark generation speed (tokens/sec) — short autoregressive generation
+        tokens_per_sec = None
+        if not is_functional_copy:
+            try:
+                bench_ids = full_sequences[0][:, :64]  # first 64 tokens as prompt
+                torch.cuda.synchronize()
+                t_gen = time.time()
+                gen_tokens = 128
+                with torch.no_grad():
+                    out = student.generate(
+                        bench_ids,
+                        max_new_tokens=gen_tokens,
+                        do_sample=False,
+                    )
+                torch.cuda.synchronize()
+                gen_time = time.time() - t_gen
+                actual_new = out.shape[1] - bench_ids.shape[1]
+                tokens_per_sec = round(actual_new / gen_time, 1)
+                print(f"  Generation speed: {tokens_per_sec} tok/s ({actual_new} tokens in {gen_time:.2f}s)", flush=True)
+            except Exception as gen_err:
+                print(f"  Generation benchmark failed: {gen_err}", flush=True)
+
         student_result = {
             "kl_global_avg": kl_global,
             "kl_per_prompt": kl_per_prompt,
             "total_positions": total_positions,
             "load_time_s": round(load_time, 1),
             "scoring_time_s": round(scoring_time, 1),
+            "tokens_per_sec": tokens_per_sec,
         }
         if is_functional_copy:
             student_result["functional_copy"] = True

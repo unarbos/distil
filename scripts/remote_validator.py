@@ -40,7 +40,7 @@ MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 
 # Prompts per head-to-head evaluation (king + challenger on same prompts)
-EVAL_PROMPTS = 40
+EVAL_PROMPTS = 60
 # Epsilon: challenger must beat king by this relative margin to dethrone
 # e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
 EPSILON = 0.01
@@ -49,6 +49,23 @@ EPSILON = 0.01
 def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, state_dir):
     """Write a pending announcement to state/announcement.json for async Discord posting."""
     improvement = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
+
+    # Fetch earnings data for the announcement
+    earnings_line = ""
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen("http://127.0.0.1:3710/api/price", timeout=5)
+        price_data = json.loads(resp.read())
+        tao_per_day = price_data.get("miners_tao_per_day", 0)
+        tao_usd = price_data.get("tao_usd", 0)
+        usd_per_day = tao_per_day * tao_usd
+        earnings_line = (
+            f"\n💰 **Winner earns ~{tao_per_day:.1f} τ/day (${usd_per_day:,.0f}/day)** — "
+            f"winner takes all!\n"
+        )
+    except Exception:
+        pass
+
     announcement = {
         "type": "new_king",
         "timestamp": time.time(),
@@ -58,7 +75,8 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
             f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
             f"📊 **KL: {new_kl:.6f}** (was {old_kl:.6f}, {improvement:.1f}% improvement)\n"
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
-            f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n\n"
+            f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
+            f"{earnings_line}\n"
             f"Think you can beat **{new_kl * (1 - EPSILON):.6f} KL** (1% epsilon)? "
             f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"
             f"📈 [Live Dashboard](<https://distil.arbos.life>)"
