@@ -408,6 +408,41 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             with open(progress_path, "w") as f:
                 json.dump(progress, f)
 
+            # Background thread: poll live progress from pod every 10s
+            import threading
+            poll_stop = threading.Event()
+
+            def _poll_pod_progress():
+                while not poll_stop.is_set():
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+                            tmp_path = tmp.name
+                        lium.download(pod, remote="/home/eval_progress.json", local=tmp_path)
+                        with open(tmp_path) as f:
+                            pod_progress = json.load(f)
+                        os.unlink(tmp_path)
+                        # Merge pod progress into our progress file
+                        progress["pod"] = pod_progress
+                        progress["phase"] = "scoring"
+                        if pod_progress.get("current"):
+                            cur = pod_progress["current"]
+                            progress["current_student"] = cur.get("student_name")
+                            progress["current_prompt"] = cur.get("prompts_done", 0)
+                            progress["current_kl"] = cur.get("kl_running_mean")
+                            progress["current_se"] = cur.get("kl_running_se")
+                            progress["current_ci"] = cur.get("ci_95")
+                            progress["current_best"] = cur.get("best_kl_so_far")
+                            progress["students_done"] = cur.get("student_idx", 0)
+                        progress["completed"] = pod_progress.get("completed", [])
+                        with open(progress_path, "w") as f:
+                            json.dump(progress, f)
+                    except Exception:
+                        pass  # Pod progress not ready yet or SSH hiccup
+                    poll_stop.wait(10)
+
+            poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
+            poll_thread.start()
+
             try:
                 result = lium.exec(pod, command=cmd)
                 print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
@@ -415,10 +450,15 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 print(f"[VALIDATOR] lium.exec EXCEPTION: {exec_err}", flush=True)
                 import traceback
                 traceback.print_exc()
+                poll_stop.set()
+                poll_thread.join(timeout=5)
                 if once:
                     break
                 time.sleep(tempo)
                 continue
+            finally:
+                poll_stop.set()
+                poll_thread.join(timeout=5)
 
             if result['stdout'].strip():
                 for line in result['stdout'].strip().split('\n')[-30:]:

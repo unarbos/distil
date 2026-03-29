@@ -248,6 +248,26 @@ def main():
         "students": {},
     }
 
+    # Live progress file — written after every prompt for real-time dashboard updates
+    progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
+    live_progress = {
+        "phase": "scoring",
+        "students": students,
+        "students_total": len(students),
+        "prompts_total": len(prompts),
+        "completed": [],  # finished student results for dashboard
+        "current": None,  # currently scoring student
+    }
+
+    def _write_progress():
+        try:
+            with open(progress_path, "w") as pf:
+                json.dump(live_progress, pf)
+        except Exception:
+            pass
+
+    _write_progress()
+
     # Track best KL across students for early stopping
     best_kl_so_far = None  # best (lowest) global KL mean from fully-evaluated students
     MIN_PROMPTS_EARLY_STOP = 3  # minimum for non-degenerate variance estimate
@@ -261,6 +281,18 @@ def main():
     for student_idx, student_name in enumerate(students):
         print(f"\n{'=' * 60}", flush=True)
         print(f"[eval] Student: {student_name}", flush=True)
+
+        # Update live progress: loading model
+        live_progress["current"] = {
+            "student_idx": student_idx,
+            "student_name": student_name,
+            "phase": "loading",
+            "prompts_done": 0,
+            "kl_running_mean": None,
+            "kl_running_se": None,
+            "ci_95": None,
+        }
+        _write_progress()
 
         t0 = time.time()
         student = load_model(student_name, device)
@@ -337,6 +369,28 @@ def main():
                     if is_functional_copy:
                         break
 
+                # Update live progress with running stats
+                n = len(prompt_kl_means)
+                running_mean = sum(prompt_kl_means) / n if n > 0 else 0
+                running_se = 0
+                ci_low, ci_high = running_mean, running_mean
+                if n >= 2:
+                    running_var = sum((x - running_mean) ** 2 for x in prompt_kl_means) / (n - 1)
+                    running_se = math.sqrt(running_var / n)
+                    ci_low = running_mean - 2 * running_se
+                    ci_high = running_mean + 2 * running_se
+                live_progress["current"] = {
+                    "student_idx": student_idx,
+                    "student_name": student_name,
+                    "phase": "scoring",
+                    "prompts_done": n,
+                    "kl_running_mean": round(running_mean, 6),
+                    "kl_running_se": round(running_se, 6) if running_se else None,
+                    "ci_95": [round(ci_low, 6), round(ci_high, 6)] if n >= 2 else None,
+                    "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far is not None else None,
+                }
+                _write_progress()
+
                 # Free per-prompt GPU tensors
                 del s_logits, cont_s, t_logits, kl_per_pos
 
@@ -403,6 +457,28 @@ def main():
         if not early_stopped and not is_functional_copy:
             if best_kl_so_far is None or kl_global < best_kl_so_far:
                 best_kl_so_far = kl_global
+
+        # Record completed student in live progress
+        status = "scored"
+        status_detail = f"KL={kl_global:.6f}"
+        if is_functional_copy:
+            status = "functional_copy"
+            status_detail = f"copy of {copy_of}"
+        elif early_stopped:
+            status = "early_stopped"
+            status_detail = f"KL={kl_global:.6f} after {len(kl_per_prompt)}/{len(prompts)} prompts"
+        live_progress["completed"].append({
+            "student_idx": student_idx,
+            "student_name": student_name,
+            "status": status,
+            "status_detail": status_detail,
+            "kl": round(kl_global, 6),
+            "prompts_scored": len(kl_per_prompt),
+            "prompts_total": len(prompts),
+            "scoring_time_s": round(scoring_time, 1),
+        })
+        live_progress["current"] = None
+        _write_progress()
 
         del student
         free_gpu()
