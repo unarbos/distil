@@ -230,24 +230,75 @@ def test_commitment_caching():
 
     cache = {}
 
-    # New model → changed
+    # New model → not cached yet
     assert commitment_changed(1, "user/model-v1", "abc123", cache)
-    logger.info("✓ New model detected as changed")
+    logger.info("✓ New model detected as not-yet-cached")
 
     # Cache it
     cache["1"] = {"model": "user/model-v1", "revision": "abc123", "kl": 2.5}
 
-    # Same model → not changed
+    # Same model → already cached
     assert not commitment_changed(1, "user/model-v1", "abc123", cache)
-    logger.info("✓ Same model detected as unchanged")
+    logger.info("✓ Same model detected as already cached")
 
-    # New revision → changed
-    assert commitment_changed(1, "user/model-v1", "def456", cache)
-    logger.info("✓ New revision detected as changed")
 
-    # New model → changed
-    assert commitment_changed(1, "user/model-v2", "abc123", cache)
-    logger.info("✓ New model name detected as changed")
+def test_permanent_commitments():
+    """Test that only FIRST commitment per hotkey is honored."""
+    logger.info("\n── Permanent Commitment Tests ──")
+
+    # Simulate on-chain data: hotkey has multiple commits
+    revealed = {
+        "hotkey_5": [
+            (100, json.dumps({"model": "alice/first-model", "revision": "aaa"})),
+            (200, json.dumps({"model": "alice/second-model", "revision": "bbb"})),
+            (300, json.dumps({"model": "alice/third-model", "revision": "ccc"})),
+        ],
+        "hotkey_8": [
+            (150, json.dumps({"model": "carol/only-model", "revision": "ddd"})),
+        ],
+    }
+
+    # Validator logic: take [0] (first), not [-1] (latest)
+    commitments = {}
+    hotkeys = {5: "hotkey_5", 8: "hotkey_8"}
+    for uid, hotkey in hotkeys.items():
+        if hotkey in revealed and len(revealed[hotkey]) > 0:
+            block, commit_data = revealed[hotkey][0]  # FIRST only
+            data = json.loads(commit_data)
+            commitments[uid] = {"block": block, **data}
+
+    # Alice's first model should be used, not second or third
+    assert commitments[5]["model"] == "alice/first-model"
+    assert commitments[5]["revision"] == "aaa"
+    assert commitments[5]["block"] == 100
+    logger.info("✓ First commitment honored for multi-commit miner")
+
+    # Carol has one commit — that's what's used
+    assert commitments[8]["model"] == "carol/only-model"
+    logger.info("✓ Single commit miner works correctly")
+
+    # Verify later commits are ignored
+    assert "alice/second-model" not in str(commitments)
+    assert "alice/third-model" not in str(commitments)
+    logger.info("✓ Later commitments are ignored (permanent rule)")
+
+
+def test_kl_floor_in_weights():
+    """Test that KL near zero doesn't cause infinite weights."""
+    logger.info("\n── KL Floor in Weights Tests ──")
+
+    ema_scores = {"1": 0.0000001, "2": 1.0, "3": 5.0}  # UID 1 near-perfect
+    failures = {}
+    weights = compute_proportional_weights(ema_scores, failures, 256)
+
+    # Near-zero KL should still produce finite weights
+    assert weights[1] < 1.0, f"Weight should be < 1.0, got {weights[1]}"
+    assert weights[1] > 0.0
+    assert all(w >= 0 for w in weights)
+    total = sum(weights)
+    assert abs(total - 1.0) < 1e-6
+    logger.info(f"✓ Near-zero KL: weight={weights[1]:.6f} (finite, not infinite)")
+    logger.info(f"✓ All weights non-negative, sum to {total:.6f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -473,6 +524,8 @@ if __name__ == "__main__":
     test_ema_persistence()
     test_failure_tracking()
     test_commitment_caching()
+    test_permanent_commitments()
+    test_kl_floor_in_weights()
     test_block_seeded_prompts()
     test_moe_param_counting()
     test_full_simulation()

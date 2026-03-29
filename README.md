@@ -4,7 +4,7 @@ A Bittensor subnet that incentivizes miners to produce the best knowledge-distil
 
 ## How It Works
 
-**Miners** train a distilled/compressed model (≤3.5B total params) that preserves the teacher's output distribution as closely as possible. They upload the model to HuggingFace and commit the repo link on-chain.
+**Miners** train a distilled/compressed model (≤3.5B total params) that preserves the teacher's output distribution as closely as possible. They upload the model to HuggingFace and commit the repo link on-chain. **One commitment per hotkey, permanently** — choose your model carefully.
 
 **Validators** evaluate submitted models by computing full-distribution KL-divergence between the teacher and student on GPU. Lower KL = better distillation = higher rewards.
 
@@ -58,17 +58,22 @@ python validator.py \
 
 ### Miner
 
+⚠️ **ONE SUBMISSION PER HOTKEY, PERMANENTLY.** You cannot update, replace, or re-commit. Choose wisely.
+
 ```bash
 # Install
 pip install -e .
 
-# Submit your model
+# Submit your model (THIS IS PERMANENT)
 python miner.py \
     --network finney \
     --netuid <NETUID> \
-    --wallet-name default \
-    --hotkey-name miner \
+    --wallet-name my_wallet \
+    --wallet-path ~/.bittensor/wallets \
+    --hotkey-name my_hotkey \
     --model-repo your-username/your-distilled-model
+
+# To change models, you must register a new hotkey.
 ```
 
 ### Model Requirements

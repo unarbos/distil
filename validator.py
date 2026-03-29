@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Distillation Subnet Validator (v0.5.0) — Production-ready for mainnet.
+Distillation Subnet Validator (v0.6.0) — Production-ready for mainnet.
 
 Chi pattern: single long-running process, no synapse/axon/dendrite.
 Miners commit HuggingFace model links on-chain via Commitments pallet.
 Validator evaluates KL(teacher || student) using full-distribution GPU forward passes.
 
 Key features:
+  - ONE commitment per hotkey, PERMANENTLY (first commit wins, later ones ignored)
   - Full-distribution KL on 248K vocab (not top-k approximation)
   - Teacher continuation: generates 512 tokens, scores on continuation positions
   - Proportional inverse-KL weights (not winner-take-all)
@@ -14,6 +15,7 @@ Key features:
   - Block-seeded prompt selection (unpredictable, reproducible)
   - Model caching: only re-eval changed commitments
   - Copy detection via SHA256 of first safetensors shard
+  - Same-tokenizer enforcement (exact encoding match)
   - Staleness: 3 failures → weight 0 until new commitment
   - MoE-aware param counting
 """
@@ -88,6 +90,7 @@ def main(
     from eval.model_checker import (
         check_model_architecture, compute_model_hash,
         check_duplicate_hash, register_model_hash,
+        verify_tokenizer,
     )
     from eval.scoring import (
         load_ema_scores, save_ema_scores, update_ema,
@@ -131,21 +134,28 @@ def main(
             metagraph.sync(subtensor=subtensor)
             current_block = subtensor.block
 
-            # ── Read commitments (latest per hotkey) ───────────────────
+            # ── Read commitments (FIRST per hotkey — permanent, no updates) ─
             commitments = {}
             revealed = subtensor.get_all_revealed_commitments(netuid)
             for uid in range(metagraph.n):
                 hotkey = metagraph.hotkeys[uid]
                 try:
-                    if hotkey in revealed:
-                        block, commit_data = revealed[hotkey][-1]
+                    if hotkey in revealed and len(revealed[hotkey]) > 0:
+                        # Use FIRST commitment only — miners cannot update
+                        block, commit_data = revealed[hotkey][0]
                         data = json.loads(commit_data)
                         if "model" in data:
                             commitments[uid] = {"block": block, **data}
+                            # Log if miner tried to update (extra commits ignored)
+                            if len(revealed[hotkey]) > 1:
+                                logger.debug(
+                                    f"UID {uid} has {len(revealed[hotkey])} commits — "
+                                    f"only first (block {block}) is honored"
+                                )
                 except Exception:
                     continue
 
-            logger.info(f"Found {len(commitments)} miner commitments")
+            logger.info(f"Found {len(commitments)} miner commitments (first-commit-only)")
 
             if not commitments:
                 logger.info(f"No commitments, sleeping {tempo}s")
@@ -153,31 +163,24 @@ def main(
                 continue
 
             # ── Determine which models need (re-)evaluation ────────────
+            # Commitments are permanent — no "changed" check needed.
+            # Priority: unevaluated miners first, then re-eval oldest for EMA freshness.
             needs_eval = []
+            already_scored = []
             for uid, commit in commitments.items():
-                model = commit["model"]
-                revision = commit.get("revision", "main")
-
-                # Skip stale miners (unless commitment changed)
-                if is_stale(uid, failures) and not commitment_changed(uid, model, revision, commit_cache):
+                # Skip stale miners entirely
+                if is_stale(uid, failures):
                     continue
 
-                # Priority: new/changed commitments first
-                if commitment_changed(uid, model, revision, commit_cache):
-                    needs_eval.insert(0, (uid, commit))  # Front of queue
-                elif str(uid) not in ema_scores:
+                if str(uid) not in ema_scores:
+                    # Never evaluated — highest priority
                     needs_eval.append((uid, commit))
+                else:
+                    already_scored.append((uid, commit))
 
-            # Also re-evaluate oldest cached scores (freshness rotation)
-            cached_uids = [
-                (uid, commit) for uid, commit in commitments.items()
-                if str(uid) in ema_scores and not commitment_changed(
-                    uid, commit["model"], commit.get("revision", "main"), commit_cache
-                )
-            ]
-            # Sort by last eval block (oldest first)
-            cached_uids.sort(key=lambda x: commit_cache.get(str(x[0]), {}).get("block", 0))
-            needs_eval.extend(cached_uids[:2])  # Re-eval up to 2 stale caches
+            # Re-evaluate oldest cached scores (freshness rotation for EMA)
+            already_scored.sort(key=lambda x: commit_cache.get(str(x[0]), {}).get("block", 0))
+            needs_eval.extend(already_scored[:2])  # Re-eval up to 2 oldest
 
             # Cap evaluations per epoch
             to_eval = needs_eval[:max_eval_per_epoch]
@@ -211,7 +214,14 @@ def main(
                         record_failure(uid, failures)
                         continue
 
-                    # 2. Copy detection
+                    # 2. Tokenizer verification
+                    tok_ok, tok_reason = verify_tokenizer(teacher_model, model_repo)
+                    if not tok_ok:
+                        logger.warning(f"UID {uid} tokenizer mismatch: {tok_reason}")
+                        record_failure(uid, failures)
+                        continue
+
+                    # 3. Copy detection
                     model_hash = compute_model_hash(model_repo, revision)
                     if model_hash:
                         dup_uid = check_duplicate_hash(model_hash, uid, state_path)
@@ -223,7 +233,7 @@ def main(
                             continue
                         register_model_hash(model_hash, uid, state_path)
 
-                    # 3. Load student
+                    # 4. Load student
                     logger.info(f"Evaluating UID {uid}: {model_repo}@{revision[:12] if revision else 'main'} "
                                 f"({check.get('params_b', '?'):.2f}B total)")
                     student = AutoModelForCausalLM.from_pretrained(
@@ -235,13 +245,14 @@ def main(
                     )
                     student.eval()
 
-                    # 4. KL evaluation with teacher continuation
+                    # 5. KL evaluation with teacher continuation
                     kl_results = []
                     for i, ids in enumerate(input_ids_list):
                         result = evaluate_kl_with_continuation(
                             teacher, student, ids,
                             max_new_tokens=max_new_tokens,
                             device=device,
+                            block_seed=current_block,
                         )
                         kl_results.append(result)
                         logger.debug(
@@ -265,11 +276,11 @@ def main(
                         f"({total_positions} total positions across {len(kl_results)} prompts)"
                     )
 
-                    # 5. Update EMA
+                    # 6. Update EMA
                     new_ema = update_ema(uid, avg_kl, ema_scores, EMA_ALPHA)
                     logger.info(f"  UID {uid}: EMA KL={new_ema:.6f}")
 
-                    # 6. Update cache
+                    # 7. Update cache
                     commit_cache[str(uid)] = {
                         "model": model_repo,
                         "revision": revision,

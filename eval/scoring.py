@@ -19,6 +19,7 @@ logger = logging.getLogger("distillation.scoring")
 STATE_DIR = Path("state")
 DEFAULT_EMA_ALPHA = 0.3
 DEFAULT_MAX_KL = 10.0  # Quality floor — reject if KL above this
+MIN_KL_FLOOR = 1e-6  # Prevents div-by-zero for near-perfect models
 
 
 def _load_json(path: Path) -> dict:
@@ -157,8 +158,9 @@ def compute_proportional_weights(
     if not valid:
         return weights
 
-    # Inverse-KL weighting
-    inv_kls = {uid: 1.0 / kl for uid, kl in valid.items()}
+    # Inverse-KL weighting with floor to prevent div-by-zero on perfect copies
+    MIN_KL_FLOOR = 1e-6
+    inv_kls = {uid: 1.0 / max(kl, MIN_KL_FLOOR) for uid, kl in valid.items()}
     total = sum(inv_kls.values())
 
     for uid, inv_kl in inv_kls.items():

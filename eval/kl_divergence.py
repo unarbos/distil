@@ -65,12 +65,13 @@ def evaluate_kl_with_continuation(
     input_ids: torch.Tensor,
     max_new_tokens: int = 512,
     device: str = "cuda",
+    block_seed: Optional[int] = None,
 ) -> dict:
     """
     Production KL evaluation with teacher continuation.
 
     Steps:
-    1. Generate greedy continuation from teacher
+    1. Generate continuation from teacher (block-seeded sampling for anti-gaming)
     2. Forward pass full sequence through both models
     3. Compute KL on continuation positions only
 
@@ -80,6 +81,9 @@ def evaluate_kl_with_continuation(
         input_ids: [1, prompt_len] tokenized prompt
         max_new_tokens: teacher continuation length
         device: cuda/cpu
+        block_seed: if provided, use seeded sampling (temperature=0.7, top_p=0.9)
+                    for anti-memorization; all validators with same seed produce
+                    identical continuations
 
     Returns:
         dict with kl_mean, kl_std, kl_max, kl_min, n_positions, prompt_len, gen_len
@@ -87,13 +91,20 @@ def evaluate_kl_with_continuation(
     input_ids = input_ids.to(device)
     prompt_len = input_ids.shape[1]
 
-    # 1. Generate teacher continuation (greedy)
-    teacher_output = teacher_model.generate(
-        input_ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        use_cache=True,
-    )
+    # 1. Generate teacher continuation
+    # Block-seeded sampling prevents miners from memorizing greedy continuations
+    # while ensuring all validators agree on the same output for a given block
+    gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=True)
+    if block_seed is not None:
+        # Seed torch RNG so all validators with same block_seed get identical output
+        torch.manual_seed(block_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(block_seed)
+        gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
+    else:
+        gen_kwargs.update(do_sample=False)
+
+    teacher_output = teacher_model.generate(input_ids, **gen_kwargs)
     gen_len = teacher_output.shape[1] - prompt_len
 
     if gen_len == 0:
