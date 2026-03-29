@@ -233,11 +233,13 @@ def get_commitments():
 
 @app.get("/api/scores")
 def get_scores():
-    result = {"ema_scores": {}, "last_eval": None, "last_eval_time": None, "tempo_seconds": 600}
+    result = {"scores": {}, "ema_scores": {}, "last_eval": None, "last_eval_time": None, "tempo_seconds": 600}
     scores_path = os.path.join(STATE_DIR, "scores.json")
     if os.path.exists(scores_path):
         with open(scores_path) as f:
-            result["ema_scores"] = json.load(f)
+            s = json.load(f)
+            result["scores"] = s
+            result["ema_scores"] = s  # backward compat
     eval_path = os.path.join(STATE_DIR, "last_eval.json")
     if os.path.exists(eval_path):
         with open(eval_path) as f:
