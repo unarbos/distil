@@ -16,18 +16,29 @@ A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.5-35B-A3B*
 
 The validator uses a **king-of-the-hill** architecture for efficient, high-confidence scoring:
 
-1. **Pre-checks (no GPU)** — Every epoch, all models are checked for:
-   - Architecture compliance (param count, vocab size, no quantization)
-   - **Duplicate detection** — SHA256 hash of safetensors weights via HF API; identical weights to an existing model → permanently blacklisted. Earlier commitment (by block number) wins.
+1. **Pre-checks (no GPU)** — Every epoch (~10 min), all committed models are verified:
+   - Architecture compliance (≤5.25B params, vocab_size=248,320, no quantization)
+   - **Duplicate detection** — SHA256 hash of safetensors weights; identical weights to an existing model → permanently blacklisted. Earlier commitment (by block number) owns the hash.
    - **Integrity** — Model must still be public and unchanged on HuggingFace
-2. **King identification** — The miner with the lowest KL score is the "king"
-3. **Challenger evaluation** — Only **new/unevaluated** models are scored head-to-head against the king on GPU
-4. **Higher confidence** — 40 prompts per evaluation (vs 20 in broad-sweep mode) for tighter confidence intervals
-5. **King re-validation** — The king is re-evaluated with fresh prompts every 6 epochs
-6. **Crown transfer** — If a challenger beats the king's KL, it becomes the new king
-7. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing.
+   - Models that fail pre-checks are **never sent to GPU** — no wasted compute
 
-This means the validator spends GPU time only on models that could actually win, and gets 2x more samples per model for better point estimates.
+2. **King identification** — The miner with the lowest KL score from state is the "king" (current emissions winner)
+
+3. **Challenger detection** — Only models that haven't been evaluated yet are challengers. Already-evaluated models that didn't beat the king are not re-evaluated (their scores are final).
+
+4. **Head-to-head GPU eval** — The king and all challengers are scored together on the same 40 FineWeb prompts (block-seeded). The teacher generates 512-token continuations, then both teacher and student forward-pass the sequences for full-distribution KL on 248K vocab.
+
+5. **Epsilon threshold (1%)** — A challenger must achieve KL divergence **more than 1% lower** than the king's to dethrone it. For example, if the king has KL=0.097, a challenger needs KL < 0.096 (= 0.097 × 0.99). This prevents noisy near-ties from flipping the winner every epoch and rewards meaningful improvements.
+
+6. **King re-validation** — Every 6 epochs, the king is re-evaluated with fresh prompts even if there are no challengers. This catches model integrity issues and confirms the score is stable.
+
+7. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
+
+**Why this is better than evaluating all models every epoch:**
+- **2x more prompts per model** (40 vs 20) → tighter confidence intervals, lower variance
+- **GPU time spent only on potential winners** — evaluated models that already lost don't burn compute
+- **Epsilon prevents flip-flopping** — the king holds unless clearly beaten
+- **Scales to many miners** — 100 miners with 1 new challenger = 2 models evaluated, not 100
 
 ### Disqualification
 

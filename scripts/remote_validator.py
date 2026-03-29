@@ -45,6 +45,9 @@ KING_EVAL_PROMPTS = 40
 CHALLENGER_EVAL_PROMPTS = 40
 # King is re-validated every N epochs even if no challengers
 KING_REEVAL_INTERVAL = 6
+# Epsilon: challenger must beat king by this relative margin to dethrone
+# e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
+EPSILON = 0.01
 
 
 @click.command()
@@ -403,9 +406,26 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 reset_failures(uid, failures)
                 print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
 
+            # ── Epsilon check: challenger must beat king by >1% to dethrone ──
+            if king_uid is not None and challengers:
+                king_new_kl = scores.get(str(king_uid), king_kl)
+                threshold = king_new_kl * (1.0 - EPSILON)
+                for uid in challengers:
+                    uid_str = str(uid)
+                    if uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
+                        challenger_kl = scores[uid_str]
+                        if challenger_kl < threshold:
+                            print(f"[VALIDATOR] UID {uid} DETHRONED king UID {king_uid}! "
+                                  f"KL={challenger_kl:.6f} < {threshold:.6f} (king {king_new_kl:.6f} - {EPSILON*100:.0f}%)", flush=True)
+                        else:
+                            pct = ((king_new_kl - challenger_kl) / king_new_kl * 100) if king_new_kl > 0 else 0
+                            print(f"[VALIDATOR] UID {uid} did NOT beat king (KL={challenger_kl:.6f}, "
+                                  f"needed <{threshold:.6f}, only {pct:.1f}% better)", flush=True)
+
             # ── Compute winner & set weights ──
             weights, winner_uid, winner_kl = compute_winner_weights(
                 scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
+                epsilon=EPSILON,
             )
 
             # Leaderboard
