@@ -4,6 +4,7 @@ import time
 import json
 import traceback
 import os
+import threading
 import requests as req
 
 app = FastAPI(title="Distillation Subnet API")
@@ -20,188 +21,232 @@ TMC_KEY = "***REMOVED***"
 TMC_BASE = "https://api.taomarketcap.com"
 TMC_HEADERS = {"Authorization": TMC_KEY}
 
-# ── Caches ────────────────────────────────────────────────────────────────────
-_meta_cache = {"data": None, "ts": 0}
-_commit_cache = {"data": None, "ts": 0}
-_price_cache = {"data": None, "ts": 0}
-_table_cache = {"data": None, "ts": 0}
+STATE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state")
+DISK_CACHE_DIR = os.path.join(STATE_DIR, "api_cache")
+os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+
+# ── Disk-backed cache ────────────────────────────────────────────────────────
+
+def _disk_read(name: str):
+    path = os.path.join(DISK_CACHE_DIR, f"{name}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+def _disk_write(name: str, data):
+    path = os.path.join(DISK_CACHE_DIR, f"{name}.json")
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+# In-memory caches (fast path)
+_mem = {
+    "metagraph": {"data": None, "ts": 0},
+    "commitments": {"data": None, "ts": 0},
+    "price": {"data": None, "ts": 0},
+}
+
+def _get_cached(name: str, ttl: int):
+    """Return cached data if fresh enough, from memory or disk."""
+    now = time.time()
+    mc = _mem[name]
+    if mc["data"] and now - mc["ts"] < ttl:
+        return mc["data"]
+    # Try disk
+    disk = _disk_read(name)
+    if disk and now - disk.get("_ts", 0) < ttl:
+        mc["data"] = disk
+        mc["ts"] = disk.get("_ts", 0)
+        return disk
+    return None
+
+def _set_cached(name: str, data: dict):
+    now = time.time()
+    data["_ts"] = now
+    _mem[name]["data"] = data
+    _mem[name]["ts"] = now
+    _disk_write(name, data)
+
+def _get_stale(name: str):
+    """Return ANY cached data, even stale — for fallback."""
+    mc = _mem[name]
+    if mc["data"]:
+        return mc["data"]
+    return _disk_read(name)
 
 
-def _tmc_get(path: str, timeout: int = 10):
-    """GET from TaoMarketCap API."""
-    r = req.get(f"{TMC_BASE}{path}", headers=TMC_HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+# ── Background refresh (non-blocking) ────────────────────────────────────────
+
+_refresh_lock = threading.Lock()
+_refreshing = set()
+
+def _bg_refresh(name: str, fn):
+    """Refresh cache in background thread. Non-blocking."""
+    if name in _refreshing:
+        return
+    def _do():
+        try:
+            _refreshing.add(name)
+            result = fn()
+            if result:
+                _set_cached(name, result)
+        except Exception as e:
+            print(f"[bg_refresh] {name} failed: {e}")
+        finally:
+            _refreshing.discard(name)
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
 
 
-# ── Metagraph via TMC neurons endpoint ────────────────────────────────────────
+# ── Data fetchers ─────────────────────────────────────────────────────────────
+
+def _fetch_metagraph():
+    import bittensor as bt
+    sub = bt.Subtensor(network="finney")
+    meta = sub.metagraph(NETUID)
+    block = sub.block
+    neurons = []
+    for uid in range(meta.n):
+        neurons.append({
+            "uid": uid,
+            "hotkey": str(meta.hotkeys[uid]),
+            "coldkey": str(meta.coldkeys[uid]),
+            "stake": float(meta.S[uid]),
+            "trust": float(meta.T[uid]),
+            "consensus": float(meta.C[uid]),
+            "incentive": float(meta.I[uid]),
+            "emission": float(meta.E[uid]),
+            "dividends": float(meta.D[uid]),
+            "is_validator": float(meta.S[uid]) > 1000,
+        })
+    return {
+        "netuid": NETUID,
+        "block": int(block),
+        "n": int(meta.n),
+        "neurons": neurons,
+        "timestamp": time.time(),
+    }
+
+def _fetch_commitments():
+    import bittensor as bt
+    sub = bt.Subtensor(network="finney")
+    revealed = sub.get_all_revealed_commitments(NETUID)
+    commits = {}
+    for hotkey, entries in revealed.items():
+        if entries:
+            block, data = entries[0]
+            try:
+                parsed = json.loads(data)
+                commits[str(hotkey)] = {"block": block, **parsed}
+            except Exception:
+                commits[str(hotkey)] = {"block": block, "raw": str(data)}
+    return {"commitments": commits, "count": len(commits)}
+
+def _fetch_price():
+    data = req.get(f"{TMC_BASE}/public/v1/subnets/table/", headers=TMC_HEADERS, timeout=10).json()
+    sn97 = next((item for item in data if item.get("subnet") == NETUID), None)
+    if not sn97:
+        raise ValueError("Subnet 97 not found")
+
+    alpha_price_tao = sn97.get("price", 0)
+    try:
+        r = req.get("https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd", timeout=5)
+        tao_usd = r.json().get("bittensor", {}).get("usd", 0)
+    except Exception:
+        tao_usd = (_get_stale("price") or {}).get("tao_usd", 0)
+
+    return {
+        "alpha_price_tao": round(alpha_price_tao, 6),
+        "alpha_price_usd": round(alpha_price_tao * tao_usd, 4),
+        "tao_usd": round(tao_usd, 2),
+        "alpha_in_pool": round(sn97.get("alpha_liquidity", 0) / 1e9, 2),
+        "tao_in_pool": round(sn97.get("tao_liquidity", 0) / 1e9, 2),
+        "marketcap_tao": round(sn97.get("marketcap", 0), 2),
+        "emission_pct": round(sn97.get("emission", 0), 4),
+        "volume_tao": round(sn97.get("volume", 0), 2),
+        "price_change_1h": round(sn97.get("price_difference_hour", 0), 2),
+        "price_change_24h": round(sn97.get("price_difference_day", 0), 2),
+        "price_change_7d": round(sn97.get("price_difference_week", 0), 2),
+        "miners_tao_per_day": round(sn97.get("miners_tao_per_day", 0), 2),
+        "block_number": sn97.get("block_number", 0),
+        "name": sn97.get("name", ""),
+        "symbol": sn97.get("symbol", ""),
+        "timestamp": time.time(),
+    }
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/metagraph")
 def get_metagraph():
-    """Get metagraph from TMC (no bittensor SDK needed)."""
-    now = time.time()
-    if _meta_cache["data"] and now - _meta_cache["ts"] < CACHE_TTL:
-        return _meta_cache["data"]
-
+    # Fast: return cache immediately, refresh in background if stale
+    cached = _get_cached("metagraph", CACHE_TTL)
+    if cached:
+        return cached
+    # No fresh cache — return stale if available, and refresh in background
+    stale = _get_stale("metagraph")
+    if stale:
+        _bg_refresh("metagraph", _fetch_metagraph)
+        return stale
+    # No cache at all — must block (first ever request)
     try:
-        import bittensor as bt
-        sub = bt.Subtensor(network="finney")
-        meta = sub.metagraph(NETUID)
-        block = sub.block
-
-        neurons = []
-        for uid in range(meta.n):
-            neurons.append({
-                "uid": uid,
-                "hotkey": str(meta.hotkeys[uid]),
-                "coldkey": str(meta.coldkeys[uid]),
-                "stake": float(meta.S[uid]),
-                "trust": float(meta.T[uid]),
-                "consensus": float(meta.C[uid]),
-                "incentive": float(meta.I[uid]),
-                "emission": float(meta.E[uid]),
-                "dividends": float(meta.D[uid]),
-                "is_validator": float(meta.S[uid]) > 1000,
-            })
-
-        result = {
-            "netuid": NETUID,
-            "block": int(block),
-            "n": int(meta.n),
-            "neurons": neurons,
-            "timestamp": now,
-        }
-        _meta_cache["data"] = result
-        _meta_cache["ts"] = now
+        result = _fetch_metagraph()
+        _set_cached("metagraph", result)
         return result
     except Exception as e:
-        if _meta_cache["data"]:
-            return _meta_cache["data"]
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-# ── Commitments (still needs bt SDK for now) ──────────────────────────────────
-
 @app.get("/api/commitments")
 def get_commitments():
-    """Get all revealed commitments (miner model submissions)."""
-    now = time.time()
-    if _commit_cache["data"] and now - _commit_cache["ts"] < CACHE_TTL:
-        return _commit_cache["data"]
-
+    cached = _get_cached("commitments", CACHE_TTL)
+    if cached:
+        return cached
+    stale = _get_stale("commitments")
+    if stale:
+        _bg_refresh("commitments", _fetch_commitments)
+        return stale
     try:
-        import bittensor as bt
-        sub = bt.Subtensor(network="finney")
-        revealed = sub.get_all_revealed_commitments(NETUID)
-        commits = {}
-        for hotkey, entries in revealed.items():
-            if entries:
-                block, data = entries[0]
-                try:
-                    parsed = json.loads(data)
-                    commits[str(hotkey)] = {"block": block, **parsed}
-                except Exception:
-                    commits[str(hotkey)] = {"block": block, "raw": str(data)}
-
-        result = {"commitments": commits, "count": len(commits)}
-        _commit_cache["data"] = result
-        _commit_cache["ts"] = now
+        result = _fetch_commitments()
+        _set_cached("commitments", result)
         return result
     except Exception as e:
-        if _commit_cache["data"]:
-            return _commit_cache["data"]
         return {"commitments": {}, "count": 0, "error": str(e)}
 
 
-# ── Scores (local file) ──────────────────────────────────────────────────────
-
 @app.get("/api/scores")
 def get_scores():
-    """Get latest eval scores from state files."""
-    state_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state")
     result = {"ema_scores": {}, "last_eval": None}
-
-    scores_path = os.path.join(state_dir, "scores.json")
+    scores_path = os.path.join(STATE_DIR, "scores.json")
     if os.path.exists(scores_path):
         with open(scores_path) as f:
             result["ema_scores"] = json.load(f)
-
-    eval_path = os.path.join(state_dir, "last_eval.json")
+    eval_path = os.path.join(STATE_DIR, "last_eval.json")
     if os.path.exists(eval_path):
         with open(eval_path) as f:
             result["last_eval"] = json.load(f)
-
     return result
 
 
-# ── Price via TaoMarketCap (no Subtensor!) ────────────────────────────────────
-
 @app.get("/api/price")
 def get_price():
-    """Get SN97 alpha price, TAO/USD, market data from TaoMarketCap."""
-    now = time.time()
-    if _price_cache["data"] and now - _price_cache["ts"] < 30:
-        return _price_cache["data"]
-
+    cached = _get_cached("price", 30)
+    if cached:
+        return cached
+    stale = _get_stale("price")
+    if stale:
+        _bg_refresh("price", _fetch_price)
+        return stale
     try:
-        data = _tmc_get(f"/public/v1/subnets/table/")
-        sn97 = None
-        for item in data:
-            if item.get("subnet") == NETUID:
-                sn97 = item
-                break
-
-        if not sn97:
-            raise ValueError("Subnet 97 not found in TMC table")
-
-        alpha_price_tao = sn97.get("price", 0)
-
-        # Get TAO/USD from coingecko (lightweight)
-        try:
-            r = req.get(
-                "https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd",
-                timeout=5,
-            )
-            tao_usd = r.json().get("bittensor", {}).get("usd", 0)
-        except Exception:
-            tao_usd = _price_cache.get("data", {}).get("tao_usd", 0) if _price_cache["data"] else 0
-
-        alpha_price_usd = alpha_price_tao * tao_usd
-        alpha_in_pool = sn97.get("alpha_liquidity", 0) / 1e9
-        tao_in_pool = sn97.get("tao_liquidity", 0) / 1e9
-
-        result = {
-            "alpha_price_tao": round(alpha_price_tao, 6),
-            "alpha_price_usd": round(alpha_price_usd, 4),
-            "tao_usd": round(tao_usd, 2),
-            "alpha_in_pool": round(alpha_in_pool, 2),
-            "tao_in_pool": round(tao_in_pool, 2),
-            "marketcap_tao": round(sn97.get("marketcap", 0), 2),
-            "emission_pct": round(sn97.get("emission", 0), 4),
-            "volume_tao": round(sn97.get("volume", 0), 2),
-            "price_change_1h": round(sn97.get("price_difference_hour", 0), 2),
-            "price_change_24h": round(sn97.get("price_difference_day", 0), 2),
-            "price_change_7d": round(sn97.get("price_difference_week", 0), 2),
-            "miners_tao_per_day": round(sn97.get("miners_tao_per_day", 0), 2),
-            "block_number": sn97.get("block_number", 0),
-            "name": sn97.get("name", ""),
-            "symbol": sn97.get("symbol", ""),
-            "timestamp": now,
-        }
-        _price_cache["data"] = result
-        _price_cache["ts"] = now
+        result = _fetch_price()
+        _set_cached("price", result)
         return result
     except Exception as e:
-        if _price_cache["data"]:
-            return _price_cache["data"]
         return {"error": str(e)}
 
 
-# ── TMC SSE config (for frontend to connect directly) ────────────────────────
-
 @app.get("/api/tmc-config")
 def get_tmc_config():
-    """Return TMC SSE endpoint config for frontend to connect directly."""
     return {
         "sse_price_url": f"{TMC_BASE}/public/v1/sse/subnets/prices/",
         "sse_subnet_url": f"{TMC_BASE}/public/v1/sse/subnets/{NETUID}/",
@@ -215,7 +260,17 @@ def health():
     return {
         "status": "ok",
         "netuid": NETUID,
-        "cache_age_meta": time.time() - _meta_cache["ts"] if _meta_cache["ts"] else None,
-        "cache_age_price": time.time() - _price_cache["ts"] if _price_cache["ts"] else None,
-        "price_source": "taomarketcap",
+        "has_metagraph_cache": _get_stale("metagraph") is not None,
+        "has_commit_cache": _get_stale("commitments") is not None,
+        "has_price_cache": _get_stale("price") is not None,
     }
+
+
+# ── Startup: prime caches ────────────────────────────────────────────────────
+
+@app.on_event("startup")
+def prime_caches():
+    """On startup, kick off background refreshes so first request is fast."""
+    _bg_refresh("metagraph", _fetch_metagraph)
+    _bg_refresh("commitments", _fetch_commitments)
+    _bg_refresh("price", _fetch_price)
