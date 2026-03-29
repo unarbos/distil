@@ -187,8 +187,9 @@ def root():
         "endpoints": {
             "/api/metagraph": "Full subnet metagraph (UIDs, stakes, weights, incentive)",
             "/api/commitments": "Miner model commitments (HuggingFace links)",
-            "/api/scores": "Current KL scores + last eval details",
+            "/api/scores": "Current KL scores, disqualifications, last eval details",
             "/api/price": "Token price, emission, market data",
+            "/api/model-info/{repo}": "HuggingFace model card info (params, MoE, tags, etc.)",
             "/api/health": "Service health check",
         },
     }
@@ -267,6 +268,66 @@ def get_price():
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/model-info/{model_path:path}")
+def get_model_info(model_path: str):
+    """Fetch HuggingFace model card info (cached 1h)."""
+    cache_key = f"model_info:{model_path}"
+    cached = _get_cached(cache_key, 3600)
+    if cached:
+        return cached
+    try:
+        from huggingface_hub import model_info as hf_model_info
+        info = hf_model_info(model_path, files_metadata=True)
+
+        # Get param count from safetensors metadata
+        params_b = None
+        if info.safetensors and hasattr(info.safetensors, "total"):
+            params_b = round(info.safetensors.total / 1e9, 2)
+
+        # Parse config for MoE info
+        active_params_b = None
+        is_moe = False
+        num_experts = None
+        num_active_experts = None
+        try:
+            from eval.model_checker import compute_moe_params
+            from huggingface_hub import hf_hub_download
+            config_path = hf_hub_download(repo_id=model_path, filename="config.json")
+            with open(config_path) as f:
+                config = json.load(f)
+            moe_info = compute_moe_params(config)
+            is_moe = moe_info.get("is_moe", False)
+            if is_moe:
+                active_params_b = round(moe_info["active_params"] / 1e9, 2)
+                num_experts = moe_info.get("num_experts")
+                num_active_experts = moe_info.get("num_active_experts")
+        except Exception:
+            pass
+
+        result = {
+            "model": model_path,
+            "author": info.author or model_path.split("/")[0],
+            "description": (info.card_data.get("description") if info.card_data else None)
+                or (getattr(info, "description", None)),
+            "tags": list(info.tags) if info.tags else [],
+            "downloads": info.downloads,
+            "likes": info.likes,
+            "created_at": info.created_at.isoformat() if info.created_at else None,
+            "last_modified": info.last_modified.isoformat() if info.last_modified else None,
+            "params_b": params_b,
+            "active_params_b": active_params_b,
+            "is_moe": is_moe,
+            "num_experts": num_experts,
+            "num_active_experts": num_active_experts,
+            "license": (info.card_data.get("license") if info.card_data else None),
+            "pipeline_tag": info.pipeline_tag,
+        }
+        _set_cached(cache_key, result)
+        return result
+    except Exception as e:
+        return {"error": str(e), "model": model_path}
 
 
 @app.get("/api/tmc-config")

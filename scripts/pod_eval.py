@@ -15,6 +15,7 @@ Usage:
         --max-new-tokens 512 \
         --max-params-b 36.0
 """
+import math
 import torch
 import torch.nn.functional as F
 import json
@@ -247,7 +248,11 @@ def main():
         "students": {},
     }
 
-    for student_name in students:
+    # Track best KL across students for early stopping
+    best_kl_so_far = None  # best (lowest) global KL mean from fully-evaluated students
+    MIN_PROMPTS_EARLY_STOP = 10
+
+    for student_idx, student_name in enumerate(students):
         print(f"\n{'=' * 60}", flush=True)
         print(f"[eval] Student: {student_name}", flush=True)
 
@@ -257,40 +262,70 @@ def main():
         load_time = time.time() - t0
         print(f"[eval] Loaded in {load_time:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
-        # Try batch scoring first
+        # --- Per-prompt sequential scoring with early stopping ---
+        can_early_stop = (student_idx > 0) and (best_kl_so_far is not None)
+        kl_per_prompt = []
+        early_stopped = False
         t0 = time.time()
-        try:
-            kl_per_prompt, fwd_time = batch_forward_kl(
-                student, full_sequences, prompt_lens, teacher_logits_list, device,
-                batch_label=student_name.split("/")[-1],
-            )
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"  [batch] OOM, falling back to per-prompt scoring...", flush=True)
-                free_gpu()
-                kl_per_prompt = []
-                fwd_time = 0.0
-                with torch.no_grad():
-                    for i, full_ids in enumerate(full_sequences):
+
+        # Collect per-prompt KL means for running stats
+        prompt_kl_means = []  # list of per-prompt kl_mean values
+
+        with torch.no_grad():
+            for i, full_ids in enumerate(full_sequences):
+                try:
+                    s_logits = student(full_ids).logits.float()
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"  [prompt {i}] OOM, clearing cache and retrying...", flush=True)
+                        free_gpu()
                         s_logits = student(full_ids).logits.float()
-                        cont_s = s_logits[:, prompt_lens[i] - 1:-1, :]
-                        t_logits = teacher_logits_list[i].to(device)
-                        min_len = min(cont_s.shape[1], t_logits.shape[1])
-                        kl_per_pos = compute_kl(t_logits[:, :min_len, :], cont_s[:, :min_len, :]).squeeze(0)
-                        n_pos = kl_per_pos.shape[0]
-                        kl_per_prompt.append({
-                            "kl_mean": kl_per_pos.mean().item(),
-                            "kl_std": kl_per_pos.std().item() if n_pos > 1 else 0.0,
-                            "kl_max": kl_per_pos.max().item(),
-                            "kl_min": kl_per_pos.min().item(),
-                            "n_positions": n_pos,
-                        })
-                fwd_time = time.time() - t0
-            else:
-                raise
+                    else:
+                        raise
+
+                cont_s = s_logits[:, prompt_lens[i] - 1:-1, :]
+                t_logits = teacher_logits_list[i].to(device)
+                min_len = min(cont_s.shape[1], t_logits.shape[1])
+                kl_per_pos = compute_kl(t_logits[:, :min_len, :], cont_s[:, :min_len, :]).squeeze(0)
+                n_pos = kl_per_pos.shape[0]
+                kl_mean_val = kl_per_pos.mean().item()
+
+                kl_per_prompt.append({
+                    "kl_mean": kl_mean_val,
+                    "kl_std": kl_per_pos.std().item() if n_pos > 1 else 0.0,
+                    "kl_max": kl_per_pos.max().item(),
+                    "kl_min": kl_per_pos.min().item(),
+                    "n_positions": n_pos,
+                })
+                prompt_kl_means.append(kl_mean_val)
+
+                # Free per-prompt GPU tensors
+                del s_logits, cont_s, t_logits, kl_per_pos
+
+                # Early stopping check
+                n = len(prompt_kl_means)
+                if can_early_stop and n >= MIN_PROMPTS_EARLY_STOP:
+                    running_mean = sum(prompt_kl_means) / n
+                    running_var = sum((x - running_mean) ** 2 for x in prompt_kl_means) / (n - 1)
+                    running_se = math.sqrt(running_var / n)
+
+                    # Student's lower 95% CI bound (best case for student)
+                    student_lower = running_mean - 2 * running_se
+                    # Best student's upper 95% CI bound (worst case for best)
+                    best_upper = best_kl_so_far  # best_kl_so_far already stores the mean; use generous comparison
+
+                    if student_lower > best_upper:
+                        print(
+                            f"  [early-stop] {student_name}: KL={running_mean:.6f} ± {running_se:.6f} "
+                            f"after {n} prompts, best so far={best_kl_so_far:.6f}",
+                            flush=True,
+                        )
+                        early_stopped = True
+                        break
+
         scoring_time = time.time() - t0
 
-        # Compute global average
+        # Compute global average from scored prompts
         total_kl_sum = sum(r["kl_mean"] * r["n_positions"] for r in kl_per_prompt)
         total_positions = sum(r["n_positions"] for r in kl_per_prompt)
         kl_global = total_kl_sum / total_positions if total_positions > 0 else float("inf")
@@ -301,17 +336,27 @@ def main():
         for i, r in enumerate(kl_per_prompt):
             print(f"  {i:>6} | {r['kl_mean']:>10.6f} | {r['kl_std']:>10.6f} | {r['kl_max']:>10.6f} | {r['kl_min']:>10.6f} | {r['n_positions']:>10}", flush=True)
 
-        print(f"\n  ═══ {student_name}: global KL = {kl_global:.6f} ═══", flush=True)
+        status_str = f" (early-stopped after {len(kl_per_prompt)}/{len(prompts)} prompts)" if early_stopped else ""
+        print(f"\n  ═══ {student_name}: global KL = {kl_global:.6f}{status_str} ═══", flush=True)
         print(f"  Timings: load={load_time:.1f}s, scoring={scoring_time:.1f}s", flush=True)
         print(f"  VRAM after scoring: {gpu_mem_str()}", flush=True)
 
-        results["students"][student_name] = {
+        student_result = {
             "kl_global_avg": kl_global,
             "kl_per_prompt": kl_per_prompt,
             "total_positions": total_positions,
             "load_time_s": round(load_time, 1),
             "scoring_time_s": round(scoring_time, 1),
         }
+        if early_stopped:
+            student_result["early_stopped"] = True
+            student_result["prompts_scored"] = len(kl_per_prompt)
+        results["students"][student_name] = student_result
+
+        # Update best KL tracker (only from fully evaluated students)
+        if not early_stopped:
+            if best_kl_so_far is None or kl_global < best_kl_so_far:
+                best_kl_so_far = kl_global
 
         del student
         free_gpu()
