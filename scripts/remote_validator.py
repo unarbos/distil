@@ -245,7 +245,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 print("[VALIDATOR] No valid models after pre-checks", flush=True)
                 save_scores(scores, state_path)
                 save_failures(failures, state_path)
-            save_disqualified(dq_reasons, state_path)
+                save_disqualified(dq_reasons, state_path)
                 if once:
                     break
                 time.sleep(tempo)
