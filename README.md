@@ -51,6 +51,7 @@ Disqualification reasons are shown on the dashboard and available via the API.
 ### Anti-Gaming
 
 - **SHA256 hash duplicate detection**: Model weight hashes tracked forever; copies permanently blacklisted
+- **Logit fingerprinting**: Even if hashes differ, models with identical KL distributions on the first 2 prompts are flagged as functional copies (cosine similarity > 0.9999 on per-position KL vectors)
 - **Commitment block priority**: Earlier on-chain commitment wins hash ownership
 - **Integrity verification**: Models verified public + unchanged before every weight-set
 - **MoE-aware param counting**: Total params from safetensors metadata (not config estimates)

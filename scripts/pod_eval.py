@@ -252,6 +252,12 @@ def main():
     best_kl_so_far = None  # best (lowest) global KL mean from fully-evaluated students
     MIN_PROMPTS_EARLY_STOP = 10
 
+    # Logit fingerprinting: detect functional copies even if hashes differ
+    # Store per-position KL vectors from first 2 prompts per student
+    FINGERPRINT_PROMPTS = 2
+    FINGERPRINT_COSINE_THRESHOLD = 0.9999  # functional copy if above this
+    logit_fingerprints: dict[str, torch.Tensor] = {}  # student_name -> flattened KL vector
+
     for student_idx, student_name in enumerate(students):
         print(f"\n{'=' * 60}", flush=True)
         print(f"[eval] Student: {student_name}", flush=True)
@@ -266,10 +272,13 @@ def main():
         can_early_stop = (student_idx > 0) and (best_kl_so_far is not None)
         kl_per_prompt = []
         early_stopped = False
+        is_functional_copy = False
+        copy_of = None
         t0 = time.time()
 
         # Collect per-prompt KL means for running stats
         prompt_kl_means = []  # list of per-prompt kl_mean values
+        fingerprint_parts = []  # collect per-position KL vectors for fingerprinting
 
         with torch.no_grad():
             for i, full_ids in enumerate(full_sequences):
@@ -298,6 +307,35 @@ def main():
                     "n_positions": n_pos,
                 })
                 prompt_kl_means.append(kl_mean_val)
+
+                # Collect fingerprint from first N prompts
+                if i < FINGERPRINT_PROMPTS:
+                    fingerprint_parts.append(kl_per_pos.detach().cpu())
+
+                # After fingerprint prompts, check for functional copy
+                if i == FINGERPRINT_PROMPTS - 1 and logit_fingerprints:
+                    fp = torch.cat(fingerprint_parts)
+                    for prev_name, prev_fp in logit_fingerprints.items():
+                        # Match lengths (use min)
+                        fp_len = min(fp.shape[0], prev_fp.shape[0])
+                        if fp_len < 10:
+                            continue
+                        cos = torch.nn.functional.cosine_similarity(
+                            fp[:fp_len].unsqueeze(0),
+                            prev_fp[:fp_len].unsqueeze(0),
+                        ).item()
+                        if cos > FINGERPRINT_COSINE_THRESHOLD:
+                            is_functional_copy = True
+                            copy_of = prev_name
+                            print(
+                                f"  [FUNCTIONAL COPY] {student_name} is a copy of {prev_name} "
+                                f"(cosine={cos:.8f} after {FINGERPRINT_PROMPTS} prompts)",
+                                flush=True,
+                            )
+                            break
+
+                    if is_functional_copy:
+                        break
 
                 # Free per-prompt GPU tensors
                 del s_logits, cont_s, t_logits, kl_per_pos
@@ -348,13 +386,21 @@ def main():
             "load_time_s": round(load_time, 1),
             "scoring_time_s": round(scoring_time, 1),
         }
-        if early_stopped:
+        if is_functional_copy:
+            student_result["functional_copy"] = True
+            student_result["copy_of"] = copy_of
+            student_result["prompts_scored"] = len(kl_per_prompt)
+        elif early_stopped:
             student_result["early_stopped"] = True
             student_result["prompts_scored"] = len(kl_per_prompt)
         results["students"][student_name] = student_result
 
-        # Update best KL tracker (only from fully evaluated students)
-        if not early_stopped:
+        # Store fingerprint for future comparisons (only if not a copy itself)
+        if not is_functional_copy and fingerprint_parts:
+            logit_fingerprints[student_name] = torch.cat(fingerprint_parts)
+
+        # Update best KL tracker (only from fully evaluated, non-copy students)
+        if not early_stopped and not is_functional_copy:
             if best_kl_so_far is None or kl_global < best_kl_so_far:
                 best_kl_so_far = kl_global
 
