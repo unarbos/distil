@@ -357,9 +357,27 @@ def get_announcement():
     return {"type": None}
 
 
+@app.post("/api/announcement/claim")
+def claim_announcement():
+    """Atomically claim a pending announcement — returns it and marks posted in one call."""
+    ann_path = os.path.join(STATE_DIR, "announcement.json")
+    if os.path.exists(ann_path):
+        try:
+            with open(ann_path) as f:
+                ann = json.load(f)
+            if not ann.get("posted", True):
+                ann["posted"] = True
+                with open(ann_path, "w") as f:
+                    json.dump(ann, f, indent=2)
+                return ann
+        except Exception:
+            pass
+    return {"type": None}
+
+
 @app.post("/api/announcement/posted")
 def mark_announcement_posted():
-    """Mark the current announcement as posted."""
+    """Mark the current announcement as posted (legacy compat)."""
     ann_path = os.path.join(STATE_DIR, "announcement.json")
     if os.path.exists(ann_path):
         try:

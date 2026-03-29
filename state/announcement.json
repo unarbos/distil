@@ -1,0 +1,14 @@
+{
+  "type": "new_king",
+  "timestamp": 1774825468.5364816,
+  "posted": true,
+  "message": "## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 115** has dethroned **UID 174**\n\n\ud83d\udcca **KL: 0.068799** (was 0.097231, 29.2% improvement)\n\ud83e\udd17 Model: [Qwen/Qwen3.5-4B-Base](<https://huggingface.co/Qwen/Qwen3.5-4B-Base>)\n\ud83d\udc51 Previous king: [unconst/sn97-qwen35-4b-distilled](<https://huggingface.co/unconst/sn97-qwen35-4b-distilled>)\n\nThink you can beat **0.068111 KL** (1% epsilon)? Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
+  "data": {
+    "new_uid": 115,
+    "new_model": "Qwen/Qwen3.5-4B-Base",
+    "new_kl": 0.06879900423809886,
+    "old_uid": 174,
+    "old_model": "unconst/sn97-qwen35-4b-distilled",
+    "old_kl": 0.09723138776516467
+  }
+}

@@ -4,5 +4,7 @@
   "158": "arch: Model not found on HuggingFace (404)",
   "28": "copy: identical weights to UID 174 (unconst/sn97-qwen35-4b-distilled), committed later at block 7854397 vs 7854191",
   "52": "integrity: Cannot compute model hash \u2014 safetensors may have been removed",
-  "61": "integrity: Cannot compute model hash \u2014 safetensors may have been removed"
+  "61": "integrity: Cannot compute model hash \u2014 safetensors may have been removed",
+  "230": "copy: identical weights to UID 115 (Qwen/Qwen3.5-4B-Base), committed later at block 7854520 vs 7854471",
+  "185": "copy: functional copy of Bittensor-110/qwen35-4b (UID 27) \u2014 identical logit distribution"
 }

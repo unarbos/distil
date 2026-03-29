@@ -301,7 +301,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             if not challengers:
                 print(f"[VALIDATOR] No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds", flush=True)
-                # Still set weights to keep tempo
+                # Still set weights periodically to keep tempo
                 weights, winner_uid, winner_kl = compute_winner_weights(
                     scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
                 )
@@ -314,8 +314,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 print(f"[VALIDATOR] Epoch complete in {elapsed:.0f}s (no eval needed)", flush=True)
                 if once:
                     break
-                print(f"[VALIDATOR] Sleeping {tempo}s...", flush=True)
-                time.sleep(tempo)
+                # Poll for new challengers every 60s instead of sleeping full tempo
+                poll_interval = 60
+                print(f"[VALIDATOR] Polling for new challengers every {poll_interval}s...", flush=True)
+                time.sleep(poll_interval)
                 continue
 
             # ══════════════════════════════════════════════════════════════
@@ -635,8 +637,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             if once:
                 break
-            print(f"[VALIDATOR] Sleeping {tempo}s...", flush=True)
-            time.sleep(tempo)
+            # After eval, check immediately for new challengers (may have arrived during eval)
+            print(f"[VALIDATOR] Checking for new challengers immediately...", flush=True)
 
         except KeyboardInterrupt:
             logger.info("Shutting down")
