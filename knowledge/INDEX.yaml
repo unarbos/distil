@@ -1,0 +1,20 @@
+# Distillation Subnet Knowledge Base
+# Entry point for LLM agents
+
+purpose: |
+  Knowledge repository for the Distillation subnet — a Bittensor subnet
+  where miners compete to produce the best compressed version of GLM-5
+  (744B MoE → ≤74.4B), scored by KL-divergence on coding tasks.
+
+files:
+  distillation.yaml: "Subnet design: measurement, mechanism, scoring, anti-gaming"
+
+task_routing:
+  understanding_subnet:
+    load: [distillation.yaml]
+  running_validator:
+    load: [distillation.yaml]
+    then: "see validator.py CLI options and scripts/run_validator.sh"
+  running_miner:
+    load: [distillation.yaml]
+    then: "see miner.py CLI options and scripts/run_miner.sh"

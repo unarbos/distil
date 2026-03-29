@@ -1,0 +1,29 @@
+[project]
+name = "distillation"
+version = "0.1.0"
+description = "Bittensor subnet for GLM-5 model distillation competition"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "bittensor>=8.0.0",
+    "bittensor-cli>=9.17.0",
+    "bittensor-wallet>=2.0.0",
+    "click>=8.0.0",
+    "vllm>=0.6.0",
+    "transformers>=4.40.0",
+    "huggingface-hub>=0.20.0",
+    "numpy>=1.26.0",
+    "torch>=2.0.0",
+]
+
+[project.scripts]
+distillation-validator = "validator:main"
+distillation-miner = "miner:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,177 @@
+# Distillation Subnet
+# Competitive model compression for GLM-5 on Bittensor
+# Pattern: tournament / model-quality competition
+
+metadata:
+  name: distillation
+  category: model_compression
+  patterns_used:
+    - model_tournament  # miners submit models, validators rank them
+  teacher_model: "zai-org/GLM-5"
+  teacher_params: "744B total (40B active, MoE)"
+  max_student_ratio: 0.1  # ≤10% of teacher = 74.4B
+
+# ===========================================================================
+# WHAT IS BEING MEASURED
+# ===========================================================================
+
+measurement:
+  one_sentence: "How well can a compressed model reproduce GLM-5's output distribution on coding tasks?"
+  commodity: model_quality
+  metric: "KL(teacher || student) on per-token logprobs"
+  lower_is_better: true
+
+  detail: |
+    Miners distill, quantize, or prune GLM-5 into a model with at most
+    1/10 of the original parameters. They commit their HuggingFace model
+    URL on-chain. Validators download both models, run them on identical
+    coding prompts from SweInfinite, and compare per-token logprob
+    distributions via KL-divergence.
+
+    The miner whose student model produces the lowest average KL-divergence
+    (closest to the teacher's output distribution) wins all emission weight
+    for that epoch. Winner-take-all scoring creates strong competitive
+    pressure toward state-of-the-art distillation.
+
+# ===========================================================================
+# MECHANISM
+# ===========================================================================
+
+mechanism:
+  summary: |
+    No synapse/axon/dendrite — follows the Chi pattern.
+    Miners commit HF model links on-chain via the Commitments pallet.
+    Validators pull models, run local GPU inference, compare logprobs.
+
+  flow:
+    miner:
+      1_distill_model: "Compress GLM-5 using distillation, quantization, or pruning"
+      2_upload_to_hf: "Push model to HuggingFace Hub"
+      3_verify_locally: "Check tokenizer compat and param count"
+      4_commit_on_chain: "Write JSON commitment via Commitments pallet"
+      5_keep_alive: "Periodically re-commit; update model URL if improved"
+
+    validator:
+      1_sync_metagraph: "Get current network state and miner UIDs"
+      2_read_commitments: "Query Commitments pallet for each miner's model URL"
+      3_gate_checks: "Verify param count (≤74.4B) and tokenizer compatibility"
+      4_load_teacher: "Load GLM-5 via vLLM (kept resident in GPU memory)"
+      5_sample_prompts: "Pick N random SweInfinite coding problems"
+      6_teacher_inference: "Generate logprobs from teacher on all prompts"
+      7_student_loop: "For each valid miner: load model → inference → KL-div → unload"
+      8_score: "Winner-take-all — lowest KL-div gets weight 1.0"
+      9_set_weights: "Submit weight vector to chain"
+
+  commitment_format:
+    type: JSON
+    schema: |
+      {
+        "model_repo": "username/distilled-glm5",
+        "tokenizer": "zai-org/GLM-5",
+        "params_b": 70.0
+      }
+    pallet: Commitments
+    rate_limit: "1 per 100 blocks (~20 min)"
+
+# ===========================================================================
+# SCORING
+# ===========================================================================
+
+scoring:
+  metric: kl_divergence
+  formula: "KL(P_teacher || P_student) averaged over token positions and prompts"
+  aggregation: "Mean across N sampled prompts per epoch"
+  winner_selection: "Winner-take-all: argmin(KL) gets weight=1.0, all others 0.0"
+
+  parameters:
+    samples_per_epoch: 5
+    max_tokens: 128
+    top_k_logprobs: 50
+    temperature: 0.0  # deterministic generation
+
+  why_kl_divergence: |
+    KL-divergence directly measures how well the student approximates the
+    teacher's full output distribution, not just the argmax token. This
+    rewards models that preserve uncertainty and confidence calibration,
+    not just top-1 accuracy. It is the natural loss function for
+    knowledge distillation (Hinton et al., 2015).
+
+# ===========================================================================
+# CONSTRAINTS
+# ===========================================================================
+
+constraints:
+  tokenizer:
+    rule: "Student MUST use the same tokenizer as GLM-5"
+    why: "KL-divergence requires comparing probability distributions over the same vocabulary"
+    check: "Compare vocab_size and encode() outputs on test strings"
+
+  parameter_count:
+    rule: "Student model ≤ 74.4B parameters (10% of 744B)"
+    check: "HuggingFace model_info() safetensors metadata"
+    why: "Enforces actual compression — prevents trivially copying the teacher"
+
+  model_hosting:
+    rule: "Model must be publicly accessible on HuggingFace Hub"
+    why: "Validators must be able to download and run inference"
+
+# ===========================================================================
+# ANTI-GAMING
+# ===========================================================================
+
+anti_gaming:
+  random_prompt_selection: |
+    Prompts are randomly sampled each epoch from the SweInfinite dataset.
+    Miners cannot overfit to a fixed eval set.
+
+  tokenizer_enforcement: |
+    Incompatible tokenizers are detected and rejected before evaluation.
+    Miners cannot game by using a different vocabulary.
+
+  param_count_verification: |
+    Model size is checked via HuggingFace metadata before download.
+    Oversized models are rejected without wasting GPU time.
+
+  winner_take_all: |
+    Only the absolute best model earns weight. This prevents lazy
+    submissions and creates maximum competitive pressure.
+
+  teacher_kept_resident: |
+    The teacher model stays in GPU memory across evaluations, ensuring
+    consistent teacher logprobs for fair comparison.
+
+# ===========================================================================
+# DATASET
+# ===========================================================================
+
+dataset:
+  name: SweInfinite
+  source: "/tmp/SweInfinite/dataset/"
+  format: "JSON files, one per GitHub issue"
+  fields: ["instance_id", "repo", "problem_statement"]
+  count: "~20 files"
+  domain: "Real GitHub issues — code analysis and bug fixing"
+  why: |
+    Coding tasks exercise both reasoning and code generation capabilities.
+    Real GitHub issues provide diverse, challenging problems that test
+    whether the student model retains the teacher's full capabilities.
+
+# ===========================================================================
+# INFRASTRUCTURE
+# ===========================================================================
+
+infrastructure:
+  validator_gpu_requirements: |
+    Validators must run both GLM-5 (744B MoE, ~40B active) and student
+    models (up to 74.4B). This requires substantial GPU memory.
+    Recommended: 8×H100 or equivalent via Lium.io GPU rental.
+    vLLM tensor parallelism is supported (--tensor-parallel-size).
+
+  model_caching: |
+    Student models are cached at ~/.cache/distillation/models/ to avoid
+    re-downloading every epoch. Teacher model stays in GPU memory.
+
+  lium_integration: |
+    Validators can rent GPUs from Lium.io (SN51) for inference.
+    Configure vLLM to point to remote GPU endpoints if local hardware
+    is insufficient.
