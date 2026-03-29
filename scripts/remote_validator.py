@@ -267,6 +267,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     "model": model_repo,
                     "revision": revision,
                     "params_b": check.get("params_b", 0),
+                    "commit_block": commit.get("block", float("inf")),
                 }
                 print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
 
@@ -363,8 +364,18 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             # Re-upload eval script (in case it changed)
             lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
 
-            # Run eval
-            student_list = ",".join(m["model"] for m in models_to_eval.values())
+            # Run eval — king first, then challengers by commit block (earliest first).
+            # Earlier commits are more established → likely lower KL → sets best_kl_so_far
+            # early for better early-stopping on weaker newcomers.
+            ordered_uids = []
+            if king_uid is not None and king_uid in models_to_eval:
+                ordered_uids.append(king_uid)
+            challenger_uids_sorted = sorted(
+                [uid for uid in models_to_eval if uid != king_uid],
+                key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")),
+            )
+            ordered_uids.extend(challenger_uids_sorted)
+            student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
             cmd = (
                 f"cd /home && python3 pod_eval.py "
                 f"--teacher {TEACHER_MODEL} "
@@ -400,23 +411,45 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             if result['stderr'].strip():
                 for line in result['stderr'].strip().split('\n')[-10:]:
                     print(f"  GPU ERR: {line[:200]}", flush=True)
-            if not result['success']:
-                print(f"[VALIDATOR] Eval failed on pod, skipping", flush=True)
-                if once:
-                    break
-                time.sleep(tempo)
-                continue
-
-            # ── Download results ──
+            # ── Download results (try even on failure — partial results may exist) ──
             results_local = str(state_path / "last_eval.json")
             try:
                 lium.download(pod, remote="/home/eval_results.json", local=results_local)
             except Exception as e:
                 logger.error(f"Failed to download results: {e}")
-                if once:
-                    break
-                time.sleep(tempo)
-                continue
+                if not result['success']:
+                    print(f"[VALIDATOR] Eval failed and no results to recover, skipping", flush=True)
+                    with open(progress_path, "w") as f:
+                        json.dump({"active": False}, f)
+                    if once:
+                        break
+                    time.sleep(tempo)
+                    continue
+
+            if not result['success']:
+                # Check if partial results are usable
+                try:
+                    with open(results_local) as f:
+                        partial = json.load(f)
+                    n_students = len(partial.get("students", {}))
+                    if n_students > 0:
+                        print(f"[VALIDATOR] Eval failed but recovered {n_students} partial results", flush=True)
+                    else:
+                        print(f"[VALIDATOR] Eval failed, no usable partial results", flush=True)
+                        with open(progress_path, "w") as f:
+                            json.dump({"active": False}, f)
+                        if once:
+                            break
+                        time.sleep(tempo)
+                        continue
+                except Exception:
+                    print(f"[VALIDATOR] Eval failed, results file corrupt", flush=True)
+                    with open(progress_path, "w") as f:
+                        json.dump({"active": False}, f)
+                    if once:
+                        break
+                    time.sleep(tempo)
+                    continue
 
             with open(results_local) as f:
                 results = json.load(f)
