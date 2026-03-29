@@ -1,0 +1,41 @@
+{
+  "instance_id": "openmc-dev__openmc-3802",
+  "repo": "openmc-dev/openmc",
+  "base_commit": "8198e6021dae83e4e9519108ca1483ad656f06a4",
+  "version": "0.15",
+  "created_at": "2026-02-13T22:36:21.141662+00:00",
+  "problem_statement": "**Bug Report: Presence of `None` Values in Cross Section Data**\n\n**Component Affected:** `Model.autoconvert` function within the cross-section data generation process.\n\n**Incorrect Behavior:** When users generate isothermal multi-group cross sections using the `autoconvert` function, `None` values incorrectly appear in the temperature data when the value `294` is not included in the specified temperature data points.\n\n**Expected Behavior:** The cross-section data should be populated appropriately with valid temperature values, without any `None` entries, regardless of the inclusion of specific temperature points.\n\n**Actual Behavior:** The output of the cross-section data contains `None` values, which may lead to incorrect interpretations and results in subsequent calculations or analyses.",
+  "patch": "diff --git a/openmc/model/model.py b/openmc/model/model.py\nindex 82fe87ca5..a512c4d38 100644\n--- a/openmc/model/model.py\n+++ b/openmc/model/model.py\n@@ -2052,7 +2052,8 @@ class Model:\n             # Unpack the isothermal XSData objects and build a single XSData object per material.\n             mgxs_sets = []\n             for m in range(len(self.materials)):\n-                mgxs_sets.append(openmc.XSdata(self.materials[m].name, groups))\n+                mgxs_sets.append(openmc.XSdata(self.materials[m].name, groups,\n+                                               temperatures=temperatures))\n                 mgxs_sets[-1].order = 0\n                 for temperature in temperatures:\n                     mgxs_sets[-1].add_temperature_data(raw_mgxs_sets[temperature][m])\n@@ -2333,7 +2334,7 @@ class Model:\n             # Unpack the isothermal XSData objects and build a single XSData object per material.\n             mgxs_sets = []\n             for mat in self.materials:\n-                mgxs_sets.append(openmc.XSdata(mat.name, groups))\n+                mgxs_sets.append(openmc.XSdata(mat.name, groups, temperatures=temperatures))\n                 mgxs_sets[-1].order = 0\n                 for temperature in temperatures:\n                     mgxs_sets[-1].add_temperature_data(raw_mgxs_sets[temperature][mat.name])\n@@ -2500,7 +2501,7 @@ class Model:\n             # Unpack the isothermal XSData objects and build a single XSData object per material.\n             mgxs_sets = []\n             for mat in self.materials:\n-                mgxs_sets.append(openmc.XSdata(mat.name, groups))\n+                mgxs_sets.append(openmc.XSdata(mat.name, groups, temperatures=temperatures))\n                 mgxs_sets[-1].order = 0\n                 for temperature in temperatures:\n                     mgxs_sets[-1].add_temperature_data(raw_mgxs_sets[temperature][mat.name])\n",
+  "test_patch": "diff --git a/tests/test_generated_model.py b/tests/test_generated_model.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_generated_model.py\n@@ -0,0 +1,21 @@\n+import pytest\n+from openmc.model.model import Model\n+import openmc\n+\n+def test_mgxs_data_includes_temperatures():\n+    # Setup a simple model with materials and a temperature list\n+    material1 = openmc.Material(1, name=\"material1\")\n+    material2 = openmc.Material(2, name=\"material2\")\n+    materials = openmc.Materials([material1, material2])\n+\n+    model = Model(materials=materials)\n+    groups = openmc.mgxs.EnergyGroups([0.0, 0.625e-6, 20.0e6])\n+    temperatures = [294, 600]\n+\n+    # Use autoconvertion to generate mgxs_data\n+    mgxs_data = model.autoconvert(temperatures=temperatures, groups=groups)\n+\n+    # Check that all XSdata instances correctly include the temperatures\n+    for data in mgxs_data:\n+        assert hasattr(data, 'temperatures'), \"XSdata object missing 'temperatures' attribute\"\n+        assert data.temperatures == temperatures, \"XSdata object temperatures attribute does not match input temperatures\"\n",
+  "hints_text": "",
+  "environment_setup_commit": "8198e6021dae83e4e9519108ca1483ad656f06a4",
+  "install_config": {
+    "python": "3.11",
+    "packages": null,
+    "install": "mkdir -p build && cd build && cmake .. && make -j && cd .. && pip install -e .[test]",
+    "test_cmd": "pytest -v tests/unit_tests",
+    "pre_install": [
+      "apt-get update -y",
+      "apt-get install -y g++ cmake libhdf5-dev libpng-dev git"
+    ],
+    "reqs_path": null,
+    "env_yml_path": null,
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    }
+  },
+  "license_name": "MIT",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

@@ -1,0 +1,51 @@
+{
+  "instance_id": "laosuan__istio-1157",
+  "repo": "laosuan/istio",
+  "base_commit": "f6dcc184396367394582a12fd2dfaebcff498854",
+  "version": "1.2",
+  "created_at": "2026-02-13T20:54:28.994573+00:00",
+  "problem_statement": "**Bug Report: Incorrect Cluster Action Handling in Multicluster Component**\n\n**Bug Report: Incorrect Cluster Action Handling in Multicluster Component**\n\n**Component:** `multicluster` in `pkg/kube/cluster.go`\n\n**Description:** The `Run` function in the `Cluster` struct does not correctly set the action attribute before reporting the cluster's synchronization status. As a result, the action that the cluster is supposed to perform may not be reflected in its status updates, leading to potential synchronization issues. \n\n**Symptoms:** When the `Run` function is invoked, the synchronization status reports that it is \"Syncing,\" but the actual action being taken may not align with the expected behavior. This discrepancy can cause confusion and hinder proper operation within multi-cluster environments, as users may receive misleading status notifications that do not represent the current state of the cluster.",
+  "patch": "diff --git a/pkg/kube/multicluster/cluster.go b/pkg/kube/multicluster/cluster.go\nindex 814ed5fa7..83080cbf6 100644\n--- a/pkg/kube/multicluster/cluster.go\n+++ b/pkg/kube/multicluster/cluster.go\n@@ -96,7 +96,6 @@ func (c *Cluster) Run(mesh mesh.Watcher, handlers []handler, action ACTION, swap\n \t// Ensure previous cluster is cleaned up when this method exits (success, failure, or timeout)\n \tdefer swap.Complete()\n \n-\tc.Action = action\n \tc.reportStatus(SyncStatusSyncing)\n \tif features.RemoteClusterTimeout > 0 {\n \t\ttime.AfterFunc(features.RemoteClusterTimeout, func() {\n",
+  "test_patch": "diff --git a/pkg/test/framework/components/echo/kube/instance.go b/pkg/test/framework/components/echo/kube/instance.go\nindex d4eca43ff..eb6c36572 100644\n--- a/pkg/test/framework/components/echo/kube/instance.go\n+++ b/pkg/test/framework/components/echo/kube/instance.go\n@@ -291,12 +291,23 @@ func (c *instance) Restart() error {\n \t\treturn fmt.Errorf(\"restart failed to get initial workloads: %v\", err)\n \t}\n \n+\t// Collect original pod UIDs so we can verify new pods have come up.\n+\t// Pod names are not sufficient because StatefulSet pods keep their names across restarts,\n+\t// but UIDs always change when a pod is deleted and recreated.\n+\torigPodUIDs := make(map[string]struct{}, len(origWorkloads))\n+\tfor _, w := range origWorkloads {\n+\t\torigPodUIDs[string(w.(*workload).pod.UID)] = struct{}{}\n+\t}\n+\n \t// Restart the deployment.\n \tif err := c.deployment.Restart(); err != nil {\n \t\treturn err\n \t}\n \n-\t// Wait until all pods are ready and match the original count.\n+\t// Wait until all pods are ready, match the original count, and are actually new pods.\n+\t// Without the UID check, there's a race where the workload manager's informer hasn't\n+\t// processed delete/add events yet, so WaitForReadyWorkloads returns stale old pods\n+\t// with the correct count, causing this loop to exit before new pods are actually up.\n \treturn retry.UntilSuccess(func() (err error) {\n \t\t// Get the currently ready workloads.\n \t\tworkloads, err := c.workloadMgr.WaitForReadyWorkloads()\n@@ -311,6 +322,15 @@ func (c *instance) Restart() error {\n \t\t\t\tc.cfg.Namespace.Name(), c.cfg.Service, len(workloads), len(origWorkloads))\n \t\t}\n \n+\t\t// Verify all workloads are actually new pods, not old ones lingering in the workload manager.\n+\t\tfor _, w := range workloads {\n+\t\t\tuid := string(w.(*workload).pod.UID)\n+\t\t\tif _, ok := origPodUIDs[uid]; ok {\n+\t\t\t\treturn fmt.Errorf(\"failed restarting echo %s/%s: old pod %s (UID %s) still present\",\n+\t\t\t\t\tc.cfg.Namespace.Name(), c.cfg.Service, w.PodName(), uid)\n+\t\t\t}\n+\t\t}\n+\n \t\treturn nil\n \t}, retry.Timeout(c.cfg.ReadinessTimeout), startDelay)\n }\n",
+  "hints_text": "",
+  "environment_setup_commit": "f6dcc184396367394582a12fd2dfaebcff498854",
+  "install_config": {
+    "python": "3.9",
+    "packages": "",
+    "install": "make build",
+    "test_cmd": "make test",
+    "pre_install": [
+      "go version",
+      "docker --version"
+    ],
+    "reqs_path": [],
+    "env_yml_path": [],
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    }
+  },
+  "license_name": "Apache-2.0",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": "",
+  "eval_result": {
+    "status": "unresolved",
+    "model": "opus-4.6",
+    "agent_time_seconds": 597.0,
+    "token_count": null,
+    "tool_calls": null,
+    "sanity_check": true,
+    "evaluated_at": "2026-02-13T21:35:58.267887+00:00",
+    "error": null
+  }
+}

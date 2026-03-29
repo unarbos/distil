@@ -1,0 +1,50 @@
+{
+  "instance_id": "intel__device-modeling-language-411",
+  "repo": "intel/device-modeling-language",
+  "base_commit": "20c92242aadb57b10f464fa153c4ba0d278a0972",
+  "version": "unknown",
+  "created_at": "2026-02-13T23:12:37.100488+00:00",
+  "problem_statement": "**Problem Statement:**\n\nThe documentation contains a typo and inconsistent formatting. In `README.md`, the DMLC_DIR section uses \"build compiler\" instead of \"built compiler\", which is grammatically incorrect. In `py/README.md`, the title uses inconsistent capitalization (\"A short hacking guide to dmlc\" instead of title case), and the introductory sentence is wordy and unclear. These issues reduce clarity and professionalism.",
+  "patch": "diff --git a/README.md b/README.md\nindex 7d7d0f1..c0c259d 100644\n--- a/README.md\n+++ b/README.md\n@@ -52,7 +52,7 @@ regularly with a locally built DMLC, then consider setting the variables\n ### DMLC_DIR\n After building DMLC, you need to set `DMLC_DIR` to `<your-project>/<hosttype>/bin`\n in subsequent invocations of `make` in order to build devices with the locally\n-build compiler. `<hosttype>` is either `linux64` or `win64` depending on your \n+built compiler. `<hosttype>` is either `linux64` or `win64` depending on your \n host type. \n \n ### T126_JOBS\ndiff --git a/py/README.md b/py/README.md\nindex b4fe07d..f326c59 100644\n--- a/py/README.md\n+++ b/py/README.md\n@@ -3,9 +3,9 @@\n   SPDX-License-Identifier: MPL-2.0\n -->\n \n-# A short hacking guide to dmlc\n+# A Short Hacking Guide to DMLC\n \n-This text is an attempt to make it easier for you to find your way around the\n+This text is intended to help you find your way around the\n sources and understand what is going on inside the DML compiler (`dmlc`).\n \n ## dml/dmlc.py\n",
+  "test_patch": "diff --git a/test/1.2/internal/README.md b/test/1.2/internal/README.md\nindex 9680b33..ed8106f 100644\n--- a/test/1.2/internal/README.md\n+++ b/test/1.2/internal/README.md\n@@ -3,13 +3,15 @@\n   SPDX-License-Identifier: MPL-2.0\n -->\n \n+# DML Confidentiality Parameter\n+\n A new parameter `_confidentiality` (note the leading underscore) was\n introduced to allow the DML programmer to hide certain information\n from the end user. This parameter is a property of the whole device\n and is by default inherited by all the banks and registers defined in\n the device. The default value of this parameter is `undefined`, which\n-means no information hidden is required. Each bank/register/bitfield\n-can also override the default value hence it is possible to\n+means no information hiding is required. Each bank/register/bitfield\n+can also override the default value, hence it is possible to\n selectively hide confidential information for individual\n banks/registers.\n \n@@ -23,12 +25,12 @@ of the log string. All of this is handled by the DML compiler without\n interference from the programmer. Attributes of confidential registers\n will be registered as internal attributes and their docstring will not\n be registered as part of property of that attribute, hence completely\n-hidden from the on-line help system. Lastly, bank/register/bitfield\n-marked as confidential will not be processed when generating the xml\n+hidden from the online help system. Lastly, banks/registers/bitfields\n+marked as confidential will not be processed when generating the XML\n information file for the device.\n \n For convenience, there is a global hidden parameter\n-`_build_confidentiality` that DML compiler recognized as a way to\n+`_build_confidentiality` that the DML compiler recognizes as a way to\n specify the confidentiality of the target being built. This parameter\n is preferably defined in the Makefile as an input parameter to the DML\n compiler and is effectively serving as a threshold confidentiality\n",
+  "hints_text": "",
+  "environment_setup_commit": "20c92242aadb57b10f464fa153c4ba0d278a0972",
+  "install_config": {
+    "python": "3.7",
+    "packages": null,
+    "install": "make dmlc",
+    "test_cmd": "make test-dmlc",
+    "pre_install": [],
+    "reqs_path": [],
+    "env_yml_path": [],
+    "pip_packages": [
+      "ply==3.4"
+    ]
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 2,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    },
+    "solution_lines": 6,
+    "lines_added": 3,
+    "lines_removed": 3,
+    "repo_stars": 105,
+    "repo_forks": 50,
+    "repo_contributors": 5,
+    "has_ci": true,
+    "has_test_framework": true,
+    "is_archived": false,
+    "is_fork": false
+  },
+  "license_name": "AGPL-3.0",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

@@ -1,0 +1,41 @@
+{
+  "instance_id": "Mzmarianna__Learning-41",
+  "repo": "Mzmarianna/Learning",
+  "base_commit": "9ae463dabd61ab29d73502d9f7e57ea444e7607b",
+  "version": "unknown",
+  "created_at": "2026-02-13T21:17:04.188731+00:00",
+  "problem_statement": "**Bug Report: Node.js Setup Caching Issue**\n\n**Bug Report: Node.js Setup Caching Issue**\n\n**Component Affected:** GitHub Actions Workflow (Linting Process)\n\n**Incorrect Behavior:** The current GitHub Actions workflow for setting up Node.js is using an outdated version of the `actions/setup-node` action (v4) that lacks enhanced caching capabilities for dependency management.\n\n**Expected vs Actual Behavior:** It is expected that the workflow would automate caching for npm dependencies, improving build times and efficiency. However, due to the outdated action version, caching is ineffective, potentially leading to longer workflow execution times and unnecessary network usage when installing node modules.",
+  "patch": "diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml\nindex 2824cf4..2a6cec3 100644\n--- a/.github/workflows/lint.yml\n+++ b/.github/workflows/lint.yml\n@@ -17,7 +17,7 @@ jobs:\n         uses: actions/checkout@v4\n \n       - name: Setup Node.js\n-        uses: actions/setup-node@v4\n+        uses: actions/setup-node@v6\n         with:\n           node-version: '20'\n           cache: 'npm'\n",
+  "test_patch": "diff --git a/tests/test_generated_lint.py b/tests/test_generated_lint.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_generated_lint.py\n@@ -0,0 +1,16 @@\n+# Assuming there is a function or a module in the project that interacts with the specific setup\n+# We will create a mock function call to simulate the use of node setup that would have failed previously\n+\n+import pytest\n+import subprocess\n+\n+def node_version():\n+    # Simulated function to check node version setup in the environment\n+    result = subprocess.run(['node', '--version'], capture_output=True, text=True)\n+    return result.stdout.strip()\n+\n+def test_node_version_set_properly():\n+    # This test verifies if node version 20 is set up correctly\n+    expected_version_prefix = \"v20.\"\n+    node_ver = node_version()\n+    assert node_ver.startswith(expected_version_prefix), f\"Expected Node.js version to start with {expected_version_prefix}, but got {node_ver}\"\n",
+  "hints_text": "",
+  "environment_setup_commit": "9ae463dabd61ab29d73502d9f7e57ea444e7607b",
+  "install_config": {
+    "python": "3.9",
+    "packages": "requirements.txt",
+    "install": "npm install",
+    "test_cmd": "npm run build",
+    "pre_install": [
+      "apt-get update",
+      "apt-get install -y nodejs npm"
+    ],
+    "reqs_path": [],
+    "env_yml_path": [],
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    }
+  },
+  "license_name": "Apache-2.0",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

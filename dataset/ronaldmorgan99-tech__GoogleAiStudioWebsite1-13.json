@@ -1,0 +1,48 @@
+{
+  "instance_id": "ronaldmorgan99-tech__GoogleAiStudioWebsite1-13",
+  "repo": "ronaldmorgan99-tech/GoogleAiStudioWebsite1",
+  "base_commit": "d325692004dc678c27a9963d109d5d3e9b23ea10",
+  "version": "unknown",
+  "created_at": "2026-02-13T22:51:16.396457+00:00",
+  "problem_statement": "## Problem Statement\n\nRefreshing the browser on nested client routes (e.g., `/users/123` or `/dashboard/settings`) returns a server `NOT_FOUND` (404) response instead of rendering the React app. This occurs because the server treats these paths as real requests and doesn't serve the SPA entry point. Navigating to these routes via client-side navigation works, but refreshing or opening them directly fails. The routing component fails to handle server-side route resolution, causing a broken refresh experience for nested routes.",
+  "patch": "diff --git a/web/src/main.tsx b/web/src/main.tsx\nindex 2589c4d..94816d6 100644\n--- a/web/src/main.tsx\n+++ b/web/src/main.tsx\n@@ -1,6 +1,6 @@\n import React from 'react';\n import ReactDOM from 'react-dom/client';\n-import { BrowserRouter } from 'react-router-dom';\n+import { HashRouter } from 'react-router-dom';\n import { QueryClient, QueryClientProvider } from '@tanstack/react-query';\n import App from './App';\n import './styles/index.css';\n@@ -10,9 +10,9 @@ const queryClient = new QueryClient();\n ReactDOM.createRoot(document.getElementById('root')!).render(\n   <React.StrictMode>\n     <QueryClientProvider client={queryClient}>\n-      <BrowserRouter>\n+      <HashRouter>\n         <App />\n-      </BrowserRouter>\n+      </HashRouter>\n     </QueryClientProvider>\n   </React.StrictMode>\n );\n",
+  "test_patch": "diff --git a/__tests__/generated_main.test.ts b/__tests__/generated_main.test.ts\nnew file mode 100644\n--- /dev/null\n+++ b/__tests__/generated_main.test.ts\n@@ -0,0 +1,58 @@\n+import React from 'react';\n+import { render } from '@testing-library/react';\n+import { useLocation } from 'react-router-dom';\n+import { HashRouter } from 'react-router-dom';\n+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';\n+\n+const TestComponent = () => {\n+  const location = useLocation();\n+  return <div data-testid=\"location\">{location.pathname}</div>;\n+};\n+\n+describe('Router Configuration', () => {\n+  beforeEach(() => {\n+    window.history.replaceState(null, '', '/');\n+  });\n+\n+  it('should extract pathname from hash URL on page refresh', () => {\n+    const queryClient = new QueryClient({\n+      defaultOptions: {\n+        queries: { retry: false },\n+      },\n+    });\n+\n+    window.location.hash = '#/test-route';\n+\n+    const { getByTestId } = render(\n+      <QueryClientProvider client={queryClient}>\n+        <HashRouter>\n+          <TestComponent />\n+        </HashRouter>\n+      </QueryClientProvider>\n+    );\n+\n+    const locationElement = getByTestId('location');\n+    expect(locationElement.textContent).toBe('/test-route');\n+  });\n+\n+  it('should handle hash-based routing without server configuration', () => {\n+    const queryClient = new QueryClient({\n+      defaultOptions: {\n+        queries: { retry: false },\n+      },\n+    });\n+\n+    window.location.hash = '#/dashboard/settings';\n+\n+    const { getByTestId } = render(\n+      <QueryClientProvider client={queryClient}>\n+        <HashRouter>\n+          <TestComponent />\n+        </HashRouter>\n+      </QueryClientProvider>\n+    );\n+\n+    const locationElement = getByTestId('location');\n+    expect(locationElement.textContent).toBe('/dashboard/settings');\n+  });\n+});\n",
+  "hints_text": "",
+  "environment_setup_commit": "d325692004dc678c27a9963d109d5d3e9b23ea10",
+  "install_config": {
+    "python": "",
+    "packages": "",
+    "install": "npm install && npm --prefix server install && npm --prefix web install",
+    "test_cmd": "npm test",
+    "pre_install": [],
+    "reqs_path": [],
+    "env_yml_path": [],
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    },
+    "solution_lines": 6,
+    "lines_added": 3,
+    "lines_removed": 3,
+    "repo_stars": 0,
+    "repo_forks": 0,
+    "repo_contributors": 1,
+    "has_ci": false,
+    "has_test_framework": false,
+    "is_archived": false,
+    "is_fork": false
+  },
+  "license_name": null,
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

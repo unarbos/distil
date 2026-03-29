@@ -1,0 +1,41 @@
+{
+  "instance_id": "containers__ramalama-2419",
+  "repo": "containers/ramalama",
+  "base_commit": "65d33e31c2860ae35a5eee95e4aabdb5e5223ecf",
+  "version": "0.17",
+  "created_at": "2026-02-13T21:15:35.156230+00:00",
+  "problem_statement": "**Bug Report: Inconsistent Linting Across Python Versions**\n\n**Bug Report: Inconsistent Linting Across Python Versions**\n\n**Component:** Continuous Integration (CI) Linting Process\n\n**Issue:** The current CI pipeline does not consistently validate the codebase against the minimum supported Python version specified in `pyproject.toml`. As a result, developers may inadvertently introduce code that utilizes features from newer Python versions, leading to compatibility issues on systems running older versions, such as macOS. \n\n**Expected Behavior:** Linting should occur under the context of the declared minimum Python version to ensure code compatibility.\n\n**Actual Behavior:** Existing CI processes may run linting with different Python versions, potentially allowing code that is incompatible with the minimum supported version to pass linting checks, thereby introducing bugs and discrepancies in project compatibility.",
+  "patch": "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\nindex 8350dc2..50acff3 100644\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -18,8 +18,23 @@ jobs:\n     steps:\n       - uses: actions/checkout@v6\n \n+      - name: Determine minimum supported Python\n+        id: min-python\n+        shell: bash\n+        run: |\n+          req=\"$(sed -nE \"s/^requires-python\\s*=\\s*['\\\"]([^'\\\"]+)['\\\"]/\\1/p\" pyproject.toml | head -n1)\"\n+          min=\"$(printf '%s\\n' \"$req\" \\\n+            | grep -oE '(>=|>)[[:space:]]*[0-9]+(\\.[0-9]+){0,2}' \\\n+            | sed -E 's/(>=|>)\\s*//' \\\n+            | sort -V \\\n+            | tail -n1)\"\n+          test -n \"$min\" || { echo \"Failed to parse requires-python: $req\"; exit 1; }\n+          echo \"version=$min\" >> \"$GITHUB_OUTPUT\"\n+\n       - name: Install the latest version of uv\n         uses: astral-sh/setup-uv@v7\n+        with:\n+          python-version: ${{ steps.min-python.outputs.version }}\n \n       - name: Install dependencies\n         run: |\ndiff --git a/Makefile b/Makefile\nindex c884159..95273e9 100644\n--- a/Makefile\n+++ b/Makefile\n@@ -114,9 +114,6 @@ docsite-docs:\n \n .PHONY: lint\n lint:\n-ifneq (,$(wildcard /usr/bin/python3))\n-\t${PYTHON} -m compileall -q -x '\\.venv' .\n-endif\n \t! git grep -n -- '#!/usr/bin/python3' -- ':!Makefile'\n \truff check $(RUFF_TARGETS)\n \tshellcheck *.sh */*.sh */*/*.sh\ndiff --git a/pyproject.toml b/pyproject.toml\nindex 1cb2fe1..81e2720 100644\n--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -253,3 +253,6 @@ dev = { features = [\"dev\"], solve-group = \"default\" }\n \n [tool.pixi.dependencies]\n tox = \">=4.30.2,<5\"\n+\n+[tool.mypy]\n+python_version = \"3.10\"\n\\ No newline at end of file\ndiff --git a/ramalama/compat.py b/ramalama/compat.py\nindex 66a0b0a..433b155 100644\n--- a/ramalama/compat.py\n+++ b/ramalama/compat.py\n@@ -5,16 +5,15 @@ import sys\n from contextlib import contextmanager\n from tempfile import NamedTemporaryFile as _NamedTemporaryFile\n \n-# Python 3.10 doesn't have StrEnum\n-try:\n+if sys.version_info >= (3, 11):\n     from enum import StrEnum\n-except ImportError:\n+else:\n     from enum import Enum\n \n     class StrEnum(str, Enum):  # type: ignore[no-redef]\n         \"\"\"StrEnum class for Python 3.10.\"\"\"\n \n-        def __str__(self):\n+        def __str__(self) -> str:\n             return self.value\n \n \n",
+  "test_patch": "diff --git a/tests/test_generated_ci.py b/tests/test_generated_ci.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_generated_ci.py\n@@ -0,0 +1,29 @@\n+import sys\n+import pytest\n+from ramalama.compat import StrEnum\n+\n+\n+def test_strenum_integration():\n+    class Color(StrEnum):\n+        RED = 'red'\n+        GREEN = 'green'\n+        BLUE = 'blue'\n+\n+    assert str(Color.RED) == 'red'\n+    assert str(Color.GREEN) == 'green'\n+    assert str(Color.BLUE) == 'blue'\n+\n+\n+def test_strenum_fallback_on_python_3_10():\n+    if sys.version_info >= (3, 11):\n+        pytest.skip(\"Test only applicable for Python 3.10 and below.\")\n+\n+    class Animal(StrEnum):\n+        DOG = 'dog'\n+        CAT = 'cat'\n+        MOUSE = 'mouse'\n+\n+    assert isinstance(Animal.DOG, StrEnum)\n+    assert str(Animal.DOG) == 'dog'\n+    assert str(Animal.CAT) == 'cat'\n+    assert str(Animal.MOUSE) == 'mouse'\n",
+  "hints_text": "",
+  "environment_setup_commit": "65d33e31c2860ae35a5eee95e4aabdb5e5223ecf",
+  "install_config": {
+    "python": "3.10",
+    "packages": "pyproject.toml",
+    "install": "pip install -e '.[dev]'",
+    "test_cmd": "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning -m 'not e2e' test/",
+    "pip_packages": [
+      "pytest",
+      "tox"
+    ],
+    "pre_install": [],
+    "reqs_path": [],
+    "env_yml_path": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 4,
+    "has_test_patch": true,
+    "is_lite": false,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    }
+  },
+  "license_name": "MIT",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

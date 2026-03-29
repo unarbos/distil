@@ -1,0 +1,50 @@
+{
+  "instance_id": "medinabenjamin__landing_page_test-54",
+  "repo": "medinabenjamin/landing_page_test",
+  "base_commit": "075e4875565b23119caba58f361343930ac6b3d3",
+  "version": "unknown",
+  "created_at": "2026-02-13T22:57:59.820161+00:00",
+  "problem_statement": "**Problem Statement:**\n\nThe contact form API endpoint (`POST /api/contact`) does not distinguish network connection errors from other failures. When the email server is unreachable, connection is refused, times out, or the host is unreachable, the endpoint returns a generic \"No se pudo enviar el formulario\" with HTTP 500, masking the actual network issue. Users cannot tell if the failure is due to email server connectivity or another error. The endpoint should detect these network errors and return a more specific message with an appropriate status code (e.g., 502 Bad Gateway) to indicate a service connectivity problem.",
+  "patch": "diff --git a/src/app/api/contact/route.ts b/src/app/api/contact/route.ts\nindex f918d3d..e7964be 100644\n--- a/src/app/api/contact/route.ts\n+++ b/src/app/api/contact/route.ts\n@@ -74,6 +74,22 @@ export async function POST(request: Request) {\n     return NextResponse.json({ ok: true });\n   } catch (error) {\n     console.error(\"Error enviando formulario de contacto\", error);\n+\n+    const errorCode =\n+      typeof error === \"object\" && error !== null && \"code\" in error && typeof error.code === \"string\"\n+        ? error.code\n+        : null;\n+\n+    if (errorCode && [\"ENETUNREACH\", \"ECONNREFUSED\", \"ETIMEDOUT\", \"EHOSTUNREACH\"].includes(errorCode)) {\n+      return NextResponse.json(\n+        {\n+          error:\n+            \"No se pudo conectar con el servidor de correo. Verifica la red del servidor o intenta nuevamente en unos minutos.\",\n+        },\n+        { status: 502 }\n+      );\n+    }\n+\n     return NextResponse.json({ error: \"No se pudo enviar el formulario.\" }, { status: 500 });\n   }\n }\n",
+  "test_patch": "diff --git a/__tests__/generated_route.test.ts b/__tests__/generated_route.test.ts\nnew file mode 100644\n--- /dev/null\n+++ b/__tests__/generated_route.test.ts\n@@ -0,0 +1,74 @@\n+import { describe, it, expect, vi, beforeEach, afterEach } from \"vitest\";\n+import { POST } from \"./route\";\n+\n+vi.mock(\"@/lib/smtp\", () => ({\n+  sendMailWithSmtp: vi.fn(),\n+}));\n+\n+import { sendMailWithSmtp } from \"@/lib/smtp\";\n+\n+const mockSendMailWithSmtp = vi.mocked(sendMailWithSmtp);\n+\n+describe(\"POST /api/contact\", () => {\n+  const originalEnv = process.env;\n+\n+  beforeEach(() => {\n+    vi.resetModules();\n+    process.env = {\n+      ...originalEnv,\n+      SMTP_USER: \"test@example.com\",\n+      SMTP_PASS: \"testpass\",\n+      CONTACT_RECEIVER_EMAIL: \"recipient@example.com\",\n+    };\n+    mockSendMailWithSmtp.mockReset();\n+  });\n+\n+  afterEach(() => {\n+    process.env = originalEnv;\n+  });\n+\n+  it(\"should return 502 status for network connection errors\", async () => {\n+    const error = new Error(\"Connection refused\");\n+    (error as any).code = \"ECONNREFUSED\";\n+    mockSendMailWithSmtp.mockRejectedValueOnce(error);\n+\n+    const request = new Request(\"http://localhost/api/contact\", {\n+      method: \"POST\",\n+      headers: { \"Content-Type\": \"application/json\" },\n+      body: JSON.stringify({\n+        fullName: \"Test User\",\n+        company: \"Test Company\",\n+        email: \"test@example.com\",\n+      }),\n+    });\n+\n+    const response = await POST(request);\n+    const data = await response.json();\n+\n+    expect(response.status).toBe(502);\n+    expect(data.error).toBe(\n+      \"No se pudo conectar con el servidor de correo. Verifica la red del servidor o intenta nuevamente en unos minutos.\"\n+    );\n+  });\n+\n+  it(\"should return 500 status for non-network errors\", async () => {\n+    const error = new Error(\"Some other error\");\n+    mockSendMailWithSmtp.mockRejectedValueOnce(error);\n+\n+    const request = new Request(\"http://localhost/api/contact\", {\n+      method: \"POST\",\n+      headers: { \"Content-Type\": \"application/json\" },\n+      body: JSON.stringify({\n+        fullName: \"Test User\",\n+        company: \"Test Company\",\n+        email: \"test@example.com\",\n+      }),\n+    });\n+\n+    const response = await POST(request);\n+    const data = await response.json();\n+\n+    expect(response.status).toBe(500);\n+    expect(data.error).toBe(\"No se pudo enviar el formulario.\");\n+  });\n+});\n",
+  "hints_text": "",
+  "environment_setup_commit": "075e4875565b23119caba58f361343930ac6b3d3",
+  "install_config": {
+    "python": "3.9",
+    "packages": "requirements.txt",
+    "install": "pip install -e .",
+    "test_cmd": "echo 'No Python tests found - this is a Node.js project'",
+    "pre_install": [],
+    "reqs_path": [
+      "requirements.txt"
+    ],
+    "env_yml_path": [],
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    },
+    "solution_lines": 16,
+    "lines_added": 16,
+    "lines_removed": 0,
+    "repo_stars": 0,
+    "repo_forks": 0,
+    "repo_contributors": 1,
+    "has_ci": false,
+    "has_test_framework": false,
+    "is_archived": false,
+    "is_fork": false
+  },
+  "license_name": null,
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

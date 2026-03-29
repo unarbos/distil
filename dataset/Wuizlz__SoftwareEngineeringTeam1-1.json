@@ -1,0 +1,48 @@
+{
+  "instance_id": "Wuizlz__SoftwareEngineeringTeam1-1",
+  "repo": "Wuizlz/SoftwareEngineeringTeam1",
+  "base_commit": "e6f641c16193acea90ce2fc6eed9fe2012c65dd0",
+  "version": "unknown",
+  "created_at": "2026-02-13T23:08:25.257870+00:00",
+  "problem_statement": "**Problem Statement:**\n\nThe Insertion Sort algorithm implementation is missing from the Java algorithms module. The `InsertionSort.java` file does not exist, so the Insertion Sort class is unavailable. Any code that references or uses Insertion Sort will fail to compile or run. The expected behavior is a complete Insertion Sort implementation that can sort integer arrays in ascending order. This leaves Task 3 of 5 incomplete.",
+  "patch": "diff --git a/Hw1/javaAlgos/InsertionSort.java b/Hw1/javaAlgos/InsertionSort.java\nnew file mode 100644\nindex 0000000..345d5d7\n--- /dev/null\n+++ b/Hw1/javaAlgos/InsertionSort.java\n@@ -0,0 +1,63 @@\n+/*\n+ * Name: Daniel Briseno\n+ * Professor: Dr. Dai\n+ * Course: CS416 - Software Engineering\n+ * Date: Feb 13, 2026\n+ *\n+ * File: InsertionSort.java\n+ * Description:\n+ *   Implements the Insertion Sort algorithm for sorting an integer array in ascending order.\n+ */\n+\n+import java.util.Arrays;\n+\n+public class InsertionSort {\n+\n+    /**\n+     * Sorts the given array in ascending order using Insertion Sort.\n+     *\n+     * Insertion Sort builds a sorted portion of the array one element at a time.\n+     * For each element, it shifts larger elements in the sorted portion to the right\n+     * and inserts the current element into its correct position.\n+     *\n+     * Time Complexity:\n+     *   - Worst/Average: O(n^2)\n+     *   - Best (already sorted): O(n)\n+     * Space Complexity:\n+     *   - O(1) (in-place)\n+     *\n+     * @param arr the array to be sorted (modified in-place)\n+     */\n+    public static void insertionSort(int[] arr) {\n+        if (arr == null || arr.length <= 1) {\n+            return; // Nothing to sort\n+        }\n+\n+        // Start from the second element since a single-element \"sorted\" list is already sorted.\n+        for (int i = 1; i < arr.length; i++) {\n+            int key = arr[i];      // The element we want to insert into the sorted portion.\n+            int j = i - 1;         // Index of the last element in the sorted portion.\n+\n+            // Shift elements that are greater than key one position to the right.\n+            while (j >= 0 && arr[j] > key) {\n+                arr[j + 1] = arr[j];\n+                j--;\n+            }\n+\n+            // Insert the key into the correct position.\n+            arr[j + 1] = key;\n+        }\n+    }\n+\n+    /**\n+     * Example driver to demonstrate Insertion Sort.\n+     * You can remove or modify this main method depending on assignment requirements.\n+     */\n+    public static void main(String[] args) {\n+        int[] data = { 9, 5, 1, 4, 3, 0, -2 };\n+\n+        System.out.println(\"Before: \" + Arrays.toString(data));\n+        insertionSort(data);\n+        System.out.println(\"After:  \" + Arrays.toString(data));\n+    }\n+}\n",
+  "test_patch": "diff --git a/src/test/java/generated/TestInsertionsort.java b/src/test/java/generated/TestInsertionsort.java\nnew file mode 100644\n--- /dev/null\n+++ b/src/test/java/generated/TestInsertionsort.java\n@@ -0,0 +1,25 @@\n+import org.junit.jupiter.api.Test;\n+import static org.junit.jupiter.api.Assertions.*;\n+\n+public class InsertionSortTest {\n+\n+    @Test\n+    public void testInsertionSortWithNullArray() {\n+        int[] arr = null;\n+        assertDoesNotThrow(() -> InsertionSort.insertionSort(arr));\n+    }\n+\n+    @Test\n+    public void testInsertionSortWithEmptyArray() {\n+        int[] arr = {};\n+        assertDoesNotThrow(() -> InsertionSort.insertionSort(arr));\n+        assertEquals(0, arr.length);\n+    }\n+\n+    @Test\n+    public void testInsertionSortWithSingleElement() {\n+        int[] arr = {42};\n+        InsertionSort.insertionSort(arr);\n+        assertArrayEquals(new int[]{42}, arr);\n+    }\n+}\n",
+  "hints_text": "",
+  "environment_setup_commit": "e6f641c16193acea90ce2fc6eed9fe2012c65dd0",
+  "install_config": {
+    "python": "3.9",
+    "packages": null,
+    "install": "pip install -e .[dev]",
+    "test_cmd": "echo 'No test command found'",
+    "pre_install": [],
+    "reqs_path": [],
+    "env_yml_path": [],
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    },
+    "solution_lines": 63,
+    "lines_added": 63,
+    "lines_removed": 0,
+    "repo_stars": 0,
+    "repo_forks": 0,
+    "repo_contributors": 2,
+    "has_ci": false,
+    "has_test_framework": false,
+    "is_archived": false,
+    "is_fork": false
+  },
+  "license_name": null,
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

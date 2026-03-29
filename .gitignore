@@ -1,37 +1,15 @@
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
 *.egg-info/
 dist/
 build/
-*.egg
-
-# Virtual environments
 .venv/
 venv/
-env/
-
-# Dataset (large, not tracked in git)
-dataset/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
+*.egg
+.eggs/
+*.so
+.mypy_cache/
+.pytest_cache/
 *.log
-
-# Model cache
-.cache/
-
-# uv
-uv.lock
+wallets/

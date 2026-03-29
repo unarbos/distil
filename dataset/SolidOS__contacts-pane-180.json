@@ -1,0 +1,43 @@
+{
+  "instance_id": "SolidOS__contacts-pane-180",
+  "repo": "SolidOS/contacts-pane",
+  "base_commit": "74cbeda0f044ae37a4f57d13fa5b787d507bff7b",
+  "version": "3.0",
+  "created_at": "2026-02-13T21:15:00.218309+00:00",
+  "problem_statement": "### Bug Report: solid-ui Version 3.0.3 Issue\n\n### Bug Report: solid-ui Version 3.0.3 Issue\n\n**Component Affected:** solid-ui library (version 3.0.3)\n\n**Description of the Problem:** In version 3.0.3 of the solid-ui library, the functionality of certain components was impaired, leading to unexpected behavior during testing. Specifically, interactions that were expected to trigger events, such as clicking on interactive elements, did not function correctly. For example, invoking the `clickMe` function resulted in an \"is not a function\" error, indicating a failure in the expected event handling mechanism.\n\n**Expected Behavior:** Users should be able to click on interactive components without error, and appropriate event handlers should be executed. \n\n**Actual Behavior:** Clicking on certain elements, such as the one corresponding to the `clickMe` function, resulted in an error indicating that the function was undefined, preventing users from successfully interacting with the interface.",
+  "patch": "diff --git a/package-lock.json b/package-lock.json\nindex 631151e..08e7670 100644\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -10672,9 +10672,9 @@\n       \"license\": \"MIT\"\n     },\n     \"node_modules/solid-ui\": {\n-      \"version\": \"3.0.3\",\n-      \"resolved\": \"https://registry.npmjs.org/solid-ui/-/solid-ui-3.0.3.tgz\",\n-      \"integrity\": \"sha512-lH6JjF1WvpBMhsyEmF+gvHXLFumnzO6bZGpvMbkdnsmNoBD3GMi8/BElz7hPNiX6Fubgya/s/ZykQm1NmXRdnQ==\",\n+      \"version\": \"3.0.4\",\n+      \"resolved\": \"https://registry.npmjs.org/solid-ui/-/solid-ui-3.0.4.tgz\",\n+      \"integrity\": \"sha512-WJt4LT+GC61ai85RFlv+fduLSTksd2CwqLUVQy+7vU2+CzybxbT/nn2pwLOVOoIWPXTN8kW9ZL1mVnxnr2ETtQ==\",\n       \"dev\": true,\n       \"license\": \"MIT\",\n       \"dependencies\": {\n",
+  "test_patch": "diff --git a/tests/test_generated_package_lock.py b/tests/test_generated_package_lock.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_generated_package_lock.py\n@@ -0,0 +1,24 @@\n+import pytest\n+from solid_ui import SomeComponentClass  # replace with actual component class that had the bug\n+\n+def test_component_handles_edge_case_correctly():\n+    component = SomeComponentClass()\n+\n+    # Setup the component with the specific edge case that was causing the issue\n+    component.setup_with_problematic_input(\"specific edge case input\")\n+\n+    # Perform the operation that was buggy before\n+    result = component.perform_operation()\n+\n+    # Assert the expected behavior after the bug fix\n+    assert result == \"expected result after fix\"\n+\n+def test_component_validation_error_handling():\n+    component = SomeComponentClass()\n+\n+    # Simulate input that previously caused a validation error\n+    with pytest.raises(SomeSpecificException):  # replace with actual exception\n+        component.setup_with_problematic_input(\"invalid input causing exception\")\n+\n+    # Assert no change in state or unintended side effects\n+    assert component.state == \"expected stable state\"\n",
+  "hints_text": "",
+  "environment_setup_commit": "74cbeda0f044ae37a4f57d13fa5b787d507bff7b",
+  "install_config": {
+    "python": "3.9",
+    "packages": "requirements.txt",
+    "install": "npm install",
+    "test_cmd": "npx jest --no-coverage --no-cache",
+    "pre_install": [
+      "apt-get update",
+      "apt-get install -y curl",
+      "curl -fsSL https://deb.nodesource.com/setup_18.x | bash -",
+      "apt-get install -y nodejs"
+    ],
+    "pip_packages": [],
+    "reqs_path": [],
+    "env_yml_path": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 1,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    }
+  },
+  "license_name": "MIT",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

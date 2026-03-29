@@ -1,0 +1,51 @@
+{
+  "instance_id": "sipeed__picoclaw-83",
+  "repo": "sipeed/picoclaw",
+  "base_commit": "d83fb6e0819f99d2d5744706bea77a29c5cfd272",
+  "version": "0.0",
+  "created_at": "2026-02-13T23:09:54.164298+00:00",
+  "problem_statement": "BUG: Telegram allow_from with numeric user ID does not work when the user has a username\n\n### Summary\nTelegram messages are rejected by `allow_from` even when the configured value is the correct user ID (as a string), if the sender has a Telegram username.\n\n### Environment\n- Project: picoclaw\n- Command: `picoclaw gateway` (also reproducible with `--debug`)\n- Config uses `allow_from` as documented\n\n### Config\n```json\n{\n  \"channels\": {\n    \"telegram\": {\n      \"enabled\": true,\n      \"token\": \"REDACTED\",\n      \"allow_from\": [\"123456789\"]\n    }\n  }\n}\n```\n\n### Steps to reproduce\n1. Enable Telegram channel with a valid bot token.\n2. Set `allow_from` to a numeric Telegram user ID string (e.g. `\"123456789\"`).\n3. Start gateway.\n4. Send a message to the bot from that Telegram account.\n\n### Actual behavior\n- The bot does not process/reply to the message.\n- With `--debug`, logs show the message is rejected by allowlist.\n\n### Expected behavior\n- A numeric user ID string in `allow_from` should allow that user\u2019s messages, as shown in docs/examples.\n\n### Suspected cause\nTelegram sender ID is constructed as `\"<id>|<username>\"` when username exists, but allowlist matching is strict string equality.  \nSo `\"123456789\"` does not match `\"123456789|myusername\"`.\n\n### Workarounds\n- Set `allow_from` to `\"<id>|<username>\"`, or\n- Leave `allow_from` empty (allow all users).\n\n### Suggested fix\nMatch Telegram allowlist primarily against pure `user.ID` (string), and optionally keep backward compatibility for `\"<id>|<username>\"` entries.\n\n### Code references\n\n1. Telegram sender ID is built as `id|username`:\nhttps://github.com/sipeed/picoclaw/blob/13fcbe6c5936a23a3729d680dacf9a533b75c4ce/pkg/channels/telegram.go#L164-L167\n\n2. Allowlist check is strict string equality:\nhttps://github.com/sipeed/picoclaw/blob/13fcbe6c5936a23a3729d680dacf9a533b75c4ce/pkg/channels/base.go#L45-L52",
+  "patch": "diff --git a/pkg/channels/base.go b/pkg/channels/base.go\nindex fabec1a..8d2d9a6 100644\n--- a/pkg/channels/base.go\n+++ b/pkg/channels/base.go\n@@ -59,7 +59,22 @@ func (c *BaseChannel) IsAllowed(senderID string) bool {\n \tfor _, allowed := range c.allowList {\n \t\t// Strip leading \"@\" from allowed value for username matching\n \t\ttrimmed := strings.TrimPrefix(allowed, \"@\")\n-\t\tif senderID == allowed || idPart == allowed || senderID == trimmed || idPart == trimmed || (userPart != \"\" && (userPart == allowed || userPart == trimmed)) {\n+\t\tallowedID := trimmed\n+\t\tallowedUser := \"\"\n+\t\tif idx := strings.Index(trimmed, \"|\"); idx > 0 {\n+\t\t\tallowedID = trimmed[:idx]\n+\t\t\tallowedUser = trimmed[idx+1:]\n+\t\t}\n+\n+\t\t// Support either side using \"id|username\" compound form.\n+\t\t// This keeps backward compatibility with legacy Telegram allowlist entries.\n+\t\tif senderID == allowed ||\n+\t\t\tidPart == allowed ||\n+\t\t\tsenderID == trimmed ||\n+\t\t\tidPart == trimmed ||\n+\t\t\tidPart == allowedID ||\n+\t\t\t(allowedUser != \"\" && senderID == allowedUser) ||\n+\t\t\t(userPart != \"\" && (userPart == allowed || userPart == trimmed || userPart == allowedUser)) {\n \t\t\treturn true\n \t\t}\n \t}\ndiff --git a/pkg/channels/telegram.go b/pkg/channels/telegram.go\nindex 3ad4818..38f4dbb 100644\n--- a/pkg/channels/telegram.go\n+++ b/pkg/channels/telegram.go\n@@ -177,15 +177,17 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, update telego.Updat\n \t\treturn\n \t}\n \n-\tsenderID := fmt.Sprintf(\"%d\", user.ID)\n+\tuserID := fmt.Sprintf(\"%d\", user.ID)\n+\tsenderID := userID\n \tif user.Username != \"\" {\n-\t\tsenderID = fmt.Sprintf(\"%d|%s\", user.ID, user.Username)\n+\t\tsenderID = fmt.Sprintf(\"%s|%s\", userID, user.Username)\n \t}\n \n \t// \u68c0\u67e5\u767d\u540d\u5355\uff0c\u907f\u514d\u4e3a\u88ab\u62d2\u7edd\u7684\u7528\u6237\u4e0b\u8f7d\u9644\u4ef6\n-\tif !c.IsAllowed(senderID) {\n+\tif !c.IsAllowed(userID) && !c.IsAllowed(senderID) {\n \t\tlogger.DebugCF(\"telegram\", \"Message rejected by allowlist\", map[string]interface{}{\n-\t\t\t\"user_id\": senderID,\n+\t\t\t\"user_id\":  userID,\n+\t\t\t\"username\": user.Username,\n \t\t})\n \t\treturn\n \t}\n@@ -359,7 +361,7 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, update telego.Updat\n \t\t\"is_group\":   fmt.Sprintf(\"%t\", message.Chat.Type != \"private\"),\n \t}\n \n-\tc.HandleMessage(fmt.Sprintf(\"%d\", user.ID), fmt.Sprintf(\"%d\", chatID), content, mediaPaths, metadata)\n+\tc.HandleMessage(senderID, fmt.Sprintf(\"%d\", chatID), content, mediaPaths, metadata)\n }\n \n func (c *TelegramChannel) downloadPhoto(ctx context.Context, fileID string) string {\n",
+  "test_patch": "diff --git a/pkg/channels/base_test.go b/pkg/channels/base_test.go\nnew file mode 100644\nindex 0000000..f82b04c\n--- /dev/null\n+++ b/pkg/channels/base_test.go\n@@ -0,0 +1,53 @@\n+package channels\n+\n+import \"testing\"\n+\n+func TestBaseChannelIsAllowed(t *testing.T) {\n+\ttests := []struct {\n+\t\tname      string\n+\t\tallowList []string\n+\t\tsenderID  string\n+\t\twant      bool\n+\t}{\n+\t\t{\n+\t\t\tname:      \"empty allowlist allows all\",\n+\t\t\tallowList: nil,\n+\t\t\tsenderID:  \"anyone\",\n+\t\t\twant:      true,\n+\t\t},\n+\t\t{\n+\t\t\tname:      \"compound sender matches numeric allowlist\",\n+\t\t\tallowList: []string{\"123456\"},\n+\t\t\tsenderID:  \"123456|alice\",\n+\t\t\twant:      true,\n+\t\t},\n+\t\t{\n+\t\t\tname:      \"compound sender matches username allowlist\",\n+\t\t\tallowList: []string{\"@alice\"},\n+\t\t\tsenderID:  \"123456|alice\",\n+\t\t\twant:      true,\n+\t\t},\n+\t\t{\n+\t\t\tname:      \"numeric sender matches legacy compound allowlist\",\n+\t\t\tallowList: []string{\"123456|alice\"},\n+\t\t\tsenderID:  \"123456\",\n+\t\t\twant:      true,\n+\t\t},\n+\t\t{\n+\t\t\tname:      \"non matching sender is denied\",\n+\t\t\tallowList: []string{\"123456\"},\n+\t\t\tsenderID:  \"654321|bob\",\n+\t\t\twant:      false,\n+\t\t},\n+\t}\n+\n+\tfor _, tt := range tests {\n+\t\tt.Run(tt.name, func(t *testing.T) {\n+\t\t\tch := NewBaseChannel(\"test\", nil, nil, tt.allowList)\n+\t\t\tif got := ch.IsAllowed(tt.senderID); got != tt.want {\n+\t\t\t\tt.Fatalf(\"IsAllowed(%q) = %v, want %v\", tt.senderID, got, tt.want)\n+\t\t\t}\n+\t\t})\n+\t}\n+}\n+\n",
+  "hints_text": "",
+  "environment_setup_commit": "d83fb6e0819f99d2d5744706bea77a29c5cfd272",
+  "install_config": {
+    "python": "",
+    "packages": "",
+    "install": "make install",
+    "test_cmd": "go test ./...",
+    "pre_install": [
+      "which go || (echo 'Go not found. Please install Go 1.25.7+ from https://go.dev/dl/' && exit 1)",
+      "which make || (echo 'make not found. Please install make.' && exit 1)"
+    ],
+    "reqs_path": [],
+    "env_yml_path": [],
+    "pip_packages": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 2,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    },
+    "solution_lines": 29,
+    "lines_added": 23,
+    "lines_removed": 6,
+    "repo_stars": 5831,
+    "repo_forks": 558,
+    "repo_contributors": 5,
+    "has_ci": true,
+    "has_test_framework": false,
+    "is_archived": false,
+    "is_fork": false
+  },
+  "license_name": "MIT",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}

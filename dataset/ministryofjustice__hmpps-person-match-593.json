@@ -1,0 +1,52 @@
+{
+  "instance_id": "ministryofjustice__hmpps-person-match-593",
+  "repo": "ministryofjustice/hmpps-person-match",
+  "base_commit": "da1471be886177306373f09ade377fed5e87065f",
+  "version": "unknown",
+  "created_at": "2026-02-13T21:13:50.391003+00:00",
+  "problem_statement": "### Bug Report: Alembic Dependency Issue\n\n### Bug Report: Alembic Dependency Issue\n\n**Affected Component:** Database migration tool (Alembic)\n\n**Incorrect Behavior:** The application is using Alembic version 1.18.3, which is known to contain several bugs and performance issues that can lead to failed migrations and inconsistencies in database schema synchronization.\n\n**Expected vs Actual Behavior:** Users expect the application to handle database migrations seamlessly and efficiently. However, due to the outdated version of Alembic, users may experience failures during migration, resulting in application errors and potential data loss, particularly when interacting with complex database schemas or running automated migration scripts.",
+  "patch": "diff --git a/pyproject.toml b/pyproject.toml\nindex 2300326..b3ec568 100644\n--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -17,7 +17,7 @@ dependencies = [\n   \"cachetools==7.0.1\",\n   \"pyjwt==2.11.0\",\n   \"cryptography==46.0.5\",\n-  \"alembic==1.18.3\",\n+  \"alembic==1.18.4\",\n   \"asyncpg==0.31.0\",\n   \"greenlet==3.3.1\",\n   \"opentelemetry-instrumentation-sqlalchemy==0.60b0\",\ndiff --git a/uv.lock b/uv.lock\nindex 5af62b7..a4f5f7a 100644\n--- a/uv.lock\n+++ b/uv.lock\n@@ -4,16 +4,16 @@ requires-python = \">=3.14\"\n \n [[package]]\n name = \"alembic\"\n-version = \"1.18.3\"\n+version = \"1.18.4\"\n source = { registry = \"https://pypi.org/simple\" }\n dependencies = [\n     { name = \"mako\" },\n     { name = \"sqlalchemy\" },\n     { name = \"typing-extensions\" },\n ]\n-sdist = { url = \"https://files.pythonhosted.org/packages/79/41/ab8f624929847b49f84955c594b165855efd829b0c271e1a8cac694138e5/alembic-1.18.3.tar.gz\", hash = \"sha256:1212aa3778626f2b0f0aa6dd4e99a5f99b94bd25a0c1ac0bba3be65e081e50b0\", size = 2052564, upload-time = \"2026-01-29T20:24:15.124Z\" }\n+sdist = { url = \"https://files.pythonhosted.org/packages/94/13/8b084e0f2efb0275a1d534838844926f798bd766566b1375174e2448cd31/alembic-1.18.4.tar.gz\", hash = \"sha256:cb6e1fd84b6174ab8dbb2329f86d631ba9559dd78df550b57804d607672cedbc\", size = 2056725, upload-time = \"2026-02-10T16:00:47.195Z\" }\n wheels = [\n-    { url = \"https://files.pythonhosted.org/packages/45/8e/d79281f323e7469b060f15bd229e48d7cdd219559e67e71c013720a88340/alembic-1.18.3-py3-none-any.whl\", hash = \"sha256:12a0359bfc068a4ecbb9b3b02cf77856033abfdb59e4a5aca08b7eacd7b74ddd\", size = 262282, upload-time = \"2026-01-29T20:24:17.488Z\" },\n+    { url = \"https://files.pythonhosted.org/packages/d2/29/6533c317b74f707ea28f8d633734dbda2119bbadfc61b2f3640ba835d0f7/alembic-1.18.4-py3-none-any.whl\", hash = \"sha256:a5ed4adcf6d8a4cb575f3d759f071b03cd6e5c7618eb796cb52497be25bfe19a\", size = 263893, upload-time = \"2026-02-10T16:00:49.997Z\" },\n ]\n \n [[package]]\n@@ -602,7 +602,7 @@ dev = [\n \n [package.metadata]\n requires-dist = [\n-    { name = \"alembic\", specifier = \"==1.18.3\" },\n+    { name = \"alembic\", specifier = \"==1.18.4\" },\n     { name = \"asyncpg\", specifier = \"==0.31.0\" },\n     { name = \"authlib\", specifier = \"==1.6.7\" },\n     { name = \"azure-monitor-opentelemetry\", specifier = \"==1.8.6\" },\n",
+  "test_patch": "diff --git a/tests/test_generated_pyproject.py b/tests/test_generated_pyproject.py\nnew file mode 100644\n--- /dev/null\n+++ b/tests/test_generated_pyproject.py\n@@ -0,0 +1,38 @@\n+import pytest\n+from alembic import command, config\n+from sqlalchemy import create_engine\n+from sqlalchemy.exc import OperationalError\n+\n+@pytest.fixture\n+def alembic_cfg():\n+    cfg = config.Config('alembic.ini')\n+    return cfg\n+\n+@pytest.fixture\n+def database_url():\n+    # Use an in-memory SQLite database for testing\n+    return \"sqlite:///:memory:\"\n+\n+@pytest.fixture\n+def setup_database(database_url):\n+    engine = create_engine(database_url)\n+    yield engine\n+    engine.dispose()\n+\n+def test_alembic_upgrade_without_errors(alembic_cfg, setup_database):\n+    # Ensure that the alembic upgrade process runs without an OperationalError\n+    try:\n+        command.upgrade(alembic_cfg, 'head')\n+        upgrade_successful = True\n+    except OperationalError:\n+        upgrade_successful = False\n+    assert upgrade_successful, \"Alembic upgrade failed with an OperationalError\"\n+\n+def test_alembic_upgrade_creates_expected_tables(alembic_cfg, setup_database):\n+    # Perform the upgrade\n+    command.upgrade(alembic_cfg, 'head')\n+\n+    # Check if the expected table exists\n+    inspector = sqlalchemy.inspect(setup_database)\n+    tables = inspector.get_table_names()\n+    assert 'expected_table_name' in tables, \"Expected table 'expected_table_name' not found after upgrade\"\n",
+  "hints_text": "",
+  "environment_setup_commit": "da1471be886177306373f09ade377fed5e87065f",
+  "install_config": {
+    "python": "3.14",
+    "packages": "pyproject.toml",
+    "install": "pip install -e .",
+    "test_cmd": "python -m pytest hmpps_person_match/ hmpps_cpr_splink/ --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning",
+    "pre_install": [
+      "apt-get update",
+      "apt-get install -y build-essential curl"
+    ],
+    "pip_packages": [
+      "ruff==0.15.0",
+      "pytest==9.0.2",
+      "pytest-cov==7.0.0",
+      "pytest-asyncio==1.3.0",
+      "faker==40.4.0",
+      "httpx==0.28.1",
+      "requests-mock==1.12.1",
+      "mypy>=1.18.2",
+      "pyyaml==6.0.3",
+      "fastapi[standard]==0.129.0"
+    ],
+    "reqs_path": [],
+    "env_yml_path": []
+  },
+  "meta": {
+    "commit_name": "head_commit",
+    "num_modified_files": 2,
+    "has_test_patch": true,
+    "is_lite": true,
+    "llm_score": {
+      "difficulty_score": null,
+      "issue_text_score": null,
+      "test_score": null
+    }
+  },
+  "license_name": "MIT",
+  "FAIL_TO_PASS": [],
+  "PASS_TO_PASS": [],
+  "requirements": "",
+  "environment": ""
+}
