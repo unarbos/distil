@@ -247,10 +247,10 @@ def get_price():
 
 @app.get("/api/tmc-config")
 def get_tmc_config():
+    """SSE config — key is proxied server-side, not exposed to frontend."""
     return {
         "sse_price_url": f"{TMC_BASE}/public/v1/sse/subnets/prices/",
         "sse_subnet_url": f"{TMC_BASE}/public/v1/sse/subnets/{NETUID}/",
-        "api_key": TMC_KEY,
         "netuid": NETUID,
     }
 
