@@ -1,25 +1,22 @@
 """
-Scoring logic: EMA tracking, proportional weights, staleness management.
+Scoring logic: EMA tracking, winner-take-all weights, staleness management.
 
 Key design decisions:
-- Inverse-KL weighting (lower KL = higher weight) instead of winner-take-all
-- EMA smoothing (alpha=0.3) prevents single-epoch flukes from dominating
+- Winner-take-all: best KL miner gets ALL the weight (1.0), everyone else gets 0.0
+- EMA smoothing (alpha=0.3) prevents single-epoch flukes from flipping the winner
 - Quality floor: models with KL > threshold get zero weight
 - Staleness: 3 consecutive failures → weight 0 until new commitment
 - All state persisted to disk for restart survival
 """
 import json
 import logging
-import math
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("distillation.scoring")
 
 STATE_DIR = Path("state")
 DEFAULT_EMA_ALPHA = 0.3
 DEFAULT_MAX_KL = 2.0  # Quality floor — reject if KL above this (good distill ~0.1-0.5)
-MIN_KL_FLOOR = 1e-6  # Prevents div-by-zero for near-perfect models
 
 
 def _load_json(path: Path) -> dict:
@@ -124,27 +121,27 @@ def commitment_changed(
 # ── Weight Computation ────────────────────────────────────────────────────
 
 
-def compute_proportional_weights(
+def compute_winner_weights(
     ema_scores: dict[str, float],
     failures: dict[str, int],
     n_uids: int,
     max_kl: float = DEFAULT_MAX_KL,
     max_failures: int = 3,
-) -> list[float]:
+) -> tuple[list[float], int | None, float]:
     """
-    Compute proportional weights using inverse-KL weighting.
+    Winner-take-all: the miner with the lowest EMA KL gets ALL the weight.
 
     - Filters out miners above max_kl threshold (quality floor)
     - Filters out stale miners (too many failures)
-    - Weight_i = (1/KL_i) / sum(1/KL_j) for all valid miners
-    - Lower KL → higher weight (continuous incentive to improve)
+    - Best valid miner gets weight 1.0, everyone else gets 0.0
 
-    Returns list of weights indexed by UID (length n_uids).
+    Returns (weights_list, winner_uid, winner_kl).
+    winner_uid is None if no valid miners.
     """
     weights = [0.0] * n_uids
 
-    # Collect valid miners
-    valid = {}
+    best_uid = None
+    best_kl = float("inf")
     for uid_str, kl in ema_scores.items():
         uid = int(uid_str)
         if uid >= n_uids:
@@ -153,17 +150,11 @@ def compute_proportional_weights(
             continue
         if is_stale(uid, failures, max_failures):
             continue
-        valid[uid] = kl
+        if kl < best_kl:
+            best_kl = kl
+            best_uid = uid
 
-    if not valid:
-        return weights
+    if best_uid is not None:
+        weights[best_uid] = 1.0
 
-    # Inverse-KL weighting with floor to prevent div-by-zero on perfect copies
-    MIN_KL_FLOOR = 1e-6
-    inv_kls = {uid: 1.0 / max(kl, MIN_KL_FLOOR) for uid, kl in valid.items()}
-    total = sum(inv_kls.values())
-
-    for uid, inv_kl in inv_kls.items():
-        weights[uid] = inv_kl / total
-
-    return weights
+    return weights, best_uid, best_kl

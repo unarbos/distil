@@ -3,7 +3,7 @@
 Full end-to-end simulation of the distillation subnet (v0.5.0).
 
 Tests ALL production features without GPU or chain:
-  1. Proportional inverse-KL weights (not winner-take-all)
+  1. Winner-take-all weights (best KL gets all weight)
   2. EMA smoothing across epochs
   3. Block-seeded prompt selection
   4. Model caching (skip unchanged commitments)
@@ -32,7 +32,7 @@ logger = logging.getLogger("sim")
 
 from eval.kl_divergence import compute_kl_divergence
 from eval.scoring import (
-    update_ema, compute_proportional_weights,
+    update_ema, compute_winner_weights,
     load_ema_scores, save_ema_scores,
     load_failures, save_failures,
     record_failure, reset_failures, is_stale,
@@ -87,50 +87,47 @@ def test_kl_divergence_properties():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# TEST: Proportional Weights (not winner-take-all)
+# TEST: Winner-Take-All Weights
 # ══════════════════════════════════════════════════════════════════════════
 
-def test_proportional_weights():
-    logger.info("\n── Proportional Weight Tests ──")
+def test_winner_weights():
+    logger.info("\n── Winner-Take-All Weight Tests ──")
 
-    ema_scores = {"0": 1.0, "1": 2.0, "2": 4.0}
+    ema_scores = {"0": 1.0, "1": 0.5, "2": 4.0}
     failures = {}
     n_uids = 10
 
-    weights = compute_proportional_weights(ema_scores, failures, n_uids, max_kl=10.0)
+    weights, winner_uid, winner_kl = compute_winner_weights(ema_scores, failures, n_uids, max_kl=10.0)
 
-    # All three should have non-zero weight
-    assert weights[0] > 0
-    assert weights[1] > 0
-    assert weights[2] > 0
-    logger.info(f"✓ All valid miners have non-zero weights: {weights[:3]}")
+    # Only the best miner (UID 1, KL=0.5) gets weight
+    assert winner_uid == 1
+    assert winner_kl == 0.5
+    assert weights[1] == 1.0
+    logger.info(f"✓ Winner is UID {winner_uid} with KL={winner_kl}")
 
-    # Lower KL → higher weight
-    assert weights[0] > weights[1] > weights[2]
-    logger.info(f"✓ Lower KL → higher weight: {weights[0]:.4f} > {weights[1]:.4f} > {weights[2]:.4f}")
+    # Everyone else gets zero
+    assert weights[0] == 0.0
+    assert weights[2] == 0.0
+    logger.info("✓ Non-winners get weight 0.0")
 
-    # Weights sum to ~1
+    # Weights sum to 1
     total = sum(weights)
-    assert abs(total - 1.0) < 1e-6, f"Weights should sum to 1, got {total}"
-    logger.info(f"✓ Weights sum to {total:.6f} ≈ 1.0")
+    assert abs(total - 1.0) < 1e-6
+    logger.info(f"✓ Weights sum to {total:.6f}")
 
-    # Inverse proportionality: w0/w1 should ≈ KL1/KL0 = 2.0
-    ratio = weights[0] / weights[1]
-    assert abs(ratio - 2.0) < 0.01
-    logger.info(f"✓ Weight ratio w0/w1 = {ratio:.4f} ≈ 2.0 (inverse of KL ratio)")
+    # Quality floor: all miners above max_kl → no winner
+    ema_bad = {"5": 15.0}
+    w_bad, uid_bad, kl_bad = compute_winner_weights(ema_bad, failures, n_uids, max_kl=10.0)
+    assert uid_bad is None
+    assert sum(w_bad) == 0.0
+    logger.info("✓ No winner when all miners above KL threshold")
 
-    # Quality floor: miners above max_kl get zero
-    ema_scores_bad = {"5": 15.0}  # Above max_kl=10
-    weights_bad = compute_proportional_weights(ema_scores_bad, failures, n_uids, max_kl=10.0)
-    assert weights_bad[5] == 0.0
-    logger.info("✓ Miners above KL threshold get zero weight")
-
-    # Stale miners get zero weight
+    # Stale miners can't win
     stale_failures = {"3": 3}
-    ema_stale = {"3": 1.0}
-    weights_stale = compute_proportional_weights(ema_stale, stale_failures, n_uids)
-    assert weights_stale[3] == 0.0
-    logger.info("✓ Stale miners (3+ failures) get zero weight")
+    ema_stale = {"3": 0.1}  # Great KL but stale
+    w_stale, uid_stale, _ = compute_winner_weights(ema_stale, stale_failures, n_uids)
+    assert uid_stale is None
+    logger.info("✓ Stale miners (3+ failures) cannot win")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -283,22 +280,25 @@ def test_permanent_commitments():
     logger.info("✓ Later commitments are ignored (permanent rule)")
 
 
-def test_kl_floor_in_weights():
-    """Test that KL near zero doesn't cause infinite weights."""
-    logger.info("\n── KL Floor in Weights Tests ──")
+def test_winner_edge_cases():
+    """Test winner-take-all edge cases."""
+    logger.info("\n── Winner Edge Case Tests ──")
 
-    ema_scores = {"1": 0.0000001, "2": 1.0, "3": 5.0}  # UID 1 near-perfect
+    # Near-zero KL — winner should still get exactly 1.0
+    ema_scores = {"1": 0.0000001, "2": 1.0, "3": 5.0}
     failures = {}
-    weights = compute_proportional_weights(ema_scores, failures, 256)
+    weights, winner, kl = compute_winner_weights(ema_scores, failures, 256)
+    assert winner == 1
+    assert weights[1] == 1.0
+    assert weights[2] == 0.0
+    logger.info(f"✓ Near-zero KL miner wins cleanly: UID {winner}, weight={weights[1]}")
 
-    # Near-zero KL should still produce finite weights
-    assert weights[1] < 1.0, f"Weight should be < 1.0, got {weights[1]}"
-    assert weights[1] > 0.0
-    assert all(w >= 0 for w in weights)
-    total = sum(weights)
-    assert abs(total - 1.0) < 1e-6
-    logger.info(f"✓ Near-zero KL: weight={weights[1]:.6f} (finite, not infinite)")
-    logger.info(f"✓ All weights non-negative, sum to {total:.6f}")
+    # Tie-breaking: both have same KL — last one checked wins (dict order)
+    ema_tie = {"5": 0.3, "10": 0.3}
+    w_tie, uid_tie, _ = compute_winner_weights(ema_tie, {}, 256)
+    assert uid_tie in [5, 10]
+    assert sum(w_tie) == 1.0
+    logger.info(f"✓ Tie handled: UID {uid_tie} wins (deterministic)")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -424,16 +424,15 @@ def test_full_simulation():
             }
             logger.info(f"  UID {uid}: KL={avg_kl:.6f}, EMA={ema_scores[str(uid)]:.6f}")
 
-        weights_1 = compute_proportional_weights(ema_scores, failures, N_UIDS)
-        logger.info(f"\nEpoch 1 weights: UID5={weights_1[5]:.4f}, UID8={weights_1[8]:.4f}, UID12={weights_1[12]:.4f}")
+        weights_1, winner_1, kl_1 = compute_winner_weights(ema_scores, failures, N_UIDS)
+        logger.info(f"\nEpoch 1: WINNER = UID {winner_1} (KL={kl_1:.6f})")
 
-        # Alice (best KL) should have highest weight
-        assert weights_1[5] > weights_1[8] > weights_1[12]
-        logger.info("✓ Weights correctly ordered by KL quality")
-
-        # All should be non-zero (proportional, not winner-take-all)
-        assert weights_1[5] > 0 and weights_1[8] > 0 and weights_1[12] > 0
-        logger.info("✓ All miners have non-zero weights (proportional)")
+        # Alice (UID 5, best KL) should win
+        assert winner_1 == 5
+        assert weights_1[5] == 1.0
+        assert weights_1[8] == 0.0
+        assert weights_1[12] == 0.0
+        logger.info("✓ Best KL miner wins (winner-take-all)")
 
         # ── Epoch 2: Carol improves ──
         logger.info("\n── Epoch 2: Carol improves dramatically ──")
@@ -449,13 +448,12 @@ def test_full_simulation():
             update_ema(uid, avg_kl, ema_scores)
             logger.info(f"  UID {uid}: new KL={avg_kl:.6f}, EMA={ema_scores[str(uid)]:.6f}")
 
-        weights_2 = compute_proportional_weights(ema_scores, failures, N_UIDS)
-        logger.info(f"\nEpoch 2 weights: UID5={weights_2[5]:.4f}, UID8={weights_2[8]:.4f}, UID12={weights_2[12]:.4f}")
+        weights_2, winner_2, kl_2 = compute_winner_weights(ema_scores, failures, N_UIDS)
+        logger.info(f"\nEpoch 2: WINNER = UID {winner_2} (KL={kl_2:.6f})")
 
-        # Carol's EMA should reflect improvement (but smoothed)
-        # She might not be #1 yet because EMA smooths
-        logger.info(f"  Carol's EMA: {ema_scores['8']:.6f} (smoothed from previous)")
-        assert ema_scores["8"] < ema_scores.get("8_old", float("inf"))  # Better than epoch 1
+        # Alice should still win because EMA smooths Carol's improvement
+        logger.info(f"  Carol's EMA: {ema_scores['8']:.6f} (smoothed — may not overtake yet)")
+        logger.info(f"  Alice's EMA: {ema_scores['5']:.6f}")
 
         # ── Epoch 3: Bob fails ──
         logger.info("\n── Epoch 3: Bob's model fails to download ──")
@@ -465,15 +463,15 @@ def test_full_simulation():
         assert is_stale(12, failures)
         logger.info("  UID 12: 3 failures → stale")
 
-        weights_3 = compute_proportional_weights(ema_scores, failures, N_UIDS)
+        weights_3, winner_3, _ = compute_winner_weights(ema_scores, failures, N_UIDS)
         assert weights_3[12] == 0.0
         logger.info(f"  UID 12 weight = {weights_3[12]} (stale → zero)")
-        logger.info(f"  UID 5 weight = {weights_3[5]:.4f}, UID 8 weight = {weights_3[8]:.4f}")
+        logger.info(f"  WINNER = UID {winner_3} (weight=1.0)")
 
-        # Remaining weights should still sum to ~1
-        total = sum(weights_3)
-        assert abs(total - 1.0) < 1e-6 or total == 0
-        logger.info(f"✓ Weights sum to {total:.6f}")
+        # Winner should still exist (Alice or Carol)
+        assert winner_3 is not None
+        assert sum(weights_3) == 1.0
+        logger.info(f"✓ Weights sum to {sum(weights_3):.6f}")
 
         # ── Persistence test ──
         logger.info("\n── Persistence test ──")
@@ -519,13 +517,13 @@ def test_model_rejection():
 if __name__ == "__main__":
     test_kl_divergence_properties()
     test_model_rejection()
-    test_proportional_weights()
+    test_winner_weights()
     test_ema_scoring()
     test_ema_persistence()
     test_failure_tracking()
     test_commitment_caching()
     test_permanent_commitments()
-    test_kl_floor_in_weights()
+    test_winner_edge_cases()
     test_block_seeded_prompts()
     test_moe_param_counting()
     test_full_simulation()

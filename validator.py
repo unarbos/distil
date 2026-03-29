@@ -96,7 +96,7 @@ def main(
         load_ema_scores, save_ema_scores, update_ema,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
         load_commitment_cache, save_commitment_cache, commitment_changed,
-        compute_proportional_weights,
+        compute_winner_weights,
     )
 
     max_student_params_b = TEACHER_TOTAL_PARAMS_B * max_param_ratio
@@ -299,17 +299,21 @@ def main(
                         del student
                     free_gpu()
 
-            # ── Compute and set proportional weights ──────────────────
-            weights = compute_proportional_weights(
+            # ── Winner-take-all weight assignment ─────────────────────
+            weights, winner_uid, winner_kl = compute_winner_weights(
                 ema_scores, failures, metagraph.n,
                 max_kl=MAX_KL_THRESHOLD,
             )
 
-            non_zero = [(i, w) for i, w in enumerate(weights) if w > 0]
-            if non_zero:
-                logger.info("Weight distribution:")
-                for uid, w in sorted(non_zero, key=lambda x: -x[1])[:10]:
-                    logger.info(f"  UID {uid}: weight={w:.4f} (EMA KL={ema_scores.get(str(uid), '?')})")
+            if winner_uid is not None:
+                logger.info(f"WINNER: UID {winner_uid} — EMA KL={winner_kl:.6f} (weight=1.0)")
+                sorted_scores = sorted(
+                    [(int(k), v) for k, v in ema_scores.items()
+                     if int(k) != winner_uid and v <= MAX_KL_THRESHOLD],
+                    key=lambda x: x[1],
+                )
+                for uid, kl in sorted_scores[:5]:
+                    logger.info(f"  Runner-up UID {uid}: EMA KL={kl:.6f}")
 
                 uids = list(range(metagraph.n))
                 for attempt in range(3):
