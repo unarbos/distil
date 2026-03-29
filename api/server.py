@@ -116,6 +116,52 @@ def get_scores():
     return result
 
 
+_price_cache = {"data": None, "ts": 0}
+
+@app.get("/api/price")
+def get_price():
+    """Get SN97 alpha price and TAO/USD."""
+    now = time.time()
+    if _price_cache["data"] and now - _price_cache["ts"] < 120:
+        return _price_cache["data"]
+
+    try:
+        import requests as req
+        sub = bt.Subtensor(network="finney")
+
+        # Subnet pool data
+        alpha_in = int(sub.substrate.query("SubtensorModule", "SubnetAlphaIn", [NETUID]).value)
+        tao_in = int(sub.substrate.query("SubtensorModule", "SubnetTAO", [NETUID]).value)
+        alpha_tao = alpha_in / 1e9
+        tao_pool = tao_in / 1e9
+        alpha_price_tao = tao_pool / alpha_tao if alpha_tao > 0 else 0
+
+        # TAO/USD from coingecko
+        try:
+            r = req.get("https://api.coingecko.com/api/v3/simple/price?ids=bittensor&vs_currencies=usd", timeout=5)
+            tao_usd = r.json().get("bittensor", {}).get("usd", 0)
+        except Exception:
+            tao_usd = 0
+
+        alpha_price_usd = alpha_price_tao * tao_usd
+
+        result = {
+            "alpha_price_tao": round(alpha_price_tao, 6),
+            "alpha_price_usd": round(alpha_price_usd, 4),
+            "tao_usd": round(tao_usd, 2),
+            "alpha_in_pool": round(alpha_tao, 2),
+            "tao_in_pool": round(tao_pool, 2),
+            "timestamp": now,
+        }
+        _price_cache["data"] = result
+        _price_cache["ts"] = now
+        return result
+    except Exception as e:
+        if _price_cache["data"]:
+            return _price_cache["data"]
+        return {"error": str(e)}
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "netuid": NETUID, "cache_age_meta": time.time() - _meta_cache["ts"] if _meta_cache["ts"] else None}
