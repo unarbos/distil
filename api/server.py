@@ -93,6 +93,29 @@ def get_commitments():
         return {"commitments": {}, "count": 0, "error": str(e)}
 
 
+@app.get("/api/scores")
+def get_scores():
+    """Get latest eval scores from state/scores.json and state/last_eval.json."""
+    import os
+    state_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "state")
+    
+    result = {"ema_scores": {}, "last_eval": None}
+    
+    # EMA scores
+    scores_path = os.path.join(state_dir, "scores.json")
+    if os.path.exists(scores_path):
+        with open(scores_path) as f:
+            result["ema_scores"] = json.load(f)
+    
+    # Last eval results
+    eval_path = os.path.join(state_dir, "last_eval.json")
+    if os.path.exists(eval_path):
+        with open(eval_path) as f:
+            result["last_eval"] = json.load(f)
+    
+    return result
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "netuid": NETUID, "cache_age_meta": time.time() - _meta_cache["ts"] if _meta_cache["ts"] else None}
