@@ -14,7 +14,7 @@ A Bittensor subnet that incentivizes miners to produce the best knowledge-distil
 2. **Teacher continuation** — The teacher generates 512-token greedy continuations for each prompt
 3. **Full-sequence KL** — Both models forward-pass the full sequence (prompt + continuation); KL is computed on continuation positions only, using the full 248K vocabulary
 4. **EMA smoothing** — KL scores are smoothed with exponential moving average (α=0.3) across epochs
-5. **Proportional weights** — Rewards are distributed proportionally via inverse-KL weighting (not winner-take-all)
+5. **Winner-take-all weights** — The miner with the lowest KL gets ALL the weight (1.0), everyone else gets 0.0
 
 ### Anti-Gaming
 
@@ -110,9 +110,9 @@ distillation/
 
 Computed on full vocabulary (248K tokens) at each position of the teacher's **generated continuation** (not just the prompt). This measures how well the student predicts what the teacher would generate — the gold standard for distillation quality.
 
-**Weight Formula**: `weight_i = (1/KL_i) / Σ(1/KL_j)` for all miners below the quality threshold (KL < 2.0).
+**Weight Formula**: Winner-take-all — the miner with the lowest EMA KL below the quality threshold (KL < 2.0) gets `weight = 1.0`. Everyone else gets `weight = 0.0`.
 
-Lower KL → higher weight → more rewards. Continuous incentive to improve.
+The best distillation wins everything. Submit the best model or get nothing.
 
 ### Expected KL Ranges (calibrated on real Qwen3.5 family)
 
