@@ -27,15 +27,18 @@ os.makedirs(DISK_CACHE_DIR, exist_ok=True)
 
 # ── Disk-backed cache ────────────────────────────────────────────────────────
 
+def _safe_filename(name: str) -> str:
+    return name.replace("/", "__").replace(":", "_")
+
 def _disk_read(name: str):
-    path = os.path.join(DISK_CACHE_DIR, f"{name}.json")
+    path = os.path.join(DISK_CACHE_DIR, f"{_safe_filename(name)}.json")
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
     return None
 
 def _disk_write(name: str, data):
-    path = os.path.join(DISK_CACHE_DIR, f"{name}.json")
+    path = os.path.join(DISK_CACHE_DIR, f"{_safe_filename(name)}.json")
     with open(path, "w") as f:
         json.dump(data, f)
 
