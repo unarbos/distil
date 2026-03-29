@@ -113,37 +113,26 @@ def get_safetensors_param_count(model_repo: str, revision: str = None) -> float:
 
 def compute_model_hash(model_repo: str, revision: str = None) -> Optional[str]:
     """
-    Compute SHA256 of the first safetensors shard for identity verification.
-    Returns hex digest or None if download fails.
+    Get a stable identity hash for a model using HuggingFace API metadata.
+    Uses the SHA256 from safetensors file info (no download needed).
+    Returns hex digest or None if unavailable.
     """
     try:
-        # Try common shard names
-        for filename in [
-            "model.safetensors",
-            "model-00001-of-00001.safetensors",
-            "model-00001-of-00002.safetensors",
-            "model-00001-of-00003.safetensors",
-            "model-00001-of-00004.safetensors",
-            "model-00001-of-00005.safetensors",
-            "model-00001-of-00006.safetensors",
-            "model-00001-of-00008.safetensors",
-            "model-00001-of-00010.safetensors",
-        ]:
-            try:
-                path = hf_hub_download(
-                    repo_id=model_repo, filename=filename, revision=revision,
-                )
-                sha = hashlib.sha256()
-                with open(path, "rb") as f:
-                    # Read first 64MB for speed (enough for identity)
-                    data = f.read(64 * 1024 * 1024)
-                    sha.update(data)
-                return sha.hexdigest()
-            except Exception:
-                continue
+        info = model_info(model_repo, revision=revision, files_metadata=True)
+        # Find first safetensors shard and use its SHA from HF API
+        for sibling in sorted(info.siblings or [], key=lambda s: s.rfilename):
+            if sibling.rfilename.endswith(".safetensors"):
+                # HF provides lfs sha256 for each file
+                if hasattr(sibling, "lfs") and sibling.lfs:
+                    return sibling.lfs.get("sha256", sibling.lfs.get("oid", None))
+                # Fallback: use the blob_id (git SHA) as identity
+                if hasattr(sibling, "blob_id") and sibling.blob_id:
+                    return sibling.blob_id
+        # No safetensors found
+        return None
     except Exception as e:
         logger.warning(f"Hash computation failed for {model_repo}: {e}")
-    return None
+        return None
 
 
 def check_duplicate_hash(
