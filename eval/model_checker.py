@@ -12,8 +12,9 @@ from huggingface_hub import hf_hub_download, model_info
 
 logger = logging.getLogger("distillation.model_checker")
 
-# GLM-5 reference values
-GLM5_VOCAB_SIZE = 151552  # From GLM-5 config
+# Baseline model reference values
+# Qwen3.5-35B-A3B: vocab_size=248320 (padded), 35B total, 3B active
+BASELINE_VOCAB_SIZE = 248320
 
 
 def estimate_params_from_config(config: dict) -> float:
@@ -100,10 +101,10 @@ def check_model_architecture(
 
         # Check tokenizer compatibility (vocab_size must match GLM-5)
         vocab_size = config.get("vocab_size", 0)
-        if vocab_size != GLM5_VOCAB_SIZE:
+        if vocab_size != BASELINE_VOCAB_SIZE:
             return {
                 "pass": False,
-                "reason": f"vocab_mismatch:{vocab_size} != {GLM5_VOCAB_SIZE}",
+                "reason": f"vocab_mismatch:{vocab_size} != {BASELINE_VOCAB_SIZE}",
                 "params_b": params_b,
                 "vocab_size": vocab_size,
             }

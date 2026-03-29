@@ -17,9 +17,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("distillation.validator")
 
 # ── Constants ──────────────────────────────────────────────────────────────
-TEACHER_MODEL = "zai-org/GLM-5"
-TEACHER_TOTAL_PARAMS_B = 744.0
-DEFAULT_MAX_PARAM_RATIO = 0.1  # Miner model must be ≤ 10% of teacher
+TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+TEACHER_TOTAL_PARAMS_B = 35.0  # 35B total (3B active, MoE)
+DEFAULT_MAX_PARAM_RATIO = 0.1  # Miner model must be ≤ 10% of teacher = 3.5B
 EPSILON = 0.01  # 1% improvement required to dethrone current winner
 
 
