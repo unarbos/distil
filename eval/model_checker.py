@@ -14,6 +14,7 @@ logger = logging.getLogger("distillation.model_checker")
 
 # Baseline model reference values
 # Qwen3.5-35B-A3B: vocab_size=248320 (padded), 35B total, 3B active
+# ALL student models MUST use the same tokenizer (verified by exact encoding match)
 BASELINE_VOCAB_SIZE = 248320
 
 
@@ -54,6 +55,36 @@ def estimate_params_from_config(config: dict) -> float:
 
     total = attn_params + ffn_params + embed_params
     return total / 1e9
+
+
+def verify_same_tokenizer(teacher_model: str, student_model: str) -> tuple:
+    """Verify student uses EXACT same tokenizer as teacher. Returns (ok, reason)."""
+    from transformers import AutoTokenizer
+    t_tok = AutoTokenizer.from_pretrained(teacher_model, trust_remote_code=True)
+    s_tok = AutoTokenizer.from_pretrained(student_model, trust_remote_code=True)
+
+    if t_tok.vocab_size != s_tok.vocab_size:
+        return False, f"vocab_size mismatch: {s_tok.vocab_size} vs {t_tok.vocab_size}"
+
+    test_strings = [
+        "def fibonacci(n):\n    if n <= 1: return n",
+        "The quick brown fox jumps over the lazy dog.",
+        "import torch\nclass Model(nn.Module):",
+        "class MyClass(BaseClass):\n    def __init__(self):\n        pass",
+    ]
+    for s in test_strings:
+        if t_tok.encode(s) != s_tok.encode(s):
+            return False, f"encoding mismatch on: {s[:40]}..."
+
+    return True, "ok"
+
+
+def get_verified_param_count(model_repo: str, revision: str = None) -> float:
+    """Get cheat-proof param count from safetensors metadata (billions). Returns -1 if can't verify."""
+    info = model_info(model_repo, revision=revision)
+    if info.safetensors and hasattr(info.safetensors, 'total'):
+        return info.safetensors.total / 1e9
+    return -1.0
 
 
 def check_model_architecture(
