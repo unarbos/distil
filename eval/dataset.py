@@ -1,41 +1,86 @@
 """
-SweInfinite dataset loader with block-seeded prompt selection.
+Dataset loader with block-seeded prompt selection.
 
-Prompts are selected deterministically based on the current block number,
-making it impossible for miners to predict/overfit to specific prompts.
+Uses HuggingFace pretraining datasets (streamed) for diverse, unpredictable prompts.
+Prompts are selected deterministically based on the current block number.
 """
-import glob
 import json
 import os
 import random
+import hashlib
 import logging
+from pathlib import Path
 
 logger = logging.getLogger("distillation.dataset")
 
+# Default HF dataset for prompt sourcing
+DEFAULT_DATASET = "HuggingFaceFW/fineweb"
+DEFAULT_SPLIT = "train"
+DEFAULT_TEXT_FIELD = "text"
+PROMPT_CACHE_DIR = Path("state/prompt_cache")
 
-def load_swe_infinite_prompts(dataset_path: str) -> list[dict]:
-    """
-    Load all problem statements from SweInfinite JSON files.
 
-    Returns list of dicts with keys: instance_id, repo, problem_statement.
+def load_prompts_from_hf(
+    dataset_name: str = DEFAULT_DATASET,
+    split: str = DEFAULT_SPLIT,
+    text_field: str = DEFAULT_TEXT_FIELD,
+    n: int = 500,
+    min_chars: int = 200,
+    max_chars: int = 4000,
+    cache_path: Path | None = None,
+) -> list[str]:
     """
-    prompts: list[dict] = []
-    for filepath in sorted(glob.glob(os.path.join(dataset_path, "*.json"))):
-        with open(filepath) as f:
-            data = json.load(f)
-        prompts.append({
-            "instance_id": data["instance_id"],
-            "repo": data["repo"],
-            "problem_statement": data["problem_statement"],
-        })
+    Stream n prompts from a HuggingFace dataset.
+    Caches locally so we don't re-download every epoch.
+    """
+    if cache_path is None:
+        cache_path = PROMPT_CACHE_DIR / f"{dataset_name.replace('/', '_')}_{n}.json"
+
+    # Return cached if fresh enough
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text())
+            if len(cached) >= n:
+                return cached[:n]
+        except Exception:
+            pass
+
+    # Stream from HF
+    from datasets import load_dataset
+
+    print(f"[dataset] Streaming {n} prompts from {dataset_name}...", flush=True)
+    ds = load_dataset(dataset_name, split=split, streaming=True, name="default")
+
+    prompts: list[str] = []
+    seen = 0
+    for item in ds:
+        seen += 1
+        text = item.get(text_field, "")
+        if not text or len(text) < min_chars:
+            continue
+        # Truncate long texts to max_chars
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        prompts.append(text)
+        if len(prompts) >= n:
+            break
+        if seen > n * 20:  # Safety: don't scan forever
+            break
+
+    print(f"[dataset] Got {len(prompts)} prompts (scanned {seen} items)", flush=True)
+
+    # Cache to disk
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(prompts))
+
     return prompts
 
 
 def sample_prompts_seeded(
-    prompts: list[dict],
+    prompts: list[str],
     n: int,
     block_number: int,
-) -> list[dict]:
+) -> list[str]:
     """
     Sample n prompts deterministically seeded by block_number.
 
@@ -47,17 +92,24 @@ def sample_prompts_seeded(
     return rng.sample(prompts, min(n, len(prompts)))
 
 
-def sample_prompts(prompts: list[dict], n: int) -> list[dict]:
+def sample_prompts(prompts: list[str], n: int) -> list[str]:
     """Random sample without block seeding (for testing/simulation)."""
     return random.sample(prompts, min(n, len(prompts)))
 
 
-def format_coding_prompt(problem: dict) -> str:
-    """Format a SweInfinite problem as a coding prompt for model inference."""
-    return (
-        "You are an expert software engineer. "
-        "Analyze the following GitHub issue and provide a solution.\n\n"
-        f"Repository: {problem['repo']}\n\n"
-        f"Issue:\n{problem['problem_statement']}\n\n"
-        "Provide your analysis and proposed code changes:"
-    )
+def format_prompt(text: str) -> str:
+    """
+    Format a raw pretraining text as a continuation prompt.
+    Uses the first ~512 chars as context, model continues from there.
+    """
+    # Clean up: strip leading whitespace, normalize
+    text = text.strip()
+    # Use first portion as the prompt prefix
+    if len(text) > 512:
+        # Try to cut at a sentence boundary
+        cut = text[:512].rfind(". ")
+        if cut > 200:
+            text = text[: cut + 1]
+        else:
+            text = text[:512]
+    return text
