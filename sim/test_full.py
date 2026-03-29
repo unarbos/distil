@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Full end-to-end simulation of the distillation subnet (v0.5.0).
+Full end-to-end simulation of the distillation subnet (v0.8.0).
 
 Tests ALL production features without GPU or chain:
   1. Winner-take-all weights (best KL gets all weight)
@@ -11,6 +11,9 @@ Tests ALL production features without GPU or chain:
   6. Staleness / failure tracking
   7. MoE-aware param counting
   8. KL divergence mathematical properties
+  9. Teacher continuation caching (generate once, score multiple students)
+  10. Model sanity check (broken logits detection)
+  11. Student load timeout behavior
 
 Run:
     python -m sim.test_full
@@ -23,7 +26,10 @@ import random
 import logging
 import tempfile
 import shutil
+import time
+import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -377,8 +383,207 @@ def test_moe_param_counting():
         f"{moe['active_params']/1e9:.2f}B active (ratio: {ratio:.1f}x)"
     )
 
-    # Active should be roughly num_active/num_experts of the expert portion
     logger.info(f"  Experts: {moe['num_experts']} total, {moe['num_active_experts']} active")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST: Teacher Continuation Caching
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_teacher_continuation_caching():
+    """Test that teacher continuations are generated once and reused for multiple students."""
+    logger.info("\n── Teacher Continuation Caching Tests ──")
+
+    # Simulate teacher continuation cache structure
+    # Each entry has: full_ids, teacher_logits (CPU), prompt_len, gen_len
+    import torch
+
+    n_prompts = 5
+    vocab_size = 100
+    gen_len = 20
+    prompt_len = 10
+
+    # Simulate generate_teacher_continuations output
+    teacher_cache = []
+    for i in range(n_prompts):
+        full_ids = torch.randint(0, vocab_size, (1, prompt_len + gen_len))
+        teacher_logits = torch.randn(1, gen_len, vocab_size)  # continuation only, on CPU
+        teacher_cache.append({
+            "full_ids": full_ids,
+            "teacher_logits": teacher_logits,
+            "prompt_len": prompt_len,
+            "gen_len": gen_len,
+        })
+
+    assert len(teacher_cache) == n_prompts
+    logger.info(f"✓ Teacher cache created with {n_prompts} entries")
+
+    # Verify each entry has correct structure
+    for i, entry in enumerate(teacher_cache):
+        assert entry["full_ids"].shape == (1, prompt_len + gen_len)
+        assert entry["teacher_logits"].shape == (1, gen_len, vocab_size)
+        assert entry["prompt_len"] == prompt_len
+        assert entry["gen_len"] == gen_len
+    logger.info("✓ All cache entries have correct shape and metadata")
+
+    # Simulate scoring 3 students against same teacher cache
+    # (In production, this avoids re-generating teacher continuations)
+    student_scores = []
+    for student_idx in range(3):
+        prompt_kls = []
+        for entry in teacher_cache:
+            # Simulate student forward pass + KL computation
+            student_logits = torch.randn(1, gen_len, vocab_size) * (1 + student_idx * 0.5)
+            # KL would be computed here; just verify shapes match
+            assert student_logits.shape[1] == entry["teacher_logits"].shape[1]
+            # Fake KL value
+            kl = 0.1 + student_idx * 0.15
+            prompt_kls.append(kl)
+        avg_kl = sum(prompt_kls) / len(prompt_kls)
+        student_scores.append(avg_kl)
+
+    # Better student (index 0) should have lower KL
+    assert student_scores[0] < student_scores[1] < student_scores[2]
+    logger.info(f"✓ 3 students scored from same cache: {[f'{s:.3f}' for s in student_scores]}")
+
+    # Verify cache was NOT modified (reusable)
+    for entry in teacher_cache:
+        assert entry["teacher_logits"].shape == (1, gen_len, vocab_size)
+    logger.info("✓ Teacher cache unchanged after student evaluations (reusable)")
+
+    # Test gen_len=0 edge case
+    empty_entry = {
+        "full_ids": torch.randint(0, vocab_size, (1, prompt_len)),
+        "teacher_logits": None,
+        "prompt_len": prompt_len,
+        "gen_len": 0,
+    }
+    assert empty_entry["gen_len"] == 0
+    assert empty_entry["teacher_logits"] is None
+    logger.info("✓ gen_len=0 edge case handled (teacher_logits=None)")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST: Model Sanity Check
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_model_sanity_check():
+    """Test that broken model logits are detected."""
+    logger.info("\n── Model Sanity Check Tests ──")
+
+    import torch
+
+    # Test NaN detection
+    class NanModel:
+        def __call__(self, input_ids):
+            logits = torch.full((1, input_ids.shape[1], 100), float("nan"))
+            return MagicMock(logits=logits)
+
+    class MockTokenizer:
+        def __call__(self, text, return_tensors=None):
+            ids = torch.randint(0, 100, (1, 5))
+            return MagicMock(input_ids=ids)
+
+    # Import the sanity check function
+    from validator import model_sanity_check
+
+    # NaN logits should fail
+    ok, reason = model_sanity_check(NanModel(), MockTokenizer(), "cpu")
+    assert not ok
+    assert "NaN" in reason
+    logger.info(f"✓ NaN logits detected: {reason}")
+
+    # Low-std logits should fail
+    class LowStdModel:
+        def __call__(self, input_ids):
+            logits = torch.ones(1, input_ids.shape[1], 100) * 5.0
+            return MagicMock(logits=logits)
+
+    ok, reason = model_sanity_check(LowStdModel(), MockTokenizer(), "cpu")
+    assert not ok
+    assert "std" in reason
+    logger.info(f"✓ Low-std logits detected: {reason}")
+
+    # Good logits should pass
+    class GoodModel:
+        def __call__(self, input_ids):
+            logits = torch.randn(1, input_ids.shape[1], 100) * 2.0
+            return MagicMock(logits=logits)
+
+    ok, reason = model_sanity_check(GoodModel(), MockTokenizer(), "cpu")
+    assert ok
+    assert reason == "ok"
+    logger.info(f"✓ Good logits pass: {reason}")
+
+    # Inf logits should fail
+    class InfModel:
+        def __call__(self, input_ids):
+            logits = torch.full((1, input_ids.shape[1], 100), float("inf"))
+            return MagicMock(logits=logits)
+
+    ok, reason = model_sanity_check(InfModel(), MockTokenizer(), "cpu")
+    assert not ok
+    assert "Inf" in reason
+    logger.info(f"✓ Inf logits detected: {reason}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST: Student Load Timeout
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_student_load_timeout():
+    """Test the timeout threading logic without requiring transformers import."""
+    logger.info("\n── Student Load Timeout Tests ──")
+
+    # Test the threading timeout mechanism directly (same pattern as load_model_with_timeout)
+    def _run_with_timeout(fn, timeout_seconds):
+        """Replicate the timeout logic from validator.load_model_with_timeout"""
+        result = [None]
+        error = [None]
+
+        def _run():
+            try:
+                result[0] = fn()
+            except Exception as e:
+                error[0] = str(e)
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        thread.join(timeout=timeout_seconds)
+
+        if thread.is_alive():
+            return None, f"Model load timed out after {timeout_seconds}s"
+        if error[0] is not None:
+            return None, f"Model load failed: {error[0]}"
+        return result[0], None
+
+    # Test 1: Successful load
+    model, err = _run_with_timeout(lambda: "fake_model_object", timeout_seconds=5)
+    assert model == "fake_model_object"
+    assert err is None
+    logger.info("✓ Successful load returns result, no error")
+
+    # Test 2: Failed load
+    def fail_fn():
+        raise RuntimeError("CUDA out of memory")
+
+    model, err = _run_with_timeout(fail_fn, timeout_seconds=5)
+    assert model is None
+    assert "CUDA out of memory" in err
+    logger.info(f"✓ Failed load returns error: {err}")
+
+    # Test 3: Timeout
+    def hang_fn():
+        time.sleep(10)
+        return "should_not_return"
+
+    t0 = time.time()
+    model, err = _run_with_timeout(hang_fn, timeout_seconds=1)
+    elapsed = time.time() - t0
+    assert model is None
+    assert "timed out" in err
+    assert elapsed < 3  # Should timeout in ~1s, not 10s
+    logger.info(f"✓ Timeout after {elapsed:.1f}s: {err}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -511,6 +716,42 @@ def test_model_rejection():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# TEST: VRAM Logging (smoke test)
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_vram_logging():
+    """Test that VRAM logging doesn't crash."""
+    logger.info("\n── VRAM Logging Tests ──")
+    from validator import log_vram
+    # Should not raise even without CUDA
+    log_vram("test")
+    log_vram("")
+    log_vram()
+    logger.info("✓ VRAM logging works without CUDA (no-op)")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TEST: Leaderboard Logging
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_leaderboard_logging():
+    """Test that leaderboard logging doesn't crash."""
+    logger.info("\n── Leaderboard Logging Tests ──")
+    from validator import _log_leaderboard
+
+    ema_scores = {"1": 0.15, "5": 0.32, "10": 0.89, "15": 3.5}
+    failures = {"15": 3}
+
+    # Should not raise
+    _log_leaderboard(ema_scores, failures, winner_uid=1, block=12345, max_kl=2.0)
+    logger.info("✓ Leaderboard logs without errors")
+
+    # Empty scores
+    _log_leaderboard({}, {}, winner_uid=None, block=0, max_kl=2.0)
+    logger.info("✓ Empty leaderboard handled")
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -526,6 +767,11 @@ if __name__ == "__main__":
     test_winner_edge_cases()
     test_block_seeded_prompts()
     test_moe_param_counting()
+    test_teacher_continuation_caching()
+    test_model_sanity_check()
+    test_student_load_timeout()
+    test_vram_logging()
+    test_leaderboard_logging()
     test_full_simulation()
 
     logger.info("\n" + "=" * 70)

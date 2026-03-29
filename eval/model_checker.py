@@ -187,7 +187,7 @@ def verify_tokenizer(teacher_model: str, student_model: str) -> tuple[bool, str]
     s_tok = AutoTokenizer.from_pretrained(student_model, trust_remote_code=True)
 
     if t_tok.vocab_size != s_tok.vocab_size:
-        return False, f"vocab_size mismatch: {s_tok.vocab_size} vs {t_tok.vocab_size}"
+        return False, f"Vocab size mismatch: {s_tok.vocab_size} ≠ {t_tok.vocab_size} (teacher)"
 
     test_strings = [
         "def fibonacci(n):\n    if n <= 1: return n",
@@ -197,7 +197,7 @@ def verify_tokenizer(teacher_model: str, student_model: str) -> tuple[bool, str]
     ]
     for s in test_strings:
         if t_tok.encode(s) != s_tok.encode(s):
-            return False, f"encoding mismatch on: {s[:40]}..."
+            return False, f"Tokenizer encoding mismatch on test string: '{s[:40]}...'"
 
     return True, "ok"
 
@@ -237,13 +237,17 @@ def check_model_architecture(
         total_params_b = safetensors_params_b if safetensors_params_b > 0 else config_total_b
 
         if total_params_b <= 0:
-            return {"pass": False, "reason": "cannot_determine_param_count", "params_b": 0}
+            return {
+                "pass": False,
+                "reason": "Cannot determine parameter count — model may be missing safetensors metadata and config",
+                "params_b": 0,
+            }
 
         # 4. Check TOTAL param count (not active — prevents gaming with huge MoE)
         if total_params_b > max_total_params_b:
             return {
                 "pass": False,
-                "reason": f"too_large:{total_params_b:.2f}B > {max_total_params_b:.1f}B",
+                "reason": f"Model too large: {total_params_b:.2f}B > {max_total_params_b:.1f}B max",
                 "params_b": total_params_b,
                 "active_params_b": config_active_b,
             }
@@ -254,7 +258,7 @@ def check_model_architecture(
             quant_method = quant_config.get("quant_method", "unknown")
             return {
                 "pass": False,
-                "reason": f"quantized_model:{quant_method} — subnet requires bf16/fp16 architecture distillation",
+                "reason": f"Quantized model detected ({quant_method}) — subnet requires bf16/fp16 architecture distillation",
                 "params_b": total_params_b,
             }
 
@@ -263,7 +267,7 @@ def check_model_architecture(
         if vocab_size != BASELINE_VOCAB_SIZE:
             return {
                 "pass": False,
-                "reason": f"vocab_mismatch:{vocab_size} != {BASELINE_VOCAB_SIZE}",
+                "reason": f"Vocab size mismatch: {vocab_size} ≠ {BASELINE_VOCAB_SIZE} (teacher)",
                 "params_b": total_params_b,
                 "vocab_size": vocab_size,
             }

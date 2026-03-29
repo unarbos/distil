@@ -2,11 +2,12 @@
 Full-distribution KL-divergence computation on GPU tensors.
 
 Production approach:
-1. Forward pass prompt through both models → KL on prompt positions
-2. Generate teacher continuation (greedy, 512 tokens)
-3. Forward pass full sequence (prompt + continuation) through both models
-4. Compute KL only on continuation positions (after prompt)
-5. Return weighted average across all evaluated positions
+1. Pre-generate teacher continuations ONCE per epoch (cached on CPU)
+2. For each student: forward pass full sequence, compute KL on continuation positions
+3. Only continuation logits are kept (memory efficient)
+
+Key optimization: teacher continuations are generated once and reused for all
+students, reducing teacher generation from O(students × prompts) to O(prompts).
 """
 import torch
 import torch.nn.functional as F
@@ -59,6 +60,134 @@ def compute_kl_from_logits(
 
 
 @torch.no_grad()
+def generate_teacher_continuations(
+    teacher_model,
+    input_ids_list: list[torch.Tensor],
+    max_new_tokens: int = 512,
+    block_seed: Optional[int] = None,
+    device: str = "cuda",
+) -> list[dict]:
+    """
+    Pre-generate teacher continuations for all prompts in an epoch.
+
+    Called ONCE per epoch, results cached and reused for all student evaluations.
+    This reduces teacher generation from O(students × prompts) to O(prompts).
+
+    Args:
+        teacher_model: loaded teacher model (on GPU)
+        input_ids_list: list of [1, prompt_len] tokenized prompts
+        max_new_tokens: continuation length
+        block_seed: if provided, use seeded sampling (temperature=0.7, top_p=0.9)
+        device: cuda/cpu
+
+    Returns:
+        List of dicts, each with:
+            - full_ids: [1, prompt_len + gen_len] tensor (on device)
+            - teacher_logits: [1, gen_len, vocab_size] continuation logits (on CPU)
+            - prompt_len: int
+            - gen_len: int
+    """
+    cache = []
+    for i, input_ids in enumerate(input_ids_list):
+        input_ids = input_ids.to(device)
+        prompt_len = input_ids.shape[1]
+
+        # Generate teacher continuation
+        gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=True)
+        if block_seed is not None:
+            torch.manual_seed(block_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(block_seed)
+            gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
+        else:
+            gen_kwargs.update(do_sample=False)
+
+        teacher_output = teacher_model.generate(input_ids, **gen_kwargs)
+        gen_len = teacher_output.shape[1] - prompt_len
+
+        if gen_len == 0:
+            cache.append({
+                "full_ids": teacher_output,
+                "teacher_logits": None,
+                "prompt_len": prompt_len,
+                "gen_len": 0,
+            })
+            continue
+
+        # Forward pass for teacher logits
+        full_ids = teacher_output  # [1, prompt_len + gen_len]
+        teacher_logits_full = teacher_model(full_ids).logits
+
+        # Only keep continuation logits (memory efficient) — slice BEFORE .cpu()
+        # logits[i] predicts token i+1, so logits[prompt_len-1:-1] predicts continuation
+        teacher_cont_logits = teacher_logits_full[:, prompt_len - 1:-1, :].float().cpu()
+
+        cache.append({
+            "full_ids": full_ids,  # keep on device for student forward pass
+            "teacher_logits": teacher_cont_logits,  # CPU to save GPU memory
+            "prompt_len": prompt_len,
+            "gen_len": gen_len,
+        })
+
+        logger.debug(
+            f"  Teacher continuation {i}: {prompt_len} prompt + {gen_len} gen tokens"
+        )
+
+    return cache
+
+
+@torch.no_grad()
+def evaluate_student_kl(
+    student_model,
+    teacher_cache_entry: dict,
+    device: str = "cuda",
+) -> dict:
+    """
+    Evaluate a student model against cached teacher continuation data.
+
+    Uses pre-generated teacher continuations to avoid redundant teacher inference.
+
+    Args:
+        student_model: loaded student model
+        teacher_cache_entry: dict from generate_teacher_continuations()
+        device: cuda/cpu
+
+    Returns:
+        dict with kl_mean, kl_std, kl_max, kl_min, n_positions, prompt_len, gen_len
+    """
+    prompt_len = teacher_cache_entry["prompt_len"]
+    gen_len = teacher_cache_entry["gen_len"]
+
+    if gen_len == 0 or teacher_cache_entry["teacher_logits"] is None:
+        return {
+            "kl_mean": float("inf"),
+            "kl_std": 0.0,
+            "kl_max": float("inf"),
+            "kl_min": float("inf"),
+            "n_positions": 0,
+            "prompt_len": prompt_len,
+            "gen_len": 0,
+        }
+
+    full_ids = teacher_cache_entry["full_ids"].to(device)
+
+    # Student forward pass on the full sequence
+    student_logits_full = student_model(full_ids).logits
+
+    # Only keep continuation logits — slice BEFORE moving to avoid full-seq on CPU
+    student_cont_logits = student_logits_full[:, prompt_len - 1:-1, :].float()
+
+    # Move teacher logits to device for KL computation
+    teacher_cont_logits = teacher_cache_entry["teacher_logits"].to(device)
+
+    # Compute KL on continuation positions
+    result = compute_kl_from_logits(teacher_cont_logits, student_cont_logits)
+    result["prompt_len"] = prompt_len
+    result["gen_len"] = gen_len
+    return result
+
+
+@torch.no_grad()
 def evaluate_kl_with_continuation(
     teacher_model,
     student_model,
@@ -68,35 +197,21 @@ def evaluate_kl_with_continuation(
     block_seed: Optional[int] = None,
 ) -> dict:
     """
-    Production KL evaluation with teacher continuation.
+    Legacy single-call KL evaluation with teacher continuation.
+    Kept for backward compatibility. For production, use
+    generate_teacher_continuations() + evaluate_student_kl() instead.
 
     Steps:
     1. Generate continuation from teacher (block-seeded sampling for anti-gaming)
     2. Forward pass full sequence through both models
     3. Compute KL on continuation positions only
-
-    Args:
-        teacher_model: loaded teacher model
-        student_model: loaded student model
-        input_ids: [1, prompt_len] tokenized prompt
-        max_new_tokens: teacher continuation length
-        device: cuda/cpu
-        block_seed: if provided, use seeded sampling (temperature=0.7, top_p=0.9)
-                    for anti-memorization; all validators with same seed produce
-                    identical continuations
-
-    Returns:
-        dict with kl_mean, kl_std, kl_max, kl_min, n_positions, prompt_len, gen_len
     """
     input_ids = input_ids.to(device)
     prompt_len = input_ids.shape[1]
 
     # 1. Generate teacher continuation
-    # Block-seeded sampling prevents miners from memorizing greedy continuations
-    # while ensuring all validators agree on the same output for a given block
     gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=True)
     if block_seed is not None:
-        # Seed torch RNG so all validators with same block_seed get identical output
         torch.manual_seed(block_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(block_seed)
@@ -119,16 +234,13 @@ def evaluate_kl_with_continuation(
         }
 
     # 2. Forward pass both models on full sequence (prompt + continuation)
-    full_ids = teacher_output  # [1, prompt_len + gen_len]
-    teacher_logits = teacher_model(full_ids).logits.float()  # [1, seq, vocab]
-    student_logits = student_model(full_ids).logits.float()  # [1, seq, vocab]
+    full_ids = teacher_output
+    teacher_logits = teacher_model(full_ids).logits
+    student_logits = student_model(full_ids).logits
 
-    # 3. KL on continuation positions only
-    # logits[i] predicts token at position i+1
-    # We want predictions for positions prompt_len..end
-    # So we use logits at positions (prompt_len-1)..(end-1)
-    t_logits = teacher_logits[:, prompt_len - 1:-1, :]
-    s_logits = student_logits[:, prompt_len - 1:-1, :]
+    # 3. KL on continuation positions only — slice before .float() for memory
+    t_logits = teacher_logits[:, prompt_len - 1:-1, :].float()
+    s_logits = student_logits[:, prompt_len - 1:-1, :].float()
 
     result = compute_kl_from_logits(t_logits, s_logits)
     result["prompt_len"] = prompt_len

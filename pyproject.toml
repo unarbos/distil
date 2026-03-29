@@ -1,6 +1,6 @@
 [project]
 name = "distillation"
-version = "0.6.0"
+version = "0.8.0"
 description = "Bittensor subnet for Qwen3.5-35B-A3B model distillation — competitive knowledge compression"
 readme = "README.md"
 requires-python = ">=3.10"

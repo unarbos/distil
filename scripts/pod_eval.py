@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone GPU evaluation script for testing on remote pods (v0.6.0).
+Standalone GPU evaluation script for testing on remote pods (v0.8.0).
 
 Uses the same KL computation as the validator but runs independently.
 Supports batch scoring, sequential (memory-efficient) mode, and detailed metrics.
