@@ -1,5 +1,7 @@
 {
   "97": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7853985 vs 7852887",
-  "203": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7853997 vs 7852887",
-  "158": "arch: Model not found on HuggingFace (404)"
+  "203": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later",
+  "158": "arch: Model not found on HuggingFace (404)",
+  "28": "copy: identical weights to UID 174 (unconst/sn97-qwen35-4b-distilled), committed later at block 7854397 vs 7854191",
+  "52": "integrity: Cannot compute model hash \u2014 safetensors may have been removed"
 }
