@@ -387,6 +387,22 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     record_failure(uid, failures)
                     continue
 
+                # Check for functional copy detected by logit fingerprinting
+                if student_result.get("functional_copy"):
+                    copy_of_model = student_result.get("copy_of", "unknown")
+                    # Find the UID of the model it's a copy of
+                    copy_of_uid = None
+                    for other_uid, other_info in models_to_eval.items():
+                        if other_info["model"] == copy_of_model:
+                            copy_of_uid = other_uid
+                            break
+                    reason = f"copy: functional copy of {copy_of_model}" + (f" (UID {copy_of_uid})" if copy_of_uid else "") + " — identical logit distribution"
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): FUNCTIONAL COPY — {reason}", flush=True)
+                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(uid, reason, dq_reasons)
+                    evaluated_uids.add(str(uid))
+                    continue
+
                 kl = student_result.get("kl_global_avg", float("inf"))
                 if kl == float("inf") or kl <= 0:
                     logger.warning(f"UID {uid}: invalid KL={kl}")
