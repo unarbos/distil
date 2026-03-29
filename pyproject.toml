@@ -1,16 +1,25 @@
 [project]
 name = "distillation"
-version = "0.2.0"
-description = "Bittensor subnet for GLM-5 model distillation — competitive model compression"
+version = "0.5.0"
+description = "Bittensor subnet for Qwen3.5-35B-A3B model distillation — competitive knowledge compression"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
+license = {text = "MIT"}
 dependencies = [
     "bittensor>=8.0.0",
     "bittensor-wallet>=2.0.0",
     "click>=8.0.0",
-    "vllm>=0.6.0",
-    "transformers>=4.40.0",
+    "transformers>=4.45.0",
     "huggingface-hub>=0.20.0",
     "numpy>=1.26.0",
-    "torch>=2.0.0",
+    "torch>=2.1.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+gpu = [
+    "flash-attn>=2.5.0",
 ]

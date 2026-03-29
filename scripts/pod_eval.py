@@ -1,121 +1,162 @@
 #!/usr/bin/env python3
 """
-Batch inference on a Lium GPU pod. Evaluates multiple models in a single run.
+Standalone GPU evaluation script for testing on remote pods.
+
+Uses the same KL computation as the validator but runs independently.
+Upload to a GPU pod, provide prompts, get KL scores.
 
 Usage:
-    # Single model:
-    python3 pod_eval.py --models Qwen/Qwen3.5-35B-A3B --prompts prompts.json --outdir /home/results
-
-    # Multiple models (batch):
-    python3 pod_eval.py --models Qwen/Qwen3.5-35B-A3B,Qwen/Qwen3-8B,Qwen/Qwen3-1.7B \
-        --prompts prompts.json --outdir /home/results
-
-Output: /home/results/<sanitized_model_name>.json per model
+    python3 pod_eval.py \
+        --teacher Qwen/Qwen3.5-35B-A3B \
+        --students student1/model,student2/model \
+        --prompts prompts.json \
+        --output results.json \
+        --max-prompt-len 1024 \
+        --max-new-tokens 512
 """
-import json, sys, argparse, time, os, gc
+import torch
+import torch.nn.functional as F
+import json
+import time
+import argparse
+import gc
 
 
-def sanitize_name(model: str) -> str:
-    return model.replace("/", "_").replace(".", "-")
-
-
-def eval_model(model_name: str, prompts: list, outdir: str,
-               max_tokens: int, top_k: int, max_model_len: int):
-    """Load model, run batch inference, save results, free GPU."""
-    from vllm import LLM, SamplingParams
-
-    out_path = os.path.join(outdir, f"{sanitize_name(model_name)}.json")
-    print(f"\n{'='*60}", flush=True)
-    print(f"[eval] Model: {model_name}", flush=True)
-    print(f"[eval] Prompts: {len(prompts)}, max_tokens: {max_tokens}, top_k: {top_k}", flush=True)
-
-    t0 = time.time()
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
-        dtype="auto",
-        max_model_len=max_model_len,
-        gpu_memory_utilization=0.92,
-        enforce_eager=True,  # Skip CUDA graph capture — faster startup
-    )
-    load_time = time.time() - t0
-    print(f"[eval] Loaded in {load_time:.1f}s", flush=True)
-
-    params = SamplingParams(
-        temperature=0.0,
-        max_tokens=max_tokens,
-        logprobs=top_k,
-    )
-
-    # Single batch call — vLLM handles all prompts together
-    t1 = time.time()
-    outputs = llm.generate(prompts, params)
-    gen_time = time.time() - t1
-
-    results = []
-    for output in outputs:
-        completion = output.outputs[0]
-        token_logprobs = []
-        if completion.logprobs:
-            for pos_lps in completion.logprobs:
-                pos_dict = {}
-                for token_id, lp_info in pos_lps.items():
-                    pos_dict[lp_info.decoded_token] = lp_info.logprob
-                token_logprobs.append(pos_dict)
-        results.append({
-            "text": completion.text,
-            "logprobs": token_logprobs,
-            "n_tokens": len(token_logprobs),
-        })
-
-    with open(out_path, "w") as f:
-        json.dump(results, f)
-
-    total_tokens = sum(r["n_tokens"] for r in results)
-    print(f"[eval] Generated {total_tokens} tokens in {gen_time:.1f}s ({total_tokens/gen_time:.0f} tok/s)", flush=True)
-    print(f"[eval] Saved to {out_path}", flush=True)
-
-    # Free GPU memory
-    del llm
-    gc.collect()
+def load_model(name, device="cuda", dtype=torch.bfloat16):
+    from transformers import AutoModelForCausalLM
+    kwargs = dict(torch_dtype=dtype, device_map=device, trust_remote_code=True)
     try:
-        import torch
+        return AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
+    except Exception:
+        return AutoModelForCausalLM.from_pretrained(name, **kwargs)
+
+
+def free_gpu():
+    gc.collect()
+    if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-    except Exception:
-        pass
-    # Force kill any lingering CUDA contexts
-    time.sleep(2)
-    print(f"[eval] GPU freed", flush=True)
-    return out_path
+
+
+def compute_kl(teacher_logits, student_logits):
+    """KL(teacher || student) from logit tensors. Returns per-position KL."""
+    t_log_p = F.log_softmax(teacher_logits.float(), dim=-1)
+    s_log_p = F.log_softmax(student_logits.float(), dim=-1)
+    t_p = t_log_p.exp()
+    return (t_p * (t_log_p - s_log_p)).sum(dim=-1)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--models", required=True, help="Comma-separated model names")
+    parser = argparse.ArgumentParser(description="GPU KL evaluation with teacher continuation")
+    parser.add_argument("--teacher", required=True)
+    parser.add_argument("--students", required=True, help="Comma-separated student models")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt strings")
-    parser.add_argument("--outdir", default="/home/results", help="Output directory")
-    parser.add_argument("--max-tokens", type=int, default=256)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--max-prompt-len", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-params-b", type=float, default=3.5)
     args = parser.parse_args()
 
-    os.makedirs(args.outdir, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     with open(args.prompts) as f:
         prompts = json.load(f)
+    students = [s.strip() for s in args.students.split(",")]
 
-    models = [m.strip() for m in args.models.split(",")]
-    print(f"[batch] Evaluating {len(models)} models on {len(prompts)} prompts", flush=True)
+    from transformers import AutoTokenizer
+    print(f"[eval] Loading tokenizer: {args.teacher}", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
 
-    t_total = time.time()
-    for model in models:
-        eval_model(model, prompts, args.outdir,
-                   args.max_tokens, args.top_k, args.max_model_len)
+    # Tokenize prompts
+    input_ids_list = []
+    for p in prompts:
+        ids = tokenizer(p, return_tensors="pt", truncation=True, max_length=args.max_prompt_len).input_ids.to(device)
+        input_ids_list.append(ids)
+    total_prompt_tokens = sum(ids.shape[1] for ids in input_ids_list)
+    print(f"[eval] {len(prompts)} prompts, {total_prompt_tokens} prompt tokens", flush=True)
 
-    elapsed = time.time() - t_total
-    print(f"\n{'='*60}", flush=True)
-    print(f"[batch] All {len(models)} models evaluated in {elapsed:.0f}s total", flush=True)
+    # Load teacher
+    print(f"\n[eval] Loading teacher: {args.teacher}", flush=True)
+    teacher = load_model(args.teacher, device)
+    teacher.eval()
+
+    # Generate teacher continuations + get teacher logits
+    print(f"[eval] Generating teacher continuations (max_new_tokens={args.max_new_tokens})...", flush=True)
+    full_sequences = []
+    teacher_logits_list = []
+    prompt_lens = []
+
+    with torch.no_grad():
+        for i, ids in enumerate(input_ids_list):
+            prompt_len = ids.shape[1]
+            prompt_lens.append(prompt_len)
+
+            # Generate continuation
+            output_ids = teacher.generate(ids, max_new_tokens=args.max_new_tokens, do_sample=False)
+            full_sequences.append(output_ids)
+
+            # Forward pass on full sequence for logits
+            logits = teacher(output_ids).logits.float()
+            # Keep only continuation logits: logits[prompt_len-1:-1] predicts continuation tokens
+            cont_logits = logits[:, prompt_len - 1:-1, :]
+            teacher_logits_list.append(cont_logits.cpu())
+
+            gen_len = output_ids.shape[1] - prompt_len
+            print(f"  Prompt {i}: {prompt_len} prompt + {gen_len} gen tokens", flush=True)
+
+    del teacher
+    free_gpu()
+    print("[eval] Teacher unloaded", flush=True)
+
+    # Evaluate students
+    results = {"teacher": args.teacher, "students": {}}
+
+    for student_name in students:
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"[eval] Student: {student_name}", flush=True)
+
+        t0 = time.time()
+        student = load_model(student_name, device)
+        student.eval()
+        print(f"[eval] Loaded in {time.time() - t0:.1f}s", flush=True)
+
+        kl_per_prompt = []
+        total_kl_sum = 0.0
+        total_positions = 0
+
+        with torch.no_grad():
+            for i, full_ids in enumerate(full_sequences):
+                s_logits = student(full_ids).logits.float()
+                cont_s_logits = s_logits[:, prompt_lens[i] - 1:-1, :]
+                t_logits = teacher_logits_list[i].to(device)
+
+                kl_per_pos = compute_kl(t_logits, cont_s_logits).squeeze(0)
+                n_pos = kl_per_pos.shape[0]
+                kl_mean = kl_per_pos.mean().item()
+
+                kl_per_prompt.append({
+                    "kl_mean": kl_mean,
+                    "kl_std": kl_per_pos.std().item(),
+                    "n_positions": n_pos,
+                })
+                total_kl_sum += kl_mean * n_pos
+                total_positions += n_pos
+                print(f"  Prompt {i}: KL={kl_mean:.4f} ({n_pos} continuation positions)", flush=True)
+
+        kl_global = total_kl_sum / total_positions if total_positions > 0 else float("inf")
+        results["students"][student_name] = {
+            "kl_global_avg": kl_global,
+            "kl_per_prompt": kl_per_prompt,
+            "total_positions": total_positions,
+        }
+        print(f"\n[eval] {student_name}: global KL={kl_global:.6f}", flush=True)
+
+        del student
+        free_gpu()
+
+    with open(args.output, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n[eval] Results saved to {args.output}", flush=True)
 
 
 if __name__ == "__main__":
