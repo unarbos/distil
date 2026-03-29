@@ -46,6 +46,34 @@ EVAL_PROMPTS = 40
 EPSILON = 0.01
 
 
+def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, state_dir):
+    """Write a pending announcement to state/announcement.json for async Discord posting."""
+    improvement = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
+    announcement = {
+        "type": "new_king",
+        "timestamp": time.time(),
+        "posted": False,
+        "message": (
+            f"## 🏆 New King of Distil SN97!\n\n"
+            f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
+            f"📊 **KL: {new_kl:.6f}** (was {old_kl:.6f}, {improvement:.1f}% improvement)\n"
+            f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
+            f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n\n"
+            f"Think you can beat **{new_kl * (1 - EPSILON):.6f} KL** (1% epsilon)? "
+            f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"
+            f"📈 [Live Dashboard](<https://distil.arbos.life>)"
+        ),
+        "data": {
+            "new_uid": new_uid, "new_model": new_model, "new_kl": new_kl,
+            "old_uid": old_uid, "old_model": old_model, "old_kl": old_kl,
+        },
+    }
+    ann_path = Path(state_dir) / "announcement.json"
+    with open(ann_path, "w") as f:
+        json.dump(announcement, f, indent=2)
+    print(f"[VALIDATOR] Announcement written: UID {new_uid} dethroned UID {old_uid}", flush=True)
+
+
 @click.command()
 @click.option("--network", default="finney")
 @click.option("--netuid", type=int, default=NETUID)
@@ -306,6 +334,23 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             king_str = f"UID {king_uid}" if king_uid else "none"
             print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
 
+            # ── Write eval progress (for dashboard live display) ──
+            progress_path = state_path / "eval_progress.json"
+            progress = {
+                "active": True,
+                "phase": "preparing",
+                "models": {uid: info["model"] for uid, info in models_to_eval.items()},
+                "students_total": len(models_to_eval),
+                "students_done": 0,
+                "prompts_total": n_prompts,
+                "prompts_done": 0,
+                "king_uid": king_uid,
+                "challenger_uids": list(challengers.keys()),
+                "started_at": time.time(),
+            }
+            with open(progress_path, "w") as f:
+                json.dump(progress, f)
+
             # Prepare prompts
             epoch_prompts = sample_prompts_seeded(all_prompts, n_prompts, current_block)
             prompt_texts = [format_prompt(p) for p in epoch_prompts]
@@ -331,6 +376,11 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 f"--max-params-b {max_params_b}"
             )
             print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
+
+            # Update progress: scoring phase
+            progress["phase"] = "scoring"
+            with open(progress_path, "w") as f:
+                json.dump(progress, f)
 
             try:
                 result = lium.exec(pod, command=cmd)
@@ -473,6 +523,24 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     king_uid=winner_uid,
                     state_dir=state_path,
                 )
+
+            # ── Clear eval progress ──
+            progress_path = state_path / "eval_progress.json"
+            with open(progress_path, "w") as f:
+                json.dump({"active": False}, f)
+
+            # ── Discord announcement if king changed ──
+            if winner_uid is not None and winner_uid != king_uid and king_uid is not None:
+                new_king_model = uid_to_model.get(winner_uid, "unknown")
+                old_king_model = valid_models.get(king_uid, {}).get("model", "unknown")
+                try:
+                    _announce_new_king(
+                        new_uid=winner_uid, new_model=new_king_model, new_kl=winner_kl,
+                        old_uid=king_uid, old_model=old_king_model, old_kl=king_kl,
+                        state_dir=state_path,
+                    )
+                except Exception as ann_err:
+                    print(f"[VALIDATOR] Discord announcement failed: {ann_err}", flush=True)
 
             elapsed = time.time() - epoch_start
             print(f"\n[VALIDATOR] Epoch complete in {elapsed:.0f}s", flush=True)

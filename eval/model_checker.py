@@ -22,6 +22,7 @@ logger = logging.getLogger("distillation.model_checker")
 # Qwen3.5-35B-A3B: vocab_size=248320 in config (text_config.vocab_size)
 # Note: tokenizer.vocab_size reports 248044 but model config uses 248320 (padded)
 BASELINE_VOCAB_SIZE = 248320
+TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 STATE_DIR = Path("state")
 
 
@@ -267,6 +268,53 @@ def verify_model_integrity(
     }
 
 
+# Fixed test strings for tokenizer verification — diverse enough to catch mismatches
+TOKENIZER_TEST_STRINGS = [
+    "The quick brown fox jumps over the lazy dog.",
+    "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)",
+    "日本語のテスト文字列です。Unicode handling matters.",
+    "KL(P||Q) = Σ P(x) log(P(x)/Q(x)) for all x in vocabulary",
+]
+_teacher_tokenizer = None
+
+
+def _get_teacher_tokenizer():
+    """Lazily load and cache the teacher tokenizer."""
+    global _teacher_tokenizer
+    if _teacher_tokenizer is None:
+        from transformers import AutoTokenizer
+        _teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+    return _teacher_tokenizer
+
+
+def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
+    """
+    Verify that a model's tokenizer produces identical token IDs as the teacher.
+    
+    Downloads the student tokenizer and encodes fixed test strings.
+    If any encoding differs, the tokenizer is incompatible.
+    """
+    from transformers import AutoTokenizer
+
+    teacher_tok = _get_teacher_tokenizer()
+    student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=True)
+
+    for test_str in TOKENIZER_TEST_STRINGS:
+        teacher_ids = teacher_tok.encode(test_str)
+        student_ids = student_tok.encode(test_str)
+        if teacher_ids != student_ids:
+            return {
+                "match": False,
+                "reason": (
+                    f"Encoding mismatch on test string: "
+                    f"teacher produced {len(teacher_ids)} tokens, "
+                    f"student produced {len(student_ids)} tokens"
+                ),
+            }
+
+    return {"match": True}
+
+
 def check_model_architecture(
     model_repo: str,
     revision: str = None,
@@ -338,6 +386,20 @@ def check_model_architecture(
                 "params_b": total_params_b,
                 "vocab_size": vocab_size,
             }
+
+        # 7. Verify tokenizer produces identical encodings as teacher
+        try:
+            tokenizer_match = verify_tokenizer_match(model_repo, revision)
+            if not tokenizer_match["match"]:
+                return {
+                    "pass": False,
+                    "reason": f"Tokenizer mismatch: {tokenizer_match['reason']}",
+                    "params_b": total_params_b,
+                    "vocab_size": vocab_size,
+                }
+        except Exception as tok_err:
+            logger.warning(f"Tokenizer check failed for {model_repo}: {tok_err} (allowing)")
+            # Don't block on tokenizer download failure — vocab_size check is the primary gate
 
         # Log MoE info for transparency
         if moe_info["is_moe"]:

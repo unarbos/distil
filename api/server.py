@@ -200,6 +200,8 @@ def root():
             "/api/price": "Token price, emission, market data",
             "/api/model-info/{repo}": "HuggingFace model card info (params, MoE, tags, etc.)",
             "/api/history": "Score history over time (for trendline chart)",
+            "/api/eval-progress": "Live eval progress (phase, models, prompts done)",
+            "/api/announcement": "Pending announcements (new king, etc.)",
             "/api/health": "Service health check",
         },
     }
@@ -338,6 +340,51 @@ def get_model_info(model_path: str):
         return result
     except Exception as e:
         return {"error": str(e), "model": model_path}
+
+
+@app.get("/api/announcement")
+def get_announcement():
+    """Pending announcements (e.g., new king). Mark as posted via POST."""
+    ann_path = os.path.join(STATE_DIR, "announcement.json")
+    if os.path.exists(ann_path):
+        try:
+            with open(ann_path) as f:
+                ann = json.load(f)
+            if not ann.get("posted", True):
+                return ann
+        except Exception:
+            pass
+    return {"type": None}
+
+
+@app.post("/api/announcement/posted")
+def mark_announcement_posted():
+    """Mark the current announcement as posted."""
+    ann_path = os.path.join(STATE_DIR, "announcement.json")
+    if os.path.exists(ann_path):
+        try:
+            with open(ann_path) as f:
+                ann = json.load(f)
+            ann["posted"] = True
+            with open(ann_path, "w") as f:
+                json.dump(ann, f, indent=2)
+            return {"ok": True}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"ok": True, "note": "no announcement"}
+
+
+@app.get("/api/eval-progress")
+def get_eval_progress():
+    """Live eval progress — what the validator is currently doing."""
+    progress_path = os.path.join(STATE_DIR, "eval_progress.json")
+    if os.path.exists(progress_path):
+        try:
+            with open(progress_path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"active": False}
 
 
 @app.get("/api/tmc-config")
