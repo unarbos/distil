@@ -4,7 +4,7 @@ Remote Validator — runs eval on Lium GPU, sets weights locally.
 
 Architecture:
   1. This script runs on the secure server (has wallet keys)
-  2. Uploads eval script to Lium B200 pod
+  2. Uploads eval script to Lium GPU pod
   3. Pod runs teacher + student forward passes, returns KL scores
   4. This script reads KL scores and sets weights on-chain
 
@@ -29,7 +29,6 @@ logger.setLevel(logging.DEBUG)
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 NETUID = 97
 MAX_KL_THRESHOLD = 2.0
-EMA_ALPHA = 0.3
 MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 SAMPLES_PER_EPOCH = 20
@@ -53,7 +52,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     import bittensor as bt
     from lium import Lium, Config
     from eval.scoring import (
-        load_ema_scores, save_ema_scores, update_ema,
+        load_scores, save_scores,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
         compute_winner_weights,
     )
@@ -88,7 +87,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     print(f"[VALIDATOR] Loaded {len(all_prompts)} prompts from HF", flush=True)
 
     # ── Load state ──
-    ema_scores = load_ema_scores(state_path)
+    scores = load_scores(state_path)
     failures = load_failures(state_path)
 
     # ── Upload eval script ──
@@ -140,15 +139,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     logger.debug(f"UID {uid}: stale, skipping")
                     continue
 
-                # Architecture check
                 print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
                 check = check_model_architecture(model_repo, revision, max_params_b)
                 if not check["pass"]:
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
                     continue
-
-                # Tokenizer check done on GPU pod (pod_eval.py verifies before scoring)
 
                 valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": check.get("params_b", 0)}
                 print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
@@ -222,7 +218,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             with open(results_local) as f:
                 results = json.load(f)
 
-            # ── Process KL scores ──
+            # ── Process KL scores (raw, no EMA) ──
             uid_to_model = {uid: m["model"] for uid, m in valid_models.items()}
             model_to_uid = {m: uid for uid, m in uid_to_model.items()}
 
@@ -242,9 +238,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     record_failure(uid, failures)
                     continue
 
-                new_ema = update_ema(uid, kl, ema_scores, EMA_ALPHA)
+                scores[str(uid)] = kl
                 reset_failures(uid, failures)
-                logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}, EMA={new_ema:.6f}")
+                print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
 
             # ── Integrity check: verify models are public + unchanged ──
             hash_file = state_path / "model_hashes.json"
@@ -254,7 +250,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     known_hashes = json.load(f)
 
             disqualified = set()
-            for uid_str in list(ema_scores.keys()):
+            for uid_str in list(scores.keys()):
                 uid = int(uid_str)
                 model_info_entry = valid_models.get(uid) or commitments.get(uid)
                 if not model_info_entry:
@@ -267,9 +263,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not integrity["pass"]:
                     print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
                     disqualified.add(uid)
-                    ema_scores[uid_str] = MAX_KL_THRESHOLD + 1  # Effectively zero weight
+                    scores[uid_str] = MAX_KL_THRESHOLD + 1  # Zero weight
                 else:
-                    # Store hash for future comparison
                     if integrity["current_hash"]:
                         known_hashes[uid_str] = integrity["current_hash"]
 
@@ -277,16 +272,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 json.dump(known_hashes, f, indent=2)
 
             if disqualified:
-                print(f"[VALIDATOR] {len(disqualified)} miners disqualified, recalculating winner", flush=True)
+                print(f"[VALIDATOR] {len(disqualified)} miners disqualified", flush=True)
 
             # ── Compute winner & set weights ──
             weights, winner_uid, winner_kl = compute_winner_weights(
-                ema_scores, failures, metagraph.n, max_kl=MAX_KL_THRESHOLD,
+                scores, failures, int(metagraph.n), max_kl=MAX_KL_THRESHOLD,
             )
 
             # Leaderboard
             print(f"\n[VALIDATOR] LEADERBOARD (block {current_block}):", flush=True)
-            sorted_scores = sorted(ema_scores.items(), key=lambda x: x[1])
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1])
             for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
                 uid = int(uid_str)
                 dq = " ⛔ DISQUALIFIED" if uid in disqualified else ""
@@ -295,7 +290,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             if winner_uid is not None:
                 print(f"\n[VALIDATOR] Setting weights: UID {winner_uid} = 1.0", flush=True)
-                uids = list(range(metagraph.n))
+                uids = list(range(int(metagraph.n)))
                 for attempt in range(3):
                     try:
                         success = subtensor.set_weights(
@@ -305,37 +300,37 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                             wait_for_finalization=True,
                         )
                         if success:
-                            logger.info("✓ Weights set on-chain!")
+                            print("[VALIDATOR] ✓ Weights set on-chain!", flush=True)
                             break
                         logger.warning(f"Attempt {attempt + 1}: rejected")
                     except Exception as e:
                         logger.error(f"Attempt {attempt + 1}: {e}")
                     time.sleep(30)
             else:
-                logger.info("No valid miners — skipping weight setting")
+                print("[VALIDATOR] No valid miners — skipping weight setting", flush=True)
 
             # ── Persist state ──
-            save_ema_scores(ema_scores, state_path)
+            save_scores(scores, state_path)
             save_failures(failures, state_path)
 
             elapsed = time.time() - epoch_start
-            logger.info(f"\nEpoch complete in {elapsed:.0f}s")
+            print(f"\n[VALIDATOR] Epoch complete in {elapsed:.0f}s", flush=True)
 
             if once:
                 break
-            logger.info(f"Sleeping {tempo}s...")
+            print(f"[VALIDATOR] Sleeping {tempo}s...", flush=True)
             time.sleep(tempo)
 
         except KeyboardInterrupt:
             logger.info("Shutting down")
-            save_ema_scores(ema_scores, state_path)
+            save_scores(scores, state_path)
             save_failures(failures, state_path)
             break
         except Exception as e:
             print(f"[VALIDATOR ERROR] Epoch error: {e}", flush=True)
             import traceback
             traceback.print_exc()
-            save_ema_scores(ema_scores, state_path)
+            save_scores(scores, state_path)
             save_failures(failures, state_path)
             if once:
                 break
