@@ -22,8 +22,9 @@ import click
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 logger = logging.getLogger("distillation.remote_validator")
+logger.setLevel(logging.DEBUG)
 
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 NETUID = 97
@@ -56,7 +57,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
         compute_winner_weights,
     )
-    from eval.model_checker import check_model_architecture, verify_tokenizer
+    from eval.model_checker import check_model_architecture, verify_tokenizer, verify_model_integrity, compute_model_hash
     from eval.dataset import load_swe_infinite_prompts, sample_prompts_seeded, format_coding_prompt
 
     state_path = Path(state_dir)
@@ -97,14 +98,18 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     while True:
         try:
             epoch_start = time.time()
+            print(f"[VALIDATOR] Fetching metagraph...", flush=True)
             metagraph = subtensor.metagraph(netuid)
             current_block = subtensor.block
+            print(f"[VALIDATOR] Block {current_block}, n={metagraph.n}", flush=True)
             logger.info(f"\n{'='*60}")
             logger.info(f"EPOCH — Block {current_block}")
             logger.info(f"{'='*60}")
 
             # ── Read commitments ──
+            print(f"[VALIDATOR] Reading commitments...", flush=True)
             revealed = subtensor.get_all_revealed_commitments(netuid)
+            print(f"[VALIDATOR] Got {len(revealed)} revealed entries", flush=True)
             commitments = {}
             for uid in range(metagraph.n):
                 hotkey = str(metagraph.hotkeys[uid])
@@ -117,7 +122,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     except:
                         continue
 
-            logger.info(f"Found {len(commitments)} miner commitments")
+            print(f"[VALIDATOR] Found {len(commitments)} miner commitments", flush=True)
             if not commitments:
                 logger.info(f"No commitments, sleeping {tempo}s")
                 if once:
@@ -136,24 +141,20 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     continue
 
                 # Architecture check
+                print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
                 check = check_model_architecture(model_repo, revision, max_params_b)
                 if not check["pass"]:
-                    logger.warning(f"UID {uid} ({model_repo}): {check['reason']}")
+                    print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
                     continue
 
-                # Tokenizer check
-                tok_ok, tok_reason = verify_tokenizer(TEACHER_MODEL, model_repo)
-                if not tok_ok:
-                    logger.warning(f"UID {uid} ({model_repo}): tokenizer — {tok_reason}")
-                    record_failure(uid, failures)
-                    continue
+                # Tokenizer check done on GPU pod (pod_eval.py verifies before scoring)
 
                 valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": check.get("params_b", 0)}
-                logger.info(f"UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓")
+                print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
 
             if not valid_models:
-                logger.info("No valid models to evaluate")
+                print("[VALIDATOR] No valid models to evaluate", flush=True)
                 if once:
                     break
                 time.sleep(tempo)
@@ -180,16 +181,32 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 f"--max-new-tokens {MAX_NEW_TOKENS} "
                 f"--max-params-b {max_params_b}"
             )
-            logger.info(f"Running eval on Lium pod ({len(valid_models)} models, {SAMPLES_PER_EPOCH} prompts)...")
+            print(f"[VALIDATOR] Running eval on Lium pod ({len(valid_models)} models, {SAMPLES_PER_EPOCH} prompts)...", flush=True)
 
-            output_lines = []
-            for chunk in lium.stream_exec(pod, command=cmd):
-                text = str(chunk.get("output", chunk.get("stdout", chunk)))
-                if text.strip():
-                    # Log summary lines
-                    if any(k in text for k in ["[eval]", "SUMMARY", "global KL", "Timings"]):
-                        logger.info(f"  GPU: {text.strip()[:150]}")
-                    output_lines.append(text)
+            print(f"[VALIDATOR] >>> Calling lium.exec now...", flush=True)
+            try:
+                result = lium.exec(pod, command=cmd)
+                print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
+            except Exception as exec_err:
+                print(f"[VALIDATOR] lium.exec EXCEPTION: {exec_err}", flush=True)
+                import traceback
+                traceback.print_exc()
+                if once:
+                    break
+                time.sleep(tempo)
+                continue
+            if result['stdout'].strip():
+                for line in result['stdout'].strip().split('\n')[-30:]:
+                    print(f"  GPU: {line[:200]}", flush=True)
+            if result['stderr'].strip():
+                for line in result['stderr'].strip().split('\n')[-10:]:
+                    print(f"  GPU ERR: {line[:200]}", flush=True)
+            if not result['success']:
+                print(f"[VALIDATOR] Eval failed on pod, skipping", flush=True)
+                if once:
+                    break
+                time.sleep(tempo)
+                continue
 
             # ── Download results ──
             results_local = str(state_path / "last_eval.json")
@@ -229,20 +246,55 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 reset_failures(uid, failures)
                 logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}, EMA={new_ema:.6f}")
 
+            # ── Integrity check: verify models are public + unchanged ──
+            hash_file = state_path / "model_hashes.json"
+            known_hashes = {}
+            if hash_file.exists():
+                with open(hash_file) as f:
+                    known_hashes = json.load(f)
+
+            disqualified = set()
+            for uid_str in list(ema_scores.keys()):
+                uid = int(uid_str)
+                model_info_entry = valid_models.get(uid) or commitments.get(uid)
+                if not model_info_entry:
+                    continue
+                model_repo = model_info_entry["model"]
+                revision = model_info_entry.get("revision", "main")
+                expected_hash = known_hashes.get(uid_str)
+
+                integrity = verify_model_integrity(model_repo, revision, expected_hash)
+                if not integrity["pass"]:
+                    print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
+                    disqualified.add(uid)
+                    ema_scores[uid_str] = MAX_KL_THRESHOLD + 1  # Effectively zero weight
+                else:
+                    # Store hash for future comparison
+                    if integrity["current_hash"]:
+                        known_hashes[uid_str] = integrity["current_hash"]
+
+            with open(hash_file, "w") as f:
+                json.dump(known_hashes, f, indent=2)
+
+            if disqualified:
+                print(f"[VALIDATOR] {len(disqualified)} miners disqualified, recalculating winner", flush=True)
+
             # ── Compute winner & set weights ──
             weights, winner_uid, winner_kl = compute_winner_weights(
                 ema_scores, failures, metagraph.n, max_kl=MAX_KL_THRESHOLD,
             )
 
             # Leaderboard
-            logger.info(f"\nLEADERBOARD (block {current_block}):")
+            print(f"\n[VALIDATOR] LEADERBOARD (block {current_block}):", flush=True)
             sorted_scores = sorted(ema_scores.items(), key=lambda x: x[1])
             for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
-                marker = " ← WINNER" if int(uid_str) == winner_uid else ""
-                logger.info(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}")
+                uid = int(uid_str)
+                dq = " ⛔ DISQUALIFIED" if uid in disqualified else ""
+                marker = " ← WINNER" if uid == winner_uid else ""
+                print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{dq}", flush=True)
 
             if winner_uid is not None:
-                logger.info(f"\nSetting weights: UID {winner_uid} = 1.0")
+                print(f"\n[VALIDATOR] Setting weights: UID {winner_uid} = 1.0", flush=True)
                 uids = list(range(metagraph.n))
                 for attempt in range(3):
                     try:
@@ -280,7 +332,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             save_failures(failures, state_path)
             break
         except Exception as e:
-            logger.error(f"Epoch error: {e}")
+            print(f"[VALIDATOR ERROR] Epoch error: {e}", flush=True)
             import traceback
             traceback.print_exc()
             save_ema_scores(ema_scores, state_path)
