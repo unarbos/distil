@@ -56,7 +56,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
         compute_winner_weights,
     )
-    from eval.model_checker import check_model_architecture, verify_tokenizer, verify_model_integrity, compute_model_hash
+    from eval.model_checker import (
+        check_model_architecture, verify_tokenizer, verify_model_integrity,
+        compute_model_hash, check_duplicate_hash, register_model_hash,
+    )
     from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
 
     state_path = Path(state_dir)
@@ -145,6 +148,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
                     continue
+
+                # Duplicate hash check — reject if same weights as another miner
+                model_hash = compute_model_hash(model_repo, revision)
+                if model_hash:
+                    original_uid = check_duplicate_hash(model_hash, uid, state_path)
+                    if original_uid is not None:
+                        print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid} — same model weights", flush=True)
+                        scores[str(uid)] = MAX_KL_THRESHOLD + 1  # Permanent zero weight
+                        continue
+                    register_model_hash(model_hash, uid, state_path)
 
                 valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": check.get("params_b", 0)}
                 print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
