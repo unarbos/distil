@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-Remote Validator — runs eval on Lium GPU, sets weights locally.
+Remote Validator — King-of-the-Hill Architecture
 
-Architecture:
-  1. This script runs on the secure server (has wallet keys)
-  2. Uploads eval script to Lium GPU pod
-  3. Pod runs teacher + student forward passes, returns KL scores
-  4. This script reads KL scores and sets weights on-chain
+Design:
+  - The "king" is the miner with the best KL score (lowest)
+  - Each epoch, only NEW/UNEVALUATED challengers are scored head-to-head vs the king
+  - Challengers get MORE prompts (higher confidence) than the broad sweep
+  - If a challenger beats the king, it becomes the new king
+  - Pre-checks (architecture, hash, integrity) filter out invalid models BEFORE GPU eval
+  - Wallet keys never leave this machine; GPU pod has no chain access
 
-No wallet keys leave this machine. No chain access needed on the GPU pod.
+Flow:
+  1. Read commitments, pre-check all models (arch, hash, integrity)
+  2. Identify king (lowest KL from state) and challengers (new/unevaluated)
+  3. If challengers exist: evaluate king + challengers head-to-head on GPU
+  4. If a challenger beats king: it becomes king
+  5. Set weights: king gets 1.0, everyone else 0.0
 """
 import os
 import sys
@@ -31,7 +38,13 @@ NETUID = 97
 MAX_KL_THRESHOLD = 2.0
 MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
-SAMPLES_PER_EPOCH = 20
+
+# King gets periodic re-validation with this many prompts
+KING_EVAL_PROMPTS = 40
+# Challengers get evaluated with this many prompts (higher = tighter CI)
+CHALLENGER_EVAL_PROMPTS = 40
+# King is re-validated every N epochs even if no challengers
+KING_REEVAL_INTERVAL = 6
 
 
 @click.command()
@@ -48,7 +61,7 @@ SAMPLES_PER_EPOCH = 20
 @click.option("--once", is_flag=True, help="Run one epoch and exit (for testing)")
 def main(network, netuid, wallet_name, hotkey_name, wallet_path,
          lium_api_key, lium_pod_name, state_dir, max_params_b, tempo, once):
-    """Run the distillation validator with remote GPU eval."""
+    """Run the distillation validator with king-of-the-hill evaluation."""
     import bittensor as bt
     from lium import Lium, Config
     from eval.scoring import (
@@ -57,7 +70,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         compute_winner_weights,
     )
     from eval.model_checker import (
-        check_model_architecture, verify_tokenizer, verify_model_integrity,
+        check_model_architecture, verify_model_integrity,
         compute_model_hash, check_duplicate_hash, register_model_hash,
     )
     from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
@@ -92,6 +105,19 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     # ── Load state ──
     scores = load_scores(state_path)
     failures = load_failures(state_path)
+    epoch_count = 0
+
+    # ── Track which UIDs have been evaluated ──
+    evaluated_file = state_path / "evaluated_uids.json"
+    evaluated_uids = set()
+    if evaluated_file.exists():
+        try:
+            evaluated_uids = set(json.loads(evaluated_file.read_text()))
+        except Exception:
+            pass
+
+    def save_evaluated():
+        evaluated_file.write_text(json.dumps(list(evaluated_uids)))
 
     # ── Upload eval script ──
     logger.info("Uploading eval script to pod...")
@@ -100,28 +126,28 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     while True:
         try:
             epoch_start = time.time()
+            epoch_count += 1
+            print(f"\n[VALIDATOR] === EPOCH {epoch_count} ===", flush=True)
             print(f"[VALIDATOR] Fetching metagraph...", flush=True)
             metagraph = subtensor.metagraph(netuid)
             current_block = subtensor.block
-            print(f"[VALIDATOR] Block {current_block}, n={metagraph.n}", flush=True)
-            logger.info(f"\n{'='*60}")
-            logger.info(f"EPOCH — Block {current_block}")
-            logger.info(f"{'='*60}")
+            n_uids = int(metagraph.n)
+            print(f"[VALIDATOR] Block {current_block}, n={n_uids}", flush=True)
 
             # ── Read commitments ──
             print(f"[VALIDATOR] Reading commitments...", flush=True)
             revealed = subtensor.get_all_revealed_commitments(netuid)
             print(f"[VALIDATOR] Got {len(revealed)} revealed entries", flush=True)
             commitments = {}
-            for uid in range(metagraph.n):
+            for uid in range(n_uids):
                 hotkey = str(metagraph.hotkeys[uid])
                 if hotkey in revealed and len(revealed[hotkey]) > 0:
-                    block, data = revealed[hotkey][0]  # First commit only
+                    block, data = revealed[hotkey][0]
                     try:
                         parsed = json.loads(data)
                         if "model" in parsed:
                             commitments[uid] = {"block": block, **parsed}
-                    except:
+                    except Exception:
                         continue
 
             print(f"[VALIDATOR] Found {len(commitments)} miner commitments", flush=True)
@@ -132,57 +158,152 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            # ── Pre-check models locally (no GPU needed) ──
-            valid_models = {}
+            # ══════════════════════════════════════════════════════════════
+            # PHASE 1: Pre-check ALL models (no GPU needed)
+            # ══════════════════════════════════════════════════════════════
+            valid_models = {}  # uid -> {model, revision, params_b}
+            disqualified = set()
+
             for uid, commit in commitments.items():
                 model_repo = commit["model"]
                 revision = commit.get("revision", "main")
 
+                # Already permanently disqualified (duplicate hash)
+                if scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
+                    disqualified.add(uid)
+                    continue
+
                 if is_stale(uid, failures):
-                    logger.debug(f"UID {uid}: stale, skipping")
+                    logger.debug(f"UID {uid}: stale (too many failures), skipping")
+                    disqualified.add(uid)
                     continue
 
                 print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
+
+                # Architecture check
                 check = check_model_architecture(model_repo, revision, max_params_b)
                 if not check["pass"]:
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
+                    disqualified.add(uid)
                     continue
 
-                # Duplicate hash check — reject if same weights as another miner
-                # Earlier commitment (lower block number) wins
+                # Duplicate hash check — earlier commitment wins
                 model_hash = compute_model_hash(model_repo, revision)
                 if model_hash:
                     original_uid = check_duplicate_hash(model_hash, uid, state_path)
                     if original_uid is not None:
-                        # Check who committed first
                         orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
                         this_block = commit.get("block", float("inf"))
                         if this_block >= orig_block:
-                            print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid} — same model weights", flush=True)
+                            print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}", flush=True)
                             scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                            disqualified.add(uid)
                             continue
                         else:
-                            # This miner committed earlier — they own the hash, disqualify the other
-                            print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier) — reassigning hash", flush=True)
+                            print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier)", flush=True)
                             scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
                             valid_models.pop(original_uid, None)
+                            disqualified.add(original_uid)
                             register_model_hash(model_hash, uid, state_path)
                     else:
                         register_model_hash(model_hash, uid, state_path)
 
-                valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": check.get("params_b", 0)}
+                # Integrity check — model still public + unchanged
+                hash_file = state_path / "model_hashes.json"
+                known_hashes = {}
+                if hash_file.exists():
+                    try:
+                        known_hashes = json.loads(hash_file.read_text())
+                    except Exception:
+                        pass
+                expected_hash = known_hashes.get(str(uid))
+                integrity = verify_model_integrity(model_repo, revision, expected_hash)
+                if not integrity["pass"]:
+                    print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
+                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualified.add(uid)
+                    continue
+                if integrity["current_hash"]:
+                    known_hashes[str(uid)] = integrity["current_hash"]
+                    hash_file.write_text(json.dumps(known_hashes, indent=2))
+
+                valid_models[uid] = {
+                    "model": model_repo,
+                    "revision": revision,
+                    "params_b": check.get("params_b", 0),
+                }
                 print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
 
             if not valid_models:
-                print("[VALIDATOR] No valid models to evaluate", flush=True)
+                print("[VALIDATOR] No valid models after pre-checks", flush=True)
+                save_scores(scores, state_path)
+                save_failures(failures, state_path)
                 if once:
                     break
                 time.sleep(tempo)
                 continue
 
-            # ── Prepare prompts ──
-            epoch_prompts = sample_prompts_seeded(all_prompts, SAMPLES_PER_EPOCH, current_block)
+            # ══════════════════════════════════════════════════════════════
+            # PHASE 2: Identify king and challengers
+            # ══════════════════════════════════════════════════════════════
+            king_uid = None
+            king_kl = float("inf")
+            for uid in valid_models:
+                uid_str = str(uid)
+                if uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
+                    if scores[uid_str] < king_kl:
+                        king_kl = scores[uid_str]
+                        king_uid = uid
+
+            # Challengers = valid models that haven't been evaluated yet
+            challengers = {
+                uid: info for uid, info in valid_models.items()
+                if str(uid) not in evaluated_uids
+            }
+
+            # Periodic king re-validation
+            king_needs_reeval = (epoch_count % KING_REEVAL_INTERVAL == 0)
+
+            if not challengers and not king_needs_reeval:
+                print(f"[VALIDATOR] No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds", flush=True)
+                # Still set weights to keep tempo
+                weights, winner_uid, winner_kl = compute_winner_weights(
+                    scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
+                )
+                if winner_uid is not None:
+                    _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
+                save_scores(scores, state_path)
+                save_failures(failures, state_path)
+                elapsed = time.time() - epoch_start
+                print(f"[VALIDATOR] Epoch complete in {elapsed:.0f}s (no eval needed)", flush=True)
+                if once:
+                    break
+                print(f"[VALIDATOR] Sleeping {tempo}s...", flush=True)
+                time.sleep(tempo)
+                continue
+
+            # ══════════════════════════════════════════════════════════════
+            # PHASE 3: GPU evaluation — king + challengers only
+            # ══════════════════════════════════════════════════════════════
+            models_to_eval = {}
+            if king_uid is not None and king_uid in valid_models:
+                models_to_eval[king_uid] = valid_models[king_uid]
+            for uid, info in challengers.items():
+                models_to_eval[uid] = info
+
+            n_prompts = CHALLENGER_EVAL_PROMPTS
+            if not challengers and king_needs_reeval:
+                # Just re-validating king with fresh prompts
+                n_prompts = KING_EVAL_PROMPTS
+                print(f"[VALIDATOR] Re-validating king UID {king_uid} ({n_prompts} prompts)", flush=True)
+            else:
+                chall_str = ", ".join(f"UID {u}" for u in challengers)
+                king_str = f"UID {king_uid}" if king_uid else "none"
+                print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
+
+            # Prepare prompts
+            epoch_prompts = sample_prompts_seeded(all_prompts, n_prompts, current_block)
             prompt_texts = [format_prompt(p) for p in epoch_prompts]
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 json.dump(prompt_texts, f)
@@ -190,8 +311,11 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             lium.upload(pod, local=prompts_file, remote="/home/prompts.json")
             os.unlink(prompts_file)
 
-            # ── Run eval on Lium GPU ──
-            student_list = ",".join(m["model"] for m in valid_models.values())
+            # Re-upload eval script (in case it changed)
+            lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+
+            # Run eval
+            student_list = ",".join(m["model"] for m in models_to_eval.values())
             cmd = (
                 f"cd /home && python3 pod_eval.py "
                 f"--teacher {TEACHER_MODEL} "
@@ -202,9 +326,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 f"--max-new-tokens {MAX_NEW_TOKENS} "
                 f"--max-params-b {max_params_b}"
             )
-            print(f"[VALIDATOR] Running eval on Lium pod ({len(valid_models)} models, {SAMPLES_PER_EPOCH} prompts)...", flush=True)
+            print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
-            print(f"[VALIDATOR] >>> Calling lium.exec now...", flush=True)
             try:
                 result = lium.exec(pod, command=cmd)
                 print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
@@ -216,6 +339,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     break
                 time.sleep(tempo)
                 continue
+
             if result['stdout'].strip():
                 for line in result['stdout'].strip().split('\n')[-30:]:
                     print(f"  GPU: {line[:200]}", flush=True)
@@ -243,8 +367,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             with open(results_local) as f:
                 results = json.load(f)
 
-            # ── Process KL scores (raw, no EMA) ──
-            uid_to_model = {uid: m["model"] for uid, m in valid_models.items()}
+            # ══════════════════════════════════════════════════════════════
+            # PHASE 4: Process results — update scores, crown new king
+            # ══════════════════════════════════════════════════════════════
+            uid_to_model = {uid: m["model"] for uid, m in models_to_eval.items()}
             model_to_uid = {m: uid for uid, m in uid_to_model.items()}
 
             for model_name, student_result in results.get("students", {}).items():
@@ -264,79 +390,37 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     continue
 
                 scores[str(uid)] = kl
+                evaluated_uids.add(str(uid))
                 reset_failures(uid, failures)
                 print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
 
-            # ── Integrity check: verify models are public + unchanged ──
-            hash_file = state_path / "model_hashes.json"
-            known_hashes = {}
-            if hash_file.exists():
-                with open(hash_file) as f:
-                    known_hashes = json.load(f)
-
-            disqualified = set()
-            for uid_str in list(scores.keys()):
-                uid = int(uid_str)
-                model_info_entry = valid_models.get(uid) or commitments.get(uid)
-                if not model_info_entry:
-                    continue
-                model_repo = model_info_entry["model"]
-                revision = model_info_entry.get("revision", "main")
-                expected_hash = known_hashes.get(uid_str)
-
-                integrity = verify_model_integrity(model_repo, revision, expected_hash)
-                if not integrity["pass"]:
-                    print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
-                    disqualified.add(uid)
-                    scores[uid_str] = MAX_KL_THRESHOLD + 1  # Zero weight
-                else:
-                    if integrity["current_hash"]:
-                        known_hashes[uid_str] = integrity["current_hash"]
-
-            with open(hash_file, "w") as f:
-                json.dump(known_hashes, f, indent=2)
-
-            if disqualified:
-                print(f"[VALIDATOR] {len(disqualified)} miners disqualified", flush=True)
-
             # ── Compute winner & set weights ──
             weights, winner_uid, winner_kl = compute_winner_weights(
-                scores, failures, int(metagraph.n), max_kl=MAX_KL_THRESHOLD,
+                scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
             )
 
             # Leaderboard
             print(f"\n[VALIDATOR] LEADERBOARD (block {current_block}):", flush=True)
-            sorted_scores = sorted(scores.items(), key=lambda x: x[1])
+            sorted_scores = sorted(
+                [(uid_str, kl) for uid_str, kl in scores.items()],
+                key=lambda x: x[1]
+            )
             for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
                 uid = int(uid_str)
-                dq = " ⛔ DISQUALIFIED" if uid in disqualified else ""
-                marker = " ← WINNER" if uid == winner_uid else ""
-                print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{dq}", flush=True)
+                dq = " ⛔ DQ" if uid in disqualified else ""
+                marker = " ← KING" if uid == winner_uid else ""
+                new = " (NEW)" if uid_str in [str(u) for u in challengers] else ""
+                print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{new}{dq}", flush=True)
 
             if winner_uid is not None:
-                print(f"\n[VALIDATOR] Setting weights: UID {winner_uid} = 1.0", flush=True)
-                uids = list(range(int(metagraph.n)))
-                for attempt in range(3):
-                    try:
-                        success = subtensor.set_weights(
-                            wallet=wallet, netuid=netuid,
-                            uids=uids, weights=weights,
-                            wait_for_inclusion=True,
-                            wait_for_finalization=True,
-                        )
-                        if success:
-                            print("[VALIDATOR] ✓ Weights set on-chain!", flush=True)
-                            break
-                        logger.warning(f"Attempt {attempt + 1}: rejected")
-                    except Exception as e:
-                        logger.error(f"Attempt {attempt + 1}: {e}")
-                    time.sleep(30)
+                _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
             else:
                 print("[VALIDATOR] No valid miners — skipping weight setting", flush=True)
 
             # ── Persist state ──
             save_scores(scores, state_path)
             save_failures(failures, state_path)
+            save_evaluated()
 
             elapsed = time.time() - epoch_start
             print(f"\n[VALIDATOR] Epoch complete in {elapsed:.0f}s", flush=True)
@@ -350,16 +434,39 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             logger.info("Shutting down")
             save_scores(scores, state_path)
             save_failures(failures, state_path)
+            save_evaluated()
             break
         except Exception as e:
-            print(f"[VALIDATOR ERROR] Epoch error: {e}", flush=True)
+            print(f"[VALIDATOR ERROR] {e}", flush=True)
             import traceback
             traceback.print_exc()
             save_scores(scores, state_path)
             save_failures(failures, state_path)
+            save_evaluated()
             if once:
                 break
             time.sleep(60)
+
+
+def _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid):
+    """Set weights on-chain with retry."""
+    print(f"\n[VALIDATOR] Setting weights: UID {winner_uid} = 1.0", flush=True)
+    uids = list(range(n_uids))
+    for attempt in range(3):
+        try:
+            success = subtensor.set_weights(
+                wallet=wallet, netuid=netuid,
+                uids=uids, weights=weights,
+                wait_for_inclusion=True,
+                wait_for_finalization=True,
+            )
+            if success:
+                print("[VALIDATOR] ✓ Weights set on-chain!", flush=True)
+                return
+            logger.warning(f"Attempt {attempt + 1}: rejected")
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1}: {e}")
+        time.sleep(30)
 
 
 if __name__ == "__main__":
