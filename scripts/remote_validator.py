@@ -58,7 +58,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         compute_winner_weights,
     )
     from eval.model_checker import check_model_architecture, verify_tokenizer, verify_model_integrity, compute_model_hash
-    from eval.dataset import load_swe_infinite_prompts, sample_prompts_seeded, format_coding_prompt
+    from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
 
     state_path = Path(state_dir)
     state_path.mkdir(parents=True, exist_ok=True)
@@ -84,8 +84,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     logger.info(f"Using Lium pod: {pod.name} ({pod.id[:12]})")
 
     # ── Load dataset ──
-    all_prompts = load_swe_infinite_prompts("./dataset")
-    logger.info(f"Loaded {len(all_prompts)} prompts")
+    all_prompts = load_prompts_from_hf(n=500)
+    print(f"[VALIDATOR] Loaded {len(all_prompts)} prompts from HF", flush=True)
 
     # ── Load state ──
     ema_scores = load_ema_scores(state_path)
@@ -162,7 +162,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             # ── Prepare prompts ──
             epoch_prompts = sample_prompts_seeded(all_prompts, SAMPLES_PER_EPOCH, current_block)
-            prompt_texts = [format_coding_prompt(p) for p in epoch_prompts]
+            prompt_texts = [format_prompt(p) for p in epoch_prompts]
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 json.dump(prompt_texts, f)
                 prompts_file = f.name
