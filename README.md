@@ -1,107 +1,113 @@
 # Distillation Subnet
 
-Bittensor subnet for competitive model distillation of [GLM-5](https://huggingface.co/zai-org/GLM-5) (744B params).
+A Bittensor subnet that incentivizes miners to produce the best knowledge-distilled version of **Qwen/Qwen3.5-35B-A3B** (35B total parameters, 3B active, MoE architecture, vocab_size=248,320).
 
-Miners submit distilled models (≤74.4B params, same tokenizer). Validators evaluate by KL-divergence of logprobs on coding prompts. **Winner-take-all**: lowest divergence gets all weight.
+## How It Works
+
+**Miners** train a distilled/compressed model (≤3.5B total params) that preserves the teacher's output distribution as closely as possible. They upload the model to HuggingFace and commit the repo link on-chain.
+
+**Validators** evaluate submitted models by computing full-distribution KL-divergence between the teacher and student on GPU. Lower KL = better distillation = higher rewards.
+
+### Evaluation Pipeline
+
+1. **Block-seeded prompt selection** — Prompts are sampled from the SweInfinite dataset using the current block number as seed (unpredictable, reproducible)
+2. **Teacher continuation** — The teacher generates 512-token greedy continuations for each prompt
+3. **Full-sequence KL** — Both models forward-pass the full sequence (prompt + continuation); KL is computed on continuation positions only, using the full 248K vocabulary
+4. **EMA smoothing** — KL scores are smoothed with exponential moving average (α=0.3) across epochs
+5. **Proportional weights** — Rewards are distributed proportionally via inverse-KL weighting (not winner-take-all)
+
+### Anti-Gaming
+
+- **Copy detection**: SHA256 hash of model weights prevents re-uploading existing models
+- **MoE-aware param counting**: Limits on total params (not just active) prevent gaming via huge sparse models
+- **Staleness timeout**: 3 consecutive failures → zero weight until new submission
+- **Dynamic prompts**: Block-seeded selection prevents overfitting to specific prompts
+
+## Requirements
+
+### Validator
+- **GPU**: 80GB+ VRAM (H100/A100) — teacher model runs in bfloat16
+- **RAM**: 64GB+
+- **Python**: 3.10+
+- **Bittensor wallet** with validator registration on the subnet
+
+### Miner
+- **Training infrastructure**: Whatever you need to train your distilled model
+- **HuggingFace account**: To host your model
+- **Bittensor wallet** with miner registration on the subnet
+
+## Quick Start
+
+### Validator
+
+```bash
+# Install
+pip install -e .
+
+# Run
+python validator.py \
+    --network finney \
+    --netuid <NETUID> \
+    --wallet-name default \
+    --hotkey-name validator \
+    --teacher-model Qwen/Qwen3.5-35B-A3B \
+    --dataset-path ./dataset \
+    --samples-per-epoch 12 \
+    --tempo 360
+```
+
+### Miner
+
+```bash
+# Install
+pip install -e .
+
+# Submit your model
+python miner.py \
+    --network finney \
+    --netuid <NETUID> \
+    --wallet-name default \
+    --hotkey-name miner \
+    --model-repo your-username/your-distilled-model
+```
+
+### Model Requirements
+
+Your distilled model must:
+- Use the **same tokenizer** as Qwen3.5-35B-A3B (vocab_size=248,320)
+- Have ≤ **3.5B total parameters** (10% of teacher)
+- Be hosted on **HuggingFace** in safetensors format
+- Be loadable via `transformers.AutoModelForCausalLM`
 
 ## Architecture
 
 ```
-┌──────────┐     commit(model, revision)      ┌───────────┐
-│  Miner   │ ─────────────────────────────────→│  Chain     │
-│          │   set_reveal_commitment()         │  (Finney)  │
-└──────────┘                                   └─────┬─────┘
-                                                     │
-                 get_all_revealed_commitments()       │
-┌──────────┐ ←───────────────────────────────────────┘
-│ Validator│
-│          │──→ 1. Read commitments (model repo + git SHA)
-│          │──→ 2. Check architecture (config.json, param count, vocab)
-│          │──→ 3. Load teacher (GLM-5) + student via vLLM
-│          │──→ 4. Generate logprobs on SweInfinite prompts
-│          │──→ 5. Compute KL(teacher || student)
-│          │──→ 6. Set weight 1.0 on lowest KL-div miner
-└──────────┘
+distillation/
+├── validator.py          # Main validator (Chi pattern, single long-running process)
+├── miner.py              # Miner commitment script
+├── eval/
+│   ├── kl_divergence.py  # Full-distribution KL on GPU tensors + teacher continuation
+│   ├── model_checker.py  # MoE-aware param counting, tokenizer verification, hash identity
+│   ├── dataset.py        # SweInfinite loader with block-seeded selection
+│   └── scoring.py        # EMA tracking, proportional weights, staleness management
+├── state/                # Persistent validator state (scores, failures, caches)
+├── scripts/
+│   ├── pod_eval.py       # Standalone GPU eval with teacher continuation
+│   └── pod_eval_fast.py  # Fast prompt-only KL eval (no generation)
+├── sim/
+│   └── test_full.py      # Full simulation (run without GPU)
+└── dataset/              # SweInfinite JSON files
 ```
 
-## Key Design Choices
+## Scoring Details
 
-- **Quantization-proof model checking** — validates architecture via HuggingFace `config.json` fields (hidden_size, num_layers, vocab_size), not file sizes. Adapted from [Affine Cortex](https://github.com/AffineLabs/affine-cortex).
-- **Revision pinning** — commitments include HF git SHA, so validators evaluate the exact snapshot.
-- **Commit/reveal on-chain** — uses `set_reveal_commitment()` / `get_all_revealed_commitments()` for tamper-proof model submissions.
-- **Winner-take-all** — simplest incentive: best distillation gets all weight.
-- **SweInfinite dataset** — real-world coding problems for evaluation.
+**KL Divergence**: `KL(teacher || student) = Σ P_teacher(x) · log(P_teacher(x) / P_student(x))`
 
-## File Structure
+Computed on full vocabulary (248K tokens) at each position of the teacher's generated continuation. This measures how well the student predicts what the teacher would generate — the gold standard for distillation quality.
 
-```
-validator.py          Single-file validator (Click CLI)
-miner.py              Miner commit script (Click CLI)
-eval/
-  kl_divergence.py    KL(P||Q) from top-k logprobs
-  inference.py        vLLM wrapper with revision support
-  dataset.py          SweInfinite JSON loader
-  model_checker.py    HF config.json architecture validation
-sim/
-  test_full.py        Full end-to-end simulation (no GPU needed)
-dataset/              SweInfinite JSON files
-```
+**Weight Formula**: `weight_i = (1/KL_i) / Σ(1/KL_j)` for all miners below the quality threshold.
 
-## Quick Start
-
-### Run the Simulation (no GPU, no chain)
-
-```bash
-pip install numpy
-cd /home/openclaw/distillation
-python -m sim.test_full
-```
-
-This runs a complete end-to-end test with synthetic logprobs:
-- Two mock miners with different distillation quality
-- Real KL-divergence computation
-- Winner-take-all weight assignment
-- All assertions verified
-
-### Run Validator (requires GPU + chain)
-
-```bash
-pip install -e .
-python validator.py \
-  --network finney \
-  --netuid 1 \
-  --wallet-name default \
-  --hotkey-name default \
-  --tensor-parallel-size 4
-```
-
-### Run Miner (requires chain)
-
-```bash
-python miner.py \
-  --network finney \
-  --netuid 1 \
-  --model-repo your-username/distilled-glm5-70b \
-  --revision abc123def456
-```
-
-## Miner Requirements
-
-| Requirement | Value |
-|---|---|
-| Max parameters | 74.4B (10% of GLM-5's 744B) |
-| Tokenizer | Must match GLM-5 vocab_size (151,552) |
-| Format | HuggingFace model repo |
-| Commitment | On-chain via `set_reveal_commitment()` |
-
-## Evaluation
-
-Each epoch, the validator:
-1. Samples 5 random SweInfinite coding prompts
-2. Generates teacher (GLM-5) logprobs via vLLM
-3. For each miner: checks architecture → loads model → generates student logprobs
-4. Computes `KL(teacher || student)` averaged across prompts
-5. Winner (lowest KL-div) gets weight 1.0, all others get 0.0
+Lower KL → higher weight → more rewards. Continuous incentive to improve.
 
 ## License
 

@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 """
-Distillation Subnet Validator (v3)
+Distillation Subnet Validator (v0.5.0) — Production-ready for mainnet.
 
-Changes from v2:
-  1. One submission per hotkey (latest commitment only)
-  2. Eval by commitment timestamp (FIFO — earliest first)
-  3. 1% epsilon threshold for taking weights (incumbent advantage)
-  4. More thorough evaluation (10-15 prompts, 256 max_tokens, all token positions)
-  5. Real GPU eval support via Lium pods
+Chi pattern: single long-running process, no synapse/axon/dendrite.
+Miners commit HuggingFace model links on-chain via Commitments pallet.
+Validator evaluates KL(teacher || student) using full-distribution GPU forward passes.
+
+Key features:
+  - Full-distribution KL on 248K vocab (not top-k approximation)
+  - Teacher continuation: generates 512 tokens, scores on continuation positions
+  - Proportional inverse-KL weights (not winner-take-all)
+  - EMA smoothing across epochs (alpha=0.3)
+  - Block-seeded prompt selection (unpredictable, reproducible)
+  - Model caching: only re-eval changed commitments
+  - Copy detection via SHA256 of first safetensors shard
+  - Staleness: 3 failures → weight 0 until new commitment
+  - MoE-aware param counting
 """
-import os, sys, time, json, random, math, logging, traceback
+import os
+import sys
+import time
+import json
+import gc
+import logging
+import traceback
+from pathlib import Path
+
 import click
 import numpy as np
 
@@ -18,9 +34,25 @@ logger = logging.getLogger("distillation.validator")
 
 # ── Constants ──────────────────────────────────────────────────────────────
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
-TEACHER_TOTAL_PARAMS_B = 35.0  # 35B total (3B active, MoE)
-DEFAULT_MAX_PARAM_RATIO = 0.1  # Miner model must be ≤ 10% of teacher = 3.5B
-EPSILON = 0.01  # 1% improvement required to dethrone current winner
+TEACHER_TOTAL_PARAMS_B = 35.0
+DEFAULT_MAX_PARAM_RATIO = 0.1  # Students ≤ 10% of teacher = 3.5B total
+MAX_KL_THRESHOLD = 10.0  # Quality floor
+EMA_ALPHA = 0.3
+MAX_EVAL_PER_EPOCH = 5  # Max new models to evaluate per epoch
+MAX_NEW_TOKENS = 512  # Teacher continuation length
+MAX_PROMPT_TOKENS = 1024
+STATE_DIR = Path("state")
+
+
+def free_gpu():
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except ImportError:
+        pass
 
 
 @click.command()
@@ -32,59 +64,80 @@ EPSILON = 0.01  # 1% improvement required to dethrone current winner
 @click.option("--max-param-ratio", type=float, default=DEFAULT_MAX_PARAM_RATIO)
 @click.option("--dataset-path", default="./dataset")
 @click.option("--samples-per-epoch", type=int, default=12)
-@click.option("--max-tokens", type=int, default=256)
-@click.option("--top-k-logprobs", type=int, default=50)
-@click.option("--tensor-parallel-size", type=int, default=1)
+@click.option("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
+@click.option("--max-eval-per-epoch", type=int, default=MAX_EVAL_PER_EPOCH)
 @click.option("--tempo", type=int, default=360, help="Seconds between evaluation epochs")
-@click.option("--epsilon", type=float, default=EPSILON, help="Min improvement to dethrone winner")
+@click.option("--state-dir", type=click.Path(), default=str(STATE_DIR))
 @click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]), default="INFO")
 def main(
     network, netuid, wallet_name, hotkey_name, teacher_model, max_param_ratio,
-    dataset_path, samples_per_epoch, max_tokens, top_k_logprobs,
-    tensor_parallel_size, tempo, epsilon, log_level,
+    dataset_path, samples_per_epoch, max_new_tokens, max_eval_per_epoch,
+    tempo, state_dir, log_level,
 ):
     """Run the distillation subnet validator."""
     logging.getLogger().setLevel(getattr(logging, log_level))
+    state_path = Path(state_dir)
+    state_path.mkdir(parents=True, exist_ok=True)
 
     import bittensor as bt
-    from eval.inference import load_model, generate_with_logprobs, unload_model
-    from eval.kl_divergence import compute_kl_divergence
-    from eval.dataset import load_swe_infinite_prompts, sample_prompts, format_coding_prompt
-    from eval.model_checker import check_model_architecture
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from eval.kl_divergence import evaluate_kl_with_continuation
+    from eval.dataset import load_swe_infinite_prompts, sample_prompts_seeded, format_coding_prompt
+    from eval.model_checker import (
+        check_model_architecture, compute_model_hash,
+        check_duplicate_hash, register_model_hash,
+    )
+    from eval.scoring import (
+        load_ema_scores, save_ema_scores, update_ema,
+        load_failures, save_failures, record_failure, reset_failures, is_stale,
+        load_commitment_cache, save_commitment_cache, commitment_changed,
+        compute_proportional_weights,
+    )
 
     max_student_params_b = TEACHER_TOTAL_PARAMS_B * max_param_ratio
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Init
+    # ── Init chain ─────────────────────────────────────────────────────
     wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
     subtensor = bt.Subtensor(network=network)
     metagraph = subtensor.metagraph(netuid)
 
-    # Load dataset
+    # ── Load dataset ───────────────────────────────────────────────────
     all_prompts = load_swe_infinite_prompts(dataset_path)
     logger.info(f"Loaded {len(all_prompts)} prompts from {dataset_path}")
 
-    # Load teacher model (kept resident)
+    # ── Load teacher model (kept resident) ─────────────────────────────
     logger.info(f"Loading teacher model: {teacher_model}")
-    teacher_llm = load_model(teacher_model, tensor_parallel_size=tensor_parallel_size)
-    logger.info("Teacher model loaded")
+    tokenizer = AutoTokenizer.from_pretrained(teacher_model, trust_remote_code=True)
+    teacher = AutoModelForCausalLM.from_pretrained(
+        teacher_model,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+        trust_remote_code=True,
+    )
+    teacher.eval()
+    logger.info("Teacher model loaded and resident in GPU memory")
 
-    # Persistent winner state across epochs
-    current_winner_uid = None
-    current_winner_kl = float("inf")
+    # ── Load persistent state ──────────────────────────────────────────
+    ema_scores = load_ema_scores(state_path)
+    failures = load_failures(state_path)
+    commit_cache = load_commitment_cache(state_path)
 
     # ── Main loop ──────────────────────────────────────────────────────
     while True:
         try:
             metagraph.sync(subtensor=subtensor)
+            current_block = subtensor.block
 
-            # ─── Change 1: One submission per hotkey (latest only) ─────
-            commitments = {}  # uid -> {block, model, revision, ...}
+            # ── Read commitments (latest per hotkey) ───────────────────
+            commitments = {}
             revealed = subtensor.get_all_revealed_commitments(netuid)
             for uid in range(metagraph.n):
                 hotkey = metagraph.hotkeys[uid]
                 try:
                     if hotkey in revealed:
-                        # Take only the LATEST commitment for this hotkey
                         block, commit_data = revealed[hotkey][-1]
                         data = json.loads(commit_data)
                         if "model" in data:
@@ -92,104 +145,162 @@ def main(
                 except Exception:
                     continue
 
-            logger.info(f"Found {len(commitments)} miner commitments (deduplicated per hotkey)")
+            logger.info(f"Found {len(commitments)} miner commitments")
 
             if not commitments:
-                logger.info(f"No commitments found, sleeping {tempo}s")
+                logger.info(f"No commitments, sleeping {tempo}s")
                 time.sleep(tempo)
                 continue
 
-            # ─── Change 2: Sort by commitment timestamp (FIFO) ────────
-            sorted_miners = sorted(commitments.items(), key=lambda x: x[1]["block"])
-            logger.info(f"Evaluation order (earliest first): {[uid for uid, _ in sorted_miners]}")
+            # ── Determine which models need (re-)evaluation ────────────
+            needs_eval = []
+            for uid, commit in commitments.items():
+                model = commit["model"]
+                revision = commit.get("revision", "main")
 
-            # Sample more prompts for thorough evaluation (Change 4)
-            epoch_prompts = sample_prompts(all_prompts, samples_per_epoch)
+                # Skip stale miners (unless commitment changed)
+                if is_stale(uid, failures) and not commitment_changed(uid, model, revision, commit_cache):
+                    continue
+
+                # Priority: new/changed commitments first
+                if commitment_changed(uid, model, revision, commit_cache):
+                    needs_eval.insert(0, (uid, commit))  # Front of queue
+                elif str(uid) not in ema_scores:
+                    needs_eval.append((uid, commit))
+
+            # Also re-evaluate oldest cached scores (freshness rotation)
+            cached_uids = [
+                (uid, commit) for uid, commit in commitments.items()
+                if str(uid) in ema_scores and not commitment_changed(
+                    uid, commit["model"], commit.get("revision", "main"), commit_cache
+                )
+            ]
+            # Sort by last eval block (oldest first)
+            cached_uids.sort(key=lambda x: commit_cache.get(str(x[0]), {}).get("block", 0))
+            needs_eval.extend(cached_uids[:2])  # Re-eval up to 2 stale caches
+
+            # Cap evaluations per epoch
+            to_eval = needs_eval[:max_eval_per_epoch]
+            logger.info(f"Evaluating {len(to_eval)} models this epoch "
+                        f"(of {len(needs_eval)} pending)")
+
+            # ── Block-seeded prompt selection ──────────────────────────
+            epoch_prompts = sample_prompts_seeded(all_prompts, samples_per_epoch, current_block)
             prompt_texts = [format_coding_prompt(p) for p in epoch_prompts]
+            logger.info(f"Selected {len(prompt_texts)} prompts (block seed: {current_block})")
 
-            # Get teacher logprobs
-            logger.info(f"Generating teacher logprobs for {len(prompt_texts)} prompts "
-                        f"(max_tokens={max_tokens})")
-            teacher_results = generate_with_logprobs(
-                teacher_llm, prompt_texts, max_tokens=max_tokens,
-                top_k_logprobs=top_k_logprobs,
-            )
+            # ── Tokenize prompts ──────────────────────────────────────
+            input_ids_list = []
+            for text in prompt_texts:
+                ids = tokenizer(
+                    text, return_tensors="pt", truncation=True, max_length=MAX_PROMPT_TOKENS,
+                ).input_ids.to(device)
+                input_ids_list.append(ids)
 
-            # ─── Evaluate miners in FIFO order ────────────────────────
-            for uid, commitment in sorted_miners:
-                model_repo = commitment["model"]
-                revision = commitment.get("revision")
+            # ── Evaluate each model ───────────────────────────────────
+            for uid, commit in to_eval:
+                model_repo = commit["model"]
+                revision = commit.get("revision", "main")
+                student = None
 
                 try:
-                    # 1. Check model architecture & size
-                    check_result = check_model_architecture(
-                        model_repo, revision, max_student_params_b
-                    )
-                    if not check_result["pass"]:
-                        logger.warning(f"UID {uid} model check failed: {check_result['reason']}")
+                    # 1. Architecture check
+                    check = check_model_architecture(model_repo, revision, max_student_params_b)
+                    if not check["pass"]:
+                        logger.warning(f"UID {uid} model check failed: {check['reason']}")
+                        record_failure(uid, failures)
                         continue
 
-                    # 2. Load student model
-                    logger.info(f"Evaluating UID {uid}: {model_repo} (block {commitment['block']})")
-                    student_llm = load_model(
-                        model_repo, revision=revision,
-                        tensor_parallel_size=tensor_parallel_size,
+                    # 2. Copy detection
+                    model_hash = compute_model_hash(model_repo, revision)
+                    if model_hash:
+                        dup_uid = check_duplicate_hash(model_hash, uid, state_path)
+                        if dup_uid is not None:
+                            logger.warning(
+                                f"UID {uid} model is duplicate of UID {dup_uid} — rejected"
+                            )
+                            record_failure(uid, failures)
+                            continue
+                        register_model_hash(model_hash, uid, state_path)
+
+                    # 3. Load student
+                    logger.info(f"Evaluating UID {uid}: {model_repo}@{revision[:12] if revision else 'main'} "
+                                f"({check.get('params_b', '?'):.2f}B total)")
+                    student = AutoModelForCausalLM.from_pretrained(
+                        model_repo,
+                        revision=revision,
+                        torch_dtype=torch.bfloat16,
+                        device_map=device,
+                        trust_remote_code=True,
+                    )
+                    student.eval()
+
+                    # 4. KL evaluation with teacher continuation
+                    kl_results = []
+                    for i, ids in enumerate(input_ids_list):
+                        result = evaluate_kl_with_continuation(
+                            teacher, student, ids,
+                            max_new_tokens=max_new_tokens,
+                            device=device,
+                        )
+                        kl_results.append(result)
+                        logger.debug(
+                            f"  Prompt {i}: KL={result['kl_mean']:.4f} "
+                            f"(gen_len={result['gen_len']}, positions={result['n_positions']})"
+                        )
+
+                    # Weighted average by number of positions
+                    total_positions = sum(r["n_positions"] for r in kl_results)
+                    if total_positions == 0:
+                        logger.warning(f"UID {uid}: no positions evaluated")
+                        record_failure(uid, failures)
+                        continue
+
+                    avg_kl = sum(
+                        r["kl_mean"] * r["n_positions"] for r in kl_results
+                    ) / total_positions
+
+                    logger.info(
+                        f"  UID {uid}: avg KL={avg_kl:.6f} "
+                        f"({total_positions} total positions across {len(kl_results)} prompts)"
                     )
 
-                    # 3. Generate student logprobs
-                    student_results = generate_with_logprobs(
-                        student_llm, prompt_texts,
-                        max_tokens=max_tokens, top_k_logprobs=top_k_logprobs,
-                    )
+                    # 5. Update EMA
+                    new_ema = update_ema(uid, avg_kl, ema_scores, EMA_ALPHA)
+                    logger.info(f"  UID {uid}: EMA KL={new_ema:.6f}")
 
-                    # 4. Compute KL-divergence across ALL tokens from ALL prompts
-                    all_kl_values = []
-                    for t_res, s_res in zip(teacher_results, student_results):
-                        kl = compute_kl_divergence(t_res["logprobs"], s_res["logprobs"])
-                        all_kl_values.append(kl)
-
-                    avg_kl = float(np.mean(all_kl_values))
-                    logger.info(f"  UID {uid}: avg KL-div = {avg_kl:.6f} "
-                                f"(per-prompt: {[f'{k:.4f}' for k in all_kl_values]})")
-
-                    # ─── Change 3: Epsilon threshold for taking weights ──
-                    if current_winner_uid is None:
-                        # No winner yet — first valid miner wins
-                        current_winner_uid = uid
-                        current_winner_kl = avg_kl
-                        logger.info(f"  UID {uid} becomes first winner (KL={avg_kl:.6f})")
-                    elif avg_kl < current_winner_kl * (1 - epsilon):
-                        # Challenger beats incumbent by >epsilon
-                        logger.info(
-                            f"  UID {uid} dethrones UID {current_winner_uid}: "
-                            f"{avg_kl:.6f} < {current_winner_kl:.6f} * {1-epsilon} "
-                            f"= {current_winner_kl*(1-epsilon):.6f}"
-                        )
-                        current_winner_uid = uid
-                        current_winner_kl = avg_kl
-                    else:
-                        logger.info(
-                            f"  UID {uid} did NOT beat incumbent UID {current_winner_uid}: "
-                            f"{avg_kl:.6f} >= threshold {current_winner_kl*(1-epsilon):.6f}"
-                        )
+                    # 6. Update cache
+                    commit_cache[str(uid)] = {
+                        "model": model_repo,
+                        "revision": revision,
+                        "kl": avg_kl,
+                        "block": current_block,
+                    }
+                    reset_failures(uid, failures)
 
                 except Exception as e:
-                    logger.error(f"  UID {uid} evaluation failed: {e}")
+                    logger.error(f"UID {uid} evaluation failed: {e}")
                     traceback.print_exc()
-                finally:
-                    if "student_llm" in locals():
-                        unload_model(student_llm)
-                        del student_llm
+                    record_failure(uid, failures)
 
-            # ── Winner-take-all weight setting ──
-            if current_winner_uid is not None:
-                logger.info(f"Current winner: UID {current_winner_uid} "
-                            f"(KL={current_winner_kl:.6f})")
+                finally:
+                    if student is not None:
+                        del student
+                    free_gpu()
+
+            # ── Compute and set proportional weights ──────────────────
+            weights = compute_proportional_weights(
+                ema_scores, failures, metagraph.n,
+                max_kl=MAX_KL_THRESHOLD,
+            )
+
+            non_zero = [(i, w) for i, w in enumerate(weights) if w > 0]
+            if non_zero:
+                logger.info("Weight distribution:")
+                for uid, w in sorted(non_zero, key=lambda x: -x[1])[:10]:
+                    logger.info(f"  UID {uid}: weight={w:.4f} (EMA KL={ema_scores.get(str(uid), '?')})")
 
                 uids = list(range(metagraph.n))
-                weights = [0.0] * metagraph.n
-                weights[current_winner_uid] = 1.0
-
                 for attempt in range(3):
                     try:
                         success = subtensor.set_weights(
@@ -201,20 +312,38 @@ def main(
                         if success:
                             logger.info("Weights set successfully")
                             break
-                        logger.warning(f"Weight setting attempt {attempt+1} rejected")
+                        logger.warning(f"Weight setting attempt {attempt + 1} rejected")
                     except Exception as e:
-                        logger.error(f"Weight setting attempt {attempt+1} failed: {e}")
+                        logger.error(f"Weight setting attempt {attempt + 1} failed: {e}")
                     time.sleep(30)
+            else:
+                logger.info("No valid miners — skipping weight setting")
+
+            # ── Persist state ─────────────────────────────────────────
+            save_ema_scores(ema_scores, state_path)
+            save_failures(failures, state_path)
+            save_commitment_cache(commit_cache, state_path)
 
             logger.info(f"Epoch complete, sleeping {tempo}s")
             time.sleep(tempo)
 
         except KeyboardInterrupt:
-            logger.info("Shutting down")
+            logger.info("Shutting down — persisting state")
+            save_ema_scores(ema_scores, state_path)
+            save_failures(failures, state_path)
+            save_commitment_cache(commit_cache, state_path)
             break
+
         except Exception as e:
             logger.error(f"Epoch error: {e}")
             traceback.print_exc()
+            # Persist state even on error
+            try:
+                save_ema_scores(ema_scores, state_path)
+                save_failures(failures, state_path)
+                save_commitment_cache(commit_cache, state_path)
+            except Exception:
+                pass
             time.sleep(60)
 
 
