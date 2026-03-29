@@ -39,12 +39,8 @@ MAX_KL_THRESHOLD = 2.0
 MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 
-# King gets periodic re-validation with this many prompts
-KING_EVAL_PROMPTS = 40
-# Challengers get evaluated with this many prompts (higher = tighter CI)
-CHALLENGER_EVAL_PROMPTS = 40
-# King is re-validated every N epochs even if no challengers
-KING_REEVAL_INTERVAL = 6
+# Prompts per head-to-head evaluation (king + challenger on same prompts)
+EVAL_PROMPTS = 40
 # Epsilon: challenger must beat king by this relative margin to dethrone
 # e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
 EPSILON = 0.01
@@ -273,10 +269,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if str(uid) not in evaluated_uids
             }
 
-            # Periodic king re-validation
-            king_needs_reeval = (epoch_count % KING_REEVAL_INTERVAL == 0)
-
-            if not challengers and not king_needs_reeval:
+            if not challengers:
                 print(f"[VALIDATOR] No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds", flush=True)
                 # Still set weights to keep tempo
                 weights, winner_uid, winner_kl = compute_winner_weights(
@@ -286,7 +279,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
                 save_scores(scores, state_path)
                 save_failures(failures, state_path)
-            save_disqualified(dq_reasons, state_path)
+                save_disqualified(dq_reasons, state_path)
                 elapsed = time.time() - epoch_start
                 print(f"[VALIDATOR] Epoch complete in {elapsed:.0f}s (no eval needed)", flush=True)
                 if once:
@@ -296,23 +289,21 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 continue
 
             # ══════════════════════════════════════════════════════════════
-            # PHASE 3: GPU evaluation — king + challengers only
+            # PHASE 3: GPU evaluation — king + challengers, same prompts
             # ══════════════════════════════════════════════════════════════
+            # King is always included so both are scored on identical prompts.
+            # King's weights are permanent so its score is stable — but we need
+            # the head-to-head comparison on the SAME prompt set for a fair test.
             models_to_eval = {}
             if king_uid is not None and king_uid in valid_models:
                 models_to_eval[king_uid] = valid_models[king_uid]
             for uid, info in challengers.items():
                 models_to_eval[uid] = info
 
-            n_prompts = CHALLENGER_EVAL_PROMPTS
-            if not challengers and king_needs_reeval:
-                # Just re-validating king with fresh prompts
-                n_prompts = KING_EVAL_PROMPTS
-                print(f"[VALIDATOR] Re-validating king UID {king_uid} ({n_prompts} prompts)", flush=True)
-            else:
-                chall_str = ", ".join(f"UID {u}" for u in challengers)
-                king_str = f"UID {king_uid}" if king_uid else "none"
-                print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
+            n_prompts = EVAL_PROMPTS
+            chall_str = ", ".join(f"UID {u}" for u in challengers)
+            king_str = f"UID {king_uid}" if king_uid else "none"
+            print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
 
             # Prepare prompts
             epoch_prompts = sample_prompts_seeded(all_prompts, n_prompts, current_block)
