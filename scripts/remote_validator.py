@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+Remote Validator — runs eval on Lium GPU, sets weights locally.
+
+Architecture:
+  1. This script runs on the secure server (has wallet keys)
+  2. Uploads eval script to Lium B200 pod
+  3. Pod runs teacher + student forward passes, returns KL scores
+  4. This script reads KL scores and sets weights on-chain
+
+No wallet keys leave this machine. No chain access needed on the GPU pod.
+"""
+import os
+import sys
+import json
+import time
+import logging
+import tempfile
+from pathlib import Path
+
+import click
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("distillation.remote_validator")
+
+TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+NETUID = 97
+MAX_KL_THRESHOLD = 2.0
+EMA_ALPHA = 0.3
+MAX_NEW_TOKENS = 512
+MAX_PROMPT_TOKENS = 1024
+SAMPLES_PER_EPOCH = 10
+
+
+@click.command()
+@click.option("--network", default="finney")
+@click.option("--netuid", type=int, default=NETUID)
+@click.option("--wallet-name", default="affine")
+@click.option("--hotkey-name", default="validator")
+@click.option("--wallet-path", default="~/.bittensor/wallets/")
+@click.option("--lium-api-key", required=True, envvar="LIUM_API_KEY")
+@click.option("--lium-pod-name", default="distill-persistent")
+@click.option("--state-dir", default="state")
+@click.option("--max-params-b", type=float, default=5.25)
+@click.option("--tempo", type=int, default=360, help="Seconds between epochs")
+@click.option("--once", is_flag=True, help="Run one epoch and exit (for testing)")
+def main(network, netuid, wallet_name, hotkey_name, wallet_path,
+         lium_api_key, lium_pod_name, state_dir, max_params_b, tempo, once):
+    """Run the distillation validator with remote GPU eval."""
+    import bittensor as bt
+    from lium import Lium, Config
+    from eval.scoring import (
+        load_ema_scores, save_ema_scores, update_ema,
+        load_failures, save_failures, record_failure, reset_failures, is_stale,
+        compute_winner_weights,
+    )
+    from eval.model_checker import check_model_architecture, verify_tokenizer
+    from eval.dataset import load_swe_infinite_prompts, sample_prompts_seeded, format_coding_prompt
+
+    state_path = Path(state_dir)
+    state_path.mkdir(parents=True, exist_ok=True)
+
+    # ── Init chain ──
+    wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name, path=wallet_path)
+    subtensor = bt.Subtensor(network=network)
+
+    # ── Init Lium ──
+    cfg = Config(api_key=lium_api_key, ssh_key_path=Path.home() / ".ssh" / "id_ed25519")
+    lium = Lium(config=cfg)
+
+    # Find pod
+    pods = lium.ps()
+    pod = None
+    for p in pods:
+        if lium_pod_name in p.name:
+            pod = p
+            break
+    if not pod:
+        logger.error(f"Lium pod '{lium_pod_name}' not found. Available: {[p.name for p in pods]}")
+        sys.exit(1)
+    logger.info(f"Using Lium pod: {pod.name} ({pod.id[:12]})")
+
+    # ── Load dataset ──
+    all_prompts = load_swe_infinite_prompts("./dataset")
+    logger.info(f"Loaded {len(all_prompts)} prompts")
+
+    # ── Load state ──
+    ema_scores = load_ema_scores(state_path)
+    failures = load_failures(state_path)
+
+    # ── Upload eval script ──
+    logger.info("Uploading eval script to pod...")
+    lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+
+    while True:
+        try:
+            epoch_start = time.time()
+            metagraph = subtensor.metagraph(netuid)
+            current_block = subtensor.block
+            logger.info(f"\n{'='*60}")
+            logger.info(f"EPOCH — Block {current_block}")
+            logger.info(f"{'='*60}")
+
+            # ── Read commitments ──
+            revealed = subtensor.get_all_revealed_commitments(netuid)
+            commitments = {}
+            for uid in range(metagraph.n):
+                hotkey = str(metagraph.hotkeys[uid])
+                if hotkey in revealed and len(revealed[hotkey]) > 0:
+                    block, data = revealed[hotkey][0]  # First commit only
+                    try:
+                        parsed = json.loads(data)
+                        if "model" in parsed:
+                            commitments[uid] = {"block": block, **parsed}
+                    except:
+                        continue
+
+            logger.info(f"Found {len(commitments)} miner commitments")
+            if not commitments:
+                logger.info(f"No commitments, sleeping {tempo}s")
+                if once:
+                    break
+                time.sleep(tempo)
+                continue
+
+            # ── Pre-check models locally (no GPU needed) ──
+            valid_models = {}
+            for uid, commit in commitments.items():
+                model_repo = commit["model"]
+                revision = commit.get("revision", "main")
+
+                if is_stale(uid, failures):
+                    logger.debug(f"UID {uid}: stale, skipping")
+                    continue
+
+                # Architecture check
+                check = check_model_architecture(model_repo, revision, max_params_b)
+                if not check["pass"]:
+                    logger.warning(f"UID {uid} ({model_repo}): {check['reason']}")
+                    record_failure(uid, failures)
+                    continue
+
+                # Tokenizer check
+                tok_ok, tok_reason = verify_tokenizer(TEACHER_MODEL, model_repo)
+                if not tok_ok:
+                    logger.warning(f"UID {uid} ({model_repo}): tokenizer — {tok_reason}")
+                    record_failure(uid, failures)
+                    continue
+
+                valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": check.get("params_b", 0)}
+                logger.info(f"UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓")
+
+            if not valid_models:
+                logger.info("No valid models to evaluate")
+                if once:
+                    break
+                time.sleep(tempo)
+                continue
+
+            # ── Prepare prompts ──
+            epoch_prompts = sample_prompts_seeded(all_prompts, SAMPLES_PER_EPOCH, current_block)
+            prompt_texts = [format_coding_prompt(p) for p in epoch_prompts]
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                json.dump(prompt_texts, f)
+                prompts_file = f.name
+            lium.upload(pod, local=prompts_file, remote="/home/prompts.json")
+            os.unlink(prompts_file)
+
+            # ── Run eval on Lium GPU ──
+            student_list = ",".join(m["model"] for m in valid_models.values())
+            cmd = (
+                f"cd /home && python3 pod_eval.py "
+                f"--teacher {TEACHER_MODEL} "
+                f"--students {student_list} "
+                f"--prompts prompts.json "
+                f"--output eval_results.json "
+                f"--max-prompt-len {MAX_PROMPT_TOKENS} "
+                f"--max-new-tokens {MAX_NEW_TOKENS} "
+                f"--max-params-b {max_params_b}"
+            )
+            logger.info(f"Running eval on Lium pod ({len(valid_models)} models, {SAMPLES_PER_EPOCH} prompts)...")
+
+            output_lines = []
+            for chunk in lium.stream_exec(pod, command=cmd):
+                text = str(chunk.get("output", chunk.get("stdout", chunk)))
+                if text.strip():
+                    # Log summary lines
+                    if any(k in text for k in ["[eval]", "SUMMARY", "global KL", "Timings"]):
+                        logger.info(f"  GPU: {text.strip()[:150]}")
+                    output_lines.append(text)
+
+            # ── Download results ──
+            results_local = str(state_path / "last_eval.json")
+            try:
+                lium.download(pod, remote="/home/eval_results.json", local=results_local)
+            except Exception as e:
+                logger.error(f"Failed to download results: {e}")
+                if once:
+                    break
+                time.sleep(tempo)
+                continue
+
+            with open(results_local) as f:
+                results = json.load(f)
+
+            # ── Process KL scores ──
+            uid_to_model = {uid: m["model"] for uid, m in valid_models.items()}
+            model_to_uid = {m: uid for uid, m in uid_to_model.items()}
+
+            for model_name, student_result in results.get("students", {}).items():
+                uid = model_to_uid.get(model_name)
+                if uid is None:
+                    continue
+
+                if "error" in student_result:
+                    logger.warning(f"UID {uid} ({model_name}): eval error — {student_result['error']}")
+                    record_failure(uid, failures)
+                    continue
+
+                kl = student_result.get("kl_global_avg", float("inf"))
+                if kl == float("inf") or kl <= 0:
+                    logger.warning(f"UID {uid}: invalid KL={kl}")
+                    record_failure(uid, failures)
+                    continue
+
+                new_ema = update_ema(uid, kl, ema_scores, EMA_ALPHA)
+                reset_failures(uid, failures)
+                logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}, EMA={new_ema:.6f}")
+
+            # ── Compute winner & set weights ──
+            weights, winner_uid, winner_kl = compute_winner_weights(
+                ema_scores, failures, metagraph.n, max_kl=MAX_KL_THRESHOLD,
+            )
+
+            # Leaderboard
+            logger.info(f"\nLEADERBOARD (block {current_block}):")
+            sorted_scores = sorted(ema_scores.items(), key=lambda x: x[1])
+            for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
+                marker = " ← WINNER" if int(uid_str) == winner_uid else ""
+                logger.info(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}")
+
+            if winner_uid is not None:
+                logger.info(f"\nSetting weights: UID {winner_uid} = 1.0")
+                uids = list(range(metagraph.n))
+                for attempt in range(3):
+                    try:
+                        success = subtensor.set_weights(
+                            wallet=wallet, netuid=netuid,
+                            uids=uids, weights=weights,
+                            wait_for_inclusion=True,
+                            wait_for_finalization=True,
+                        )
+                        if success:
+                            logger.info("✓ Weights set on-chain!")
+                            break
+                        logger.warning(f"Attempt {attempt + 1}: rejected")
+                    except Exception as e:
+                        logger.error(f"Attempt {attempt + 1}: {e}")
+                    time.sleep(30)
+            else:
+                logger.info("No valid miners — skipping weight setting")
+
+            # ── Persist state ──
+            save_ema_scores(ema_scores, state_path)
+            save_failures(failures, state_path)
+
+            elapsed = time.time() - epoch_start
+            logger.info(f"\nEpoch complete in {elapsed:.0f}s")
+
+            if once:
+                break
+            logger.info(f"Sleeping {tempo}s...")
+            time.sleep(tempo)
+
+        except KeyboardInterrupt:
+            logger.info("Shutting down")
+            save_ema_scores(ema_scores, state_path)
+            save_failures(failures, state_path)
+            break
+        except Exception as e:
+            logger.error(f"Epoch error: {e}")
+            import traceback
+            traceback.print_exc()
+            save_ema_scores(ema_scores, state_path)
+            save_failures(failures, state_path)
+            if once:
+                break
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    main()
