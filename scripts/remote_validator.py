@@ -623,8 +623,12 @@ else:
                                 pod_progress = json.load(f)
                             os.unlink(tmp_path)
                             progress["pod"] = pod_progress
-                            progress["phase"] = "scoring"
-                            if pod_progress.get("current"):
+                            pod_phase = pod_progress.get("phase", "scoring")
+                            progress["phase"] = pod_phase
+                            if pod_phase == "teacher_generation":
+                                progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
+                                progress["prompts_total"] = pod_progress.get("prompts_total", n_prompts)
+                            elif pod_progress.get("current"):
                                 cur = pod_progress["current"]
                                 progress["current_student"] = cur.get("student_name")
                                 progress["current_prompt"] = cur.get("prompts_done", 0)
@@ -638,7 +642,7 @@ else:
                                 json.dump(progress, f)
                         except Exception:
                             pass
-                        poll_stop.wait(10)
+                        poll_stop.wait(5)
 
                 poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
                 poll_thread.start()
