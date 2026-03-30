@@ -896,6 +896,22 @@ else:
             with open(progress_path, "w") as f:
                 json.dump({"active": False}, f)
 
+            # ── Clean HF model cache to prevent disk full ──
+            # Keep only the teacher model; students re-download each eval anyway
+            try:
+                clean_cmd = (
+                    "cd /root/.cache/huggingface/hub 2>/dev/null && "
+                    "for d in models--*; do "
+                    "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
+                    "  rm -rf \"$d\"; "
+                    "done; "
+                    "df -h / | tail -1"
+                )
+                result = lium.exec(pod, command=clean_cmd)
+                print(f"[VALIDATOR] Cache cleanup: {result.strip() if result else 'done'}", flush=True)
+            except Exception as e:
+                print(f"[VALIDATOR] Cache cleanup failed (non-fatal): {e}", flush=True)
+
             # ── Restart any background tasks that were cleared for eval ──
             try:
                 lium.exec(pod, command="test -f /home/autostart.sh && bash /home/autostart.sh; echo 'Background tasks resumed'")
