@@ -108,20 +108,20 @@ These are *untrained baselines* — purpose-built distillations should do signif
 
 ### Requirements
 
-- **GPU**: ~80GB+ VRAM (teacher model is 35B params in bf16 ≈ 70GB, plus student + overhead)
-  - Recommended: 1x A100 80GB, 1x H100, or 2x RTX PRO 6000
-- **Bittensor wallet** registered as a validator on subnet 97
+- **GPU**: 1x with ≥80GB VRAM (A100 80GB, H100, or similar)
+- **Bittensor wallet** registered as validator on subnet 97
 - **Python 3.10+**
 
-### Setup
+### Quick Start
 
 ```bash
 git clone https://github.com/unarbos/distil.git
 cd distil
 pip install .
+python validator.py --netuid 97 --wallet-name YOUR_WALLET --hotkey-name YOUR_HOTKEY
 ```
 
-If `pip install .` fails, install dependencies manually:
+If `pip install .` fails:
 
 ```bash
 pip install "bittensor>=8.0.0" "bittensor-wallet>=2.0.0" "click>=8.0.0" \
@@ -129,44 +129,44 @@ pip install "bittensor>=8.0.0" "bittensor-wallet>=2.0.0" "click>=8.0.0" \
     "torch>=2.1.0" "safetensors>=0.4.0"
 ```
 
-### Run
+### Auto-Update
+
+Keep your validator up to date automatically:
 
 ```bash
-python validator.py \
-    --network finney \
-    --netuid 97 \
-    --wallet-name my_wallet \
-    --hotkey-name my_hotkey
+# Run in background — checks for updates every 5 minutes, pulls and restarts
+nohup bash scripts/auto_update.sh &
 ```
 
-The validator will:
-1. Load the teacher model (Qwen3.5-35B-A3B) — this takes ~70GB VRAM
-2. Load 500 prompts from FineWeb (cached after first run)
-3. Poll for new challenger models every epoch (~10 min)
-4. When a new challenger is found, run head-to-head KL evaluation (40 prompts)
-5. Set weights on-chain: king = 1.0, everyone else = 0.0
+Or with PM2:
+
+```bash
+pm2 start bash --name distil-autoupdate -- scripts/auto_update.sh
+pm2 start "python validator.py --netuid 97 --wallet-name YOUR_WALLET --hotkey-name YOUR_HOTKEY" --name distil-validator
+pm2 save
+```
+
+### What It Does
+
+1. Loads the teacher model (Qwen3.5-35B-A3B) — ~70GB VRAM
+2. Loads 500 prompts from FineWeb (cached after first run)
+3. Polls for new challengers every epoch (~10 min)
+4. Head-to-head KL evaluation: king vs challengers on identical prompts
+5. Sets weights on-chain: king = 1.0, everyone else = 0.0
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--network` | `finney` | Bittensor network |
-| `--netuid` | `1` | Subnet UID (use `97`) |
+| `--netuid` | `1` | Subnet UID (**use `97`**) |
 | `--wallet-name` | `default` | Wallet name |
 | `--hotkey-name` | `default` | Hotkey name |
 | `--tempo` | `360` | Seconds between epochs |
-| `--samples-per-epoch` | `12` | Prompts per eval (increased to 40 in king-of-the-hill mode) |
-| `--log-level` | `INFO` | Logging verbosity |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ### State
 
-The validator stores state in `./state/`:
-- `scores.json` — Current KL scores per UID
-- `model_hashes.json` — SHA256 hashes for copy detection
-- `disqualified.json` — DQ'd UIDs and reasons
-- `evaluated_uids.json` — Already-evaluated UIDs (won't re-eval)
-
-To reset and re-evaluate all models, delete the `state/` directory.
+Stored in `./state/`. To reset and re-evaluate all models, delete the directory.
 
 ## API
 
