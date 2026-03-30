@@ -165,14 +165,6 @@ def _fetch_price():
         tao_usd = (_get_stale("price") or {}).get("tao_usd", 0)
 
     miners_tao_per_day = sn97.get("miners_tao_per_day", 0) or 0
-    if miners_tao_per_day == 0:
-        try:
-            emission_pct = sn97.get("emission", 0) / 100.0
-            total_tao_per_day = 7200.0
-            subnet_tao_per_day = total_tao_per_day * emission_pct
-            miners_tao_per_day = subnet_tao_per_day * 0.41
-        except Exception:
-            pass
 
     return {
         "alpha_price_tao": round(alpha_price_tao, 6),
