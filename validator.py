@@ -170,7 +170,7 @@ def main(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from eval.kl_divergence import generate_teacher_continuations, evaluate_student_kl
-    from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
+    from eval.dataset import sample_prompts_from_dataset, format_prompt
     from eval.model_checker import (
         check_model_architecture, compute_model_hash,
         check_duplicate_hash, register_model_hash,
@@ -192,8 +192,7 @@ def main(
     metagraph = subtensor.metagraph(netuid)
 
     # ── Load dataset ───────────────────────────────────────────────────
-    all_prompts = load_prompts_from_hf()
-    logger.info(f"Loaded {len(all_prompts)} prompts from {dataset_path}")
+    logger.info("Prompts sampled fresh from full dataset each epoch")
 
     # ── Load teacher model (kept resident) ─────────────────────────────
     logger.info(f"Loading teacher model: {teacher_model}")
@@ -286,7 +285,7 @@ def main(
                 continue
 
             # ── Block-seeded prompt selection ──────────────────────────
-            epoch_prompts = sample_prompts_seeded(all_prompts, samples_per_epoch, current_block)
+            epoch_prompts = sample_prompts_from_dataset(samples_per_epoch, current_block)
             prompt_texts = [format_prompt(p) for p in epoch_prompts]
             logger.info(f"Selected {len(prompt_texts)} prompts (block seed: {current_block})")
 

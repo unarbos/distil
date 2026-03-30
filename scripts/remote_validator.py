@@ -124,7 +124,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         check_model_architecture, verify_model_integrity,
         compute_model_hash, check_duplicate_hash, register_model_hash,
     )
-    from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
+    from eval.dataset import sample_prompts_from_dataset, format_prompt
 
     state_path = Path(state_dir)
     state_path.mkdir(parents=True, exist_ok=True)
@@ -150,8 +150,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     logger.info(f"Using Lium pod: {pod.name} ({pod.id[:12]})")
 
     # ── Load dataset ──
-    all_prompts = load_prompts_from_hf()  # defaults to 10,000 prompt pool
-    print(f"[VALIDATOR] Loaded {len(all_prompts)} prompts from HF", flush=True)
+    print(f"[VALIDATOR] Prompts sampled fresh from full dataset each epoch", flush=True)
 
     # ── Load state ──
     scores = load_scores(state_path)
@@ -397,7 +396,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 json.dump(progress, f)
 
             # Prepare prompts
-            epoch_prompts = sample_prompts_seeded(all_prompts, n_prompts, current_block)
+            epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block)
             prompt_texts = [format_prompt(p) for p in epoch_prompts]
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 json.dump(prompt_texts, f)
