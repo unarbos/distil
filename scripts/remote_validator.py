@@ -40,7 +40,7 @@ MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 
 # Prompts per head-to-head evaluation (king + challenger on same prompts)
-EVAL_PROMPTS = 60
+EVAL_PROMPTS = 40
 # Epsilon: challenger must beat king by this relative margin to dethrone
 # e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
 EPSILON = 0.01
@@ -355,15 +355,20 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             king_str = f"UID {king_uid}" if king_uid else "none"
             print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
 
+            # Sort challengers by commit block (earliest first) — used for both
+            # progress display and eval ordering
+            challenger_uids_sorted = sorted(
+                [uid for uid in models_to_eval if uid != king_uid],
+                key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")),
+            )
+
             # ── Write eval progress (for dashboard live display) ──
-            # Estimate: ~45s per prompt per model for teacher gen + student scoring
-            # Teacher gen is shared (~90s for 40 prompts), then ~30s per student per prompt
+            # Realistic estimates: teacher gen ~90s, each student ~5s/prompt on Blackwell
             est_teacher_s = 90
-            est_per_student_s = 30 * n_prompts  # ~30s per prompt per student
+            est_per_student_s = 5 * n_prompts  # ~5s per prompt per student (not 30s)
             est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
             progress_path = state_path / "eval_progress.json"
             now = time.time()
-            # Build ordered eval list for display
             eval_order = []
             if king_uid is not None and king_uid in models_to_eval:
                 eval_order.append({"uid": king_uid, "model": models_to_eval[king_uid]["model"], "role": "king"})
@@ -399,16 +404,19 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             # Re-upload eval script (in case it changed)
             lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
 
+            # Kill any background GPU processes to free VRAM for eval
+            try:
+                lium.exec(pod, command="for s in distil train; do tmux kill-session -t $s 2>/dev/null; done; sleep 2; echo 'GPU cleared'")
+                print("[VALIDATOR] Cleared GPU for eval", flush=True)
+            except Exception:
+                pass
+
             # Run eval — king first, then challengers by commit block (earliest first).
             # Earlier commits are more established → likely lower KL → sets best_kl_so_far
             # early for better early-stopping on weaker newcomers.
             ordered_uids = []
             if king_uid is not None and king_uid in models_to_eval:
                 ordered_uids.append(king_uid)
-            challenger_uids_sorted = sorted(
-                [uid for uid in models_to_eval if uid != king_uid],
-                key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")),
-            )
             ordered_uids.extend(challenger_uids_sorted)
             student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
             cmd = (
@@ -636,6 +644,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             progress_path = state_path / "eval_progress.json"
             with open(progress_path, "w") as f:
                 json.dump({"active": False}, f)
+
+            # ── Restart any background tasks that were cleared for eval ──
+            try:
+                lium.exec(pod, command="test -f /home/autostart.sh && bash /home/autostart.sh; echo 'Background tasks resumed'")
+                print("[VALIDATOR] Resumed background tasks on pod", flush=True)
+            except Exception:
+                pass
 
             # ── Discord announcement if king changed ──
             if winner_uid is not None and winner_uid != king_uid and king_uid is not None:

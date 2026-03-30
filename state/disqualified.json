@@ -6,5 +6,9 @@
   "52": "integrity: Cannot compute model hash \u2014 safetensors may have been removed",
   "61": "integrity: Cannot compute model hash \u2014 safetensors may have been removed",
   "230": "copy: identical weights to UID 115 (Qwen/Qwen3.5-4B-Base), committed later at block 7854520 vs 7854471",
-  "185": "copy: functional copy of Bittensor-110/qwen35-4b (UID 27) \u2014 identical logit distribution"
+  "185": "copy: functional copy of Bittensor-110/qwen35-4b (UID 27) \u2014 identical logit distribution",
+  "65": "copy: identical weights to UID 191 (unconst/sn97-qwen35-4b-base-distilled), committed later at block 7854942 vs 7854783",
+  "170": "copy: identical weights to UID 174 (unconst/sn97-qwen35-4b-distilled), committed later at block 7854897 vs 7854191",
+  "39": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7855036 vs 7852887",
+  "214": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7855065 vs 7852887"
 }
