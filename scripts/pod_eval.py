@@ -150,10 +150,21 @@ def main():
                         help="Block seed for teacher sampling (enables temperature=0.7 sampling)")
     parser.add_argument("--sequential", action="store_true",
                         help="Memory-efficient mode: unload teacher before loading students")
+    parser.add_argument("--gpu", type=int, default=None,
+                        help="Specific GPU index to use (e.g. 0 or 1). Default: auto-select.")
+    parser.add_argument("--teacher-logits", type=str, default=None,
+                        help="Path to pre-cached teacher logits (.pt file). Skips teacher inference.")
+    parser.add_argument("--save-teacher-logits", type=str, default=None,
+                        help="Save teacher logits to this path after generation.")
     args = parser.parse_args()
 
     total_start = time.time()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+        device = "cuda"
+        print(f"[eval] Pinned to GPU {args.gpu}", flush=True)
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     timings = {}
 
     with open(args.prompts) as f:
@@ -181,59 +192,72 @@ def main():
             return
         print(f"  ✓ Tokenizer matches teacher", flush=True)
 
-    # Load teacher
-    print(f"\n[eval] Loading teacher: {args.teacher}", flush=True)
-    t0 = time.time()
-    teacher = load_model(args.teacher, device)
-    teacher.eval()
-    timings["teacher_load"] = time.time() - t0
-    print(f"[eval] Teacher loaded in {timings['teacher_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
-
-    # Generate teacher continuations + get teacher logits
-    print(f"\n[eval] Generating teacher continuations (max_new_tokens={args.max_new_tokens})...", flush=True)
+    # Load teacher logits — either from cache or by running inference
     full_sequences = []
     teacher_logits_list = []
     prompt_lens = []
 
-    t0 = time.time()
-    with torch.no_grad():
-        for i, ids in enumerate(input_ids_list):
-            prompt_len = ids.shape[1]
-            prompt_lens.append(prompt_len)
-
-            # Generate continuation (block-seeded sampling if specified)
-            gen_kwargs = dict(max_new_tokens=args.max_new_tokens, use_cache=True)
-            if args.block_seed is not None:
-                # Seed torch RNG so all validators with same block_seed get identical output
-                torch.manual_seed(args.block_seed + i)  # +i to vary per prompt
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed(args.block_seed + i)
-                gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
-            else:
-                gen_kwargs.update(do_sample=False)
-
-            output_ids = teacher.generate(ids, **gen_kwargs)
-            full_sequences.append(output_ids)
-
-            # Forward pass on full sequence for logits
-            logits = teacher(output_ids).logits.float()
-            # Keep only continuation logits: logits[prompt_len-1:-1] predicts continuation tokens
-            cont_logits = logits[:, prompt_len - 1:-1, :]
-            teacher_logits_list.append(cont_logits.cpu())
-
-            gen_len = output_ids.shape[1] - prompt_len
-            print(f"  Prompt {i}: {prompt_len} prompt + {gen_len} gen tokens, VRAM: {gpu_mem_str()}", flush=True)
-
-    timings["teacher_generation"] = time.time() - t0
-    print(f"[eval] Generation complete in {timings['teacher_generation']:.1f}s", flush=True)
-
-    # In sequential mode, unload teacher to free VRAM for students
-    if args.sequential:
-        del teacher
-        free_gpu()
-        print(f"[eval] Teacher unloaded (sequential mode), VRAM: {gpu_mem_str()}", flush=True)
+    if args.teacher_logits and os.path.exists(args.teacher_logits):
+        # Load pre-cached teacher logits (for parallel GPU eval)
+        print(f"\n[eval] Loading cached teacher logits from {args.teacher_logits}", flush=True)
+        t0 = time.time()
+        cache = torch.load(args.teacher_logits, map_location="cpu", weights_only=True)
+        full_sequences = [s.to(device) for s in cache["full_sequences"]]
+        teacher_logits_list = cache["teacher_logits"]  # keep on CPU
+        prompt_lens = cache["prompt_lens"]
+        timings["teacher_load"] = time.time() - t0
+        print(f"[eval] Loaded cached logits in {timings['teacher_load']:.1f}s ({len(full_sequences)} prompts)", flush=True)
+        timings["teacher_generation"] = 0.0
     else:
-        # Even in non-sequential mode, we unload teacher since we have cached logits
+        # Run teacher inference
+        print(f"\n[eval] Loading teacher: {args.teacher}", flush=True)
+        t0 = time.time()
+        teacher = load_model(args.teacher, device)
+        teacher.eval()
+        timings["teacher_load"] = time.time() - t0
+        print(f"[eval] Teacher loaded in {timings['teacher_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+
+        # Generate teacher continuations + get teacher logits
+        print(f"\n[eval] Generating teacher continuations (max_new_tokens={args.max_new_tokens})...", flush=True)
+
+        t0 = time.time()
+        with torch.no_grad():
+            for i, ids in enumerate(input_ids_list):
+                prompt_len = ids.shape[1]
+                prompt_lens.append(prompt_len)
+
+                # Generate continuation (block-seeded sampling if specified)
+                gen_kwargs = dict(max_new_tokens=args.max_new_tokens, use_cache=True)
+                if args.block_seed is not None:
+                    torch.manual_seed(args.block_seed + i)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed(args.block_seed + i)
+                    gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
+                else:
+                    gen_kwargs.update(do_sample=False)
+
+                output_ids = teacher.generate(ids, **gen_kwargs)
+                full_sequences.append(output_ids)
+
+                logits = teacher(output_ids).logits.float()
+                cont_logits = logits[:, prompt_len - 1:-1, :]
+                teacher_logits_list.append(cont_logits.cpu())
+
+                gen_len = output_ids.shape[1] - prompt_len
+                print(f"  Prompt {i}: {prompt_len} prompt + {gen_len} gen tokens, VRAM: {gpu_mem_str()}", flush=True)
+
+        timings["teacher_generation"] = time.time() - t0
+        print(f"[eval] Generation complete in {timings['teacher_generation']:.1f}s", flush=True)
+
+        # Save teacher logits if requested (for parallel GPU eval)
+        if args.save_teacher_logits:
+            print(f"[eval] Saving teacher logits to {args.save_teacher_logits}", flush=True)
+            torch.save({
+                "full_sequences": [s.cpu() for s in full_sequences],
+                "teacher_logits": teacher_logits_list,
+                "prompt_lens": prompt_lens,
+            }, args.save_teacher_logits)
+
         del teacher
         free_gpu()
         print(f"[eval] Teacher unloaded, VRAM: {gpu_mem_str()}", flush=True)

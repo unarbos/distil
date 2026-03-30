@@ -429,74 +429,182 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 ordered_uids.append(king_uid)
             ordered_uids.extend(challenger_uids_sorted)
             student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
-            cmd = (
-                f"cd /home && python3 pod_eval.py "
-                f"--teacher {TEACHER_MODEL} "
-                f"--students {student_list} "
-                f"--prompts prompts.json "
-                f"--output eval_results.json "
-                f"--max-prompt-len {MAX_PROMPT_TOKENS} "
-                f"--max-new-tokens {MAX_NEW_TOKENS} "
-                f"--max-params-b {max_params_b}"
-            )
-            print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
-            # Update progress: scoring phase
-            progress["phase"] = "scoring"
-            with open(progress_path, "w") as f:
-                json.dump(progress, f)
-
-            # Background thread: poll live progress from pod every 10s
-            import threading
-            poll_stop = threading.Event()
-
-            def _poll_pod_progress():
-                while not poll_stop.is_set():
-                    try:
-                        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-                            tmp_path = tmp.name
-                        lium.download(pod, remote="/home/eval_progress.json", local=tmp_path)
-                        with open(tmp_path) as f:
-                            pod_progress = json.load(f)
-                        os.unlink(tmp_path)
-                        # Merge pod progress into our progress file
-                        progress["pod"] = pod_progress
-                        progress["phase"] = "scoring"
-                        if pod_progress.get("current"):
-                            cur = pod_progress["current"]
-                            progress["current_student"] = cur.get("student_name")
-                            progress["current_prompt"] = cur.get("prompts_done", 0)
-                            progress["current_kl"] = cur.get("kl_running_mean")
-                            progress["current_se"] = cur.get("kl_running_se")
-                            progress["current_ci"] = cur.get("ci_95")
-                            progress["current_best"] = cur.get("best_kl_so_far")
-                            progress["students_done"] = cur.get("student_idx", 0)
-                        progress["completed"] = pod_progress.get("completed", [])
-                        with open(progress_path, "w") as f:
-                            json.dump(progress, f)
-                    except Exception:
-                        pass  # Pod progress not ready yet or SSH hiccup
-                    poll_stop.wait(10)
-
-            poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
-            poll_thread.start()
-
+            # Detect number of GPUs on pod for parallel eval
+            n_gpus = 1
             try:
-                result = lium.exec(pod, command=cmd)
-                print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
-            except Exception as exec_err:
-                print(f"[VALIDATOR] lium.exec EXCEPTION: {exec_err}", flush=True)
-                import traceback
-                traceback.print_exc()
-                poll_stop.set()
-                poll_thread.join(timeout=5)
-                if once:
-                    break
-                time.sleep(tempo)
-                continue
-            finally:
-                poll_stop.set()
-                poll_thread.join(timeout=5)
+                gpu_check = lium.exec(pod, command="python3 -c 'import torch; print(torch.cuda.device_count())'")
+                n_gpus = int(gpu_check.get("stdout", "1").strip())
+            except Exception:
+                pass
+
+            if n_gpus >= 2 and len(ordered_uids) >= 2:
+                # Parallel eval: teacher on GPU 0, then split students across GPUs
+                print(f"[VALIDATOR] Parallel eval: {n_gpus} GPUs, {len(models_to_eval)} models, {n_prompts} prompts", flush=True)
+
+                # Step 1: Teacher generates logits on GPU 0 and saves cache
+                teacher_cmd = (
+                    f"cd /home && python3 pod_eval.py "
+                    f"--teacher {TEACHER_MODEL} "
+                    f"--students {models_to_eval[ordered_uids[0]]['model']} "
+                    f"--prompts prompts.json "
+                    f"--output /home/eval_teacher_only.json "
+                    f"--max-prompt-len {MAX_PROMPT_TOKENS} "
+                    f"--max-new-tokens {MAX_NEW_TOKENS} "
+                    f"--max-params-b {max_params_b} "
+                    f"--gpu 0 "
+                    f"--save-teacher-logits /home/teacher_cache.pt"
+                )
+                print("[VALIDATOR] Step 1: Teacher inference + first student on GPU 0...", flush=True)
+                try:
+                    result_teacher = lium.exec(pod, command=teacher_cmd)
+                    print(f"[VALIDATOR] Teacher step exit: {result_teacher.get('exit_code')}", flush=True)
+                except Exception as e:
+                    print(f"[VALIDATOR] Teacher step failed: {e}", flush=True)
+
+                # Step 2: Remaining students split across GPUs using cached teacher logits
+                remaining_uids = ordered_uids[1:]  # first student already done in step 1
+                if remaining_uids:
+                    mid = (len(remaining_uids) + 1) // 2
+                    group_0 = remaining_uids[:mid]
+                    group_1 = remaining_uids[mid:]
+
+                    def _build_student_cmd(uids, gpu_id, output_file):
+                        sl = ",".join(models_to_eval[u]["model"] for u in uids)
+                        return (
+                            f"cd /home && python3 pod_eval.py "
+                            f"--teacher {TEACHER_MODEL} "
+                            f"--students {sl} "
+                            f"--prompts prompts.json "
+                            f"--output {output_file} "
+                            f"--max-prompt-len {MAX_PROMPT_TOKENS} "
+                            f"--max-new-tokens {MAX_NEW_TOKENS} "
+                            f"--max-params-b {max_params_b} "
+                            f"--gpu {gpu_id} "
+                            f"--teacher-logits /home/teacher_cache.pt"
+                        )
+
+                    cmd_gpu0 = _build_student_cmd(group_0, 0, "/home/eval_gpu0.json") if group_0 else None
+                    cmd_gpu1 = _build_student_cmd(group_1, 1, "/home/eval_gpu1.json") if group_1 else None
+
+                    # Run both in parallel using background processes
+                    bg_cmds = []
+                    if cmd_gpu0 and cmd_gpu1:
+                        parallel_cmd = f"({cmd_gpu0}) & ({cmd_gpu1}) & wait"
+                        print(f"[VALIDATOR] Step 2: {len(group_0)} students GPU0 + {len(group_1)} students GPU1 in parallel", flush=True)
+                    elif cmd_gpu0:
+                        parallel_cmd = cmd_gpu0
+                        print(f"[VALIDATOR] Step 2: {len(group_0)} students on GPU0", flush=True)
+                    elif cmd_gpu1:
+                        parallel_cmd = cmd_gpu1
+                        print(f"[VALIDATOR] Step 2: {len(group_1)} students on GPU1", flush=True)
+                    else:
+                        parallel_cmd = None
+
+                    if parallel_cmd:
+                        try:
+                            result_parallel = lium.exec(pod, command=parallel_cmd)
+                            print(f"[VALIDATOR] Parallel step exit: {result_parallel.get('exit_code')}", flush=True)
+                        except Exception as e:
+                            print(f"[VALIDATOR] Parallel step failed: {e}", flush=True)
+
+                # Step 3: Merge all results into eval_results.json
+                merge_cmd = """python3 -c "
+import json, glob, os
+merged = None
+for f in ['/home/eval_teacher_only.json', '/home/eval_gpu0.json', '/home/eval_gpu1.json']:
+    if not os.path.exists(f): continue
+    with open(f) as fh:
+        data = json.load(fh)
+    if merged is None:
+        merged = data
+    else:
+        merged['students'].update(data.get('students', {}))
+if merged:
+    with open('/home/eval_results.json', 'w') as fh:
+        json.dump(merged, fh)
+    print(f'Merged {len(merged[\"students\"])} students')
+else:
+    print('ERROR: No results to merge')
+"
+"""
+                try:
+                    merge_result = lium.exec(pod, command=merge_cmd)
+                    print(f"[VALIDATOR] Merge: {merge_result.get('stdout', '').strip()}", flush=True)
+                except Exception as e:
+                    print(f"[VALIDATOR] Merge failed: {e}", flush=True)
+
+                # Fake result for downstream code
+                result = {"exit_code": 0}
+            else:
+                # Single GPU: original sequential eval
+                cmd = (
+                    f"cd /home && python3 pod_eval.py "
+                    f"--teacher {TEACHER_MODEL} "
+                    f"--students {student_list} "
+                    f"--prompts prompts.json "
+                    f"--output eval_results.json "
+                    f"--max-prompt-len {MAX_PROMPT_TOKENS} "
+                    f"--max-new-tokens {MAX_NEW_TOKENS} "
+                    f"--max-params-b {max_params_b}"
+                )
+                print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
+
+                # Update progress: scoring phase
+                progress["phase"] = "scoring"
+                with open(progress_path, "w") as f:
+                    json.dump(progress, f)
+
+                # Background thread: poll live progress from pod every 10s
+                import threading
+                poll_stop = threading.Event()
+
+                def _poll_pod_progress():
+                    while not poll_stop.is_set():
+                        try:
+                            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+                                tmp_path = tmp.name
+                            lium.download(pod, remote="/home/eval_progress.json", local=tmp_path)
+                            with open(tmp_path) as f:
+                                pod_progress = json.load(f)
+                            os.unlink(tmp_path)
+                            progress["pod"] = pod_progress
+                            progress["phase"] = "scoring"
+                            if pod_progress.get("current"):
+                                cur = pod_progress["current"]
+                                progress["current_student"] = cur.get("student_name")
+                                progress["current_prompt"] = cur.get("prompts_done", 0)
+                                progress["current_kl"] = cur.get("kl_running_mean")
+                                progress["current_se"] = cur.get("kl_running_se")
+                                progress["current_ci"] = cur.get("ci_95")
+                                progress["current_best"] = cur.get("best_kl_so_far")
+                                progress["students_done"] = cur.get("student_idx", 0)
+                            progress["completed"] = pod_progress.get("completed", [])
+                            with open(progress_path, "w") as f:
+                                json.dump(progress, f)
+                        except Exception:
+                            pass
+                        poll_stop.wait(10)
+
+                poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
+                poll_thread.start()
+
+                try:
+                    result = lium.exec(pod, command=cmd)
+                    print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
+                except Exception as exec_err:
+                    print(f"[VALIDATOR] lium.exec EXCEPTION: {exec_err}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    poll_stop.set()
+                    poll_thread.join(timeout=5)
+                    if once:
+                        break
+                    time.sleep(tempo)
+                    continue
+                finally:
+                    poll_stop.set()
+                    poll_thread.join(timeout=5)
 
             if result['stdout'].strip():
                 for line in result['stdout'].strip().split('\n')[-30:]:
