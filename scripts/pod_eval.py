@@ -595,7 +595,6 @@ def main():
     print(f"\n[eval] Results saved to {args.output}", flush=True)
 
     # Force exit — teacher model's CUDA/background threads can hang indefinitely
-    import os
     os._exit(0)
 
 
