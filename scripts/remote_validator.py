@@ -407,7 +407,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             prompt_texts = [format_prompt(p) for p in epoch_prompts]
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 json.dump(prompt_texts, f)
+                f.flush()
+                os.fsync(f.fileno())
                 prompts_file = f.name
+            # Verify file is non-empty before uploading
+            fsize = os.path.getsize(prompts_file)
+            print(f"[VALIDATOR] Prompts file: {fsize} bytes, {len(prompt_texts)} prompts", flush=True)
             lium.upload(pod, local=prompts_file, remote="/home/prompts.json")
             os.unlink(prompts_file)
 
