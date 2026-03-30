@@ -666,6 +666,8 @@ else:
             uid_to_model = {uid: m["model"] for uid, m in models_to_eval.items()}
             model_to_uid = {m: uid for uid, m in uid_to_model.items()}
 
+            king_h2h_kl = None  # King's score on THIS eval's prompts
+
             for model_name, student_result in results.get("students", {}).items():
                 uid = model_to_uid.get(model_name)
                 if uid is None:
@@ -698,19 +700,26 @@ else:
                     record_failure(uid, failures)
                     continue
 
-                scores[str(uid)] = kl
-                evaluated_uids.add(str(uid))
-                reset_failures(uid, failures)
-                print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
+                # For challengers, update their global score.
+                # For the king, only use H2H score for epsilon comparison — don't
+                # overwrite their global score. Different prompt sets cause variance,
+                # and overwriting would let old challengers (scored on different prompts)
+                # appear to beat the king unfairly.
+                if uid == king_uid:
+                    king_h2h_kl = kl  # Store for epsilon comparison
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score preserved at {scores.get(str(uid), 'N/A')})", flush=True)
+                else:
+                    scores[str(uid)] = kl
+                    evaluated_uids.add(str(uid))
+                    reset_failures(uid, failures)
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
 
             # ── Epsilon enforcement: challenger must beat king by >1% to dethrone ──
-            # King's new score (from this head-to-head) updates normally.
-            # But challengers that don't beat epsilon get their score recorded
-            # WITHOUT being able to dethrone — we ensure king stays king by
-            # setting challenger score = king score + tiny margin if they're
-            # within epsilon but lower than king.
+            # Use the king's H2H score (same prompts as challengers) for fair comparison.
+            # The king's GLOBAL score is preserved — only challengers who beat the king
+            # on the SAME prompt set can dethrone.
             if king_uid is not None and challengers:
-                king_new_kl = scores.get(str(king_uid), king_kl)
+                king_new_kl = king_h2h_kl if king_h2h_kl is not None else scores.get(str(king_uid), king_kl)
                 threshold = king_new_kl * (1.0 - EPSILON)
                 for uid in challengers:
                     uid_str = str(uid)
