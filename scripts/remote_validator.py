@@ -150,7 +150,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     logger.info(f"Using Lium pod: {pod.name} ({pod.id[:12]})")
 
     # ── Load dataset ──
-    all_prompts = load_prompts_from_hf(n=500)
+    all_prompts = load_prompts_from_hf()  # defaults to 10,000 prompt pool
     print(f"[VALIDATOR] Loaded {len(all_prompts)} prompts from HF", flush=True)
 
     # ── Load state ──

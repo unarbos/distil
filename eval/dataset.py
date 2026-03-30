@@ -3,6 +3,9 @@ Dataset loader with block-seeded prompt selection.
 
 Uses HuggingFace pretraining datasets (streamed) for diverse, unpredictable prompts.
 Prompts are selected deterministically based on the current block number.
+
+The prompt pool is large (10,000+) to prevent miners from overfitting to a small set.
+Block-seeded sampling selects a small eval subset each epoch.
 """
 import json
 import os
@@ -19,29 +22,40 @@ DEFAULT_SPLIT = "train"
 DEFAULT_TEXT_FIELD = "text"
 PROMPT_CACHE_DIR = Path("state/prompt_cache")
 
+# Large pool — miners can't overfit to 40 prompts if the pool is 10k+
+DEFAULT_POOL_SIZE = 10_000
+
 
 def load_prompts_from_hf(
     dataset_name: str = DEFAULT_DATASET,
     split: str = DEFAULT_SPLIT,
     text_field: str = DEFAULT_TEXT_FIELD,
-    n: int = 500,
+    n: int = DEFAULT_POOL_SIZE,
     min_chars: int = 200,
     max_chars: int = 4000,
     cache_path: Path | None = None,
 ) -> list[str]:
     """
-    Stream n prompts from a HuggingFace dataset.
-    Caches locally so we don't re-download every epoch.
+    Stream n prompts from a HuggingFace dataset to build a large pool.
+
+    The pool is cached locally. Block-seeded sampling (sample_prompts_seeded)
+    draws a small eval subset each epoch, so the full pool is never exposed
+    to miners at once.
+
+    Args:
+        n: Pool size. Default 10,000. Larger = more diversity per eval.
     """
     if cache_path is None:
         cache_path = PROMPT_CACHE_DIR / f"{dataset_name.replace('/', '_')}_{n}.json"
 
-    # Return cached if fresh enough
+    # Return cached if we have enough
     if cache_path.exists():
         try:
             cached = json.loads(cache_path.read_text())
             if len(cached) >= n:
                 return cached[:n]
+            # Cache exists but is too small (e.g. old 500-entry cache) — rebuild
+            logger.info(f"Cache has {len(cached)} prompts but need {n}, rebuilding...")
         except Exception:
             pass
 
