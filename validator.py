@@ -216,16 +216,18 @@ def main(
     while True:
         try:
             metagraph.sync(subtensor=subtensor)
-            if metagraph.n <= 1:
+            n_uids = int(metagraph.n)  # ensure native int (not numpy scalar)
+            if n_uids <= 1:
                 logger.warning(
-                    f"Metagraph returned n={metagraph.n} — likely a sync failure. "
+                    f"Metagraph returned n={n_uids} — likely a sync failure. "
                     "Retrying with fresh subtensor connection..."
                 )
                 subtensor = bt.Subtensor(network=network)
                 metagraph = subtensor.metagraph(netuid)
-                if metagraph.n <= 1:
+                n_uids = int(metagraph.n)
+                if n_uids <= 1:
                     logger.error(
-                        f"Metagraph still n={metagraph.n} after reconnect. "
+                        f"Metagraph still n={n_uids} after reconnect. "
                         "Sleeping 60s before retry."
                     )
                     time.sleep(60)

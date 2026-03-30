@@ -196,6 +196,15 @@ def compute_winner_weights(
 
     This prevents noisy near-ties from flipping the winner every epoch.
     """
+    # Ensure n_uids covers all scored UIDs (metagraph.n can be stale after sync failures)
+    max_scored_uid = max((int(k) for k in scores), default=-1)
+    if max_scored_uid >= n_uids:
+        logger.warning(
+            f"n_uids={n_uids} but scores contain UID {max_scored_uid} — "
+            f"expanding weights array (metagraph.n likely stale)"
+        )
+        n_uids = max_scored_uid + 1
+
     weights = [0.0] * n_uids
 
     # Find all eligible candidates
