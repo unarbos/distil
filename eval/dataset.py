@@ -119,7 +119,11 @@ def sample_prompts_from_dataset(
     # We use the block as both the shuffle seed and a skip offset so each epoch
     # draws from a different region of the dataset.
     block_hash = hashlib.sha256(str(block_number).encode()).hexdigest()
-    skip_offset = int(block_hash[:10], 16) % 500_000  # skip into first 500K items of shuffled stream
+    # Use 48 bits for skip offset — covers up to ~280 trillion positions.
+    # FineWeb has ~15B rows across 96 shards. The shuffle(seed=block) already
+    # randomizes shard ordering, so the skip jumps to a different region each epoch.
+    # With buffer_size=50K, we draw from a 50K-wide random window each time.
+    skip_offset = int(block_hash[:12], 16) % 5_000_000  # skip up to 5M into shuffled stream
 
     print(
         f"[dataset] Sampling {n} prompts from {dataset_name} "
@@ -127,11 +131,10 @@ def sample_prompts_from_dataset(
         flush=True,
     )
 
-    # Stream with a small buffer to keep RAM usage low.
-    # The shuffle buffer_size controls how many items are held in memory for
-    # pseudo-random sampling. 5000 is enough for diversity without OOM.
+    # Shuffle buffer: 50K items held in RAM for pseudo-random sampling.
+    # Larger buffer = more diverse sampling within the skip window.
     ds = load_dataset(dataset_name, split=split, streaming=True, name="default")
-    ds_shuffled = ds.shuffle(seed=block_number, buffer_size=5_000)
+    ds_shuffled = ds.shuffle(seed=block_number, buffer_size=50_000)
     ds_skipped = ds_shuffled.skip(skip_offset)
 
     prompts: list[str] = []
