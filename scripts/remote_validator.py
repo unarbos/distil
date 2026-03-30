@@ -331,10 +331,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                         king_kl = scores[uid_str]
                         king_uid = uid
 
-            # Challengers = valid models that haven't been evaluated yet
+            # Challengers = valid models that haven't been successfully evaluated yet
+            # A UID is only "evaluated" if it has a score — handles cases where
+            # eval was tainted (e.g. exploit) and score was never written
             challengers = {
                 uid: info for uid, info in valid_models.items()
-                if str(uid) not in evaluated_uids
+                if str(uid) not in evaluated_uids or str(uid) not in scores
             }
 
             if not challengers:
