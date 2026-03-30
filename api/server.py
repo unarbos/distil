@@ -110,46 +110,65 @@ def _bg_refresh(name: str, fn):
 # ── Data fetchers ─────────────────────────────────────────────────────────────
 
 def _fetch_metagraph():
-    import bittensor as bt
-    sub = bt.Subtensor(network="finney")
-    meta = sub.metagraph(NETUID)
-    block = sub.block
-    neurons = []
-    for uid in range(meta.n):
-        neurons.append({
-            "uid": uid,
-            "hotkey": str(meta.hotkeys[uid]),
-            "coldkey": str(meta.coldkeys[uid]),
-            "stake": float(meta.S[uid]),
-            "trust": float(meta.T[uid]),
-            "consensus": float(meta.C[uid]),
-            "incentive": float(meta.I[uid]),
-            "emission": float(meta.E[uid]),
-            "dividends": float(meta.D[uid]),
-            "is_validator": float(meta.S[uid]) > 1000,
-        })
-    return {
-        "netuid": NETUID,
-        "block": int(block),
-        "n": int(meta.n),
-        "neurons": neurons,
-        "timestamp": time.time(),
-    }
+    """Fetch metagraph via subprocess to avoid loading bittensor/torch in the API process."""
+    import subprocess
+    script = """
+import bittensor as bt, json
+sub = bt.Subtensor(network="finney")
+meta = sub.metagraph(97)
+block = sub.block
+neurons = []
+for uid in range(meta.n):
+    neurons.append({
+        "uid": uid,
+        "hotkey": str(meta.hotkeys[uid]),
+        "coldkey": str(meta.coldkeys[uid]),
+        "stake": float(meta.S[uid]),
+        "trust": float(meta.T[uid]),
+        "consensus": float(meta.C[uid]),
+        "incentive": float(meta.I[uid]),
+        "emission": float(meta.E[uid]),
+        "dividends": float(meta.D[uid]),
+        "is_validator": float(meta.S[uid]) > 1000,
+    })
+print(json.dumps({"netuid": 97, "block": int(block), "n": int(meta.n), "neurons": neurons}))
+"""
+    result = subprocess.run(
+        ["python3", "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"metagraph fetch failed: {result.stderr[-500:]}")
+    data = json.loads(result.stdout)
+    data["timestamp"] = time.time()
+    return data
 
 def _fetch_commitments():
-    import bittensor as bt
-    sub = bt.Subtensor(network="finney")
-    revealed = sub.get_all_revealed_commitments(NETUID)
-    commits = {}
-    for hotkey, entries in revealed.items():
-        if entries:
-            block, data = entries[0]
-            try:
-                parsed = json.loads(data)
-                commits[str(hotkey)] = {"block": block, **parsed}
-            except Exception:
-                commits[str(hotkey)] = {"block": block, "raw": str(data)}
-    return {"commitments": commits, "count": len(commits)}
+    """Fetch commitments via subprocess to avoid loading bittensor/torch in the API process."""
+    import subprocess
+    script = """
+import bittensor as bt, json
+sub = bt.Subtensor(network="finney")
+revealed = sub.get_all_revealed_commitments(97)
+commits = {}
+for hotkey, entries in revealed.items():
+    if entries:
+        block, data_str = entries[0]
+        try:
+            parsed = json.loads(data_str)
+            commits[str(hotkey)] = {"block": block, **parsed}
+        except Exception:
+            commits[str(hotkey)] = {"block": block, "raw": str(data_str)}
+print(json.dumps({"commitments": commits, "count": len(commits)}))
+"""
+    result = subprocess.run(
+        ["python3", "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"commitments fetch failed: {result.stderr[-500:]}")
+    data = json.loads(result.stdout)
+    return data
 
 def _fetch_price():
     data = req.get(f"{TMC_BASE}/public/v1/subnets/table/", headers=TMC_HEADERS, timeout=10).json()
@@ -292,52 +311,61 @@ def get_model_info(model_path: str):
     if cached:
         return cached
     try:
-        from huggingface_hub import model_info as hf_model_info
-        info = hf_model_info(model_path, files_metadata=True)
+        import subprocess
+        script = f"""
+import json
+from huggingface_hub import model_info as hf_model_info, hf_hub_download
 
-        # Get param count from safetensors metadata
-        params_b = None
-        if info.safetensors and hasattr(info.safetensors, "total"):
-            params_b = round(info.safetensors.total / 1e9, 2)
+info = hf_model_info("{model_path}", files_metadata=True)
 
-        # Parse config for MoE info
-        active_params_b = None
-        is_moe = False
-        num_experts = None
-        num_active_experts = None
-        try:
-            from eval.model_checker import compute_moe_params
-            from huggingface_hub import hf_hub_download
-            config_path = hf_hub_download(repo_id=model_path, filename="config.json")
-            with open(config_path) as f:
-                config = json.load(f)
-            moe_info = compute_moe_params(config)
-            is_moe = moe_info.get("is_moe", False)
-            if is_moe:
-                active_params_b = round(moe_info["active_params"] / 1e9, 2)
-                num_experts = moe_info.get("num_experts")
-                num_active_experts = moe_info.get("num_active_experts")
-        except Exception:
-            pass
+params_b = None
+if info.safetensors and hasattr(info.safetensors, "total"):
+    params_b = round(info.safetensors.total / 1e9, 2)
 
-        card = info.card_data
-        result = {
-            "model": model_path,
-            "author": info.author or model_path.split("/")[0],
-            "tags": list(info.tags) if info.tags else [],
-            "downloads": info.downloads,
-            "likes": info.likes,
-            "created_at": info.created_at.isoformat() if info.created_at else None,
-            "last_modified": info.last_modified.isoformat() if info.last_modified else None,
-            "params_b": params_b,
-            "active_params_b": active_params_b,
-            "is_moe": is_moe,
-            "num_experts": num_experts,
-            "num_active_experts": num_active_experts,
-            "license": getattr(card, "license", None) if card else None,
-            "pipeline_tag": info.pipeline_tag,
-            "base_model": getattr(card, "base_model", None) if card else None,
-        }
+active_params_b = None
+is_moe = False
+num_experts = None
+num_active_experts = None
+try:
+    config_path = hf_hub_download(repo_id="{model_path}", filename="config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    ne = config.get("num_local_experts", config.get("num_experts", 1))
+    is_moe = ne > 1
+    if is_moe:
+        hidden = config.get("hidden_size", 0)
+        num_experts = ne
+        num_active_experts = config.get("num_experts_per_tok", config.get("num_active_experts", ne))
+except Exception:
+    pass
+
+card = info.card_data
+result = {{
+    "model": "{model_path}",
+    "author": info.author or "{model_path}".split("/")[0],
+    "tags": list(info.tags) if info.tags else [],
+    "downloads": info.downloads,
+    "likes": info.likes,
+    "created_at": info.created_at.isoformat() if info.created_at else None,
+    "last_modified": info.last_modified.isoformat() if info.last_modified else None,
+    "params_b": params_b,
+    "active_params_b": active_params_b,
+    "is_moe": is_moe,
+    "num_experts": num_experts,
+    "num_active_experts": num_active_experts,
+    "license": getattr(card, "license", None) if card else None,
+    "pipeline_tag": info.pipeline_tag,
+    "base_model": getattr(card, "base_model", None) if card else None,
+}}
+print(json.dumps(result))
+"""
+        result_proc = subprocess.run(
+            ["python3", "-c", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result_proc.returncode != 0:
+            raise RuntimeError(result_proc.stderr[-300:])
+        result = json.loads(result_proc.stdout)
         _set_cached(cache_key, result)
         return result
     except Exception as e:

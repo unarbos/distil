@@ -183,19 +183,43 @@ def sample_prompts(prompts: list[str], n: int) -> list[str]:
     return random.sample(prompts, min(n, len(prompts)))
 
 
-def format_prompt(text: str) -> str:
+def format_prompt(text: str, max_chars: int = 512) -> str:
     """
     Format a raw pretraining text as a continuation prompt.
-    Uses the first ~512 chars as context, model continues from there.
+    Uses the first ~max_chars as context, model continues from there.
+
+    Includes sanitization to prevent malformed inputs from crashing
+    the tokenizer or model:
+    - Strips control characters (except newlines/tabs)
+    - Removes null bytes
+    - Limits total length
+    - Rejects prompts that are mostly non-text (binary garbage)
     """
-    # Clean up: strip leading whitespace, normalize
+    if not text or not isinstance(text, str):
+        return ""
+
+    # Remove null bytes and control chars (keep \n, \t, \r)
+    text = text.replace("\x00", "")
+    text = "".join(
+        c for c in text
+        if c in ("\n", "\t", "\r") or (ord(c) >= 32) or (ord(c) >= 128)
+    )
+
     text = text.strip()
-    # Use first portion as the prompt prefix
-    if len(text) > 512:
-        # Try to cut at a sentence boundary
-        cut = text[:512].rfind(". ")
-        if cut > 200:
+    if not text:
+        return ""
+
+    # Reject if >50% non-printable/non-ASCII after cleanup (likely binary)
+    printable_count = sum(1 for c in text if c.isprintable() or c in "\n\t\r")
+    if printable_count < len(text) * 0.5:
+        return ""
+
+    # Truncate to max_chars at a sentence boundary
+    if len(text) > max_chars:
+        cut = text[:max_chars].rfind(". ")
+        if cut > max_chars // 3:
             text = text[: cut + 1]
         else:
-            text = text[:512]
+            text = text[:max_chars]
+
     return text
