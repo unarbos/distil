@@ -596,8 +596,13 @@ else:
                 )
                 print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
-                # Update progress: scoring phase
+                # Update progress: scoring phase (clear stale data from previous eval)
                 progress["phase"] = "scoring"
+                progress["completed"] = []
+                progress.pop("pod", None)
+                progress.pop("current_student", None)
+                progress.pop("current_prompt", None)
+                progress.pop("current_kl", None)
                 with open(progress_path, "w") as f:
                     json.dump(progress, f)
 
