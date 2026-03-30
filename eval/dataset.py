@@ -1,9 +1,11 @@
 """
-Dataset loader with block-seeded prompt sampling from the full FineWeb dataset.
+Dataset loader with block-seeded prompt sampling.
 
-Each eval epoch uses the block number to seek into a different region of the
-1.5 trillion token FineWeb dataset. No fixed prompt pool — every eval draws
-from a fresh, unpredictable slice of the full dataset.
+Primary: karpathy/climbmix-400b-shuffle — 6,542 pre-shuffled parquet shards,
+~100MB each. Block hash picks a shard, load it entirely, sample from it.
+No streaming, no skip, instant random access across 400B tokens.
+
+Fallback: HuggingFaceFW/fineweb via streaming (slower but 15x more data).
 """
 import json
 import os
@@ -14,7 +16,12 @@ from pathlib import Path
 
 logger = logging.getLogger("distillation.dataset")
 
-# Default HF dataset for prompt sourcing
+# Primary: pre-sharded, pre-shuffled, fast random access
+CLIMBMIX_DATASET = "karpathy/climbmix-400b-shuffle"
+CLIMBMIX_NUM_SHARDS = 6542
+CLIMBMIX_TEXT_FIELD = "text"
+
+# Fallback HF dataset for prompt sourcing
 DEFAULT_DATASET = "HuggingFaceFW/fineweb"
 DEFAULT_SPLIT = "train"
 DEFAULT_TEXT_FIELD = "text"
@@ -82,19 +89,19 @@ def load_prompts_from_hf(
 def sample_prompts_from_dataset(
     n: int,
     block_number: int,
-    dataset_name: str = DEFAULT_DATASET,
+    dataset_name: str = CLIMBMIX_DATASET,
     split: str = DEFAULT_SPLIT,
-    text_field: str = DEFAULT_TEXT_FIELD,
+    text_field: str = CLIMBMIX_TEXT_FIELD,
     min_chars: int = 200,
     max_chars: int = 4000,
     cache_dir: Path | None = None,
 ) -> list[str]:
     """
-    Sample n prompts directly from the full dataset, seeded by block_number.
+    Sample n prompts from karpathy/climbmix-400b-shuffle (6,542 shards).
 
-    Uses the block number to compute a skip offset into the streaming dataset,
-    so each epoch draws from a completely different region of the 1.5T token
-    corpus. No fixed pool — miners cannot predict or overfit to the prompts.
+    Uses block_hash % 6542 to pick a shard, loads it entirely, shuffles with
+    block seed, and samples. Instant random access across 400B tokens — no
+    streaming skip needed. Falls back to FineWeb streaming if climbmix fails.
 
     Results are cached per block so repeated calls (e.g. retries) return the
     same prompts.
@@ -115,35 +122,72 @@ def sample_prompts_from_dataset(
 
     from datasets import load_dataset
 
-    # Use block number to seed a deterministic but unpredictable prompt selection.
-    # We use the block as both the shuffle seed and a skip offset so each epoch
-    # draws from a different region of the dataset.
     block_hash = hashlib.sha256(str(block_number).encode()).hexdigest()
-    # Use 48 bits for skip offset — covers up to ~280 trillion positions.
-    # FineWeb has ~15B rows across 96 shards. The shuffle(seed=block) already
-    # randomizes shard ordering, so the skip jumps to a different region each epoch.
-    # With buffer_size=50K, we draw from a 50K-wide random window each time.
-    skip_offset = int(block_hash[:12], 16) % 5_000_000  # skip up to 5M into shuffled stream
+
+    # ── Primary: climbmix shard-based sampling ──
+    try:
+        shard_idx = int(block_hash[:8], 16) % CLIMBMIX_NUM_SHARDS
+        shard_file = f"shard_{shard_idx:05d}.parquet"
+
+        print(
+            f"[dataset] Sampling {n} prompts from {CLIMBMIX_DATASET} "
+            f"(block={block_number}, shard={shard_idx}/{CLIMBMIX_NUM_SHARDS})",
+            flush=True,
+        )
+
+        ds = load_dataset(
+            CLIMBMIX_DATASET,
+            data_files=shard_file,
+            split="train",
+        )
+
+        # Shuffle deterministically with block seed and sample
+        rng = random.Random(block_number)
+        indices = list(range(len(ds)))
+        rng.shuffle(indices)
+
+        prompts: list[str] = []
+        for idx in indices:
+            text = ds[idx].get(text_field, "")
+            if not text or len(text) < min_chars:
+                continue
+            if len(text) > max_chars:
+                text = text[:max_chars]
+            prompts.append(text)
+            if len(prompts) >= n:
+                break
+
+        if len(prompts) >= n:
+            print(f"[dataset] Got {len(prompts)} prompts from shard {shard_idx}", flush=True)
+            # Cache and return
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(prompts))
+            return prompts
+
+        print(f"[dataset] Only got {len(prompts)}/{n} from shard, falling back to FineWeb", flush=True)
+    except Exception as e:
+        print(f"[dataset] Climbmix failed ({e}), falling back to FineWeb", flush=True)
+
+    # ── Fallback: FineWeb streaming ──
+    skip_offset = int(block_hash[:12], 16) % 5_000_000
 
     print(
-        f"[dataset] Sampling {n} prompts from {dataset_name} "
+        f"[dataset] Fallback: sampling {n} prompts from {DEFAULT_DATASET} "
         f"(block={block_number}, skip={skip_offset:,})",
         flush=True,
     )
 
-    # Shuffle buffer: 50K items held in RAM for pseudo-random sampling.
-    # Larger buffer = more diverse sampling within the skip window.
-    ds = load_dataset(dataset_name, split=split, streaming=True, name="default")
+    ds = load_dataset(DEFAULT_DATASET, split=DEFAULT_SPLIT, streaming=True, name="default")
     ds_shuffled = ds.shuffle(seed=block_number, buffer_size=50_000)
     ds_skipped = ds_shuffled.skip(skip_offset)
 
-    prompts: list[str] = []
+    prompts = []
     seen = 0
-    max_scan = n * 20  # safety limit
+    max_scan = n * 20
 
     for item in ds_skipped:
         seen += 1
-        text = item.get(text_field, "")
+        text = item.get(DEFAULT_TEXT_FIELD, "")
         if not text or len(text) < min_chars:
             continue
         if len(text) > max_chars:
