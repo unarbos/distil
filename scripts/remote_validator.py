@@ -580,7 +580,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 reset_failures(uid, failures)
                 print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
 
-            # ── Epsilon check: challenger must beat king by >1% to dethrone ──
+            # ── Epsilon enforcement: challenger must beat king by >1% to dethrone ──
+            # King's new score (from this head-to-head) updates normally.
+            # But challengers that don't beat epsilon get their score recorded
+            # WITHOUT being able to dethrone — we ensure king stays king by
+            # setting challenger score = king score + tiny margin if they're
+            # within epsilon but lower than king.
             if king_uid is not None and challengers:
                 king_new_kl = scores.get(str(king_uid), king_kl)
                 threshold = king_new_kl * (1.0 - EPSILON)
@@ -595,6 +600,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                             pct = ((king_new_kl - challenger_kl) / king_new_kl * 100) if king_new_kl > 0 else 0
                             print(f"[VALIDATOR] UID {uid} did NOT beat king (KL={challenger_kl:.6f}, "
                                   f"needed <{threshold:.6f}, only {pct:.1f}% better)", flush=True)
+                            # Enforce epsilon: if challenger is close but not epsilon-better,
+                            # don't let it dethrone. Set score to king + tiny margin so
+                            # compute_winner_weights still picks king.
+                            if challenger_kl < king_new_kl:
+                                scores[uid_str] = king_new_kl + 1e-8
+                                print(f"[VALIDATOR] UID {uid}: epsilon-pinned score to {scores[uid_str]:.8f} "
+                                      f"(actual was {challenger_kl:.6f})", flush=True)
 
             # ── Compute winner & set weights ──
             weights, winner_uid, winner_kl = compute_winner_weights(
@@ -654,8 +666,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             # ── Discord announcement if king changed ──
             if winner_uid is not None and winner_uid != king_uid and king_uid is not None:
-                new_king_model = uid_to_model.get(winner_uid, "unknown")
-                old_king_model = valid_models.get(king_uid, {}).get("model", "unknown")
+                new_king_model = (uid_to_model.get(winner_uid)
+                                  or valid_models.get(winner_uid, {}).get("model", "unknown"))
+                old_king_model = (uid_to_model.get(king_uid)
+                                  or valid_models.get(king_uid, {}).get("model", "unknown"))
                 try:
                     _announce_new_king(
                         new_uid=winner_uid, new_model=new_king_model, new_kl=winner_kl,
