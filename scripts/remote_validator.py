@@ -233,6 +233,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
                 # Architecture check
                 check = check_model_architecture(model_repo, revision, max_params_b)
+                if check.get("transient"):
+                    # Transient error (rate limit, network) — skip this epoch, retry later
+                    print(f"[VALIDATOR] UID {uid} ({model_repo}): TRANSIENT ERROR — {check['reason']}, will retry next epoch", flush=True)
+                    continue
                 if not check["pass"]:
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
@@ -274,6 +278,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                         pass
                 expected_hash = known_hashes.get(str(uid))
                 integrity = verify_model_integrity(model_repo, revision, expected_hash)
+                if integrity.get("transient"):
+                    print(f"[VALIDATOR] UID {uid} integrity check: TRANSIENT ERROR — {integrity['reason']}, will retry next epoch", flush=True)
+                    continue
                 if not integrity["pass"]:
                     print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1

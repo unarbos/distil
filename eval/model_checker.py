@@ -239,6 +239,15 @@ def verify_model_integrity(
                 "reason": f"Model {model_repo} is restricted/gated — must be publicly accessible",
                 "current_hash": None,
             }
+        # Transient errors should not DQ
+        err_lower = err.lower()
+        if any(k in err_lower for k in ["429", "rate limit", "too many", "timeout", "503", "502", "connection"]):
+            return {
+                "pass": True,
+                "reason": f"transient_error: {err}",
+                "current_hash": None,
+                "transient": True,
+            }
         return {
             "pass": False,
             "reason": f"Cannot verify model accessibility: {err}",
@@ -419,4 +428,13 @@ def check_model_architecture(
         }
 
     except Exception as e:
+        err_str = str(e).lower()
+        # Transient errors (rate limits, network issues) should NOT disqualify
+        is_transient = any(k in err_str for k in [
+            "429", "rate limit", "too many requests",
+            "connection", "timeout", "503", "502",
+            "temporary", "unavailable",
+        ])
+        if is_transient:
+            return {"pass": True, "reason": f"transient_error:{e}", "transient": True}
         return {"pass": False, "reason": f"check_failed:{e}"}
