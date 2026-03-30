@@ -360,6 +360,19 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             for uid, info in challengers.items():
                 models_to_eval[uid] = info
 
+            # Skip eval if only the king is in models_to_eval (no challengers survived filtering)
+            # This wastes compute and produces useless king-only H2H rounds on the dashboard
+            n_challengers_in_eval = sum(1 for uid in models_to_eval if uid != king_uid)
+            if n_challengers_in_eval == 0:
+                print(f"[VALIDATOR] No challengers in eval batch — skipping (king UID {king_uid} holds)", flush=True)
+                save_scores(scores, state_path)
+                save_failures(failures, state_path)
+                save_disqualified(dq_reasons, state_path)
+                if once:
+                    break
+                time.sleep(60)
+                continue
+
             n_prompts = EVAL_PROMPTS
             chall_str = ", ".join(f"UID {u}" for u in challengers)
             king_str = f"UID {king_uid}" if king_uid else "none"
@@ -812,36 +825,43 @@ else:
                 })
             h2h_results.sort(key=lambda x: x["kl"])
 
-            h2h_round = {
-                "block": current_block,
-                "timestamp": time.time(),
-                "king_uid": king_uid,
-                "king_h2h_kl": round(king_h2h_kl, 6) if king_h2h_kl else None,
-                "king_global_kl": round(king_kl, 6),
-                "epsilon": EPSILON,
-                "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
-                "n_prompts": EVAL_PROMPTS,
-                "results": h2h_results,
-                "king_changed": winner_uid != king_uid if king_uid is not None else False,
-                "new_king_uid": winner_uid if winner_uid != king_uid else None,
-            }
-            # Save latest round + append to history
-            h2h_path = state_path / "h2h_latest.json"
-            with open(h2h_path, "w") as f:
-                json.dump(h2h_round, f, indent=2)
-            h2h_history_path = state_path / "h2h_history.json"
-            history = []
-            if h2h_history_path.exists():
-                try:
-                    with open(h2h_history_path) as f:
-                        history = json.load(f)
-                except Exception:
-                    history = []
-            history.append(h2h_round)
-            # Keep last 50 rounds
-            history = history[-50:]
-            with open(h2h_history_path, "w") as f:
-                json.dump(history, f, indent=2)
+            # Don't save king-only rounds — they clutter the dashboard and mean
+            # all challengers failed during eval (errors, timeouts, etc.)
+            n_challenger_results = sum(1 for r in h2h_results if not r.get("is_king"))
+            if n_challenger_results == 0:
+                print(f"[VALIDATOR] All challengers failed — skipping H2H round save (king-only)", flush=True)
+
+            if n_challenger_results > 0:
+                h2h_round = {
+                    "block": current_block,
+                    "timestamp": time.time(),
+                    "king_uid": king_uid,
+                    "king_h2h_kl": round(king_h2h_kl, 6) if king_h2h_kl else None,
+                    "king_global_kl": round(king_kl, 6),
+                    "epsilon": EPSILON,
+                    "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
+                    "n_prompts": EVAL_PROMPTS,
+                    "results": h2h_results,
+                    "king_changed": winner_uid != king_uid if king_uid is not None else False,
+                    "new_king_uid": winner_uid if winner_uid != king_uid else None,
+                }
+                # Save latest round + append to history
+                h2h_path = state_path / "h2h_latest.json"
+                with open(h2h_path, "w") as f:
+                    json.dump(h2h_round, f, indent=2)
+                h2h_history_path = state_path / "h2h_history.json"
+                history = []
+                if h2h_history_path.exists():
+                    try:
+                        with open(h2h_history_path) as f:
+                            history = json.load(f)
+                    except Exception:
+                        history = []
+                history.append(h2h_round)
+                # Keep last 50 rounds
+                history = history[-50:]
+                with open(h2h_history_path, "w") as f:
+                    json.dump(history, f, indent=2)
 
             # ── Clear eval progress ──
             progress_path = state_path / "eval_progress.json"
