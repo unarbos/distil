@@ -42,6 +42,33 @@ def save_scores(scores: dict[str, float], state_dir: Path = STATE_DIR):
     _save_json(state_dir / "scores.json", scores)
 
 
+# Aliases for EMA-style access (validator.py uses these names)
+load_ema_scores = load_scores
+save_ema_scores = save_scores
+
+
+def update_ema(
+    uid: int,
+    new_kl: float,
+    scores: dict[str, float],
+    alpha: float = 0.3,
+) -> float:
+    """
+    Update EMA score for a UID.
+
+    EMA = alpha * new_kl + (1 - alpha) * old_kl
+    If no prior score exists, uses the new value directly.
+    """
+    uid_str = str(uid)
+    old_kl = scores.get(uid_str)
+    if old_kl is None:
+        ema = new_kl
+    else:
+        ema = alpha * new_kl + (1 - alpha) * old_kl
+    scores[uid_str] = ema
+    return ema
+
+
 # ── Disqualification Tracking ─────────────────────────────────────────────
 
 
