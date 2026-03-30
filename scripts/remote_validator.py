@@ -239,6 +239,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     disqualified.add(uid)
                     continue
 
+                # Skip expensive HF checks for already-evaluated UIDs with valid scores.
+                # They'll be rechecked if their model/revision changes (new commitment).
+                uid_str = str(uid)
+                if uid_str in evaluated_uids and uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
+                    valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None}
+                    continue
+
                 print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
 
                 # Architecture check
