@@ -568,6 +568,10 @@ def main():
         json.dump(results, f, indent=2)
     print(f"\n[eval] Results saved to {args.output}", flush=True)
 
+    # Force exit — teacher model's CUDA/background threads can hang indefinitely
+    import os
+    os._exit(0)
+
 
 if __name__ == "__main__":
     main()
