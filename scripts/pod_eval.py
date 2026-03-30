@@ -42,7 +42,9 @@ def gpu_mem_str():
 
 def load_model(name, device="cuda", dtype=torch.bfloat16):
     from transformers import AutoModelForCausalLM
-    kwargs = dict(torch_dtype=dtype, device_map=device, trust_remote_code=True)
+    # NEVER trust_remote_code for student models — only teacher needs it (Qwen custom tokenizer)
+    is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
+    kwargs = dict(torch_dtype=dtype, device_map=device, trust_remote_code=is_teacher)
     try:
         m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
         print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -72,7 +74,8 @@ def verify_tokenizer(teacher_name, student_name):
     """Check student uses same tokenizer as teacher."""
     from transformers import AutoTokenizer
     t_tok = AutoTokenizer.from_pretrained(teacher_name, trust_remote_code=True)
-    s_tok = AutoTokenizer.from_pretrained(student_name, trust_remote_code=True)
+    # NEVER trust_remote_code for students — blocks custom tokenizer.py exploits
+    s_tok = AutoTokenizer.from_pretrained(student_name, trust_remote_code=False)
 
     if t_tok.vocab_size != s_tok.vocab_size:
         return False, f"vocab_size mismatch: {s_tok.vocab_size} vs {t_tok.vocab_size}"

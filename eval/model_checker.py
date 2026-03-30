@@ -177,7 +177,7 @@ def verify_tokenizer(teacher_model: str, student_model: str) -> tuple[bool, str]
     from transformers import AutoTokenizer
 
     t_tok = AutoTokenizer.from_pretrained(teacher_model, trust_remote_code=True)
-    s_tok = AutoTokenizer.from_pretrained(student_model, trust_remote_code=True)
+    s_tok = AutoTokenizer.from_pretrained(student_model, trust_remote_code=False)
 
     if t_tok.vocab_size != s_tok.vocab_size:
         return False, f"Vocab size mismatch: {s_tok.vocab_size} ≠ {t_tok.vocab_size} (teacher)"
@@ -306,7 +306,8 @@ def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     from transformers import AutoTokenizer
 
     teacher_tok = _get_teacher_tokenizer()
-    student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=True)
+    # NEVER trust_remote_code for students — blocks custom tokenizer.py code execution exploits
+    student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
 
     for test_str in TOKENIZER_TEST_STRINGS:
         teacher_ids = teacher_tok.encode(test_str)
@@ -340,6 +341,25 @@ def check_model_architecture(
     Returns dict with pass, reason, params_b, active_params_b, vocab_size
     """
     try:
+        # 0. SECURITY: Reject repos with custom Python code files
+        # This blocks exploits like tokenizer.py that monkey-patch json.dump
+        try:
+            info = model_info(model_repo, revision=revision)
+            dangerous_files = []
+            for sibling in (info.siblings or []):
+                fname = sibling.rfilename
+                if fname.endswith('.py') and fname != '__init__.py':
+                    dangerous_files.append(fname)
+            if dangerous_files:
+                return {
+                    "pass": False,
+                    "reason": f"SECURITY: Repo contains custom code files ({', '.join(dangerous_files)}). "
+                              f"Custom code is not allowed — students must use standard architectures only.",
+                    "params_b": 0,
+                }
+        except Exception as e:
+            logger.warning(f"Could not check repo files for {model_repo}: {e}")
+
         # 1. Get safetensors-verified param count
         safetensors_params_b = get_safetensors_param_count(model_repo, revision)
 

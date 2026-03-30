@@ -118,7 +118,7 @@ def load_model_with_timeout(model_repo, revision, device, dtype, timeout_seconds
                 revision=revision,
                 torch_dtype=dtype,
                 device_map=device,
-                trust_remote_code=True,
+                trust_remote_code=False,  # NEVER trust student code — blocks tokenizer.py exploits
             )
         except Exception as e:
             error[0] = str(e)
