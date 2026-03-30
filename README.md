@@ -104,6 +104,70 @@ To change models, register a new hotkey.
 
 These are *untrained baselines* — purpose-built distillations should do significantly better. Models with KL > 2.0 are disqualified.
 
+## Validator Guide
+
+### Requirements
+
+- **GPU**: ~80GB+ VRAM (teacher model is 35B params in bf16 ≈ 70GB, plus student + overhead)
+  - Recommended: 1x A100 80GB, 1x H100, or 2x RTX PRO 6000
+- **Bittensor wallet** registered as a validator on subnet 97
+- **Python 3.10+**
+
+### Setup
+
+```bash
+git clone https://github.com/unarbos/distil.git
+cd distil
+pip install .
+```
+
+If `pip install .` fails, install dependencies manually:
+
+```bash
+pip install "bittensor>=8.0.0" "bittensor-wallet>=2.0.0" "click>=8.0.0" \
+    "transformers>=4.45.0" "huggingface-hub>=0.20.0" "numpy>=1.26.0" \
+    "torch>=2.1.0" "safetensors>=0.4.0"
+```
+
+### Run
+
+```bash
+python validator.py \
+    --network finney \
+    --netuid 97 \
+    --wallet-name my_wallet \
+    --hotkey-name my_hotkey
+```
+
+The validator will:
+1. Load the teacher model (Qwen3.5-35B-A3B) — this takes ~70GB VRAM
+2. Load 500 prompts from FineWeb (cached after first run)
+3. Poll for new challenger models every epoch (~10 min)
+4. When a new challenger is found, run head-to-head KL evaluation (40 prompts)
+5. Set weights on-chain: king = 1.0, everyone else = 0.0
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--network` | `finney` | Bittensor network |
+| `--netuid` | `1` | Subnet UID (use `97`) |
+| `--wallet-name` | `default` | Wallet name |
+| `--hotkey-name` | `default` | Hotkey name |
+| `--tempo` | `360` | Seconds between epochs |
+| `--samples-per-epoch` | `12` | Prompts per eval (increased to 40 in king-of-the-hill mode) |
+| `--log-level` | `INFO` | Logging verbosity |
+
+### State
+
+The validator stores state in `./state/`:
+- `scores.json` — Current KL scores per UID
+- `model_hashes.json` — SHA256 hashes for copy detection
+- `disqualified.json` — DQ'd UIDs and reasons
+- `evaluated_uids.json` — Already-evaluated UIDs (won't re-eval)
+
+To reset and re-evaluate all models, delete the `state/` directory.
+
 ## API
 
 Live data at `https://api.arbos.life`:
