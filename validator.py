@@ -217,6 +217,20 @@ def main(
     while True:
         try:
             metagraph.sync(subtensor=subtensor)
+            if metagraph.n <= 1:
+                logger.warning(
+                    f"Metagraph returned n={metagraph.n} — likely a sync failure. "
+                    "Retrying with fresh subtensor connection..."
+                )
+                subtensor = bt.Subtensor(network=network)
+                metagraph = subtensor.metagraph(netuid)
+                if metagraph.n <= 1:
+                    logger.error(
+                        f"Metagraph still n={metagraph.n} after reconnect. "
+                        "Sleeping 60s before retry."
+                    )
+                    time.sleep(60)
+                    continue
             current_block = subtensor.block
 
             # ── Read commitments (FIRST per hotkey — permanent, no updates) ─
