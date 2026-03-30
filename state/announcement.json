@@ -1,14 +1,14 @@
 {
   "type": "new_king",
-  "timestamp": 1774832850.199057,
+  "timestamp": 1774876277.6666102,
   "posted": true,
-  "message": "## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 191** has dethroned **UID 115**\n\n\ud83d\udcca **KL: 0.070405** (was 0.070353, -0.1% improvement)\n\ud83e\udd17 Model: [unknown](<https://huggingface.co/unknown>)\n\ud83d\udc51 Previous king: [Qwen/Qwen3.5-4B-Base](<https://huggingface.co/Qwen/Qwen3.5-4B-Base>)\n\n\ud83d\udcb0 **Winner earns ~170.0 \u03c4/day ($54,711/day)** \u2014 winner takes all!\n\nThink you can beat **0.069701 KL** (1% epsilon)? Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
+  "message": "## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 187** has dethroned **UID 18**\n\n\ud83d\udcca **KL: 0.057380** (was 0.053421, -7.4% improvement)\n\ud83e\udd17 Model: [demonwizard0/love-arbos](<https://huggingface.co/demonwizard0/love-arbos>)\n\ud83d\udc51 Previous king: [rlinprogress/sn97-distilled-V1](<https://huggingface.co/rlinprogress/sn97-distilled-V1>)\n\n\ud83d\udcb0 **Winner earns ~189.3 \u03c4/day ($60,175/day)** \u2014 winner takes all!\n\nThink you can beat **0.056807 KL** (1% epsilon)? Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
   "data": {
-    "new_uid": 191,
-    "new_model": "unknown",
-    "new_kl": 0.07040520010050386,
-    "old_uid": 115,
-    "old_model": "Qwen/Qwen3.5-4B-Base",
-    "old_kl": 0.07035319735296071
+    "new_uid": 187,
+    "new_model": "demonwizard0/love-arbos",
+    "new_kl": 0.057380307361017915,
+    "old_uid": 18,
+    "old_model": "rlinprogress/sn97-distilled-V1",
+    "old_kl": 0.05342146197044087
   }
 }
