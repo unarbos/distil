@@ -170,7 +170,7 @@ def main(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from eval.kl_divergence import generate_teacher_continuations, evaluate_student_kl
-    from eval.dataset import load_swe_infinite_prompts, sample_prompts_seeded, format_coding_prompt
+    from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
     from eval.model_checker import (
         check_model_architecture, compute_model_hash,
         check_duplicate_hash, register_model_hash,
@@ -192,7 +192,7 @@ def main(
     metagraph = subtensor.metagraph(netuid)
 
     # ── Load dataset ───────────────────────────────────────────────────
-    all_prompts = load_swe_infinite_prompts(dataset_path)
+    all_prompts = load_prompts_from_hf()
     logger.info(f"Loaded {len(all_prompts)} prompts from {dataset_path}")
 
     # ── Load teacher model (kept resident) ─────────────────────────────
@@ -273,7 +273,7 @@ def main(
 
             # ── Block-seeded prompt selection ──────────────────────────
             epoch_prompts = sample_prompts_seeded(all_prompts, samples_per_epoch, current_block)
-            prompt_texts = [format_coding_prompt(p) for p in epoch_prompts]
+            prompt_texts = [format_prompt(p) for p in epoch_prompts]
             logger.info(f"Selected {len(prompt_texts)} prompts (block seed: {current_block})")
 
             # ── Tokenize prompts ──────────────────────────────────────

@@ -164,6 +164,16 @@ def _fetch_price():
     except Exception:
         tao_usd = (_get_stale("price") or {}).get("tao_usd", 0)
 
+    miners_tao_per_day = sn97.get("miners_tao_per_day", 0) or 0
+    if miners_tao_per_day == 0:
+        try:
+            emission_pct = sn97.get("emission", 0) / 100.0
+            total_tao_per_day = 7200.0
+            subnet_tao_per_day = total_tao_per_day * emission_pct
+            miners_tao_per_day = subnet_tao_per_day * 0.41
+        except Exception:
+            pass
+
     return {
         "alpha_price_tao": round(alpha_price_tao, 6),
         "alpha_price_usd": round(alpha_price_tao * tao_usd, 4),
@@ -176,7 +186,7 @@ def _fetch_price():
         "price_change_1h": round(sn97.get("price_difference_hour", 0), 2),
         "price_change_24h": round(sn97.get("price_difference_day", 0), 2),
         "price_change_7d": round(sn97.get("price_difference_week", 0), 2),
-        "miners_tao_per_day": round(sn97.get("miners_tao_per_day", 0), 2),
+        "miners_tao_per_day": round(miners_tao_per_day, 4),
         "block_number": sn97.get("block_number", 0),
         "name": sn97.get("name", ""),
         "symbol": sn97.get("symbol", ""),

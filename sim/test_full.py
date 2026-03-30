@@ -44,7 +44,7 @@ from eval.scoring import (
     record_failure, reset_failures, is_stale,
     load_commitment_cache, save_commitment_cache, commitment_changed,
 )
-from eval.dataset import load_swe_infinite_prompts, sample_prompts_seeded, format_coding_prompt
+from eval.dataset import load_prompts_from_hf, sample_prompts_seeded, format_prompt
 from eval.model_checker import compute_moe_params
 
 # ── Config ──
@@ -331,10 +331,10 @@ def test_block_seeded_prompts():
     # Load real dataset if available
     dataset_path = Path(__file__).parent.parent / "dataset"
     if dataset_path.exists() and list(dataset_path.glob("*.json")):
-        real_prompts = load_swe_infinite_prompts(str(dataset_path))
+        real_prompts = load_prompts_from_hf(str(dataset_path))
         selected = sample_prompts_seeded(real_prompts, 5, block_number=99999)
         for p in selected:
-            text = format_coding_prompt(p)
+            text = format_prompt(p)
             assert len(text) > 100
         logger.info(f"✓ Real dataset: {len(real_prompts)} prompts loaded, selection works")
 
