@@ -10,5 +10,10 @@
   "65": "copy: identical weights to UID 191 (unconst/sn97-qwen35-4b-base-distilled), committed later at block 7854942 vs 7854783",
   "170": "copy: identical weights to UID 174 (unconst/sn97-qwen35-4b-distilled), committed later at block 7854897 vs 7854191",
   "39": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7855036 vs 7852887",
-  "214": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7855065 vs 7852887"
+  "214": "copy: identical weights to UID 179 (Qwen/Qwen3.5-4B), committed later at block 7855065 vs 7852887",
+  "66": "arch: check_failed:404 Client Error. (Request ID: Root=1-69c9df86-6951117b08e1a49d4ee37f04;43d2f4e5-fe7d-41f0-b4d8-48b7db9e29dd)\n\nEntry Not Found for url: https://huggingface.co/dsaddsaf/Qwen3.5-4B-main-1/resolve/7cc548c7df62ab17e657535a43fc387906260e72/config.json.",
+  "24": "arch: check_failed:401 Client Error. (Request ID: Root=1-69c9e92c-5bb134d7573ad51563c22823;a1b746bb-e36b-4ac7-abba-1d585e5602a4)\n\nRepository Not Found for url: https://huggingface.co/datlab755/sn97-qwen35-4b-distilled/resolve/835c4fd343ef8faa94699c95b4b511c5e7be7cac/config.json.\nPlease make sure you specified the correct `repo_id` and `repo_type`.\nIf you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication\nInvalid username or password.",
+  "192": "integrity: Model lebronjamesisachud/sn97-2 no longer exists on HuggingFace (404)",
+  "248": "copy: identical weights to UID 115 (Qwen/Qwen3.5-4B-Base), committed later at block 7857161 vs 7854471",
+  "127": "integrity: Model nbxzsds/sn97-qwen35-4b-merged no longer exists on HuggingFace (404)"
 }

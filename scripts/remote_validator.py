@@ -48,7 +48,11 @@ EPSILON = 0.01
 
 def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, state_dir):
     """Write a pending announcement to state/announcement.json for async Discord posting."""
-    improvement = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
+    # Note: "old_kl" is the PREVIOUS king's score from the LAST eval round.
+    # "new_kl" is the NEW king's score on THIS eval round's prompts.
+    # These are on DIFFERENT prompt sets, so direct comparison shows prompt variance, not real improvement.
+    # We still show both numbers for transparency but label them correctly.
+    kl_diff_pct = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
 
     # Fetch earnings data for the announcement
     earnings_line = ""
@@ -73,7 +77,7 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
         "message": (
             f"## 🏆 New King of Distil SN97!\n\n"
             f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
-            f"📊 **KL: {new_kl:.6f}** (was {old_kl:.6f}, {improvement:.1f}% improvement)\n"
+            f"📊 **KL: {new_kl:.6f}** (previous king scored {old_kl:.6f} last eval)\n"
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
             f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
             f"{earnings_line}\n"
