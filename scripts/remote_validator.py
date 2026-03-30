@@ -784,6 +784,65 @@ else:
                     state_dir=state_path,
                 )
 
+            # ── Save H2H round details for dashboard transparency ──
+            h2h_results = []
+            for uid, info in models_to_eval.items():
+                model_name = info["model"]
+                student_data = results.get("students", {}).get(model_name, {})
+                kl = student_data.get("kl_global_avg")
+                if kl is None or "error" in student_data:
+                    continue
+                is_king = (uid == king_uid)
+                vs_king = ""
+                if king_h2h_kl is not None and not is_king and king_h2h_kl > 0:
+                    pct = (king_h2h_kl - kl) / king_h2h_kl * 100
+                    epsilon_threshold = king_h2h_kl * (1.0 - EPSILON)
+                    if kl < epsilon_threshold:
+                        vs_king = f"-{pct:.3f}% (DETHRONED)"
+                    elif kl < king_h2h_kl:
+                        vs_king = f"-{pct:.3f}% (not enough, need >{EPSILON*100:.0f}%)"
+                    else:
+                        vs_king = "worse"
+                h2h_results.append({
+                    "uid": uid,
+                    "model": model_name,
+                    "kl": round(kl, 6),
+                    "is_king": is_king,
+                    "vs_king": vs_king,
+                })
+            h2h_results.sort(key=lambda x: x["kl"])
+
+            h2h_round = {
+                "block": current_block,
+                "timestamp": time.time(),
+                "king_uid": king_uid,
+                "king_h2h_kl": round(king_h2h_kl, 6) if king_h2h_kl else None,
+                "king_global_kl": round(king_kl, 6),
+                "epsilon": EPSILON,
+                "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
+                "n_prompts": EVAL_PROMPTS,
+                "results": h2h_results,
+                "king_changed": winner_uid != king_uid if king_uid is not None else False,
+                "new_king_uid": winner_uid if winner_uid != king_uid else None,
+            }
+            # Save latest round + append to history
+            h2h_path = state_path / "h2h_latest.json"
+            with open(h2h_path, "w") as f:
+                json.dump(h2h_round, f, indent=2)
+            h2h_history_path = state_path / "h2h_history.json"
+            history = []
+            if h2h_history_path.exists():
+                try:
+                    with open(h2h_history_path) as f:
+                        history = json.load(f)
+                except Exception:
+                    history = []
+            history.append(h2h_round)
+            # Keep last 50 rounds
+            history = history[-50:]
+            with open(h2h_history_path, "w") as f:
+                json.dump(history, f, indent=2)
+
             # ── Clear eval progress ──
             progress_path = state_path / "eval_progress.json"
             with open(progress_path, "w") as f:

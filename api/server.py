@@ -435,6 +435,32 @@ def get_eval_progress():
     return {"active": False}
 
 
+@app.get("/api/h2h-latest")
+def get_h2h_latest():
+    """Latest H2H round results — king vs challengers on same prompts."""
+    path = os.path.join(STATE_DIR, "h2h_latest.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"error": "No H2H data yet"}
+
+
+@app.get("/api/h2h-history")
+def get_h2h_history():
+    """H2H round history (last 50 rounds)."""
+    path = os.path.join(STATE_DIR, "h2h_history.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
 @app.get("/api/tmc-config")
 def get_tmc_config():
     """SSE config — key is proxied server-side, not exposed to frontend."""
