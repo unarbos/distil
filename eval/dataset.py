@@ -119,7 +119,7 @@ def sample_prompts_from_dataset(
     # We use the block as both the shuffle seed and a skip offset so each epoch
     # draws from a different region of the dataset.
     block_hash = hashlib.sha256(str(block_number).encode()).hexdigest()
-    skip_offset = int(block_hash[:8], 16) % 50_000  # moderate skip to avoid slow seeks
+    skip_offset = int(block_hash[:10], 16) % 500_000  # skip into first 500K items of shuffled stream
 
     print(
         f"[dataset] Sampling {n} prompts from {dataset_name} "
