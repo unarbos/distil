@@ -450,6 +450,7 @@ def main(
             weights, winner_uid, winner_kl = compute_winner_weights(
                 ema_scores, failures, metagraph.n,
                 max_kl=MAX_KL_THRESHOLD,
+                state_dir=state_path,
             )
 
             # ── Leaderboard log ───────────────────────────────────────

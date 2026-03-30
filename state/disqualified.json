@@ -20,5 +20,5 @@
   "156": "arch: check_failed:404 Client Error. (Request ID: Root=1-69ca9c85-2f07ffff12484efb25632f9d;c63244fd-dfa6-4108-be50-287d512ad877)\n\nEntry Not Found for url: https://huggingface.co/Bittensor-110/Qwen3.5-4B-666/resolve/e23b8d9a98e1146807a2cbba555460c956113cf0/config.json.",
   "41": "copy: identical weights to UID 194 (iotaminer/distil-qwen35-4b), committed later at block 7859538 vs 7858835",
   "186": "integrity: Model Cheeeeeeeeky/distillation-2 no longer exists on HuggingFace (404)",
-  "210": "Malicious tokenizer.py \u2014 obfuscated payload monkey-patches json.dump to fake KL scores (0.04481). Leaderboard fraud."
+  "210": "arch: SECURITY: Repo contains custom code files (tokenizer.py). Custom code is not allowed \u2014 students must use standard architectures only."
 }

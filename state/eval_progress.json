@@ -1,1 +1,1 @@
-{"active": true, "phase": "scoring", "models": {"210": "Cheeeeeeeeky/distillation-arbos", "224": "slowsnake/qwen35-4b-kd-v3"}, "eval_order": [{"uid": 210, "model": "Cheeeeeeeeky/distillation-arbos", "role": "king"}, {"uid": 224, "model": "slowsnake/qwen35-4b-kd-v3", "role": "challenger"}], "students_total": 2, "students_done": 0, "prompts_total": 60, "prompts_done": 0, "king_uid": 210, "challenger_uids": [224], "started_at": 1774902836.7812362, "estimated_duration_s": 690, "estimated_completion": 1774903526.7812362, "pod": {}, "completed": []}
+{"active": false}

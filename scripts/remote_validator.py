@@ -342,6 +342,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 # Still set weights periodically to keep tempo
                 weights, winner_uid, winner_kl = compute_winner_weights(
                     scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
+                    state_dir=state_path,
                 )
                 if winner_uid is not None:
                     _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
@@ -789,7 +790,7 @@ else:
             # ── Compute winner & set weights ──
             weights, winner_uid, winner_kl = compute_winner_weights(
                 scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
-                epsilon=EPSILON,
+                epsilon=EPSILON, state_dir=state_path,
             )
 
             # Leaderboard

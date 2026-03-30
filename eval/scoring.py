@@ -186,6 +186,7 @@ def compute_winner_weights(
     max_kl: float = DEFAULT_MAX_KL,
     max_failures: int = 3,
     epsilon: float = 0.0,
+    state_dir: Path = STATE_DIR,
 ) -> tuple[list[float], int | None, float]:
     """
     Winner-take-all with epsilon threshold.
@@ -207,12 +208,17 @@ def compute_winner_weights(
 
     weights = [0.0] * n_uids
 
+    # Load disqualified UIDs — DQ'd miners NEVER get weight
+    dq = load_disqualified(state_dir)
+
     # Find all eligible candidates
     candidates = []
     for uid_str, kl in scores.items():
         uid = int(uid_str)
         if uid >= n_uids:
             continue
+        if uid_str in dq or str(uid) in dq:
+            continue  # Disqualified — skip
         if kl <= 0 or kl > max_kl:
             continue
         if is_stale(uid, failures, max_failures):
