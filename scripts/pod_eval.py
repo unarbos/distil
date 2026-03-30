@@ -223,6 +223,25 @@ def main():
         # Generate teacher continuations + get teacher logits
         print(f"\n[eval] Generating teacher continuations (max_new_tokens={args.max_new_tokens})...", flush=True)
 
+        # Write initial teacher progress
+        teacher_progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
+        def _write_teacher_progress(done, total):
+            try:
+                with open(teacher_progress_path, "w") as pf:
+                    json.dump({
+                        "phase": "teacher_generation",
+                        "students": students,
+                        "students_total": len(students),
+                        "prompts_total": total,
+                        "teacher_prompts_done": done,
+                        "completed": [],
+                        "current": None,
+                    }, pf)
+            except Exception:
+                pass
+
+        _write_teacher_progress(0, len(input_ids_list))
+
         t0 = time.time()
         with torch.no_grad():
             for i, ids in enumerate(input_ids_list):
@@ -248,6 +267,7 @@ def main():
 
                 gen_len = output_ids.shape[1] - prompt_len
                 print(f"  Prompt {i}: {prompt_len} prompt + {gen_len} gen tokens, VRAM: {gpu_mem_str()}", flush=True)
+                _write_teacher_progress(i + 1, len(input_ids_list))
 
         timings["teacher_generation"] = time.time() - t0
         print(f"[eval] Generation complete in {timings['teacher_generation']:.1f}s", flush=True)
