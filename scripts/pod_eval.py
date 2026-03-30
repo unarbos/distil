@@ -44,7 +44,7 @@ def load_model(name, device="cuda", dtype=torch.bfloat16):
     from transformers import AutoModelForCausalLM
     # NEVER trust_remote_code for student models — only teacher needs it (Qwen custom tokenizer)
     is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
-    kwargs = dict(torch_dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
     try:
         m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
         print(f"  [model] Loaded with flash_attention_2", flush=True)
