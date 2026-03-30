@@ -533,6 +533,17 @@ def main():
         del student
         free_gpu()
 
+        # Clean this student's HF cache to free disk between models
+        try:
+            import shutil
+            cache_name = f"models--{student_name.replace('/', '--')}"
+            cache_path = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub", cache_name)
+            if os.path.isdir(cache_path):
+                shutil.rmtree(cache_path)
+                print(f"  [cleanup] Removed cache: {cache_name}", flush=True)
+        except Exception:
+            pass
+
     # Summary
     total_time = time.time() - total_start
     timings["total"] = total_time
