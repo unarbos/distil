@@ -99,7 +99,7 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
 @click.option("--hotkey-name", default="validator")
 @click.option("--wallet-path", default="~/.bittensor/wallets/")
 @click.option("--lium-api-key", required=True, envvar="LIUM_API_KEY")
-@click.option("--lium-pod-name", default="overnight-train")
+@click.option("--lium-pod-name", default="distil-validator")
 @click.option("--state-dir", default="state")
 @click.option("--max-params-b", type=float, default=5.25)
 @click.option("--tempo", type=int, default=360, help="Seconds between epochs")
@@ -420,7 +420,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             ordered_uids.extend(challenger_uids_sorted)
             student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
             cmd = (
-                f"cd /home && CUDA_VISIBLE_DEVICES=1 python3 pod_eval.py "
+                f"cd /home && python3 pod_eval.py "
                 f"--teacher {TEACHER_MODEL} "
                 f"--students {student_list} "
                 f"--prompts prompts.json "
