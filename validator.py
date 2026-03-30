@@ -147,7 +147,7 @@ def load_model_with_timeout(model_repo, revision, device, dtype, timeout_seconds
 @click.option("--teacher-model", default=TEACHER_MODEL)
 @click.option("--max-param-ratio", type=float, default=DEFAULT_MAX_PARAM_RATIO)
 @click.option("--dataset-path", default="./dataset")
-@click.option("--samples-per-epoch", type=int, default=12)
+@click.option("--samples-per-epoch", type=int, default=80)
 @click.option("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
 @click.option("--max-eval-per-epoch", type=int, default=MAX_EVAL_PER_EPOCH)
 @click.option("--tempo", type=int, default=360, help="Seconds between evaluation epochs")

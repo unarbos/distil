@@ -115,26 +115,24 @@ def sample_prompts_from_dataset(
 
     from datasets import load_dataset
 
-    # Use block number to determine where in the dataset to sample from.
-    # FineWeb has ~15B documents. We hash the block number to get a large
-    # skip offset, then stream from there.
+    # Use block number to seed a deterministic but unpredictable prompt selection.
+    # We use the block as both the shuffle seed and a skip offset so each epoch
+    # draws from a different region of the dataset.
     block_hash = hashlib.sha256(str(block_number).encode()).hexdigest()
-    # Use first 12 hex chars → up to ~281 trillion, way more than dataset size.
-    # The streaming dataset wraps around, so any offset works.
-    skip_offset = int(block_hash[:12], 16) % 1_000_000_000  # mod 1B for safety
+    skip_offset = int(block_hash[:8], 16) % 50_000  # moderate skip to avoid slow seeks
 
     print(
         f"[dataset] Sampling {n} prompts from {dataset_name} "
-        f"(block={block_number}, offset={skip_offset:,})",
+        f"(block={block_number}, skip={skip_offset:,})",
         flush=True,
     )
 
+    # Stream with a small buffer to keep RAM usage low.
+    # The shuffle buffer_size controls how many items are held in memory for
+    # pseudo-random sampling. 5000 is enough for diversity without OOM.
     ds = load_dataset(dataset_name, split=split, streaming=True, name="default")
-    ds_shuffled = ds.shuffle(seed=block_number, buffer_size=10_000)
-
-    # Skip into the dataset using the block-derived offset.
-    # For efficiency, use skip() which is O(1) on streaming datasets.
-    ds_skipped = ds_shuffled.skip(skip_offset % 100_000)  # skip within shuffle buffer range
+    ds_shuffled = ds.shuffle(seed=block_number, buffer_size=5_000)
+    ds_skipped = ds_shuffled.skip(skip_offset)
 
     prompts: list[str] = []
     seen = 0
