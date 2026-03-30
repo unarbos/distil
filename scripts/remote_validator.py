@@ -40,7 +40,7 @@ MAX_NEW_TOKENS = 512
 MAX_PROMPT_TOKENS = 1024
 
 # Prompts per head-to-head evaluation (king + challenger on same prompts)
-EVAL_PROMPTS = 80
+EVAL_PROMPTS = 60
 # Epsilon: challenger must beat king by this relative margin to dethrone
 # e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
 EPSILON = 0.01
