@@ -23,3 +23,7 @@ dev = [
 gpu = [
     "flash-attn>=2.5.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["eval*", "api*", "sim*"]
+exclude = ["state*", "scripts*"]
