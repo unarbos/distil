@@ -170,9 +170,19 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     def save_evaluated():
         evaluated_file.write_text(json.dumps(list(evaluated_uids)))
 
-    # ── Upload eval script ──
-    logger.info("Uploading eval script to pod...")
-    lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+    # ── Upload eval script (with retry — SFTP can be flaky on Lium pods) ──
+    for _upload_attempt in range(5):
+        try:
+            logger.info(f"Uploading eval script to pod (attempt {_upload_attempt + 1}/5)...")
+            lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+            logger.info("Upload successful")
+            break
+        except Exception as e:
+            logger.warning(f"Upload failed: {e}")
+            if _upload_attempt < 4:
+                time.sleep(10 * (_upload_attempt + 1))
+            else:
+                raise RuntimeError(f"Failed to upload eval script after 5 attempts: {e}")
 
     while True:
         try:
@@ -426,11 +436,29 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             # Verify file is non-empty before uploading
             fsize = os.path.getsize(prompts_file)
             print(f"[VALIDATOR] Prompts file: {fsize} bytes, {len(prompt_texts)} prompts", flush=True)
-            lium.upload(pod, local=prompts_file, remote="/home/prompts.json")
+            for _up_att in range(3):
+                try:
+                    lium.upload(pod, local=prompts_file, remote="/home/prompts.json")
+                    break
+                except Exception as e:
+                    print(f"[VALIDATOR ERROR] Prompts upload failed (attempt {_up_att+1}/3): {e}", flush=True)
+                    if _up_att < 2:
+                        time.sleep(5)
+                    else:
+                        raise
             os.unlink(prompts_file)
 
             # Re-upload eval script (in case it changed)
-            lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+            for _up_att in range(3):
+                try:
+                    lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+                    break
+                except Exception as e:
+                    print(f"[VALIDATOR ERROR] Eval script upload failed (attempt {_up_att+1}/3): {e}", flush=True)
+                    if _up_att < 2:
+                        time.sleep(5)
+                    else:
+                        raise
 
             # Kill any background GPU processes to free VRAM for eval
             try:
