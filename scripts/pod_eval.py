@@ -530,6 +530,12 @@ def main():
         live_progress["current"] = None
         _write_progress()
 
+        # Save incremental results after each student so partial results survive restarts
+        results["timings"] = {k: round(v, 1) for k, v in timings.items()}
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"  [incremental] Saved results ({len(results['students'])}/{len(students)} students)", flush=True)
+
         del student
         free_gpu()
 
