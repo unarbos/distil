@@ -419,7 +419,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 eval_order.append({"uid": uid, "model": models_to_eval[uid]["model"], "role": "challenger"})
             progress = {
                 "active": True,
-                "phase": "scoring",
+                "phase": "teacher_loading",
                 "models": {str(uid): info["model"] for uid, info in models_to_eval.items()},
                 "eval_order": eval_order,
                 "students_total": len(models_to_eval),
