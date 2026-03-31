@@ -342,8 +342,42 @@ def main():
         _write_progress()
 
         t0 = time.time()
-        student = load_model(student_name, device)
-        student.eval()
+        STUDENT_LOAD_TIMEOUT = 300  # 5 minutes max to load a student model
+        try:
+            import signal
+            def _timeout_handler(signum, frame):
+                raise TimeoutError(f"Student model load timed out after {STUDENT_LOAD_TIMEOUT}s")
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(STUDENT_LOAD_TIMEOUT)
+            student = load_model(student_name, device)
+            student.eval()
+            signal.alarm(0)  # cancel alarm
+            signal.signal(signal.SIGALRM, old_handler)
+        except (TimeoutError, Exception) as e:
+            signal.alarm(0)
+            print(f"[eval] FAILED to load {student_name}: {e}", flush=True)
+            results["students"][student_name] = {
+                "status": "load_failed",
+                "error": str(e),
+                "kl_global_avg": None,
+            }
+            # Save incremental results
+            results["timings"] = {k: round(v, 1) for k, v in timings.items()}
+            with open(args.output, "w") as f:
+                json.dump(results, f, indent=2)
+            progress["completed"].append({
+                "student_name": student_name,
+                "status": "load_failed",
+                "status_detail": str(e),
+            })
+            progress["current"] = None
+            _write_progress()
+            try:
+                del student
+            except NameError:
+                pass
+            free_gpu()
+            continue
         load_time = time.time() - t0
         print(f"[eval] Loaded in {load_time:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
