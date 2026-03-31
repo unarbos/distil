@@ -75,7 +75,18 @@ def compute_kl(teacher_logits, student_logits):
 
 def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
     """KL using precomputed teacher log_softmax + probs. Saves ~50% compute."""
-    s_log_p = F.log_softmax(student_logits.float(), dim=-1)
+    s_logits = student_logits.float()
+    # Handle vocab size mismatch (student vs teacher)
+    t_vocab = t_log_p.shape[-1]
+    s_vocab = s_logits.shape[-1]
+    if s_vocab < t_vocab:
+        # Pad student logits with -inf (zero probability)
+        pad = torch.full((*s_logits.shape[:-1], t_vocab - s_vocab), -1e10,
+                         device=s_logits.device, dtype=s_logits.dtype)
+        s_logits = torch.cat([s_logits, pad], dim=-1)
+    elif s_vocab > t_vocab:
+        s_logits = s_logits[..., :t_vocab]
+    s_log_p = F.log_softmax(s_logits, dim=-1)
     return (t_p * (t_log_p - s_log_p)).sum(dim=-1)
 
 def load_model(name, device="cuda", dtype=torch.bfloat16):
@@ -159,7 +170,7 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=409
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", str(max_model_len),
         "--enable-prefix-caching",
-        "--disable-log-requests",
+        "--no-enable-log-requests",
     ]
 
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
