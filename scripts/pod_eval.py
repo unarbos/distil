@@ -469,7 +469,28 @@ def main():
             free_gpu()
             continue
         load_time = time.time() - t0
+        student_vram_gb = torch.cuda.memory_allocated() / 1024**3
         print(f"[eval] Loaded in {load_time:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+
+        # ANTI-CHEAT: VRAM usage check.
+        # A real ≤5B param model in bf16 uses ~10GB VRAM. The 35B teacher uses ~70GB.
+        # If a "4B" model uses >20GB VRAM, it's likely a larger model in disguise.
+        MAX_STUDENT_VRAM_GB = 20.0  # Very generous — real 4B is ~8-10GB
+        if student_vram_gb > MAX_STUDENT_VRAM_GB:
+            vram_msg = (f"FRAUD: Model claims ≤5B params but uses {student_vram_gb:.1f}GB VRAM "
+                       f"(max {MAX_STUDENT_VRAM_GB}GB for real ≤5B model). Skipping.")
+            print(f"  ⚠️ {vram_msg}", flush=True)
+            results["students"][student_name] = {
+                "status": "fraud_vram",
+                "reason": vram_msg,
+                "vram_gb": round(student_vram_gb, 1),
+                "kl_global_avg": float('inf'),
+            }
+            # Unload and continue
+            del student
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
 
         # --- Per-prompt sequential scoring with early stopping ---
         can_early_stop = (student_idx > 0) and (best_kl_so_far is not None)
@@ -636,6 +657,17 @@ def main():
             except Exception as gen_err:
                 print(f"  Generation benchmark failed: {gen_err}", flush=True)
 
+        # ANTI-CHEAT: Minimum generation speed check.
+        # A real ≤5B param model on a B200 (192GB) generates at 100+ tok/s.
+        # The 35B teacher generates at ~20-40 tok/s. If a "4B" model is suspiciously
+        # slow, it's likely a larger model in disguise.
+        MIN_TOKENS_PER_SEC = 50  # Real 4B models do 100+ tok/s on B200; 50 is very generous
+        speed_flag = None
+        if tokens_per_sec is not None and tokens_per_sec < MIN_TOKENS_PER_SEC:
+            speed_flag = (f"SUSPICIOUS: Generation speed {tokens_per_sec} tok/s is below minimum "
+                         f"{MIN_TOKENS_PER_SEC} tok/s for a ≤5B model. Possible oversized model.")
+            print(f"  ⚠️ {speed_flag}", flush=True)
+
         student_result = {
             "kl_global_avg": kl_global,
             "kl_per_prompt": kl_per_prompt,
@@ -643,6 +675,7 @@ def main():
             "load_time_s": round(load_time, 1),
             "scoring_time_s": round(scoring_time, 1),
             "tokens_per_sec": tokens_per_sec,
+            "speed_flag": speed_flag,
         }
         if is_functional_copy:
             student_result["functional_copy"] = True

@@ -864,8 +864,34 @@ else:
                     evaluated_uids.add(str(uid))
                     continue
 
+                # ANTI-CHEAT: Check for fraud signals from pod_eval
+                fraud_status = student_result.get("status", "")
+                if fraud_status == "fraud_vram":
+                    reason = student_result.get("reason", "VRAM fraud detected")
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): {reason}", flush=True)
+                    _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+                    disqualify(_hk, reason, dq_reasons)
+                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    evaluated_uids.add(str(uid))
+                    continue
+
+                speed_flag = student_result.get("speed_flag")
+                if speed_flag:
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): ⚠️ {speed_flag}", flush=True)
+
                 kl = student_result.get("kl_global_avg", float("inf"))
-                if kl == float("inf") or kl <= 0:
+
+                # ANTI-CHEAT: KL=0 or near-zero means the model IS the teacher
+                if kl <= 1e-6:
+                    reason = f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher (likely teacher weights)"
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): {reason}", flush=True)
+                    _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+                    disqualify(_hk, reason, dq_reasons)
+                    scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    evaluated_uids.add(str(uid))
+                    continue
+
+                if kl == float("inf") or kl < 0:
                     logger.warning(f"UID {uid}: invalid KL={kl}")
                     record_failure(uid, failures)
                     continue
