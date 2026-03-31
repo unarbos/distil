@@ -842,11 +842,16 @@ async def chat_with_king(request: Request):
         try:
             data = json.loads(stdout)
             if "choices" in data:
-                return {
+                resp = {
                     "response": data["choices"][0]["message"]["content"],
                     "model": king_model,
                     "king_uid": king_uid,
                 }
+                if "thinking" in data:
+                    resp["thinking"] = data["thinking"]
+                if "usage" in data:
+                    resp["usage"] = data["usage"]
+                return resp
             return {"error": "unexpected response", "details": stdout[:300]}
         except json.JSONDecodeError:
             return {"error": "chat server not responding — may be starting up", "details": stdout[:300]}
