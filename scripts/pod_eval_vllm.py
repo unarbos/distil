@@ -298,11 +298,16 @@ def main():
     parser.add_argument("--teacher-logits", default="/home/teacher_cache.pt")
     parser.add_argument("--save-teacher-logits", default=None)
     parser.add_argument("--king", default=None, help="King model name — stays in VRAM between rounds")
+    parser.add_argument("--gpu", type=int, default=None, help="GPU device index (for compatibility)")
+    parser.add_argument("--sequential", action="store_true", help="Ignored — for compatibility")
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90)
     parser.add_argument("--vllm-max-model-len", type=int, default=4096)
     args = parser.parse_args()
 
+    # Set CUDA device if specified
+    if args.gpu is not None and torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     students = [s.strip() for s in args.students.split(",") if s.strip()]
     timings = {}
