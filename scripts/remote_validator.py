@@ -116,7 +116,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     from eval.scoring import (
         load_scores, save_scores,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
-        load_disqualified, save_disqualified, disqualify, is_disqualified, get_dq_reason,
+        load_disqualified, save_disqualified, disqualify, is_disqualified, is_flagged, get_dq_reason,
         compute_winner_weights,
         append_score_history,
     )
@@ -312,9 +312,14 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                         continue
             commitments = {}
             uid_to_hotkey = {}
+            uid_to_coldkey = {}
             for uid in range(n_uids):
                 hotkey = str(metagraph.hotkeys[uid])
                 uid_to_hotkey[uid] = hotkey
+                try:
+                    uid_to_coldkey[uid] = str(metagraph.coldkeys[uid])
+                except Exception:
+                    pass
                 if hotkey in revealed and len(revealed[hotkey]) > 0:
                     block, data = revealed[hotkey][0]
                     try:
@@ -384,6 +389,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
                 print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
 
+                # Check if this miner's coldkey or HF username is flagged
+                hf_user = model_repo.split("/")[0] if "/" in model_repo else None
+                coldkey = uid_to_coldkey.get(uid)
+                flag_reason = is_flagged(coldkey=coldkey, hf_username=hf_user, dq=dq_reasons)
+                if flag_reason:
+                    print(f"[VALIDATOR] ⚠️ UID {uid} FLAGGED: {flag_reason}", flush=True)
+
                 # Architecture check
                 check = check_model_architecture(model_repo, revision, max_params_b)
                 if check.get("transient"):
@@ -393,7 +405,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not check["pass"]:
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
-                    disqualify(hotkey, f"arch: {check['reason']}", dq_reasons)
+                    hf_user = model_repo.split("/")[0] if "/" in model_repo else None
+                    coldkey = uid_to_coldkey.get(uid)
+                    disqualify(hotkey, f"arch: {check['reason']}", dq_reasons,
+                               coldkey=coldkey, hf_username=hf_user)
                     disqualified.add(uid)
                     continue
 
