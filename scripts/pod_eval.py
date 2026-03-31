@@ -65,6 +65,66 @@ def free_gpu():
         torch.cuda.synchronize()
 
 
+def generate_teacher_vllm(vllm_url, prompts, tokenizer, max_new_tokens, block_seed=None):
+    """
+    Generate teacher continuations via vLLM server.
+
+    Returns list of full sequences (prompt + continuation) as token ID tensors.
+    Uses vLLM's seeded sampling for reproducibility — miners using vLLM
+    with the same seed will get identical continuations.
+    """
+    import requests
+
+    full_sequences = []
+    for i, prompt_text in enumerate(prompts):
+        payload = {
+            "model": "teacher",  # vLLM model name (from --served-model-name or auto)
+            "prompt": prompt_text,
+            "max_tokens": max_new_tokens,
+            "temperature": 0.7 if block_seed is not None else 0.0,
+            "top_p": 0.9 if block_seed is not None else 1.0,
+        }
+        if block_seed is not None:
+            payload["seed"] = block_seed + i
+
+        # Try with served model name first, fall back to auto-detect
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    f"{vllm_url}/v1/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                break
+            except Exception as e:
+                if attempt == 0:
+                    # Auto-detect model name
+                    try:
+                        models_resp = requests.get(f"{vllm_url}/v1/models", timeout=10)
+                        model_name = models_resp.json()["data"][0]["id"]
+                        payload["model"] = model_name
+                        print(f"  [vllm] Auto-detected model: {model_name}", flush=True)
+                    except Exception:
+                        raise e
+                else:
+                    raise
+
+        continuation_text = result["choices"][0]["text"]
+        full_text = prompt_text + continuation_text
+
+        # Tokenize the full sequence
+        full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
+        full_sequences.append(full_ids)
+
+        prompt_len = tokenizer(prompt_text, return_tensors="pt", truncation=False).input_ids.shape[1]
+        gen_len = full_ids.shape[1] - prompt_len
+        print(f"  Prompt {i}: {prompt_len} prompt + {gen_len} gen tokens (vLLM)", flush=True)
+
+    return full_sequences
+
+
 def compute_kl(teacher_logits, student_logits):
     """KL(teacher || student) from logit tensors. Returns per-position KL."""
     t_log_p = F.log_softmax(teacher_logits.float(), dim=-1)
@@ -164,6 +224,9 @@ def main():
                         help="Save teacher logits to this path after generation.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing results — skip already-scored students.")
+    parser.add_argument("--teacher-vllm-url", type=str, default=None,
+                        help="vLLM server URL for teacher generation (e.g. http://localhost:8000). "
+                             "Uses vLLM for reproducible teacher continuations, HF for logits.")
     args = parser.parse_args()
 
     total_start = time.time()
@@ -236,7 +299,68 @@ def main():
             print(f"[eval] ✗ Cache load failed: {e}. Re-running teacher.", flush=True)
 
     if not teacher_cache_loaded:
-        # Run teacher inference
+        # ── vLLM path: generate continuations via API, then HF forward pass for logits ──
+        if args.teacher_vllm_url:
+            print(f"\n[eval] Generating teacher continuations via vLLM: {args.teacher_vllm_url}", flush=True)
+            t0 = time.time()
+            vllm_sequences = generate_teacher_vllm(
+                args.teacher_vllm_url, prompts, tokenizer, args.max_new_tokens, args.block_seed
+            )
+            timings["teacher_vllm_generation"] = time.time() - t0
+            print(f"[eval] vLLM generation complete in {timings['teacher_vllm_generation']:.1f}s", flush=True)
+
+            # Now load HF teacher for forward pass to get full logits
+            print(f"\n[eval] Loading teacher (HF) for logits forward pass: {args.teacher}", flush=True)
+            t0 = time.time()
+            teacher = load_model(args.teacher, device)
+            teacher.eval()
+            timings["teacher_load"] = time.time() - t0
+            print(f"[eval] Teacher loaded in {timings['teacher_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+
+            print(f"[eval] Computing teacher logits on vLLM-generated sequences...", flush=True)
+            t0 = time.time()
+            with torch.no_grad():
+                for i, full_ids in enumerate(vllm_sequences):
+                    full_ids = full_ids.to(device)
+                    prompt_len = input_ids_list[i].shape[1]
+                    prompt_lens.append(prompt_len)
+                    full_sequences.append(full_ids)
+
+                    logits = teacher(full_ids).logits.float()
+                    cont_logits = logits[:, prompt_len - 1:-1, :]
+                    teacher_logits_list.append(cont_logits.cpu())
+
+                    if (i + 1) % 5 == 0:
+                        print(f"  Logits {i + 1}/{len(vllm_sequences)}, VRAM: {gpu_mem_str()}", flush=True)
+
+            timings["teacher_logits_pass"] = time.time() - t0
+            print(f"[eval] Logits pass complete in {timings['teacher_logits_pass']:.1f}s", flush=True)
+
+            # Save teacher cache
+            teacher_cache_path = args.save_teacher_logits or os.path.join(
+                os.path.dirname(args.output), "teacher_cache.pt"
+            )
+            print(f"[eval] Saving teacher logits to {teacher_cache_path}", flush=True)
+            torch.save({
+                "full_sequences": [s.cpu() for s in full_sequences],
+                "teacher_logits": teacher_logits_list,
+                "prompt_lens": prompt_lens,
+                "block_seed": args.block_seed,
+                "prompts_hash": prompts_hash,
+                "generation_method": "vllm",
+                "vllm_url": args.teacher_vllm_url,
+            }, teacher_cache_path)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"[eval] Teacher logits saved, VRAM: {gpu_mem_str()}", flush=True)
+
+        else:
+            # ── HF path: generate + logits in one pass (legacy) ──
+            pass  # fall through to existing HF code below
+
+    if not teacher_cache_loaded and not args.teacher_vllm_url:
+        # Run teacher inference (HF transformers — legacy path)
         print(f"\n[eval] Loading teacher: {args.teacher}", flush=True)
         t0 = time.time()
         teacher = load_model(args.teacher, device)
