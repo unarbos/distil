@@ -491,13 +491,42 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                         king_kl = scores[uid_str]
                         king_uid = uid
 
+            # ── Load persistent model score history ──
+            # Tracks best-ever KL by model repo name (not UID — UIDs recycle).
+            # Models that scored terribly before don't need re-evaluation even
+            # on new prompt sets — they're clearly not competitive.
+            model_history_file = state_path / "model_score_history.json"
+            model_score_history = {}
+            if model_history_file.exists():
+                try:
+                    model_score_history = json.loads(model_history_file.read_text())
+                except Exception:
+                    pass
+
             # Challengers = valid models that haven't been successfully evaluated yet
-            # A UID is only "evaluated" if it has a score — handles cases where
-            # eval was tainted (e.g. exploit) and score was never written
-            challengers = {
-                uid: info for uid, info in valid_models.items()
-                if str(uid) not in evaluated_uids or str(uid) not in scores
-            }
+            challengers = {}
+            skipped_known_bad = 0
+            for uid, info in valid_models.items():
+                uid_str = str(uid)
+                # Already scored in THIS round's scoring context — skip
+                if uid_str in evaluated_uids and uid_str in scores:
+                    continue
+                # Check persistent model history — if this model scored > 2x king's KL
+                # on ANY previous evaluation, don't waste GPU time re-evaluating it.
+                # It's clearly not competitive regardless of prompt set variance.
+                model_name = info["model"]
+                best_ever = model_score_history.get(model_name, {}).get("best_kl")
+                if best_ever is not None and king_kl < float("inf"):
+                    skip_threshold = max(king_kl * 2.0, king_kl + 0.05)  # 2x king or king+0.05, whichever is larger
+                    if best_ever > skip_threshold:
+                        skipped_known_bad += 1
+                        if not evaluated_uids.__contains__(uid_str):
+                            evaluated_uids.add(uid_str)
+                        continue
+                challengers[uid] = info
+
+            if skipped_known_bad:
+                print(f"[VALIDATOR] Skipped {skipped_known_bad} models with historically bad scores (>2x king KL)", flush=True)
 
             # Sanity check: if too many challengers, something may be wrong with state
             MAX_REASONABLE_CHALLENGERS = 20
@@ -1179,6 +1208,31 @@ else:
             save_failures(failures, state_path)
             save_disqualified(dq_reasons, state_path)
             save_evaluated()
+
+            # ── Update persistent model score history ──
+            # Track best-ever KL by model name so we never re-eval known-bad models.
+            model_history_file = state_path / "model_score_history.json"
+            model_score_history = {}
+            if model_history_file.exists():
+                try:
+                    model_score_history = json.loads(model_history_file.read_text())
+                except Exception:
+                    pass
+            for uid, info in models_to_eval.items():
+                uid_str = str(uid)
+                model_name = info["model"]
+                if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
+                    kl = scores[uid_str]
+                    prev = model_score_history.get(model_name, {})
+                    prev_best = prev.get("best_kl", float("inf"))
+                    if kl < prev_best:
+                        model_score_history[model_name] = {
+                            "best_kl": round(kl, 6),
+                            "uid": uid,
+                            "block": current_block,
+                            "timestamp": time.time(),
+                        }
+            model_history_file.write_text(json.dumps(model_score_history, indent=2))
 
             # ── Append score history (non-DQ scores only) ──
             valid_scores = {
