@@ -406,7 +406,42 @@ def main():
         model_start_time = time.time()
         t0 = time.time()
         STUDENT_LOAD_TIMEOUT = 300  # 5 minutes max to load a student model
+
+        # All model loading wrapped in one try/except so any failure (including
+        # subprocess probe crashes) gets handled gracefully and doesn't kill the round
         try:
+            # Step 1: Probe load in subprocess to catch segfaults
+            import subprocess
+            probe_code = f"""
+import sys
+try:
+    from transformers import AutoModelForCausalLM, AutoConfig
+    config = AutoConfig.from_pretrained("{student_name}", trust_remote_code=False)
+    model = AutoModelForCausalLM.from_pretrained("{student_name}", config=config, trust_remote_code=False, device_map="cpu", torch_dtype="auto")
+    del model
+    sys.exit(0)
+except Exception as e:
+    print(f"PROBE_FAIL: {{e}}", file=sys.stderr)
+    sys.exit(1)
+"""
+            try:
+                probe_result = subprocess.run(
+                    [sys.executable, "-c", probe_code],
+                    capture_output=True, text=True, timeout=STUDENT_LOAD_TIMEOUT
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"Model probe timed out after {STUDENT_LOAD_TIMEOUT}s")
+
+            if probe_result.returncode < 0:
+                sig_name = {-11: "SIGSEGV (segfault)", -9: "SIGKILL", -6: "SIGABRT"}.get(probe_result.returncode, f"signal {-probe_result.returncode}")
+                raise RuntimeError(f"Model probe crashed with {sig_name}")
+            elif probe_result.returncode != 0:
+                stderr = probe_result.stderr.strip()
+                raise RuntimeError(f"Model probe failed: {stderr[-500:]}")
+
+            print(f"[eval] Probe load OK ({time.time() - t0:.1f}s), loading on GPU...", flush=True)
+
+            # Step 2: Probe passed — safe to load in main process
             import signal
             def _timeout_handler(signum, frame):
                 raise TimeoutError(f"Student model load timed out after {STUDENT_LOAD_TIMEOUT}s")
@@ -414,10 +449,14 @@ def main():
             signal.alarm(STUDENT_LOAD_TIMEOUT)
             student = load_model(student_name, device)
             student.eval()
-            signal.alarm(0)  # cancel alarm
-            signal.signal(signal.SIGALRM, old_handler)
-        except (TimeoutError, Exception) as e:
             signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+        except (TimeoutError, Exception) as e:
+            try:
+                signal.alarm(0)
+            except Exception:
+                pass
             print(f"[eval] FAILED to load {student_name}: {e}", flush=True)
             results["students"][student_name] = {
                 "status": "load_failed",
