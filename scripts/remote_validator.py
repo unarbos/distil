@@ -470,7 +470,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     else:
                         raise
 
-            # Clear stale results from previous eval round (prevents --resume from reusing old scores)
+            # Clear ALL stale results from previous eval round.
+            # Must clear eval_results.json too — it contains scores from different prompts.
+            # Teacher cache causes stale king scores; result files cause --resume to skip re-eval.
+            # Crash recovery is handled at validator level (evaluated_uids), not pod level.
             try:
                 lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
                 print("[VALIDATOR] Cleared stale pod cache", flush=True)
@@ -704,10 +707,18 @@ else:
                     print(f"  GPU ERR: {line[:200]}", flush=True)
             # ── Download results (try even on failure — partial results may exist) ──
             results_local = str(state_path / "last_eval.json")
-            try:
-                lium.download(pod, remote="/home/eval_results.json", local=results_local)
-            except Exception as e:
-                logger.error(f"Failed to download results: {e}")
+            download_ok = False
+            for _dl_attempt in range(3):
+                try:
+                    lium.download(pod, remote="/home/eval_results.json", local=results_local)
+                    download_ok = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Download attempt {_dl_attempt+1}/3 failed: {e}")
+                    if _dl_attempt < 2:
+                        time.sleep(5)
+            if not download_ok:
+                logger.error("Failed to download results after 3 attempts")
                 if not result['success']:
                     print(f"[VALIDATOR] Eval failed and no results to recover, skipping", flush=True)
                     with open(progress_path, "w") as f:
