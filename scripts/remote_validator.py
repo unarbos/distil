@@ -902,6 +902,11 @@ else:
                 # Single GPU: original sequential eval
                 # --resume + --teacher-logits: if a prior eval crashed mid-round,
                 # reuse teacher logits and skip already-scored students.
+                # Build eval command — use vLLM script if enabled
+                king_flag = ""
+                if use_vllm and king_uid is not None and king_uid in models_to_eval:
+                    king_model_name = models_to_eval[king_uid]["model"]
+                    king_flag = f" --king {king_model_name}"
                 cmd = (
                     f"cd /home && python3 pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -914,6 +919,7 @@ else:
                     f"--teacher-logits /home/teacher_cache.pt "
                     f"--save-teacher-logits /home/teacher_cache.pt "
                     f"--resume"
+                    f"{king_flag}"
                 )
                 print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
