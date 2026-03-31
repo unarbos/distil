@@ -654,8 +654,21 @@ else:
                 poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
                 poll_thread.start()
 
+                EVAL_TIMEOUT = 45 * 60  # 45 minutes max for full eval
+                eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
                 try:
-                    result = lium.exec(pod, command=cmd)
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        future = pool.submit(lium.exec, pod, command=cmd, env=eval_env)
+                        try:
+                            result = future.result(timeout=EVAL_TIMEOUT)
+                        except concurrent.futures.TimeoutError:
+                            print(f"[VALIDATOR] Eval timed out after {EVAL_TIMEOUT}s — killing pod process and recovering partial results", flush=True)
+                            try:
+                                lium.exec(pod, command="pkill -9 -f pod_eval.py; echo killed")
+                            except Exception:
+                                pass
+                            result = {"stdout": "", "stderr": "timeout", "exit_code": -1, "success": False}
                     print(f"[VALIDATOR] Pod exit code: {result['exit_code']}", flush=True)
                 except Exception as exec_err:
                     print(f"[VALIDATOR] lium.exec EXCEPTION: {exec_err}", flush=True)
