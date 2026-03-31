@@ -400,9 +400,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             # Sort challengers by commit block (earliest first) — used for both
             # progress display and eval ordering
-            import random
-            challenger_uids_sorted = [uid for uid in models_to_eval if uid != king_uid]
-            random.shuffle(challenger_uids_sorted)  # randomize order so no one gets a consistent position advantage
+            challenger_uids_sorted = sorted(
+                [uid for uid in models_to_eval if uid != king_uid],
+                key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")),
             )
 
             # ── Write eval progress (for dashboard live display) ──
