@@ -67,10 +67,15 @@ def free_gpu():
         torch.cuda.synchronize()
 
 def compute_kl(teacher_logits, student_logits):
-    """KL(teacher || student) per position."""
+    """KL(teacher || student) per position. For one-off use."""
     t_log_p = F.log_softmax(teacher_logits.float(), dim=-1)
     s_log_p = F.log_softmax(student_logits.float(), dim=-1)
     t_p = t_log_p.exp()
+    return (t_p * (t_log_p - s_log_p)).sum(dim=-1)
+
+def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
+    """KL using precomputed teacher log_softmax + probs. Saves ~50% compute."""
+    s_log_p = F.log_softmax(student_logits.float(), dim=-1)
     return (t_p * (t_log_p - s_log_p)).sum(dim=-1)
 
 def load_model(name, device="cuda", dtype=torch.bfloat16):
@@ -497,6 +502,33 @@ def main():
         print(f"[eval] HF generation done in {timings['teacher_generation']:.1f}s, teacher unloaded", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
+    # PHASE 1c: Move teacher logits to GPU + precompute softmax
+    # ═══════════════════════════════════════════════════════════════════
+    # Teacher logits are ~17GB for 60 prompts × 512 tokens × 152K vocab.
+    # B200 has 192GB — we use ~40GB total (king 8GB + challenger 8GB + logits 17GB).
+    # Keeping them on GPU eliminates ~93GB of PCIe transfers per round
+    # (18.7GB × 5 students). Precomputing log_softmax + probs saves ~50%
+    # of KL computation (teacher side computed once, not per-student).
+    print(f"\n[eval] Moving teacher logits to GPU + precomputing softmax...", flush=True)
+    t0 = time.time()
+    teacher_log_probs = []  # precomputed F.log_softmax for each prompt
+    teacher_probs = []      # precomputed exp(log_softmax) for each prompt
+    for i in range(len(teacher_logits_list)):
+        tl = teacher_logits_list[i].to(device).float()
+        t_log_p = F.log_softmax(tl, dim=-1)
+        t_p = t_log_p.exp()
+        teacher_log_probs.append(t_log_p)
+        teacher_probs.append(t_p)
+        del tl  # raw logits no longer needed on GPU
+    # Free the CPU copies
+    del teacher_logits_list
+    gc.collect()
+    timings["teacher_gpu_precompute"] = time.time() - t0
+    teacher_vram = sum(t.element_size() * t.nelement() for t in teacher_log_probs) / 1024**3
+    teacher_vram += sum(t.element_size() * t.nelement() for t in teacher_probs) / 1024**3
+    print(f"[eval] Teacher on GPU: {teacher_vram:.1f}GB, precomputed in {timings['teacher_gpu_precompute']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+
+    # ═══════════════════════════════════════════════════════════════════
     # PHASE 2: Student scoring
     # ═══════════════════════════════════════════════════════════════════
 
@@ -657,7 +689,10 @@ def main():
                 king_model = student
                 print(f"[eval] King loaded — will stay in VRAM", flush=True)
 
-        # ── Score: per-prompt sequential with early stopping ──
+        # ── Score: per-prompt with precomputed teacher, early stopping ──
+        # Teacher log_probs and probs are already on GPU (precomputed in Phase 1c).
+        # No CPU→GPU transfers needed. Student does forward pass, we compute KL
+        # using precomputed teacher side (saves ~50% of KL compute).
         can_early_stop = (student_idx > 0) and (best_kl_so_far is not None)
         kl_per_prompt = []
         prompt_kl_means = []
@@ -670,13 +705,19 @@ def main():
                 try:
                     full_seq = full_sequences[i]
                     prompt_len = prompt_lens[i]
-                    t_logits = teacher_logits_list[i].to(device)
+                    # Teacher side: already on GPU, precomputed
+                    t_log_p = teacher_log_probs[i]
+                    t_p = teacher_probs[i]
+                    # Student forward pass
                     s_logits = student(full_seq).logits.float()
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
-                    min_len = min(cont_s.shape[1], t_logits.shape[1])
-                    kl_per_pos = compute_kl(t_logits[:, :min_len, :], cont_s[:, :min_len, :]).squeeze(0)
+                    min_len = min(cont_s.shape[1], t_log_p.shape[1])
+                    # KL with precomputed teacher (skip teacher softmax)
+                    kl_per_pos = compute_kl_from_precomputed(
+                        t_log_p[:, :min_len, :], t_p[:, :min_len, :], cont_s[:, :min_len, :]
+                    ).squeeze(0)
                     kl_mean = kl_per_pos.mean().item()
-                    del s_logits, cont_s, t_logits, kl_per_pos
+                    del s_logits, cont_s, kl_per_pos
 
                     if math.isnan(kl_mean) or math.isinf(kl_mean):
                         print(f"  [prompt {i}] KL={kl_mean} — invalid, stopping", flush=True)
