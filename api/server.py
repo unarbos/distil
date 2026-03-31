@@ -7,7 +7,61 @@ import os
 import threading
 import requests as req
 
-app = FastAPI(title="Distillation Subnet API")
+# Load .env from repo root
+_env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+API_DESCRIPTION = """
+# Distil — Subnet 97 API
+
+Public API for [Distil](https://distil.arbos.life), a Bittensor subnet where miners compete to produce the best knowledge-distilled small language models.
+
+## How It Works
+
+Miners submit distilled models (currently ≤4B params, based on Qwen 3.5). A validator evaluates them head-to-head against the reigning **king** model using KL-divergence on shared prompts. Lower KL = better distillation = higher rewards.
+
+## Quick Start
+
+```bash
+# Who's the current king?
+curl https://api.arbos.life/api/health
+
+# Get all miner scores
+curl https://api.arbos.life/api/scores
+
+# Get token price
+curl https://api.arbos.life/api/price
+```
+
+## Links
+
+- **Dashboard**: [distil.arbos.life](https://distil.arbos.life)
+- **GitHub**: [github.com/unarbos/distil](https://github.com/unarbos/distil)
+- **TaoMarketCap**: [taomarketcap.com/subnets/97](https://taomarketcap.com/subnets/97)
+- **Twitter**: [@arbos_born](https://x.com/arbos_born)
+"""
+
+app = FastAPI(
+    title="Distil — Subnet 97 API",
+    description=API_DESCRIPTION,
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_tags=[
+        {"name": "Overview", "description": "API info and health checks"},
+        {"name": "Metagraph", "description": "On-chain subnet data — UIDs, stakes, weights, incentive"},
+        {"name": "Miners", "description": "Miner model commitments and scores"},
+        {"name": "Evaluation", "description": "Live eval progress, head-to-head rounds, and score history"},
+        {"name": "Market", "description": "Token pricing, emission, and market data"},
+        {"name": "Chat", "description": "Chat with the current king model (when GPU is available)"},
+    ],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -218,28 +272,25 @@ def _fetch_price():
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/")
+from fastapi.responses import RedirectResponse
+
+@app.get("/", include_in_schema=False)
 def root():
-    """API overview — shown when visiting api.arbos.life directly."""
-    return {
-        "name": "Distil — Subnet 97 API",
-        "dashboard": "https://distil.arbos.life",
-        "github": "https://github.com/unarbos/distil",
-        "endpoints": {
-            "/api/metagraph": "Full subnet metagraph (UIDs, stakes, weights, incentive)",
-            "/api/commitments": "Miner model commitments (HuggingFace links)",
-            "/api/scores": "Current KL scores, disqualifications, last eval details",
-            "/api/price": "Token price, emission, market data",
-            "/api/model-info/{repo}": "HuggingFace model card info (params, MoE, tags, etc.)",
-            "/api/history": "Score history over time (for trendline chart)",
-            "/api/eval-progress": "Live eval progress (phase, models, prompts done)",
-            "/api/announcement": "Pending announcements (new king, etc.)",
-            "/api/health": "Service health check",
-        },
-    }
+    """Redirect to interactive API docs."""
+    return RedirectResponse(url="/docs")
 
 
-@app.get("/api/metagraph")
+@app.get("/api/metagraph", tags=["Metagraph"], summary="Full subnet metagraph",
+         description="""Returns all 256 UIDs with on-chain data: hotkey, coldkey, stake, trust, consensus, incentive, emission, and dividends.
+
+**Cached for 60s** — background refreshes keep data fresh without blocking requests.
+
+Response includes:
+- `block`: Current Bittensor block number
+- `n`: Number of UIDs in the subnet (256)
+- `neurons[]`: Array of all UIDs with their on-chain metrics
+""",
+         response_description="Metagraph with all 256 UIDs and their on-chain metrics")
 def get_metagraph():
     # Fast: return cache immediately, refresh in background if stale
     cached = _get_cached("metagraph", CACHE_TTL)
@@ -259,7 +310,16 @@ def get_metagraph():
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 
-@app.get("/api/commitments")
+@app.get("/api/commitments", tags=["Miners"], summary="Miner model commitments",
+         description="""Returns all miner HuggingFace model commitments (on-chain).
+
+Each commitment contains:
+- `model`: HuggingFace repo (e.g. `aceini/q-dist`)
+- `revision`: Git commit SHA of the submitted model
+- `block`: Block number when the commitment was made
+
+**Cached for 60s.**
+""")
 def get_commitments():
     cached = _get_cached("commitments", CACHE_TTL)
     if cached:
@@ -276,7 +336,17 @@ def get_commitments():
         return {"commitments": {}, "count": 0, "error": str(e)}
 
 
-@app.get("/api/scores")
+@app.get("/api/scores", tags=["Miners"], summary="Current KL scores and disqualifications",
+         description="""Returns the latest KL-divergence scores for all evaluated miners, plus disqualification status.
+
+Response includes:
+- `scores`: Map of UID → KL score (lower is better)
+- `ema_scores`: Same as scores (backward compat)
+- `disqualified`: Map of UID → disqualification reason
+- `last_eval`: Details of the most recent evaluation round
+- `last_eval_time`: Unix timestamp of last eval
+- `tempo_seconds`: Seconds between evaluation rounds (currently 600)
+""")
 def get_scores():
     result = {"scores": {}, "ema_scores": {}, "disqualified": {}, "last_eval": None, "last_eval_time": None, "tempo_seconds": 600}
     scores_path = os.path.join(STATE_DIR, "scores.json")
@@ -293,7 +363,20 @@ def get_scores():
     return result
 
 
-@app.get("/api/price")
+@app.get("/api/price", tags=["Market"], summary="Token price and market data",
+         description="""Returns SN97 alpha token pricing, TAO/USD rate, pool liquidity, emission, and volume.
+
+Response includes:
+- `alpha_price_tao` / `alpha_price_usd`: Current alpha token price
+- `tao_usd`: TAO/USD exchange rate (via CoinGecko)
+- `alpha_in_pool` / `tao_in_pool`: DEX pool liquidity
+- `marketcap_tao`: Total market cap in TAO
+- `emission_pct`: Current emission allocation percentage
+- `price_change_1h`, `_24h`, `_7d`: Price change percentages
+- `miners_tao_per_day`: Total TAO earned by miners per day
+
+**Cached for 30s.**
+""")
 def get_price():
     cached = _get_cached("price", 30)
     if cached:
@@ -310,9 +393,22 @@ def get_price():
         return {"error": str(e)}
 
 
-@app.get("/api/model-info/{model_path:path}")
+@app.get("/api/model-info/{model_path:path}", tags=["Miners"], summary="HuggingFace model info",
+         description="""Fetches model card metadata from HuggingFace for a given repo.
+
+**Example**: `/api/model-info/aceini/q-dist`
+
+Response includes:
+- `params_b`: Total parameters in billions
+- `is_moe`: Whether the model uses Mixture of Experts
+- `num_experts` / `num_active_experts`: MoE configuration
+- `tags`, `license`, `pipeline_tag`: HuggingFace metadata
+- `downloads`, `likes`: Popularity metrics
+- `base_model`: Parent model (if distilled/fine-tuned)
+
+**Cached for 1 hour.**
+""")
 def get_model_info(model_path: str):
-    """Fetch HuggingFace model card info (cached 1h)."""
     cache_key = f"model_info:{model_path}"
     cached = _get_cached(cache_key, 3600)
     if cached:
@@ -379,9 +475,9 @@ print(json.dumps(result))
         return {"error": str(e), "model": model_path}
 
 
-@app.get("/api/announcement")
+@app.get("/api/announcement", tags=["Evaluation"], summary="Pending announcements",
+         description="Returns pending announcements (e.g., new king crowned). Returns `{type: null}` if none pending.")
 def get_announcement():
-    """Pending announcements (e.g., new king). Mark as posted via POST."""
     ann_path = os.path.join(STATE_DIR, "announcement.json")
     if os.path.exists(ann_path):
         try:
@@ -394,9 +490,9 @@ def get_announcement():
     return {"type": None}
 
 
-@app.post("/api/announcement/claim")
+@app.post("/api/announcement/claim", tags=["Evaluation"], summary="Claim pending announcement",
+          description="Atomically reads and marks an announcement as posted. Returns the announcement content, or `{type: null}` if none pending.")
 def claim_announcement():
-    """Atomically claim a pending announcement — returns it and marks posted in one call."""
     ann_path = os.path.join(STATE_DIR, "announcement.json")
     if os.path.exists(ann_path):
         try:
@@ -412,9 +508,9 @@ def claim_announcement():
     return {"type": None}
 
 
-@app.post("/api/announcement/posted")
+@app.post("/api/announcement/posted", tags=["Evaluation"], summary="Mark announcement as posted",
+          description="Marks the current announcement as posted. Legacy endpoint — prefer `/api/announcement/claim`.")
 def mark_announcement_posted():
-    """Mark the current announcement as posted (legacy compat)."""
     ann_path = os.path.join(STATE_DIR, "announcement.json")
     if os.path.exists(ann_path):
         try:
@@ -429,9 +525,19 @@ def mark_announcement_posted():
     return {"ok": True, "note": "no announcement"}
 
 
-@app.get("/api/eval-progress")
+@app.get("/api/eval-progress", tags=["Evaluation"], summary="Live evaluation progress",
+         description="""Shows what the validator is currently doing in real-time.
+
+When `active: true`, the response includes:
+- `phase`: Current eval phase (e.g. `teacher_generation`, `student_eval`)
+- `students_total`: How many miners are being evaluated
+- `completed[]`: UIDs that have finished this round
+- `current`: Details on the student being evaluated right now (name, prompts done, running KL mean)
+- `prompts_total`: Total prompts in this round
+
+When `active: false`, the validator is idle between rounds.
+""")
 def get_eval_progress():
-    """Live eval progress — what the validator is currently doing."""
     progress_path = os.path.join(STATE_DIR, "eval_progress.json")
     if os.path.exists(progress_path):
         try:
@@ -442,9 +548,20 @@ def get_eval_progress():
     return {"active": False}
 
 
-@app.get("/api/h2h-latest")
+@app.get("/api/h2h-latest", tags=["Evaluation"], summary="Latest head-to-head round",
+         description="""Returns results from the most recent evaluation round where miners compete against the king.
+
+Response includes:
+- `block`: Block when this round was scored
+- `king_uid`: Current king's UID
+- `king_h2h_kl`: King's KL score in this round
+- `king_global_kl`: King's smoothed global KL
+- `epsilon` / `epsilon_threshold`: How close a challenger must get to dethrone the king
+- `n_prompts`: Number of prompts used
+- `results[]`: Array of `{uid, model, kl, is_king, vs_king}` for each evaluated miner
+- `king_changed`: Whether the king was dethroned this round
+""")
 def get_h2h_latest():
-    """Latest H2H round results — king vs challengers on same prompts."""
     path = os.path.join(STATE_DIR, "h2h_latest.json")
     if os.path.exists(path):
         try:
@@ -455,9 +572,9 @@ def get_h2h_latest():
     return {"error": "No H2H data yet"}
 
 
-@app.get("/api/h2h-history")
+@app.get("/api/h2h-history", tags=["Evaluation"], summary="Head-to-head round history",
+         description="Returns the last 50 evaluation rounds. Each entry has the same structure as `/api/h2h-latest`.")
 def get_h2h_history():
-    """H2H round history (last 50 rounds)."""
     path = os.path.join(STATE_DIR, "h2h_history.json")
     if os.path.exists(path):
         try:
@@ -468,9 +585,9 @@ def get_h2h_history():
     return []
 
 
-@app.get("/api/tmc-config")
+@app.get("/api/tmc-config", tags=["Market"], summary="TaoMarketCap SSE config",
+         description="Returns SSE (Server-Sent Events) URLs for real-time price and subnet data from TaoMarketCap. Used by the dashboard for live price updates.")
 def get_tmc_config():
-    """SSE config — key is proxied server-side, not exposed to frontend."""
     return {
         "sse_price_url": f"{TMC_BASE}/public/v1/sse/subnets/prices/",
         "sse_subnet_url": f"{TMC_BASE}/public/v1/sse/subnets/{NETUID}/",
@@ -478,9 +595,9 @@ def get_tmc_config():
     }
 
 
-@app.get("/api/history")
+@app.get("/api/history", tags=["Evaluation"], summary="Score history over time",
+         description="Returns historical KL scores for all miners over time. Used by the dashboard trendline chart. Each entry contains a timestamp and UID → score mapping.")
 def get_history():
-    """Return score history for trendline chart."""
     history_path = os.path.join(STATE_DIR, "score_history.json")
     if os.path.exists(history_path):
         try:
@@ -491,10 +608,21 @@ def get_history():
     return []
 
 
-@app.get("/api/health")
+@app.get("/api/health", tags=["Overview"], summary="Service health and quick status",
+         description="""One-stop health check that returns the current state of the validator and subnet.
+
+Response includes:
+- `status`: `ok` if the API is running
+- `king_uid` / `king_kl`: Current king and their KL score (lower = better)
+- `n_scored` / `n_disqualified`: Number of active vs disqualified miners
+- `last_eval_block` / `last_eval_age_min`: When the last eval happened
+- `eval_active`: Whether an evaluation round is in progress right now
+- `eval_progress`: Detailed progress if eval is active (phase, students done, current KL, etc.)
+
+This is the best endpoint to start with — gives you a quick overview of the entire subnet state.
+""")
 def health():
     import time as _time
-    # Check last eval time from h2h-latest
     last_eval_block = None
     last_eval_age_min = None
     eval_active = False
@@ -570,9 +698,15 @@ def _sanitize_log_line(line: str) -> str | None:
     return cleaned
 
 
-@app.get("/api/gpu-logs")
+@app.get("/api/gpu-logs", tags=["Evaluation"], summary="Recent GPU evaluation logs",
+         description="""Returns sanitized recent logs from the GPU evaluation pod and validator process.
+
+Query parameters:
+- `lines`: Number of log lines to return (default 50, max 200)
+
+Logs are sanitized — API keys, internal paths, and sensitive data are stripped. Lines are prefixed with source tags like `[GPU]`, `[eval]`, `[VALIDATOR]`.
+""")
 def gpu_logs(lines: int = 50):
-    """Stream recent GPU eval logs — combines pod output + validator events."""
     import subprocess
     max_lines = min(lines, 200)
     log_lines = []
@@ -622,45 +756,62 @@ def gpu_logs(lines: int = 50):
 # ── Chat with king model ──────────────────────────────────────────────────────
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse
-import asyncio
 
-_chat_lock = threading.Lock()
-_chat_last_used = 0.0
+# Chat server runs on the GPU pod at port 8100 (scripts/chat_server.py).
+# We proxy requests via Lium SSH exec + curl.
+CHAT_POD_PORT = 8100
 
-CHAT_SCRIPT = r'''
-import sys, json, torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_name = sys.argv[1]
-messages_json = sys.argv[2]
-max_tokens = int(sys.argv[3])
+def _get_king_info():
+    """Get king UID and model name."""
+    h2h = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
+    king_uid = h2h.get("king_uid")
+    if king_uid is None:
+        return None, None
 
-messages = json.loads(messages_json)
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype=torch.bfloat16, device_map="auto"
-)
-model.eval()
+    # Try h2h results first (has model directly)
+    for r in h2h.get("results", []):
+        if r.get("is_king") or r.get("uid") == king_uid:
+            return king_uid, r.get("model")
 
-text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    # Fallback: commitments cache (hotkey-keyed, need metagraph for UID→hotkey)
+    metagraph = _safe_json_load(os.path.join(DISK_CACHE_DIR, "metagraph.json"), {})
+    commitments_data = _safe_json_load(os.path.join(DISK_CACHE_DIR, "commitments.json"), {})
+    commitments = commitments_data.get("commitments", commitments_data) if isinstance(commitments_data, dict) else {}
 
-with torch.no_grad():
-    output = model.generate(
-        **inputs, max_new_tokens=max_tokens, do_sample=True,
-        temperature=0.7, top_p=0.9, repetition_penalty=1.1
-    )
-new_tokens = output[0][inputs["input_ids"].shape[1]:]
-response = tokenizer.decode(new_tokens, skip_special_tokens=True)
-print(json.dumps({"response": response}))
-'''
+    # Build UID→hotkey from metagraph
+    uids = metagraph.get("uids", [])
+    hotkeys = metagraph.get("hotkeys", [])
+    king_hotkey = None
+    for i, uid in enumerate(uids):
+        if uid == king_uid and i < len(hotkeys):
+            king_hotkey = hotkeys[i]
+            break
+
+    if king_hotkey and king_hotkey in commitments:
+        info = commitments[king_hotkey]
+        return king_uid, info.get("model") if isinstance(info, dict) else info
+
+    return king_uid, None
+
+
+def _lium_pod():
+    """Get Lium client and pod."""
+    from lium import Lium, Config
+    from pathlib import Path
+    lium_key = os.environ.get("LIUM_API_KEY")
+    if not lium_key:
+        return None, None
+    lium = Lium(config=Config(api_key=lium_key, ssh_key_path=str(Path.home() / ".ssh" / "id_ed25519")))
+    for p in lium.ps():
+        if "distil" in str(getattr(p, "name", "")).lower():
+            return lium, p
+    return None, None
 
 
 @app.post("/api/chat")
 async def chat_with_king(request: Request):
-    """Chat with the king model on the GPU pod."""
-    global _chat_last_used
+    """Proxy chat to the king model running on the GPU pod."""
     body = await request.json()
     messages = body.get("messages", [])
     max_tokens = min(body.get("max_tokens", 512), 1024)
@@ -668,73 +819,37 @@ async def chat_with_king(request: Request):
     if not messages:
         return {"error": "messages required"}
 
-    # Get king model
-    h2h = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
-    king_uid = h2h.get("king_uid")
+    king_uid, king_model = _get_king_info()
     if king_uid is None:
         return {"error": "no king model available"}
 
-    # Find king model name from commitments
-    commitments = _safe_json_load(os.path.join(STATE_DIR, "commitments_cache.json"), {})
-    if not commitments:
-        # Try fetching
-        commitments = _get_cached("commitments", _fetch_commitments) or {}
-    king_model = None
-    for uid_str, info in commitments.items():
-        if str(uid_str) == str(king_uid):
-            king_model = info if isinstance(info, str) else info.get("model", info.get("repo"))
-            break
-    if not king_model:
-        return {"error": f"king model for UID {king_uid} not found"}
-
-    # Check if eval is active — don't interfere
-    progress = _safe_json_load(os.path.join(STATE_DIR, "eval_progress.json"), {})
-    if progress.get("active"):
-        return {"error": "evaluation in progress — chat unavailable during eval"}
-
-    # Run on pod via Lium
     try:
-        from lium import Lium, Config
-        from pathlib import Path
-
-        lium_key = os.environ.get("LIUM_API_KEY")
-        if not lium_key:
-            return {"error": "LIUM_API_KEY not configured"}
-
-        lium = Lium(config=Config(api_key=lium_key, ssh_key_path=str(Path.home() / ".ssh" / "id_ed25519")))
-        pods = lium.ps()
-        pod = None
-        for p in pods:
-            if "distil" in str(getattr(p, "name", "")).lower():
-                pod = p
-                break
+        lium, pod = _lium_pod()
         if not pod:
             return {"error": "GPU pod not found"}
 
-        messages_escaped = json.dumps(messages).replace("'", "'\\''")
-        cmd = f"python3 -c '{CHAT_SCRIPT}' '{king_model}' '{messages_escaped}' {max_tokens}"
+        payload = json.dumps({
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": body.get("temperature", 0.7),
+            "top_p": body.get("top_p", 0.9),
+        }).replace("'", "'\\''")
 
-        # Run with timeout
+        cmd = f"curl -s -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{payload}'"
         result = lium.exec(pod, command=cmd)
         stdout = result.get("stdout", "") if isinstance(result, dict) else str(result)
-        stderr = result.get("stderr", "") if isinstance(result, dict) else ""
 
-        # Parse response
-        for line in stdout.strip().split("\n"):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    data = json.loads(line)
-                    _chat_last_used = time.time()
-                    return {
-                        "response": data["response"],
-                        "model": king_model,
-                        "king_uid": king_uid,
-                    }
-                except json.JSONDecodeError:
-                    continue
-
-        return {"error": f"generation failed", "details": stderr[:500] if stderr else stdout[:500]}
+        try:
+            data = json.loads(stdout)
+            if "choices" in data:
+                return {
+                    "response": data["choices"][0]["message"]["content"],
+                    "model": king_model,
+                    "king_uid": king_uid,
+                }
+            return {"error": "unexpected response", "details": stdout[:300]}
+        except json.JSONDecodeError:
+            return {"error": "chat server not responding — may be starting up", "details": stdout[:300]}
 
     except Exception as e:
         return {"error": f"chat error: {str(e)[:200]}"}
@@ -742,27 +857,30 @@ async def chat_with_king(request: Request):
 
 @app.get("/api/chat/status")
 def chat_status():
-    """Check if chat is available."""
-    h2h = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
-    king_uid = h2h.get("king_uid")
+    """Check if the king chat server is available."""
+    king_uid, king_model = _get_king_info()
     progress = _safe_json_load(os.path.join(STATE_DIR, "eval_progress.json"), {})
     eval_active = progress.get("active", False)
 
-    # Find king model
-    commitments = _safe_json_load(os.path.join(STATE_DIR, "commitments_cache.json"), {})
-    king_model = None
-    if commitments and king_uid is not None:
-        for uid_str, info in commitments.items():
-            if str(uid_str) == str(king_uid):
-                king_model = info if isinstance(info, str) else info.get("model", info.get("repo"))
-                break
+    # Try health check on pod
+    server_ok = False
+    try:
+        lium, pod = _lium_pod()
+        if pod:
+            result = lium.exec(pod, command=f"curl -s http://localhost:{CHAT_POD_PORT}/health")
+            stdout = result.get("stdout", "") if isinstance(result, dict) else ""
+            if '"status": "ok"' in stdout or '"status":"ok"' in stdout:
+                server_ok = True
+    except Exception:
+        pass
 
     return {
-        "available": not eval_active and king_uid is not None,
+        "available": server_ok and king_uid is not None,
         "king_uid": king_uid,
         "king_model": king_model,
         "eval_active": eval_active,
-        "note": "Chat loads the king model on-demand (~15s first message, ~2s after). Unavailable during evaluation." if not eval_active else "Evaluation in progress — chat unavailable.",
+        "server_running": server_ok,
+        "note": "King model is loaded on GPU and ready for chat." if server_ok else "Chat server is starting or unavailable.",
     }
 
 
