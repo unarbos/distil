@@ -752,14 +752,15 @@ def main():
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
                         print(f"  [prompt {i}] OOM — skipping rest of model", flush=True)
-                        free_gpu()
                     else:
                         print(f"  [prompt {i}] RuntimeError: {e}", flush=True)
                     scoring_error = str(e)
+                    free_gpu()
                     break
                 except Exception as e:
                     print(f"  [prompt {i}] Unexpected error: {e}", flush=True)
                     scoring_error = str(e)
+                    free_gpu()
                     break
 
                 # Early stopping check — compare at SAME prompt index
