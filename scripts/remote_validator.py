@@ -240,7 +240,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         for uid_str in list(fixed_scores.keys()):
             uid = int(uid_str)
             hotkey = uid_to_hotkey.get(uid, uid_to_hotkey.get(uid_str, ""))
-            if is_disqualified(uid, hotkey, dq_reasons):
+            _cb = commitments.get(uid, {}).get("block")
+            if is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb):
                 issues.append(f"UID {uid_str} is DQ'd but has score {fixed_scores[uid_str]:.6f} — removing")
                 fixed_scores.pop(uid_str)
 
@@ -384,6 +385,22 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
+            # ── Migrate bare-hotkey DQ entries to hotkey:block format ──
+            # Old DQ entries used bare hotkeys. New format is hotkey:block
+            # so miners can re-register with a new commit and not be permanently banned.
+            _migrated = 0
+            _hotkey_to_block = {com["hotkey"]: com["block"] for com in commitments.values() if "hotkey" in com and "block" in com}
+            for key in list(dq_reasons.keys()):
+                if key.startswith("flag:") or key.isdigit() or ":" in key:
+                    continue  # skip flags, UIDs, already-migrated
+                if key in _hotkey_to_block:
+                    new_key = f"{key}:{_hotkey_to_block[key]}"
+                    dq_reasons[new_key] = dq_reasons.pop(key)
+                    _migrated += 1
+            if _migrated:
+                save_disqualified(dq_reasons, state_path)
+                print(f"[VALIDATOR] Migrated {_migrated} DQ entries to per-commit format", flush=True)
+
             # ══════════════════════════════════════════════════════════════
             # STATE VALIDATION: Catch inconsistencies before they waste GPU
             # ══════════════════════════════════════════════════════════════
@@ -410,9 +427,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 revision = commit.get("revision", "main")
                 hotkey = commit.get("hotkey", uid_to_hotkey.get(uid, ""))
 
-                # Check DQ by hotkey (stable identity, survives UID recycling)
-                if is_disqualified(uid, hotkey, dq_reasons):
-                    reason = get_dq_reason(uid, hotkey, dq_reasons)
+                # Check DQ by hotkey:block (per-commitment DQ)
+                this_commit_block = commit.get("block")
+                if is_disqualified(uid, hotkey, dq_reasons, commit_block=this_commit_block):
+                    reason = get_dq_reason(uid, hotkey, dq_reasons, commit_block=this_commit_block)
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): DISQUALIFIED — {reason}", flush=True)
                     disqualified.add(uid)
                     continue
@@ -455,7 +473,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     hf_user = model_repo.split("/")[0] if "/" in model_repo else None
                     coldkey = uid_to_coldkey.get(uid)
                     disqualify(hotkey, f"arch: {check['reason']}", dq_reasons,
-                               coldkey=coldkey, hf_username=hf_user)
+                               coldkey=coldkey, hf_username=hf_user,
+                               commit_block=this_commit_block)
                     disqualified.add(uid)
                     continue
 
@@ -470,14 +489,17 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                             orig_model = commitments.get(original_uid, {}).get("model", "?")
                             print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}", flush=True)
                             scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                            disqualify(hotkey, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}", dq_reasons)
+                            disqualify(hotkey, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}", dq_reasons,
+                                       commit_block=this_commit_block)
                             disqualified.add(uid)
                             continue
                         else:
                             print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier)", flush=True)
                             scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
                             orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
-                            disqualify(orig_hotkey, f"copy: identical weights to UID {uid} ({model_repo}), committed later", dq_reasons)
+                            orig_commit_block = commitments.get(original_uid, {}).get("block")
+                            disqualify(orig_hotkey, f"copy: identical weights to UID {uid} ({model_repo}), committed later", dq_reasons,
+                                       commit_block=orig_commit_block)
                             valid_models.pop(original_uid, None)
                             disqualified.add(original_uid)
                             register_model_hash(model_hash, uid, state_path)
@@ -500,7 +522,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not integrity["pass"]:
                     print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(hotkey, f"integrity: {integrity['reason']}", dq_reasons)
+                    disqualify(hotkey, f"integrity: {integrity['reason']}", dq_reasons,
+                               commit_block=this_commit_block)
                     disqualified.add(uid)
                     continue
                 if integrity["current_hash"]:
@@ -1161,7 +1184,8 @@ else:
                     print(f"[VALIDATOR] UID {uid} ({model_name}): FUNCTIONAL COPY — {reason}", flush=True)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
                     _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    disqualify(_hk, reason, dq_reasons)
+                    _cb = models_to_eval.get(uid, {}).get("commit_block")
+                    disqualify(_hk, reason, dq_reasons, commit_block=_cb)
                     evaluated_uids.add(str(uid))
                     continue
 
@@ -1171,7 +1195,8 @@ else:
                     reason = student_result.get("reason", "VRAM fraud detected")
                     print(f"[VALIDATOR] UID {uid} ({model_name}): {reason}", flush=True)
                     _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    disqualify(_hk, reason, dq_reasons)
+                    _cb = models_to_eval.get(uid, {}).get("commit_block")
+                    disqualify(_hk, reason, dq_reasons, commit_block=_cb)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
                     evaluated_uids.add(str(uid))
                     continue
@@ -1187,7 +1212,8 @@ else:
                     reason = f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher (likely teacher weights)"
                     print(f"[VALIDATOR] UID {uid} ({model_name}): {reason}", flush=True)
                     _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
-                    disqualify(_hk, reason, dq_reasons)
+                    _cb = models_to_eval.get(uid, {}).get("commit_block")
+                    disqualify(_hk, reason, dq_reasons, commit_block=_cb)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
                     evaluated_uids.add(str(uid))
                     continue
@@ -1253,7 +1279,8 @@ else:
             for uid in all_round_uids:
                 uid_str = str(uid)
                 hotkey = uid_to_hotkey.get(uid, "")
-                if is_disqualified(uid, hotkey, dq_reasons):
+                _cb = commitments.get(uid, {}).get("block")
+                if is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb):
                     continue
                 if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
                     h2h_candidates.append((uid, scores[uid_str]))
@@ -1298,7 +1325,8 @@ else:
             for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
                 uid = int(uid_str)
                 hotkey = uid_to_hotkey.get(uid, "")
-                dq = " ⛔ DQ" if (uid in disqualified or is_disqualified(uid, hotkey, dq_reasons)) else ""
+                _cb = commitments.get(uid, {}).get("block")
+                dq = " ⛔ DQ" if (uid in disqualified or is_disqualified(uid, hotkey, dq_reasons, commit_block=_cb)) else ""
                 marker = " ← H2H WINNER" if uid == winner_uid else ""
                 in_round = " (in round)" if uid in all_round_uids else ""
                 print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{in_round}{dq}", flush=True)
