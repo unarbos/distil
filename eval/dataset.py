@@ -89,6 +89,7 @@ def load_prompts_from_hf(
 def sample_prompts_from_dataset(
     n: int,
     block_number: int,
+    block_hash: str | None = None,
     dataset_name: str = CLIMBMIX_DATASET,
     split: str = DEFAULT_SPLIT,
     text_field: str = CLIMBMIX_TEXT_FIELD,
@@ -99,9 +100,14 @@ def sample_prompts_from_dataset(
     """
     Sample n prompts from karpathy/climbmix-400b-shuffle (6,542 shards).
 
-    Uses block_hash % 6542 to pick a shard, loads it entirely, shuffles with
-    block seed, and samples. Instant random access across 400B tokens — no
-    streaming skip needed. Falls back to FineWeb streaming if climbmix fails.
+    Uses the actual on-chain block hash (from substrate) to pick a shard,
+    ensuring miners cannot predict which shard will be selected before the
+    block is finalized. Falls back to FineWeb streaming if climbmix fails.
+
+    Args:
+        block_hash: The real on-chain block hash (hex string, e.g. "0xd2f5...").
+                    If None, falls back to sha256(block_number) — INSECURE,
+                    only for local testing. Production MUST pass the real hash.
 
     Results are cached per block so repeated calls (e.g. retries) return the
     same prompts.
@@ -122,11 +128,21 @@ def sample_prompts_from_dataset(
 
     from datasets import load_dataset
 
-    block_hash = hashlib.sha256(str(block_number).encode()).hexdigest()
+    # Use real on-chain block hash if provided, otherwise fall back (insecure)
+    if block_hash:
+        # Strip 0x prefix if present, use raw hex
+        _hash_hex = block_hash.lstrip("0x") if block_hash.startswith("0x") else block_hash
+        logger.info(f"Using on-chain block hash: {block_hash[:18]}...")
+    else:
+        logger.warning(
+            f"No on-chain block hash provided — falling back to sha256(block_number). "
+            f"THIS IS PREDICTABLE. Only use for local testing."
+        )
+        _hash_hex = hashlib.sha256(str(block_number).encode()).hexdigest()
 
     # ── Primary: climbmix shard-based sampling ──
     try:
-        shard_idx = int(block_hash[:8], 16) % CLIMBMIX_NUM_SHARDS
+        shard_idx = int(_hash_hex[:8], 16) % CLIMBMIX_NUM_SHARDS
         shard_file = f"shard_{shard_idx:05d}.parquet"
 
         print(
@@ -141,8 +157,9 @@ def sample_prompts_from_dataset(
             split="train",
         )
 
-        # Shuffle deterministically with block seed and sample
-        rng = random.Random(block_number)
+        # Shuffle deterministically with block hash seed (not block number)
+        # Using the hash ensures shuffle order is also unpredictable
+        rng = random.Random(_hash_hex)
         indices = list(range(len(ds)))
         rng.shuffle(indices)
 
@@ -169,7 +186,7 @@ def sample_prompts_from_dataset(
         print(f"[dataset] Climbmix failed ({e}), falling back to FineWeb", flush=True)
 
     # ── Fallback: FineWeb streaming ──
-    skip_offset = int(block_hash[:12], 16) % 5_000_000
+    skip_offset = int(_hash_hex[:12], 16) % 5_000_000
 
     print(
         f"[dataset] Fallback: sampling {n} prompts from {DEFAULT_DATASET} "

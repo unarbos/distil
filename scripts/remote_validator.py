@@ -300,8 +300,20 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     print(f"[VALIDATOR] Fetching metagraph...", flush=True)
                     metagraph = subtensor.metagraph(netuid)
                     current_block = subtensor.block
+                    # Fetch the REAL on-chain block hash — unpredictable, derived from
+                    # actual chain state. Prevents miners from gaming prompt selection.
+                    try:
+                        current_block_hash = subtensor.substrate.get_block_hash(current_block)
+                        if current_block_hash:
+                            print(f"[VALIDATOR] Block {current_block}, hash={current_block_hash[:18]}...", flush=True)
+                        else:
+                            current_block_hash = None
+                            print(f"[VALIDATOR] Block {current_block}, hash=UNAVAILABLE (will fallback)", flush=True)
+                    except Exception as bh_err:
+                        current_block_hash = None
+                        print(f"[VALIDATOR] Block {current_block}, hash fetch failed: {bh_err}", flush=True)
                     n_uids = int(metagraph.n)
-                    print(f"[VALIDATOR] Block {current_block}, n={n_uids}", flush=True)
+                    print(f"[VALIDATOR] n={n_uids}", flush=True)
 
                     print(f"[VALIDATOR] Reading commitments...", flush=True)
                     revealed = subtensor.get_all_revealed_commitments(netuid)
@@ -671,13 +683,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             if not resuming_round:
                 # New round — sample fresh prompts
-                epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block)
+                epoch_prompts = sample_prompts_from_dataset(
+                    n_prompts, current_block, block_hash=current_block_hash
+                )
                 prompt_texts = [format_prompt(p) for p in epoch_prompts]
 
             # Save round state so we can resume after crash
             round_state = {
                 "started_at": time.time(),
                 "block": current_block,
+                "block_hash": current_block_hash,
                 "king_uid": king_uid,
                 "model_names": [info["model"] for info in models_to_eval.values()],
                 "prompts": prompt_texts,
