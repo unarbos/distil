@@ -486,12 +486,34 @@ def get_history():
 
 @app.get("/api/health")
 def health():
+    import time as _time
+    # Check last eval time from h2h-latest
+    last_eval_block = None
+    last_eval_age_min = None
+    eval_active = False
+    try:
+        h2h_path = STATE_DIR / "h2h_latest.json"
+        if h2h_path.exists():
+            h2h = json.loads(h2h_path.read_text())
+            last_eval_block = h2h.get("block")
+            ts = h2h.get("timestamp")
+            if ts:
+                last_eval_age_min = round((_time.time() - ts) / 60, 1)
+        progress_path = STATE_DIR / "eval_progress.json"
+        if progress_path.exists():
+            prog = json.loads(progress_path.read_text())
+            eval_active = prog.get("active", False)
+    except Exception:
+        pass
     return {
         "status": "ok",
         "netuid": NETUID,
         "has_metagraph_cache": _get_stale("metagraph") is not None,
         "has_commit_cache": _get_stale("commitments") is not None,
         "has_price_cache": _get_stale("price") is not None,
+        "last_eval_block": last_eval_block,
+        "last_eval_age_min": last_eval_age_min,
+        "eval_active": eval_active,
     }
 
 
