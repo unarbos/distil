@@ -653,9 +653,18 @@ def main():
         del student
         free_gpu()
 
-        # NOTE: Student HF cache is cleaned AFTER the full eval completes (see below).
-        # Previously cleaned per-student, but that caused re-downloads from HF which
-        # could hang indefinitely when rate-limited (no HF_TOKEN on pod).
+        # Clean up student model blobs immediately after scoring to prevent disk full.
+        # Only delete large blob files (>10MB), keep small metadata so HF doesn't
+        # re-download configs. Teacher model is excluded.
+        try:
+            student_cache_name = f"models--{student_name.replace('/', '--')}"
+            cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / student_cache_name
+            if cache_dir.exists():
+                import shutil
+                shutil.rmtree(cache_dir)
+                print(f"  [cleanup] Deleted cache for {student_name}", flush=True)
+        except Exception as e:
+            print(f"  [cleanup] Failed to clean {student_name}: {e}", flush=True)
 
     # Summary
     total_time = time.time() - total_start

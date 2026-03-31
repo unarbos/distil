@@ -514,6 +514,29 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 except Exception:
                     pass
 
+            # Pre-eval disk check — clean student cache if disk is >80% full
+            try:
+                disk_check = lium.exec(pod, command="df --output=pcent / | tail -1 | tr -d ' %'")
+                disk_pct_str = disk_check.get('stdout', disk_check) if isinstance(disk_check, dict) else disk_check
+                disk_pct = int(str(disk_pct_str).strip())
+                if disk_pct > 80:
+                    print(f"[VALIDATOR] Disk {disk_pct}% full — cleaning student model cache", flush=True)
+                    clean_cmd = (
+                        "cd /root/.cache/huggingface/hub 2>/dev/null && "
+                        "for d in models--*; do "
+                        "  case \"$d\" in models--Qwen--Qwen3.5-35B-A3B) continue;; esac; "
+                        "  rm -rf \"$d\"; "
+                        "done; "
+                        "df -h / | tail -1"
+                    )
+                    clean_result = lium.exec(pod, command=clean_cmd)
+                    clean_info = clean_result.get('stdout', clean_result) if isinstance(clean_result, dict) else clean_result
+                    print(f"[VALIDATOR] Pre-eval cleanup done: {str(clean_info).strip()}", flush=True)
+                else:
+                    print(f"[VALIDATOR] Disk {disk_pct}% — OK", flush=True)
+            except Exception as e:
+                print(f"[VALIDATOR] Disk check failed (non-fatal): {e}", flush=True)
+
             # Kill any background GPU processes to free VRAM for eval
             try:
                 lium.exec(pod, command="for s in distil train; do tmux kill-session -t $s 2>/dev/null; done; sleep 2; echo 'GPU cleared'")
@@ -1007,7 +1030,8 @@ else:
                     "df -h / | tail -1"
                 )
                 result = lium.exec(pod, command=clean_cmd)
-                print(f"[VALIDATOR] Cache cleanup: {result.strip() if result else 'done'}", flush=True)
+                disk_info = result.get('stdout', result) if isinstance(result, dict) else result
+                print(f"[VALIDATOR] Cache cleanup: {str(disk_info).strip()}", flush=True)
             except Exception as e:
                 print(f"[VALIDATOR] Cache cleanup failed (non-fatal): {e}", flush=True)
 
