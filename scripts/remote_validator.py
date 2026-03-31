@@ -116,7 +116,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     from eval.scoring import (
         load_scores, save_scores,
         load_failures, save_failures, record_failure, reset_failures, is_stale,
-        load_disqualified, save_disqualified, disqualify,
+        load_disqualified, save_disqualified, disqualify, is_disqualified, get_dq_reason,
         compute_winner_weights,
         append_score_history,
     )
@@ -200,14 +200,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             revealed = subtensor.get_all_revealed_commitments(netuid)
             print(f"[VALIDATOR] Got {len(revealed)} revealed entries", flush=True)
             commitments = {}
+            uid_to_hotkey = {}
             for uid in range(n_uids):
                 hotkey = str(metagraph.hotkeys[uid])
+                uid_to_hotkey[uid] = hotkey
                 if hotkey in revealed and len(revealed[hotkey]) > 0:
                     block, data = revealed[hotkey][0]
                     try:
                         parsed = json.loads(data)
                         if "model" in parsed:
-                            commitments[uid] = {"block": block, **parsed}
+                            commitments[uid] = {"block": block, "hotkey": hotkey, **parsed}
                     except Exception:
                         continue
 
@@ -228,6 +230,14 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             for uid, commit in commitments.items():
                 model_repo = commit["model"]
                 revision = commit.get("revision", "main")
+                hotkey = commit.get("hotkey", uid_to_hotkey.get(uid, ""))
+
+                # Check DQ by hotkey (stable identity, survives UID recycling)
+                if is_disqualified(uid, hotkey, dq_reasons):
+                    reason = get_dq_reason(uid, hotkey, dq_reasons)
+                    print(f"[VALIDATOR] UID {uid} ({model_repo}): DISQUALIFIED — {reason}", flush=True)
+                    disqualified.add(uid)
+                    continue
 
                 # Already permanently disqualified (duplicate hash)
                 if scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
@@ -243,7 +253,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 # They'll be rechecked if their model/revision changes (new commitment).
                 uid_str = str(uid)
                 if uid_str in evaluated_uids and uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
-                    valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None}
+                    valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None, "hotkey": hotkey}
                     continue
 
                 print(f"[VALIDATOR] Checking {model_repo}...", flush=True)
@@ -257,7 +267,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not check["pass"]:
                     print(f"[VALIDATOR] UID {uid} ({model_repo}): FAIL — {check['reason']}", flush=True)
                     record_failure(uid, failures)
-                    disqualify(uid, f"arch: {check['reason']}", dq_reasons)
+                    disqualify(hotkey, f"arch: {check['reason']}", dq_reasons)
                     disqualified.add(uid)
                     continue
 
@@ -272,13 +282,14 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                             orig_model = commitments.get(original_uid, {}).get("model", "?")
                             print(f"[VALIDATOR] UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}", flush=True)
                             scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                            disqualify(uid, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}", dq_reasons)
+                            disqualify(hotkey, f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}", dq_reasons)
                             disqualified.add(uid)
                             continue
                         else:
                             print(f"[VALIDATOR] UID {original_uid} is duplicate of UID {uid} (committed earlier)", flush=True)
                             scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                            disqualify(original_uid, f"copy: identical weights to UID {uid} ({model_repo}), committed later", dq_reasons)
+                            orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
+                            disqualify(orig_hotkey, f"copy: identical weights to UID {uid} ({model_repo}), committed later", dq_reasons)
                             valid_models.pop(original_uid, None)
                             disqualified.add(original_uid)
                             register_model_hash(model_hash, uid, state_path)
@@ -301,7 +312,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if not integrity["pass"]:
                     print(f"[VALIDATOR] UID {uid} DISQUALIFIED: {integrity['reason']}", flush=True)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(uid, f"integrity: {integrity['reason']}", dq_reasons)
+                    disqualify(hotkey, f"integrity: {integrity['reason']}", dq_reasons)
                     disqualified.add(uid)
                     continue
                 if integrity["current_hash"]:
@@ -313,6 +324,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     "revision": revision,
                     "params_b": check.get("params_b", 0),
                     "commit_block": commit.get("block", float("inf")),
+                    "hotkey": hotkey,
                 }
                 print(f"[VALIDATOR] UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓", flush=True)
 
@@ -847,7 +859,8 @@ else:
                     reason = f"copy: functional copy of {copy_of_model}" + (f" (UID {copy_of_uid})" if copy_of_uid else "") + " — identical logit distribution"
                     print(f"[VALIDATOR] UID {uid} ({model_name}): FUNCTIONAL COPY — {reason}", flush=True)
                     scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(uid, reason, dq_reasons)
+                    _hk = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+                    disqualify(_hk, reason, dq_reasons)
                     evaluated_uids.add(str(uid))
                     continue
 

@@ -73,7 +73,8 @@ def update_ema(
 
 
 def load_disqualified(state_dir: Path = STATE_DIR) -> dict[str, str]:
-    """Load disqualification reasons. Keys are string UIDs, values are reason strings."""
+    """Load disqualification reasons. Keys are hotkeys (ss58), values are reason strings.
+    Legacy entries keyed by UID are preserved but should be migrated."""
     return _load_json(state_dir / "disqualified.json")
 
 
@@ -81,9 +82,27 @@ def save_disqualified(dq: dict[str, str], state_dir: Path = STATE_DIR):
     _save_json(state_dir / "disqualified.json", dq)
 
 
-def disqualify(uid: int, reason: str, dq: dict[str, str]):
-    """Record a disqualification with reason."""
-    dq[str(uid)] = reason
+def disqualify(hotkey: str, reason: str, dq: dict[str, str]):
+    """Record a disqualification by hotkey (ss58 address).
+    UIDs get recycled — hotkeys are the stable identity."""
+    dq[hotkey] = reason
+
+
+def is_disqualified(uid: int, hotkey: str, dq: dict[str, str]) -> bool:
+    """Check if a miner is disqualified by hotkey (preferred) or legacy UID."""
+    if hotkey in dq:
+        return True
+    # Legacy: check by UID string (for old entries before hotkey migration)
+    if str(uid) in dq:
+        return True
+    return False
+
+
+def get_dq_reason(uid: int, hotkey: str, dq: dict[str, str]) -> str:
+    """Get disqualification reason by hotkey or legacy UID."""
+    if hotkey in dq:
+        return dq[hotkey]
+    return dq.get(str(uid), "")
 
 
 # ── Failure Tracking ──────────────────────────────────────────────────────
