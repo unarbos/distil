@@ -455,11 +455,20 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     saved_round = json.loads(round_file.read_text())
                     saved_models = set(saved_round.get("model_names", []))
                     current_models = set(info["model"] for info in models_to_eval.values())
-                    # Resume if the model set matches (same challengers)
-                    if saved_models == current_models and saved_round.get("prompts"):
-                        prompt_texts = saved_round["prompts"]
+                    saved_prompts = saved_round.get("prompts", [])
+                    # Resume if we have prompts AND models overlap significantly.
+                    # Exact match not required — new models can join an existing round.
+                    # pod_eval --resume will score them; already-scored models are skipped.
+                    if saved_prompts and (saved_models & current_models):
+                        prompt_texts = saved_prompts
                         resuming_round = True
-                        print(f"[VALIDATOR] RESUMING incomplete round ({len(prompt_texts)} prompts, {len(saved_models)} models)", flush=True)
+                        new_models = current_models - saved_models
+                        dropped_models = saved_models - current_models
+                        if new_models:
+                            print(f"[VALIDATOR] RESUMING round + {len(new_models)} new models added", flush=True)
+                        if dropped_models:
+                            print(f"[VALIDATOR] RESUMING round, {len(dropped_models)} models dropped (DQ/stale)", flush=True)
+                        print(f"[VALIDATOR] RESUMING incomplete round ({len(prompt_texts)} prompts, {len(current_models)} models)", flush=True)
                 except Exception as e:
                     print(f"[VALIDATOR] Could not load saved round: {e}", flush=True)
 
@@ -510,21 +519,22 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     else:
                         raise
 
-            if resuming_round:
-                # Keep eval_results.json AND teacher_cache.pt on pod — --resume skips
-                # already-scored students and reuses cached teacher logits for consistency
-                try:
-                    lium.exec(pod, command="rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
-                    print("[VALIDATOR] Resuming round (keeping eval_results.json + teacher_cache.pt)", flush=True)
-                except Exception:
-                    pass
-            else:
-                # New round — clear everything
-                try:
-                    lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
-                    print("[VALIDATOR] Cleared all stale pod cache (new round)", flush=True)
-                except Exception:
-                    pass
+            # NEVER delete teacher_cache.pt or eval_results.json blindly.
+            # pod_eval.py checks the prompts hash inside teacher_cache.pt and
+            # --resume skips already-scored students. Let pod_eval handle
+            # cache validity — it's the only thing that knows if the hash matches.
+            try:
+                lium.exec(pod, command="rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
+                if resuming_round:
+                    print("[VALIDATOR] Resuming round (keeping eval_results.json + teacher_cache.pt on pod)", flush=True)
+                else:
+                    # New round: remove eval_results.json (scores from old prompts are invalid)
+                    # but KEEP teacher_cache.pt — pod_eval.py will check the prompts hash
+                    # and reuse it if prompts happen to match, or regenerate if they don't.
+                    lium.exec(pod, command="rm -f /home/eval_results.json")
+                    print("[VALIDATOR] New round (cleared eval_results.json, keeping teacher_cache.pt for hash check)", flush=True)
+            except Exception:
+                pass
 
             # Pre-eval disk check — clean student cache if disk is >80% full
             try:
@@ -578,6 +588,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 print(f"[VALIDATOR] Parallel eval: {n_gpus} GPUs, {len(models_to_eval)} models, {n_prompts} prompts", flush=True)
 
                 # Step 1: Teacher generates logits on GPU 0 and saves cache
+                # Always pass --teacher-logits + --resume so pod_eval reuses
+                # cached teacher logits (if prompts hash matches) and skips
+                # already-scored students.
                 teacher_cmd = (
                     f"cd /home && python3 pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -588,7 +601,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     f"--max-new-tokens {MAX_NEW_TOKENS} "
                     f"--max-params-b {max_params_b} "
                     f"--gpu 0 "
-                    f"--save-teacher-logits /home/teacher_cache.pt"
+                    f"--teacher-logits /home/teacher_cache.pt "
+                    f"--save-teacher-logits /home/teacher_cache.pt "
+                    f"--resume"
                 )
                 print("[VALIDATOR] Step 1: Teacher inference + first student on GPU 0...", flush=True)
                 try:

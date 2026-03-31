@@ -309,9 +309,12 @@ def main():
             "prompts_hash": prompts_hash,
         }, teacher_cache_path)
 
-        del teacher
-        free_gpu()
-        print(f"[eval] Teacher unloaded, VRAM: {gpu_mem_str()}", flush=True)
+        # Keep teacher in VRAM — B200 has 192GB, teacher ~67GB, students ~8GB each.
+        # This saves ~3 min reload time if we ever need teacher logits again.
+        # Only clear the KV cache, not the model weights.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[eval] Teacher logits saved, VRAM: {gpu_mem_str()} (teacher stays in VRAM)", flush=True)
 
     # Evaluate students — resume from existing results if --resume and output exists
     prior_results = {}
