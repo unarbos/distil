@@ -26,14 +26,14 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
 
 3. **Challenger detection** — Only models that haven't been evaluated yet are challengers. Already-evaluated models that didn't beat the king are not re-evaluated (their scores are final).
 
-4. **Head-to-head GPU eval** — The king and all new challengers are scored together on the **same 40 FineWeb prompts** (block-seeded). Both models see identical teacher continuations, making the comparison fair. The king is only put on GPU when there's a challenger — no wasted compute on idle re-evaluation.
+4. **Head-to-head GPU eval** — The king and all new challengers are scored together on the **same 60 ClimbMix-400B prompts** (block-seeded). Both models see identical teacher continuations, making the comparison fair. The king is only put on GPU when there's a challenger — no wasted compute on idle re-evaluation.
 
 5. **Epsilon threshold (1%)** — A challenger must achieve KL divergence **more than 1% lower** than the king's to dethrone it. For example, if the king has KL=0.097, a challenger needs KL < 0.096 (= 0.097 × 0.99). This prevents noisy near-ties from flipping the winner every epoch and rewards meaningful improvements.
 
 6. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
 **Why this is better than evaluating all models every epoch:**
-- **2x more prompts per model** (40 vs 20) → tighter confidence intervals, lower variance
+- **More prompts per model** (60 vs 20) → tighter confidence intervals, lower variance
 - **GPU only runs when needed** — no challengers means no GPU eval at all
 - **Fair comparison** — king and challenger scored on identical prompts in the same run
 - **Epsilon prevents flip-flopping** — the king holds unless clearly beaten
@@ -76,6 +76,25 @@ Your model must:
 - Be loadable via `AutoModelForCausalLM.from_pretrained()`
 - **No quantized models** (GPTQ/AWQ/GGUF rejected)
 - **Unique weights** — Cannot be identical to any previously committed model
+
+### Pre-Submission Check (Recommended)
+
+Before committing, run the checker to verify your model passes ALL validator checks:
+
+```bash
+pip install click huggingface_hub transformers safetensors
+
+# Quick check (no GPU needed):
+python check_model.py --model-repo your-username/your-model
+
+# Full eval with KL scoring (requires GPU):
+python check_model.py --model-repo your-username/your-model --eval
+
+# Compare against current king:
+python check_model.py --model-repo your-username/your-model --eval --king-repo rlinprogress/sn97-distilled-V9
+```
+
+This runs the same 13 pre-checks + 4 GPU checks the validator uses. Save your TAO — fix issues before committing.
 
 ### Submit Your Model
 

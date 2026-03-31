@@ -5,14 +5,20 @@ Distil SN97 — Pre-Submission Model Checker
 Run this BEFORE committing your model to avoid wasting registration fees.
 Performs ALL the same checks the validator runs, including anti-cheat detection.
 
+Requirements:
+    pip install click huggingface_hub transformers safetensors
+
+For --eval mode (optional):
+    pip install torch datasets  # + CUDA GPU
+
 Usage:
-    # Basic pre-submission check (all validator checks):
+    # Basic pre-submission check (no GPU needed):
     python check_model.py --model-repo user/my-distilled-model
 
     # With specific revision:
     python check_model.py --model-repo user/my-distilled-model --revision abc123
 
-    # Full eval against current king (optional, requires GPU):
+    # Full eval against current king (requires GPU):
     python check_model.py --model-repo user/my-distilled-model --eval
 
     # Eval with custom prompt count:
