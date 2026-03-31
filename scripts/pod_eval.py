@@ -428,12 +428,12 @@ def main():
             results["timings"] = {k: round(v, 1) for k, v in timings.items()}
             with open(args.output, "w") as f:
                 json.dump(results, f, indent=2)
-            progress["completed"].append({
+            live_progress["completed"].append({
                 "student_name": student_name,
                 "status": "load_failed",
                 "status_detail": str(e),
             })
-            progress["current"] = None
+            live_progress["current"] = None
             _write_progress()
             try:
                 del student
