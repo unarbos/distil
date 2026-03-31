@@ -482,14 +482,31 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             # ══════════════════════════════════════════════════════════════
             # PHASE 2: Identify king and challengers
             # ══════════════════════════════════════════════════════════════
+            # Determine king from h2h_latest (authoritative) — NOT from global
+            # scores, because scores from different prompt sets aren't comparable.
             king_uid = None
             king_kl = float("inf")
-            for uid in valid_models:
-                uid_str = str(uid)
-                if uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
-                    if scores[uid_str] < king_kl:
-                        king_kl = scores[uid_str]
-                        king_uid = uid
+            h2h_file = state_path / "h2h_latest.json"
+            if h2h_file.exists():
+                try:
+                    h2h_data = json.loads(h2h_file.read_text())
+                    h2h_king = h2h_data.get("king_uid")
+                    if h2h_king is not None and h2h_king in valid_models:
+                        king_uid = h2h_king
+                        king_kl = scores.get(str(h2h_king), float("inf"))
+                        print(f"[VALIDATOR] King from h2h_latest: UID {king_uid} (KL={king_kl:.6f})", flush=True)
+                except Exception:
+                    pass
+            # Fallback: if h2h_latest doesn't exist or king isn't valid, use lowest score
+            if king_uid is None:
+                for uid in valid_models:
+                    uid_str = str(uid)
+                    if uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
+                        if scores[uid_str] < king_kl:
+                            king_kl = scores[uid_str]
+                            king_uid = uid
+                if king_uid is not None:
+                    print(f"[VALIDATOR] King from scores fallback: UID {king_uid} (KL={king_kl:.6f})", flush=True)
 
             # ── Load persistent model score history ──
             # Tracks best-ever KL by model repo name (not UID — UIDs recycle).
