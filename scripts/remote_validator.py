@@ -666,7 +666,7 @@ else:
                 poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
                 poll_thread.start()
 
-                EVAL_TIMEOUT = 45 * 60  # 45 minutes max for full eval
+                EVAL_TIMEOUT = 120 * 60  # 120 minutes max for full eval (46+ models)
                 eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
                 try:
                     import concurrent.futures
