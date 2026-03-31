@@ -435,15 +435,43 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             with open(progress_path, "w") as f:
                 json.dump(progress, f)
 
-            # Prepare prompts
-            epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block)
-            prompt_texts = [format_prompt(p) for p in epoch_prompts]
+            # ── Round resumption: reuse prompts from an incomplete round if available ──
+            round_file = state_path / "current_round.json"
+            resuming_round = False
+            if round_file.exists():
+                try:
+                    saved_round = json.loads(round_file.read_text())
+                    saved_models = set(saved_round.get("model_names", []))
+                    current_models = set(info["model"] for info in models_to_eval.values())
+                    # Resume if the model set matches (same challengers)
+                    if saved_models == current_models and saved_round.get("prompts"):
+                        prompt_texts = saved_round["prompts"]
+                        resuming_round = True
+                        print(f"[VALIDATOR] RESUMING incomplete round ({len(prompt_texts)} prompts, {len(saved_models)} models)", flush=True)
+                except Exception as e:
+                    print(f"[VALIDATOR] Could not load saved round: {e}", flush=True)
+
+            if not resuming_round:
+                # New round — sample fresh prompts
+                epoch_prompts = sample_prompts_from_dataset(n_prompts, current_block)
+                prompt_texts = [format_prompt(p) for p in epoch_prompts]
+
+            # Save round state so we can resume after crash
+            round_state = {
+                "started_at": time.time(),
+                "block": current_block,
+                "king_uid": king_uid,
+                "model_names": [info["model"] for info in models_to_eval.values()],
+                "prompts": prompt_texts,
+            }
+            round_file.write_text(json.dumps(round_state))
+
+            # Upload prompts
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 json.dump(prompt_texts, f)
                 f.flush()
                 os.fsync(f.fileno())
                 prompts_file = f.name
-            # Verify file is non-empty before uploading
             fsize = os.path.getsize(prompts_file)
             print(f"[VALIDATOR] Prompts file: {fsize} bytes, {len(prompt_texts)} prompts", flush=True)
             for _up_att in range(3):
@@ -470,15 +498,21 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     else:
                         raise
 
-            # Clear ALL stale results from previous eval round.
-            # Must clear eval_results.json too — it contains scores from different prompts.
-            # Teacher cache causes stale king scores; result files cause --resume to skip re-eval.
-            # Crash recovery is handled at validator level (evaluated_uids), not pod level.
-            try:
-                lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
-                print("[VALIDATOR] Cleared stale pod cache", flush=True)
-            except Exception:
-                pass
+            if resuming_round:
+                # Keep eval_results.json on pod — --resume will skip already-scored students
+                # Only clear teacher cache (forces fresh teacher logits on same prompts)
+                try:
+                    lium.exec(pod, command="rm -f /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
+                    print("[VALIDATOR] Cleared teacher cache (keeping eval_results.json for resume)", flush=True)
+                except Exception:
+                    pass
+            else:
+                # New round — clear everything
+                try:
+                    lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
+                    print("[VALIDATOR] Cleared all stale pod cache (new round)", flush=True)
+                except Exception:
+                    pass
 
             # Kill any background GPU processes to free VRAM for eval
             try:
@@ -949,6 +983,12 @@ else:
                 history = history[-50:]
                 with open(h2h_history_path, "w") as f:
                     json.dump(history, f, indent=2)
+
+            # ── Round complete — clear round state so next epoch starts fresh ──
+            round_file = state_path / "current_round.json"
+            if round_file.exists():
+                round_file.unlink()
+                print("[VALIDATOR] Cleared current_round.json (round complete)", flush=True)
 
             # ── Clear eval progress ──
             progress_path = state_path / "eval_progress.json"
