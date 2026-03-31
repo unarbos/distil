@@ -352,7 +352,7 @@ def check_model_architecture(
         # 0. SECURITY: Reject repos with custom Python code files
         # This blocks exploits like tokenizer.py that monkey-patch json.dump
         try:
-            info = model_info(model_repo, revision=revision)
+            info = model_info(model_repo, revision=revision, files_metadata=True)
             dangerous_files = []
             for sibling in (info.siblings or []):
                 fname = sibling.rfilename
@@ -368,25 +368,74 @@ def check_model_architecture(
         except Exception as e:
             logger.warning(f"Could not check repo files for {model_repo}: {e}")
 
-        # 0b. SECURITY: Check minimum safetensors file size.
-        # A real 1B+ param model in bf16 is at least ~2GB. Tiny files are fake.
-        MIN_SAFETENSORS_BYTES = 500_000_000  # 500MB — even a 0.5B model is bigger than this
+        # 0b. SECURITY: Comprehensive weight file analysis.
+        # Catches: fake safetensors, hidden pytorch_model.bin weights, size mismatches.
+        MIN_MODEL_BYTES = 500_000_000  # 500MB — even a 0.5B model in bf16 is ~1GB
+        MAX_MODEL_BYTES = max_total_params_b * 2.2e9  # ~2.2 bytes/param in bf16 + overhead
+
         try:
             total_st_bytes = 0
+            total_pt_bytes = 0
+            st_files = []
+            pt_files = []
             for sibling in (info.siblings or []):
-                if sibling.rfilename.endswith('.safetensors'):
-                    if hasattr(sibling, 'size') and sibling.size is not None:
-                        total_st_bytes += sibling.size
-                    elif hasattr(sibling, 'lfs') and sibling.lfs:
-                        total_st_bytes += sibling.lfs.get('size', 0)
-            if 0 < total_st_bytes < MIN_SAFETENSORS_BYTES:
+                fname = sibling.rfilename
+                fsize = 0
+                if hasattr(sibling, 'size') and sibling.size is not None:
+                    fsize = sibling.size
+                elif hasattr(sibling, 'lfs') and sibling.lfs:
+                    fsize = sibling.lfs.get('size', 0)
+
+                if fname.endswith('.safetensors'):
+                    total_st_bytes += fsize
+                    st_files.append((fname, fsize))
+                elif fname.endswith('.bin') and 'pytorch_model' in fname:
+                    total_pt_bytes += fsize
+                    pt_files.append((fname, fsize))
+
+            # RULE 1: If safetensors exist, they must be the real weights (not a placeholder alongside .bin)
+            if st_files and pt_files:
+                # Both formats present — the larger one is the real weights.
+                # If safetensors are tiny but .bin files are huge, this is an evasion attempt.
+                if total_st_bytes < MIN_MODEL_BYTES and total_pt_bytes > MIN_MODEL_BYTES:
+                    return {
+                        "pass": False,
+                        "reason": f"FRAUD: Tiny safetensors ({total_st_bytes:,}B) alongside large pytorch_model.bin "
+                                  f"({total_pt_bytes:,}B). Real model hidden in .bin to bypass safetensors param check.",
+                        "params_b": 0,
+                    }
+
+            # RULE 2: Total model weight files must be within expected range
+            total_weight_bytes = max(total_st_bytes, total_pt_bytes)
+            if 0 < total_weight_bytes < MIN_MODEL_BYTES:
                 return {
                     "pass": False,
-                    "reason": f"FRAUD: Safetensors total size {total_st_bytes:,} bytes is impossibly small for a real model (min {MIN_SAFETENSORS_BYTES:,})",
+                    "reason": f"FRAUD: Model weights total {total_weight_bytes:,} bytes — impossibly small "
+                              f"(min {MIN_MODEL_BYTES:,} for a real model)",
                     "params_b": 0,
                 }
+            if total_weight_bytes > MAX_MODEL_BYTES:
+                return {
+                    "pass": False,
+                    "reason": f"FRAUD: Model weights total {total_weight_bytes / 1e9:.1f}GB — too large for "
+                              f"{max_total_params_b:.1f}B params (max ~{MAX_MODEL_BYTES / 1e9:.1f}GB in bf16)",
+                    "params_b": total_weight_bytes / 2e9,  # rough estimate
+                }
+
+            # RULE 3: Reject repos with ONLY pytorch_model.bin (no safetensors).
+            # Modern HF models use safetensors. .bin-only is suspicious and bypasses
+            # safetensors metadata param counting.
+            if pt_files and not st_files:
+                return {
+                    "pass": False,
+                    "reason": f"Model uses pytorch_model.bin format only ({len(pt_files)} files, "
+                              f"{total_pt_bytes / 1e9:.1f}GB). Safetensors format required — "
+                              f"convert with `transformers` save_pretrained().",
+                    "params_b": 0,
+                }
+
         except Exception as e:
-            logger.warning(f"Could not check safetensors file sizes for {model_repo}: {e}")
+            logger.warning(f"Could not check weight file sizes for {model_repo}: {e}")
 
         # 1. Get safetensors-verified param count
         safetensors_params_b = get_safetensors_param_count(model_repo, revision)
@@ -421,6 +470,36 @@ def check_model_architecture(
                 "params_b": total_params_b,
                 "active_params_b": config_active_b,
             }
+
+        # 4b. Cross-validate: config param count vs actual file size
+        # A real N-billion param model in bf16 should be ~2*N GB on disk.
+        # If the config says 3B but files are 70GB, the config is lying.
+        try:
+            total_weight_bytes = 0
+            for sibling in (info.siblings or []):
+                fname = sibling.rfilename
+                fsize = 0
+                if hasattr(sibling, 'size') and sibling.size is not None:
+                    fsize = sibling.size
+                elif hasattr(sibling, 'lfs') and sibling.lfs:
+                    fsize = sibling.lfs.get('size', 0)
+                if fname.endswith('.safetensors') or (fname.endswith('.bin') and 'pytorch_model' in fname):
+                    total_weight_bytes += fsize
+
+            if total_weight_bytes > 0:
+                # Estimate params from file size (bf16 = 2 bytes/param, fp32 = 4 bytes/param)
+                estimated_params_from_size = total_weight_bytes / 2e9  # bf16 estimate
+                # If file-estimated params are >2x the config-reported params, config is lying
+                if estimated_params_from_size > total_params_b * 2.5:
+                    return {
+                        "pass": False,
+                        "reason": f"FRAUD: Config claims {total_params_b:.2f}B params but weight files are "
+                                  f"{total_weight_bytes / 1e9:.1f}GB (~{estimated_params_from_size:.1f}B params in bf16). "
+                                  f"Config/weights mismatch — possible teacher model disguised as student.",
+                        "params_b": estimated_params_from_size,
+                    }
+        except Exception as e:
+            logger.warning(f"Config vs file size cross-validation failed: {e}")
 
         # 5. Reject quantized models (GPTQ, AWQ, GGUF, etc.)
         quant_config = config.get("quantization_config", {})
