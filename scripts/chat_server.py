@@ -76,7 +76,11 @@ class ChatHandler(BaseHTTPRequestHandler):
         elapsed = time.time() - t0
         new_tokens = output[0][input_len:]
         n_tokens = len(new_tokens)
-        raw = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        raw = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        # Strip special tokens but keep <think>/<\/think>
+        for st in getattr(tokenizer, 'all_special_tokens', []):
+            if st not in ("<think>", "</think>"):
+                raw = raw.replace(st, "")
         tps = n_tokens / elapsed if elapsed > 0 else 0
 
         thinking, answer = _split_thinking(raw)
@@ -99,7 +103,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-        streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True, skip_prompt=True)
+        streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=False, skip_prompt=True)
         gen_kwargs["streamer"] = streamer
 
         t0 = time.time()
@@ -116,39 +120,50 @@ class ChatHandler(BaseHTTPRequestHandler):
         thread = threading.Thread(target=generate)
         thread.start()
 
+        # Build list of special token strings to strip from output
+        _special_strs = set()
+        if hasattr(tokenizer, 'all_special_tokens'):
+            _special_strs = set(tokenizer.all_special_tokens)
+        # Always strip common ones
+        _special_strs.update(["<|endoftext|>", "<|im_end|>", "<|im_start|>", "<|end|>"])
+
         try:
             for chunk in streamer:
-                full_text.append(chunk)
+                # Strip special tokens from chunk
+                clean_chunk = chunk
+                for st in _special_strs:
+                    clean_chunk = clean_chunk.replace(st, "")
+                if not clean_chunk:
+                    continue
+
+                full_text.append(clean_chunk)
                 joined = "".join(full_text)
                 n_tokens[0] += max(1, len(tokenizer.encode(chunk, add_special_tokens=False)))
                 elapsed = time.time() - t0
                 tps = n_tokens[0] / elapsed if elapsed > 0 else 0
 
                 # Detect phase transitions
-                current_phase = phase[0]
                 if not think_done[0]:
                     if "</think>" in joined:
                         think_done[0] = True
                         phase[0] = "answer"
-                        # Split: send the answer portion only
-                        after_think = joined.split("</think>", 1)[1]
-                        # Send transition event
+                        after_think = joined.split("</think>", 1)[1].strip()
                         self._sse({"choices": [{"delta": {"phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
-                        if after_think.strip():
-                            self._sse({"choices": [{"delta": {"content": after_think.strip(), "phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
+                        if after_think:
+                            self._sse({"choices": [{"delta": {"content": after_think, "phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
                         continue
-                    # Check if model didn't use think tags at all (first 50 chars)
-                    if len(joined) > 50 and "<think>" not in joined[:50]:
+                    # If no <think> tag at all in first 30 chars, skip thinking phase
+                    if len(joined) > 30 and "<think>" not in joined[:30]:
                         think_done[0] = True
                         phase[0] = "answer"
 
-                # Clean chunk: strip <think> tag from output
-                clean = chunk.replace("<think>", "").replace("</think>", "")
-                if not clean:
+                # Strip think tags from individual chunks
+                out = clean_chunk.replace("<think>", "").replace("</think>", "")
+                if not out:
                     continue
 
                 self._sse({
-                    "choices": [{"delta": {"content": clean, "phase": phase[0]}, "finish_reason": None}],
+                    "choices": [{"delta": {"content": out, "phase": phase[0]}, "finish_reason": None}],
                     "usage": {"tokens_per_second": round(tps, 1)},
                 })
         except (BrokenPipeError, ConnectionResetError):
