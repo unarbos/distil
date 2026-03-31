@@ -577,6 +577,7 @@ def main():
             import signal
             def _timeout_handler(signum, frame):
                 raise TimeoutError(f"Student model load timed out after {STUDENT_LOAD_TIMEOUT}s")
+            vram_before = torch.cuda.memory_allocated()
             old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
             signal.alarm(STUDENT_LOAD_TIMEOUT)
             student = load_model(student_name, device)
@@ -612,12 +613,15 @@ def main():
             free_gpu()
             continue
         load_time = time.time() - t0
-        student_vram_gb = torch.cuda.memory_allocated() / 1024**3
-        print(f"[eval] Loaded in {load_time:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+        # Measure VRAM DELTA — only the student's footprint, NOT including teacher
+        student_vram_gb = (torch.cuda.memory_allocated() - vram_before) / 1024**3
+        total_vram_gb = torch.cuda.memory_allocated() / 1024**3
+        print(f"[eval] Loaded in {load_time:.1f}s, student VRAM: {student_vram_gb:.1f}GB, total: {gpu_mem_str()}", flush=True)
 
         # ANTI-CHEAT: VRAM usage check.
         # A real ≤5B param model in bf16 uses ~10GB VRAM. The 35B teacher uses ~70GB.
         # If a "4B" model uses >20GB VRAM, it's likely a larger model in disguise.
+        # IMPORTANT: We check DELTA, not total — teacher is still in VRAM.
         MAX_STUDENT_VRAM_GB = 20.0  # Very generous — real 4B is ~8-10GB
         if student_vram_gb > MAX_STUDENT_VRAM_GB:
             vram_msg = (f"FRAUD: Model claims ≤5B params but uses {student_vram_gb:.1f}GB VRAM "
