@@ -237,14 +237,29 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         if h2h_file.exists():
             try:
                 h2h = json.loads(h2h_file.read_text())
-                king_uid = h2h.get("king_uid")
+                h2h_king = h2h.get("king_uid")
                 new_king = h2h.get("new_king_uid")
+                king_changed = h2h.get("king_changed", False)
                 if new_king is not None and str(new_king) not in fixed_scores:
-                    issues.append(f"h2h_latest.new_king_uid={new_king} has no valid score — this is stale")
-                if king_uid is not None and str(king_uid) not in fixed_scores:
-                    issues.append(f"h2h_latest.king_uid={king_uid} has no valid score — king may be stale")
+                    issues.append(f"h2h_latest.new_king_uid={new_king} has no valid score — stale")
+                if h2h_king is not None and str(h2h_king) not in fixed_scores:
+                    issues.append(f"h2h_latest.king_uid={h2h_king} has no valid score — stale")
+                # If king_changed, king_uid should have been updated to new_king
+                if king_changed and new_king is not None and h2h_king != new_king:
+                    issues.append(f"h2h_latest: king_changed=true but king_uid={h2h_king} != new_king_uid={new_king} — fixing")
+                    h2h["king_uid"] = new_king
+                    h2h_file.write_text(json.dumps(h2h, indent=2))
             except Exception:
                 pass
+
+        # Check 6: Remove garbage/sentinel scores
+        import math
+        for uid_str in list(fixed_scores.keys()):
+            kl = fixed_scores[uid_str]
+            if not isinstance(kl, (int, float)) or math.isnan(kl) or math.isinf(kl) or kl < 0 or kl >= MAX_KL_THRESHOLD:
+                issues.append(f"UID {uid_str} has garbage score {kl} — removing")
+                fixed_scores.pop(uid_str)
+                fixed_evaluated.discard(uid_str)
 
         if issues:
             print(f"[VALIDATOR] ⚠️ STATE VALIDATION found {len(issues)} issues:", flush=True)
@@ -317,35 +332,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 save_evaluated()
                 print(f"[VALIDATOR] State auto-repaired ({len(state_issues)} issues fixed)", flush=True)
 
-            # ══════════════════════════════════════════════════════════════
-            # STALE SCORE CLEANUP: Clear scores for recycled UIDs
-            # When a UID gets a new hotkey, its old score is invalid.
-            # ══════════════════════════════════════════════════════════════
+            # Save current hotkey map for next epoch (stale cleanup handled by validate_state_consistency above)
             hotkey_map_file = state_path / "uid_hotkey_map.json"
-            prev_hotkey_map = {}
-            if hotkey_map_file.exists():
-                try:
-                    prev_hotkey_map = json.loads(hotkey_map_file.read_text())
-                except Exception:
-                    pass
-
-            stale_cleared = 0
-            for uid_str, hotkey in uid_to_hotkey.items():
-                uid_s = str(uid_str)
-                prev_hotkey = prev_hotkey_map.get(uid_s)
-                if prev_hotkey and prev_hotkey != hotkey and uid_s in scores:
-                    old_score = scores.pop(uid_s)
-                    evaluated_uids.discard(uid_s)
-                    stale_cleared += 1
-                    print(f"[VALIDATOR] UID {uid_s}: hotkey changed ({prev_hotkey[:8]}→{hotkey[:8]}), "
-                          f"cleared stale score {old_score:.6f}", flush=True)
-
-            if stale_cleared:
-                save_scores(scores, state_path)
-                save_evaluated()
-                print(f"[VALIDATOR] Cleared {stale_cleared} stale scores from recycled UIDs", flush=True)
-
-            # Save current hotkey map for next epoch
             hotkey_map_file.write_text(json.dumps({str(k): v for k, v in uid_to_hotkey.items()}))
 
             # ══════════════════════════════════════════════════════════════
@@ -1062,48 +1050,63 @@ else:
                     reset_failures(uid, failures)
                     print(f"[VALIDATOR] UID {uid} ({model_name}): KL={kl:.6f}", flush=True)
 
-            # ── Epsilon enforcement: challenger must beat king by >1% to dethrone ──
-            # Use the king's H2H score (same prompts as challengers) for fair comparison.
-            # The king's GLOBAL score is preserved — only challengers who beat the king
-            # on the SAME prompt set can dethrone.
+            # ── Epsilon enforcement + winner determination ──
+            # Challenger must beat king by >EPSILON to dethrone.
+            # Scores are NEVER mutated — epsilon is enforced in winner selection only.
+            # This preserves real scores for transparency on the dashboard.
+            king_new_kl = king_h2h_kl if king_h2h_kl is not None else scores.get(str(king_uid), king_kl) if king_uid else float("inf")
+            epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
+            epsilon_dethroned_by = None  # Track which challenger dethroned king
+
             if king_uid is not None and challengers:
-                king_new_kl = king_h2h_kl if king_h2h_kl is not None else scores.get(str(king_uid), king_kl)
-                threshold = king_new_kl * (1.0 - EPSILON)
                 for uid in challengers:
                     uid_str = str(uid)
-                    if uid_str in scores and scores[uid_str] <= MAX_KL_THRESHOLD:
+                    if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
                         challenger_kl = scores[uid_str]
-                        if challenger_kl < threshold:
+                        if challenger_kl < epsilon_threshold:
                             print(f"[VALIDATOR] UID {uid} DETHRONED king UID {king_uid}! "
-                                  f"KL={challenger_kl:.6f} < {threshold:.6f} (king {king_new_kl:.6f} - {EPSILON*100:.0f}%)", flush=True)
+                                  f"KL={challenger_kl:.6f} < {epsilon_threshold:.6f} (king {king_new_kl:.6f} - {EPSILON*100:.0f}%)", flush=True)
+                            if epsilon_dethroned_by is None or challenger_kl < scores.get(str(epsilon_dethroned_by), float("inf")):
+                                epsilon_dethroned_by = uid
                         else:
                             pct = ((king_new_kl - challenger_kl) / king_new_kl * 100) if king_new_kl > 0 else 0
-                            print(f"[VALIDATOR] UID {uid} did NOT beat king (KL={challenger_kl:.6f}, "
-                                  f"needed <{threshold:.6f}, only {pct:.1f}% better)", flush=True)
-                            # Enforce epsilon: if challenger is close but not epsilon-better,
-                            # don't let it dethrone. Set score to king + tiny margin so
-                            # compute_winner_weights still picks king.
                             if challenger_kl < king_new_kl:
-                                scores[uid_str] = king_new_kl + 1e-8
-                                print(f"[VALIDATOR] UID {uid}: epsilon-pinned score to {scores[uid_str]:.8f} "
-                                      f"(actual was {challenger_kl:.6f})", flush=True)
+                                print(f"[VALIDATOR] UID {uid}: better than king but within epsilon "
+                                      f"(KL={challenger_kl:.6f}, needed <{epsilon_threshold:.6f}, only {pct:.1f}% better)", flush=True)
 
             # ── Determine winner from H2H round results ONLY ──
             # DO NOT use compute_winner_weights on global scores — scores from
             # different prompt sets are not comparable. The H2H winner is whoever
             # got the lowest KL in THIS round (same prompts for all models).
             h2h_candidates = []
-            all_round_uids = set([king_uid] + challengers) if king_uid is not None else set(challengers)
+            all_round_uids = set([king_uid] + list(challengers.keys())) if king_uid is not None else set(challengers.keys())
             for uid in all_round_uids:
                 uid_str = str(uid)
-                if uid in disqualified:
+                if uid in dq_reasons or str(uid) in dq_reasons:
+                    continue
+                hotkey = uid_to_hotkey.get(uid, "")
+                if hotkey in dq_reasons:
                     continue
                 if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
                     h2h_candidates.append((uid, scores[uid_str]))
 
             if h2h_candidates:
                 h2h_candidates.sort(key=lambda x: x[1])
-                winner_uid, winner_kl = h2h_candidates[0]
+                best_uid, best_kl = h2h_candidates[0]
+                # Respect epsilon: if best is a challenger but didn't beat king by epsilon,
+                # king retains the crown even if their KL is slightly worse
+                if king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
+                    # No challenger passed epsilon — king wins
+                    winner_uid = king_uid
+                    winner_kl = scores.get(str(king_uid), king_kl)
+                    print(f"[VALIDATOR] King UID {king_uid} retains crown (no challenger passed epsilon)", flush=True)
+                elif epsilon_dethroned_by is not None:
+                    # A challenger passed epsilon — they're the winner
+                    winner_uid = epsilon_dethroned_by
+                    winner_kl = scores.get(str(epsilon_dethroned_by), best_kl)
+                    print(f"[VALIDATOR] UID {winner_uid} is new king (passed epsilon)", flush=True)
+                else:
+                    winner_uid, winner_kl = best_uid, best_kl
             else:
                 winner_uid, winner_kl = None, float("inf")
 
@@ -1191,18 +1194,21 @@ else:
                 print(f"[VALIDATOR] All challengers failed — skipping H2H round save (king-only)", flush=True)
 
             if n_challenger_results > 0:
+                king_changed = winner_uid != king_uid if king_uid is not None else False
                 h2h_round = {
                     "block": current_block,
                     "timestamp": time.time(),
-                    "king_uid": king_uid,
+                    # king_uid = the winner (for next round to pick up correctly)
+                    "king_uid": winner_uid if winner_uid is not None else king_uid,
+                    "prev_king_uid": king_uid,
                     "king_h2h_kl": round(king_h2h_kl, 6) if king_h2h_kl else None,
                     "king_global_kl": round(king_kl, 6),
                     "epsilon": EPSILON,
                     "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
                     "n_prompts": EVAL_PROMPTS,
                     "results": h2h_results,
-                    "king_changed": winner_uid != king_uid if king_uid is not None else False,
-                    "new_king_uid": winner_uid if winner_uid != king_uid else None,
+                    "king_changed": king_changed,
+                    "new_king_uid": winner_uid if king_changed else None,
                 }
                 # Save latest round + append to history
                 h2h_path = state_path / "h2h_latest.json"
