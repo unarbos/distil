@@ -388,6 +388,9 @@ def main():
         print(f"\n{'=' * 60}", flush=True)
         print(f"[eval] Student: {student_name}", flush=True)
 
+        # Per-model total timeout (load + scoring + cleanup)
+        PER_MODEL_TIMEOUT = 600  # 10 minutes max per model (load ~60s + scoring ~15s + buffer)
+
         # Update live progress: loading model
         live_progress["current"] = {
             "student_idx": student_idx,
@@ -400,6 +403,7 @@ def main():
         }
         _write_progress()
 
+        model_start_time = time.time()
         t0 = time.time()
         STUDENT_LOAD_TIMEOUT = 300  # 5 minutes max to load a student model
         try:
@@ -555,6 +559,15 @@ def main():
                         )
                         early_stopped = True
                         break
+
+                # Per-model timeout check
+                if time.time() - model_start_time > PER_MODEL_TIMEOUT:
+                    print(
+                        f"  [timeout] {student_name}: exceeded {PER_MODEL_TIMEOUT}s after {len(prompt_kl_means)} prompts",
+                        flush=True,
+                    )
+                    early_stopped = True
+                    break
 
         scoring_time = time.time() - t0
 

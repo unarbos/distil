@@ -726,7 +726,11 @@ else:
                 poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
                 poll_thread.start()
 
-                EVAL_TIMEOUT = 240 * 60  # 4 hours max for full eval (46+ models with downloads)
+                # Dynamic timeout: 10 min per model + 30 min buffer for teacher generation
+                # Per-model timeout (10 min) is enforced inside pod_eval.py; this is a safety net
+                n_eval_models = len(models_to_eval)
+                EVAL_TIMEOUT = (n_eval_models * 10 + 30) * 60
+                print(f"[VALIDATOR] Eval timeout: {EVAL_TIMEOUT//60}m ({n_eval_models} models × 10m + 30m buffer)", flush=True)
                 eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
                 try:
                     import concurrent.futures
