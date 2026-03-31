@@ -498,31 +498,44 @@ def health():
     last_eval_block = None
     last_eval_age_min = None
     eval_active = False
+    king_uid = None
+    king_kl = None
+    n_scored = 0
+    n_dq = 0
+    eval_students_done = 0
+    eval_students_total = 0
     try:
-        h2h_path = os.path.join(STATE_DIR, "h2h_latest.json")
-        if os.path.exists(h2h_path):
-            with open(h2h_path) as f:
-                h2h = json.load(f)
-            last_eval_block = h2h.get("block")
-            ts = h2h.get("timestamp")
-            if ts:
-                last_eval_age_min = round((_time.time() - ts) / 60, 1)
-        progress_path = os.path.join(STATE_DIR, "eval_progress.json")
-        if os.path.exists(progress_path):
-            with open(progress_path) as f:
-                prog = json.load(f)
-            eval_active = prog.get("active", False)
+        h2h = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
+        last_eval_block = h2h.get("block")
+        ts = h2h.get("timestamp")
+        if ts:
+            last_eval_age_min = round((_time.time() - ts) / 60, 1)
+        king_uid = h2h.get("king_uid")
+        # Get king KL from scores
+        scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
+        n_scored = len(scores)
+        if king_uid and str(king_uid) in scores:
+            king_kl = scores[str(king_uid)]
+        dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
+        n_dq = len(dq)
+        prog = _safe_json_load(os.path.join(STATE_DIR, "eval_progress.json"), {})
+        eval_active = prog.get("active", False)
+        if eval_active:
+            eval_students_done = len(prog.get("completed", []))
+            eval_students_total = prog.get("students_total", 0)
     except Exception:
         pass
     return {
         "status": "ok",
         "netuid": NETUID,
-        "has_metagraph_cache": _get_stale("metagraph") is not None,
-        "has_commit_cache": _get_stale("commitments") is not None,
-        "has_price_cache": _get_stale("price") is not None,
+        "king_uid": king_uid,
+        "king_kl": round(king_kl, 6) if king_kl else None,
+        "n_scored": n_scored,
+        "n_disqualified": n_dq,
         "last_eval_block": last_eval_block,
         "last_eval_age_min": last_eval_age_min,
         "eval_active": eval_active,
+        "eval_progress": f"{eval_students_done}/{eval_students_total}" if eval_active else None,
     }
 
 
