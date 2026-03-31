@@ -1137,6 +1137,11 @@ else:
             # Challenger must beat king by >EPSILON to dethrone.
             # Scores are NEVER mutated — epsilon is enforced in winner selection only.
             # This preserves real scores for transparency on the dashboard.
+            #
+            # If king failed to eval this round, we MUST use the fresh scores
+            # from challengers only — the king retains crown by default.
+            if king_uid is not None and king_h2h_kl is None:
+                print(f"[VALIDATOR] ⚠️ King UID {king_uid} did not produce a score this round — retaining crown by default", flush=True)
             king_new_kl = king_h2h_kl if king_h2h_kl is not None else scores.get(str(king_uid), king_kl) if king_uid else float("inf")
             epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
             epsilon_dethroned_by = None  # Track which challenger dethroned king
@@ -1210,7 +1215,8 @@ else:
             )
             for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
                 uid = int(uid_str)
-                dq = " ⛔ DQ" if uid in disqualified else ""
+                hotkey = uid_to_hotkey.get(uid, "")
+                dq = " ⛔ DQ" if (uid in disqualified or is_disqualified(uid, hotkey, dq_reasons)) else ""
                 marker = " ← H2H WINNER" if uid == winner_uid else ""
                 in_round = " (in round)" if uid in all_round_uids else ""
                 print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{in_round}{dq}", flush=True)
@@ -1375,10 +1381,12 @@ else:
                                   or valid_models.get(winner_uid, {}).get("model", "unknown"))
                 old_king_model = (uid_to_model.get(king_uid)
                                   or valid_models.get(king_uid, {}).get("model", "unknown"))
+                # Use H2H KL (same prompt set) for accurate comparison in announcement
+                old_kl_for_announcement = king_h2h_kl if king_h2h_kl is not None else king_kl
                 try:
                     _announce_new_king(
                         new_uid=winner_uid, new_model=new_king_model, new_kl=winner_kl,
-                        old_uid=king_uid, old_model=old_king_model, old_kl=king_kl,
+                        old_uid=king_uid, old_model=old_king_model, old_kl=old_kl_for_announcement,
                         state_dir=state_path,
                     )
                 except Exception as ann_err:
