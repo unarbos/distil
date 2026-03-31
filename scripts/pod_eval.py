@@ -387,7 +387,10 @@ def main():
                 "status_detail": f"KL={kl:.6f} (resumed)" if kl else "resumed",
             })
             _write_progress()
-            if kl is not None and (best_kl_so_far is None or kl < best_kl_so_far):
+            # ANTI-CHEAT: Ignore KL ≤ 0.001 for early stopping — no real student
+            # can match the teacher that closely. A fraudulent KL=0 would poison
+            # best_kl_so_far and cause all subsequent models to early-stop.
+            if kl is not None and kl > 0.001 and (best_kl_so_far is None or kl < best_kl_so_far):
                 best_kl_so_far = kl
             continue
 
@@ -694,7 +697,8 @@ def main():
             logit_fingerprints[student_name] = torch.cat(fingerprint_parts)
 
         # Update best KL tracker (only from fully evaluated, non-copy students)
-        if not early_stopped and not is_functional_copy:
+        # ANTI-CHEAT: Ignore KL ≤ 0.001 — prevents fraudulent models from poisoning early stopping
+        if not early_stopped and not is_functional_copy and kl_global > 0.001:
             if best_kl_so_far is None or kl_global < best_kl_so_far:
                 best_kl_so_far = kl_global
 
