@@ -108,8 +108,10 @@ def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, s
 @click.option("--max-params-b", type=float, default=5.25)
 @click.option("--tempo", type=int, default=360, help="Seconds between epochs")
 @click.option("--once", is_flag=True, help="Run one epoch and exit (for testing)")
+@click.option("--use-vllm", is_flag=True, default=False, envvar="USE_VLLM",
+              help="Use vLLM-accelerated pod_eval_vllm.py instead of pod_eval.py")
 def main(network, netuid, wallet_name, hotkey_name, wallet_path,
-         lium_api_key, lium_pod_name, state_dir, max_params_b, tempo, once):
+         lium_api_key, lium_pod_name, state_dir, max_params_b, tempo, once, use_vllm):
     """Run the distillation validator with king-of-the-hill evaluation."""
     import bittensor as bt
     from lium import Lium, Config
@@ -271,10 +273,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
         return fixed_scores, fixed_evaluated, issues
 
     # ── Upload eval script (with retry — SFTP can be flaky on Lium pods) ──
+    eval_script = "scripts/pod_eval_vllm.py" if use_vllm else "scripts/pod_eval.py"
+    eval_script_remote = "/home/pod_eval.py"  # same remote name either way
+    print(f"[VALIDATOR] Eval script: {eval_script} ({'vLLM' if use_vllm else 'HF'})", flush=True)
     for _upload_attempt in range(5):
         try:
             logger.info(f"Uploading eval script to pod (attempt {_upload_attempt + 1}/5)...")
-            lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+            lium.upload(pod, local=eval_script, remote=eval_script_remote)
             logger.info("Upload successful")
             break
         except Exception as e:
@@ -700,16 +705,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             os.unlink(prompts_file)
 
             # Re-upload eval script (in case it changed)
-            for _up_att in range(3):
+            for _up_att in range(5):
                 try:
-                    lium.upload(pod, local="scripts/pod_eval.py", remote="/home/pod_eval.py")
+                    lium.upload(pod, local=eval_script, remote=eval_script_remote)
                     break
                 except Exception as e:
-                    print(f"[VALIDATOR ERROR] Eval script upload failed (attempt {_up_att+1}/3): {e}", flush=True)
-                    if _up_att < 2:
+                    print(f"[VALIDATOR ERROR] Eval script upload failed (attempt {_up_att+1}/5): {e}", flush=True)
+                    if _up_att < 4:
                         time.sleep(5)
                     else:
-                        raise
+                        raise RuntimeError(f"Failed to upload eval script after 5 attempts: {e}")
 
             # NEVER delete teacher_cache.pt or eval_results.json blindly.
             # pod_eval.py checks the prompts hash inside teacher_cache.pt and
@@ -758,10 +763,6 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             except Exception:
                 pass
 
-            # vLLM integration disabled — needs testing before production use.
-            # TODO: Re-enable once tmux/nohup startup is verified on Lium pods.
-            use_vllm = False
-
             # Run eval — king first, then challengers by commit block (earliest first).
             # Earlier commits are more established → likely lower KL → sets best_kl_so_far
             # early for better early-stopping on weaker newcomers.
@@ -787,7 +788,6 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 # Always pass --teacher-logits + --resume so pod_eval reuses
                 # cached teacher logits (if prompts hash matches) and skips
                 # already-scored students.
-                vllm_flag = f" --teacher-vllm-url {VLLM_URL}" if use_vllm else ""
                 teacher_cmd = (
                     f"cd /home && python3 pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -801,7 +801,6 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     f"--teacher-logits /home/teacher_cache.pt "
                     f"--save-teacher-logits /home/teacher_cache.pt "
                     f"--resume"
-                    f"{vllm_flag}"
                 )
                 print("[VALIDATOR] Step 1: Teacher inference + first student on GPU 0...", flush=True)
                 try:
@@ -888,7 +887,6 @@ else:
                 # Single GPU: original sequential eval
                 # --resume + --teacher-logits: if a prior eval crashed mid-round,
                 # reuse teacher logits and skip already-scored students.
-                vllm_flag = f" --teacher-vllm-url {VLLM_URL}" if use_vllm else ""
                 cmd = (
                     f"cd /home && python3 pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -901,7 +899,6 @@ else:
                     f"--teacher-logits /home/teacher_cache.pt "
                     f"--save-teacher-logits /home/teacher_cache.pt "
                     f"--resume"
-                    f"{vllm_flag}"
                 )
                 print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
