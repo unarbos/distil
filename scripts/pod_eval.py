@@ -593,16 +593,9 @@ def main():
         del student
         free_gpu()
 
-        # Clean this student's HF cache to free disk between models
-        try:
-            import shutil
-            cache_name = f"models--{student_name.replace('/', '--')}"
-            cache_path = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub", cache_name)
-            if os.path.isdir(cache_path):
-                shutil.rmtree(cache_path)
-                print(f"  [cleanup] Removed cache: {cache_name}", flush=True)
-        except Exception:
-            pass
+        # NOTE: Student HF cache is cleaned AFTER the full eval completes (see below).
+        # Previously cleaned per-student, but that caused re-downloads from HF which
+        # could hang indefinitely when rate-limited (no HF_TOKEN on pod).
 
     # Summary
     total_time = time.time() - total_start
@@ -627,6 +620,20 @@ def main():
     with open(args.output, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n[eval] Results saved to {args.output}", flush=True)
+
+    # Clean all student HF caches AFTER eval completes (not per-student).
+    # Per-student cleanup caused re-downloads from HF which could hang
+    # indefinitely when rate-limited (no HF_TOKEN on pod).
+    for student_name in students:
+        try:
+            import shutil
+            cache_name = f"models--{student_name.replace('/', '--')}"
+            cache_path = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub", cache_name)
+            if os.path.isdir(cache_path):
+                shutil.rmtree(cache_path)
+                print(f"  [cleanup] Removed cache: {cache_name}", flush=True)
+        except Exception:
+            pass
 
     # Force exit — teacher model's CUDA/background threads can hang indefinitely
     os._exit(0)
