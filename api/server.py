@@ -492,16 +492,18 @@ def health():
     last_eval_age_min = None
     eval_active = False
     try:
-        h2h_path = STATE_DIR / "h2h_latest.json"
-        if h2h_path.exists():
-            h2h = json.loads(h2h_path.read_text())
+        h2h_path = os.path.join(STATE_DIR, "h2h_latest.json")
+        if os.path.exists(h2h_path):
+            with open(h2h_path) as f:
+                h2h = json.load(f)
             last_eval_block = h2h.get("block")
             ts = h2h.get("timestamp")
             if ts:
                 last_eval_age_min = round((_time.time() - ts) / 60, 1)
-        progress_path = STATE_DIR / "eval_progress.json"
-        if progress_path.exists():
-            prog = json.loads(progress_path.read_text())
+        progress_path = os.path.join(STATE_DIR, "eval_progress.json")
+        if os.path.exists(progress_path):
+            with open(progress_path) as f:
+                prog = json.load(f)
             eval_active = prog.get("active", False)
     except Exception:
         pass
