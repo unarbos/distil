@@ -109,8 +109,12 @@ class ChatHandler(BaseHTTPRequestHandler):
         t0 = time.time()
         n_tokens = [0]
         full_text = []
-        phase = ["thinking"]  # start assuming thinking
+        # Phase detection: only use <think> tags (reliable).
+        # For models that use "Thinking Process:" style, we don't try to split
+        # in streaming — the full split happens server-side when stream=false.
+        phase = ["answer"]  # default to answer
         think_done = [False]
+        has_think_tags = [False]
 
         def generate():
             with _gen_lock:
@@ -142,22 +146,22 @@ class ChatHandler(BaseHTTPRequestHandler):
                 elapsed = time.time() - t0
                 tps = n_tokens[0] / elapsed if elapsed > 0 else 0
 
-                # Detect phase transitions
+                # Phase detection: only handle explicit <think>/<\/think> tags
                 if not think_done[0]:
-                    if "</think>" in joined:
-                        think_done[0] = True
-                        phase[0] = "answer"
-                        after_think = joined.split("</think>", 1)[1].strip()
-                        self._sse({"choices": [{"delta": {"phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
-                        if after_think:
-                            self._sse({"choices": [{"delta": {"content": after_think, "phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
-                        continue
-                    # If no <think> tag at all in first 30 chars, skip thinking phase
-                    if len(joined) > 30 and "<think>" not in joined[:30]:
-                        think_done[0] = True
-                        phase[0] = "answer"
+                    if "<think>" in joined and not has_think_tags[0]:
+                        has_think_tags[0] = True
+                        phase[0] = "thinking"
 
-                # Strip think tags from individual chunks
+                    if has_think_tags[0] and "</think>" in joined:
+                        think_done[0] = True
+                        phase[0] = "answer"
+                        after = joined.split("</think>", 1)[1].strip()
+                        self._sse({"choices": [{"delta": {"phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
+                        if after:
+                            self._sse({"choices": [{"delta": {"content": after, "phase": "answer"}, "finish_reason": None}], "usage": {"tokens_per_second": round(tps, 1)}})
+                        continue
+
+                # Strip think tags from output
                 out = clean_chunk.replace("<think>", "").replace("</think>", "")
                 if not out:
                     continue
@@ -174,10 +178,18 @@ class ChatHandler(BaseHTTPRequestHandler):
         elapsed = time.time() - t0
         tps = n_tokens[0] / elapsed if elapsed > 0 else 0
         try:
-            self._sse({
+            # For models without <think> tags, split thinking from answer retroactively
+            final_text = "".join(full_text)
+            thinking_text, answer_text = _split_thinking(final_text)
+
+            done_event = {
                 "choices": [{"delta": {}, "finish_reason": "stop"}],
                 "usage": {"completion_tokens": n_tokens[0], "tokens_per_second": round(tps, 1), "generation_time_s": round(elapsed, 2)},
-            })
+            }
+            if thinking_text:
+                done_event["thinking"] = thinking_text
+                done_event["answer"] = answer_text
+            self._sse(done_event)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -215,7 +227,8 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 
 def _split_thinking(text):
-    """Split <think>...</think> from answer."""
+    """Split thinking from answer. Handles <think> tags and 'Thinking Process:' headers."""
+    # 1. Explicit <think>...</think> tags
     if "</think>" in text:
         parts = text.split("</think>", 1)
         thinking = parts[0].replace("<think>", "").strip()
@@ -223,12 +236,40 @@ def _split_thinking(text):
         return thinking, answer if answer else "(stopped during thinking)"
     if text.lstrip().startswith("<think>"):
         return text.lstrip()[7:].strip(), "(thinking cut short)"
-    # Heuristic fallback for "Thinking Process:" style
-    for header in ["Thinking Process:", "Thought:", "Reasoning:"]:
-        if text.startswith(header):
-            parts = re.split(r'\n\n(?=[A-Z*])', text, maxsplit=1)
-            if len(parts) == 2:
-                return parts[0].strip(), parts[1].strip()
+
+    # 2. "Thinking Process:" / "Thought:" / "Reasoning:" style headers
+    # The model outputs structured thinking then transitions to the actual answer
+    # Pattern: thinking block → double newline → answer (often starts differently)
+    for header in ["Thinking Process:", "**Thinking Process:**", "Thought:", "Reasoning:", "Let me think"]:
+        if text.strip().startswith(header):
+            # Find the answer after the thinking block ends
+            # Look for patterns like: numbered list ending → double newline → non-list content
+            # Or: thinking block → "---" → answer
+            # Or: "Draft:" / "Response:" / "Answer:" / "Final" section that's the actual output
+            answer_markers = [
+                r'\n\n---\n',
+                r'\n\n(?:(?:Final )?(?:Answer|Response|Output|Result)[:\s])',
+                r'\n\n(?:Here\'s|Here is)',
+            ]
+            for pattern in answer_markers:
+                match = re.search(pattern, text)
+                if match:
+                    thinking = text[:match.start()].strip()
+                    answer = text[match.end():].strip() if text[match.end():].strip() else text[match.start():].strip()
+                    return thinking, answer
+
+            # Fallback: find last double-newline followed by short non-list content
+            # This catches cases where thinking ends and a clean answer starts
+            parts = text.rsplit('\n\n', 1)
+            if len(parts) == 2 and not parts[1].strip().startswith(('*', '-', '#', 'Option')):
+                last_block = parts[1].strip()
+                # If the last block looks like an actual answer (not another thinking step)
+                if len(last_block) > 10 and not any(last_block.startswith(m) for m in ['*', '-', '1.', '2.', '3.', '4.']):
+                    return parts[0].strip(), last_block
+
+            # If we can't find a clean split, return everything as thinking
+            return text.strip(), "(thinking — answer not yet generated)"
+
     return None, text
 
 
