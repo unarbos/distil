@@ -27,6 +27,17 @@ os.makedirs(DISK_CACHE_DIR, exist_ok=True)
 
 # ── Disk-backed cache ────────────────────────────────────────────────────────
 
+def _safe_json_load(path: str, default=None):
+    """Load JSON file, returning default on any error (missing, empty, corrupt)."""
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < 2:
+            return default
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return default
+
+
 def _safe_filename(name: str) -> str:
     return name.replace("/", "__").replace(":", "_")
 
@@ -269,19 +280,15 @@ def get_commitments():
 def get_scores():
     result = {"scores": {}, "ema_scores": {}, "disqualified": {}, "last_eval": None, "last_eval_time": None, "tempo_seconds": 600}
     scores_path = os.path.join(STATE_DIR, "scores.json")
-    if os.path.exists(scores_path):
-        with open(scores_path) as f:
-            s = json.load(f)
-            result["scores"] = s
-            result["ema_scores"] = s  # backward compat
+    s = _safe_json_load(scores_path, {})
+    result["scores"] = s
+    result["ema_scores"] = s  # backward compat
     dq_path = os.path.join(STATE_DIR, "disqualified.json")
-    if os.path.exists(dq_path):
-        with open(dq_path) as f:
-            result["disqualified"] = json.load(f)
+    result["disqualified"] = _safe_json_load(dq_path, {})
     eval_path = os.path.join(STATE_DIR, "last_eval.json")
-    if os.path.exists(eval_path):
-        with open(eval_path) as f:
-            result["last_eval"] = json.load(f)
+    last_eval = _safe_json_load(eval_path)
+    if last_eval is not None:
+        result["last_eval"] = last_eval
         result["last_eval_time"] = os.path.getmtime(eval_path)
     return result
 
