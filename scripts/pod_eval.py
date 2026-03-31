@@ -488,8 +488,12 @@ def main():
 
     _write_progress()
 
-    # Track best KL across students for early stopping
-    best_kl_so_far = None  # best (lowest) global KL mean from fully-evaluated students
+    # Track best KL across students for early stopping.
+    # We store per-prompt RUNNING MEANS (not just the final score) so we can
+    # compare at the same prompt index. This prevents unfair early-stopping
+    # when early prompts are harder than later ones.
+    best_kl_so_far = None  # best (lowest) FINAL global KL mean from fully-evaluated students
+    best_kl_per_prompt_cumulative = None  # list of running means at each prompt index for the best student
     MIN_PROMPTS_EARLY_STOP = 7  # minimum prompts before early stopping can trigger
 
     # Logit fingerprinting: detect functional copies even if hashes differ
@@ -516,10 +520,19 @@ def main():
             # best_kl_so_far and cause all subsequent models to early-stop.
             if kl is not None and kl > 0.001 and (best_kl_so_far is None or kl < best_kl_so_far):
                 best_kl_so_far = kl
+                # Reconstruct per-prompt cumulative means from saved per-prompt data
+                per_prompt = prior.get("kl_per_prompt", [])
+                if per_prompt:
+                    cumulative = []
+                    running_sum = 0
+                    for j, pp in enumerate(per_prompt):
+                        running_sum += pp.get("kl_mean", 0)
+                        cumulative.append(running_sum / (j + 1))
+                    best_kl_per_prompt_cumulative = cumulative
             continue
 
         print(f"\n{'=' * 60}", flush=True)
-        print(f"[eval] Student: {student_name}", flush=True)
+        print(f"[eval] Student {student_idx+1}/{len(students)}: {student_name}", flush=True)
 
         # Per-model total timeout (load + scoring + cleanup)
         PER_MODEL_TIMEOUT = 600  # 10 minutes max per model (load ~60s + scoring ~15s + buffer)
@@ -634,105 +647,130 @@ def main():
         prompt_kl_means = []  # list of per-prompt kl_mean values
         fingerprint_parts = []  # collect per-position KL vectors for fingerprinting
 
+        scoring_error = None
         with torch.no_grad():
             for i, full_ids in enumerate(full_sequences):
                 try:
                     s_logits = student(full_ids).logits.float()
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        print(f"  [prompt {i}] OOM, clearing cache and retrying...", flush=True)
-                        free_gpu()
-                        s_logits = student(full_ids).logits.float()
-                    else:
-                        raise
 
-                cont_s = s_logits[:, prompt_lens[i] - 1:-1, :]
-                t_logits = teacher_logits_list[i].to(device)
-                min_len = min(cont_s.shape[1], t_logits.shape[1])
-                kl_per_pos = compute_kl(t_logits[:, :min_len, :], cont_s[:, :min_len, :]).squeeze(0)
-                n_pos = kl_per_pos.shape[0]
-                kl_mean_val = kl_per_pos.mean().item()
+                    cont_s = s_logits[:, prompt_lens[i] - 1:-1, :]
+                    t_logits = teacher_logits_list[i].to(device)
+                    min_len = min(cont_s.shape[1], t_logits.shape[1])
+                    kl_per_pos = compute_kl(t_logits[:, :min_len, :], cont_s[:, :min_len, :]).squeeze(0)
+                    n_pos = kl_per_pos.shape[0]
+                    kl_mean_val = kl_per_pos.mean().item()
 
-                kl_per_prompt.append({
-                    "kl_mean": kl_mean_val,
-                    "kl_std": kl_per_pos.std().item() if n_pos > 1 else 0.0,
-                    "kl_max": kl_per_pos.max().item(),
-                    "kl_min": kl_per_pos.min().item(),
-                    "n_positions": n_pos,
-                })
-                prompt_kl_means.append(kl_mean_val)
-
-                # Collect fingerprint from first N prompts
-                if i < FINGERPRINT_PROMPTS:
-                    fingerprint_parts.append(kl_per_pos.detach().cpu())
-
-                # After fingerprint prompts, check for functional copy
-                if i == FINGERPRINT_PROMPTS - 1 and logit_fingerprints:
-                    fp = torch.cat(fingerprint_parts)
-                    for prev_name, prev_fp in logit_fingerprints.items():
-                        # Match lengths (use min)
-                        fp_len = min(fp.shape[0], prev_fp.shape[0])
-                        if fp_len < 10:
-                            continue
-                        cos = torch.nn.functional.cosine_similarity(
-                            fp[:fp_len].unsqueeze(0),
-                            prev_fp[:fp_len].unsqueeze(0),
-                        ).item()
-                        if cos > FINGERPRINT_COSINE_THRESHOLD:
-                            is_functional_copy = True
-                            copy_of = prev_name
-                            print(
-                                f"  [FUNCTIONAL COPY] {student_name} is a copy of {prev_name} "
-                                f"(cosine={cos:.8f} after {FINGERPRINT_PROMPTS} prompts)",
-                                flush=True,
-                            )
-                            break
-
-                    if is_functional_copy:
+                    # NaN/Inf check — corrupt model weights or numerical issues
+                    if math.isnan(kl_mean_val) or math.isinf(kl_mean_val):
+                        print(f"  [prompt {i}] KL is NaN/Inf — model producing garbage, stopping", flush=True)
+                        scoring_error = f"NaN/Inf KL at prompt {i}"
                         break
 
-                # Update live progress with running stats
-                n = len(prompt_kl_means)
-                running_mean = sum(prompt_kl_means) / n if n > 0 else 0
-                running_se = 0
-                ci_low, ci_high = running_mean, running_mean
-                if n >= 2:
-                    running_var = sum((x - running_mean) ** 2 for x in prompt_kl_means) / (n - 1)
-                    running_se = math.sqrt(running_var / n)
-                    ci_low = running_mean - 2 * running_se
-                    ci_high = running_mean + 2 * running_se
-                live_progress["current"] = {
-                    "student_idx": student_idx,
-                    "student_name": student_name,
-                    "phase": "scoring",
-                    "prompts_done": n,
-                    "kl_running_mean": round(running_mean, 6),
-                    "kl_running_se": round(running_se, 6) if running_se else None,
-                    "ci_95": [round(ci_low, 6), round(ci_high, 6)] if n >= 2 else None,
-                    "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far is not None else None,
-                }
-                _write_progress()
+                    kl_per_prompt.append({
+                        "kl_mean": kl_mean_val,
+                        "kl_std": kl_per_pos.std().item() if n_pos > 1 else 0.0,
+                        "kl_max": kl_per_pos.max().item(),
+                        "kl_min": kl_per_pos.min().item(),
+                        "n_positions": n_pos,
+                    })
+                    prompt_kl_means.append(kl_mean_val)
 
-                # Free per-prompt GPU tensors
-                del s_logits, cont_s, t_logits, kl_per_pos
+                    # Collect fingerprint from first N prompts
+                    if i < FINGERPRINT_PROMPTS:
+                        fingerprint_parts.append(kl_per_pos.detach().cpu())
 
-                # Early stopping check
+                    # After fingerprint prompts, check for functional copy
+                    if i == FINGERPRINT_PROMPTS - 1 and logit_fingerprints:
+                        fp = torch.cat(fingerprint_parts)
+                        for prev_name, prev_fp in logit_fingerprints.items():
+                            # Match lengths (use min)
+                            fp_len = min(fp.shape[0], prev_fp.shape[0])
+                            if fp_len < 10:
+                                continue
+                            cos = torch.nn.functional.cosine_similarity(
+                                fp[:fp_len].unsqueeze(0),
+                                prev_fp[:fp_len].unsqueeze(0),
+                            ).item()
+                            if cos > FINGERPRINT_COSINE_THRESHOLD:
+                                is_functional_copy = True
+                                copy_of = prev_name
+                                print(
+                                    f"  [FUNCTIONAL COPY] {student_name} is a copy of {prev_name} "
+                                    f"(cosine={cos:.8f} after {FINGERPRINT_PROMPTS} prompts)",
+                                    flush=True,
+                                )
+                                break
+
+                        if is_functional_copy:
+                            break
+
+                    # Update live progress with running stats
+                    n = len(prompt_kl_means)
+                    running_mean = sum(prompt_kl_means) / n if n > 0 else 0
+                    running_se = 0
+                    ci_low, ci_high = running_mean, running_mean
+                    if n >= 2:
+                        running_var = sum((x - running_mean) ** 2 for x in prompt_kl_means) / (n - 1)
+                        running_se = math.sqrt(running_var / n)
+                        ci_low = running_mean - 2 * running_se
+                        ci_high = running_mean + 2 * running_se
+                    live_progress["current"] = {
+                        "student_idx": student_idx,
+                        "student_name": student_name,
+                        "phase": "scoring",
+                        "prompts_done": n,
+                        "kl_running_mean": round(running_mean, 6),
+                        "kl_running_se": round(running_se, 6) if running_se else None,
+                        "ci_95": [round(ci_low, 6), round(ci_high, 6)] if n >= 2 else None,
+                        "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far is not None else None,
+                    }
+                    _write_progress()
+
+                    # Free per-prompt GPU tensors
+                    del s_logits, cont_s, t_logits, kl_per_pos
+
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"  [prompt {i}] OOM — skipping rest of model", flush=True)
+                        free_gpu()
+                    else:
+                        print(f"  [prompt {i}] RuntimeError: {e}", flush=True)
+                    scoring_error = str(e)
+                    break
+                except Exception as e:
+                    print(f"  [prompt {i}] Unexpected error: {e}", flush=True)
+                    scoring_error = str(e)
+                    break
+
+                # Early stopping check — compare at SAME prompt index
+                # This is fair because both student and best-so-far are evaluated
+                # on the exact same prompts in the same order. If the first 7 prompts
+                # are unusually hard, both student AND best-so-far have high means at
+                # that point, so the comparison is apples-to-apples.
                 n = len(prompt_kl_means)
                 if can_early_stop and n >= MIN_PROMPTS_EARLY_STOP:
                     running_mean = sum(prompt_kl_means) / n
                     running_var = sum((x - running_mean) ** 2 for x in prompt_kl_means) / (n - 1)
                     running_se = math.sqrt(running_var / n)
 
-                    # Student's lower 90% CI bound (best case for student)
-                    # Using 1.96 z-score for 95% CI
+                    # Student's lower 95% CI bound (best case for student)
                     student_lower = running_mean - 1.96 * running_se
-                    # Best student's upper 90% CI bound (worst case for best)
-                    best_upper = best_kl_so_far  # best_kl_so_far already stores the mean; use generous comparison
 
-                    if student_lower > best_upper:
+                    # Compare against best student's running mean AT THE SAME PROMPT INDEX.
+                    # This ensures fair comparison — if early prompts are hard, the best
+                    # student also has a high running mean at this point.
+                    if best_kl_per_prompt_cumulative is not None and n <= len(best_kl_per_prompt_cumulative):
+                        # Same-point comparison: best student's running mean after same N prompts
+                        best_at_same_point = best_kl_per_prompt_cumulative[n - 1]
+                    else:
+                        # Fallback: use final score (less fair but better than nothing)
+                        best_at_same_point = best_kl_so_far
+
+                    if student_lower > best_at_same_point:
                         print(
                             f"  [early-stop] {student_name}: KL={running_mean:.6f} ± {running_se:.6f} "
-                            f"after {n} prompts, best so far={best_kl_so_far:.6f}",
+                            f"after {n} prompts, best at same point={best_at_same_point:.6f} "
+                            f"(final={best_kl_so_far:.6f})",
                             flush=True,
                         )
                         early_stopped = True
@@ -748,6 +786,35 @@ def main():
                     break
 
         scoring_time = time.time() - t0
+
+        # If scoring hit a fatal error with no prompts scored, record as error and move on
+        if scoring_error and not kl_per_prompt:
+            print(f"  ‼️ Scoring failed completely: {scoring_error}", flush=True)
+            results["students"][student_name] = {
+                "status": "scoring_error",
+                "error": scoring_error[:500],
+                "kl_global_avg": None,
+            }
+            results["timings"] = {k: round(v, 1) for k, v in timings.items()}
+            with open(args.output, "w") as f:
+                json.dump(results, f, indent=2)
+            live_progress["completed"].append({
+                "student_name": student_name,
+                "status": "scoring_error",
+                "status_detail": scoring_error[:200],
+            })
+            live_progress["current"] = None
+            _write_progress()
+            del student
+            free_gpu()
+            try:
+                student_cache_name = f"models--{student_name.replace('/', '--')}"
+                cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / student_cache_name
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+            except Exception:
+                pass
+            continue
 
         # Compute global average from scored prompts
         total_kl_sum = sum(r["kl_mean"] * r["n_positions"] for r in kl_per_prompt)
@@ -825,6 +892,14 @@ def main():
         if not early_stopped and not is_functional_copy and kl_global > 0.001:
             if best_kl_so_far is None or kl_global < best_kl_so_far:
                 best_kl_so_far = kl_global
+                # Store per-prompt cumulative means for fair same-point early stopping.
+                # cumulative[i] = mean of prompt_kl_means[0..i]
+                cumulative = []
+                running_sum = 0
+                for j, pkm in enumerate(prompt_kl_means):
+                    running_sum += pkm
+                    cumulative.append(running_sum / (j + 1))
+                best_kl_per_prompt_cumulative = cumulative
 
         # Record completed student in live progress
         status = "scored"
