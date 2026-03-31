@@ -159,6 +159,8 @@ def main():
                         help="Path to pre-cached teacher logits (.pt file). Skips teacher inference.")
     parser.add_argument("--save-teacher-logits", type=str, default=None,
                         help="Save teacher logits to this path after generation.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing results — skip already-scored students.")
     args = parser.parse_args()
 
     total_start = time.time()
@@ -200,18 +202,37 @@ def main():
     teacher_logits_list = []
     prompt_lens = []
 
+    # Hash prompts content so teacher cache can be validated across restarts
+    import hashlib as _hl
+    prompts_hash = _hl.sha256(json.dumps(prompts, sort_keys=True).encode()).hexdigest()[:16]
+    print(f"[eval] Prompts hash: {prompts_hash}", flush=True)
+
+    teacher_cache_loaded = False
     if args.teacher_logits and os.path.exists(args.teacher_logits):
-        # Load pre-cached teacher logits (for parallel GPU eval)
-        print(f"\n[eval] Loading cached teacher logits from {args.teacher_logits}", flush=True)
-        t0 = time.time()
-        cache = torch.load(args.teacher_logits, map_location="cpu", weights_only=True)
-        full_sequences = [s.to(device) for s in cache["full_sequences"]]
-        teacher_logits_list = cache["teacher_logits"]  # keep on CPU
-        prompt_lens = cache["prompt_lens"]
-        timings["teacher_load"] = time.time() - t0
-        print(f"[eval] Loaded cached logits in {timings['teacher_load']:.1f}s ({len(full_sequences)} prompts)", flush=True)
-        timings["teacher_generation"] = 0.0
-    else:
+        # Load pre-cached teacher logits — verify they match current prompts
+        print(f"\n[eval] Checking cached teacher logits at {args.teacher_logits}", flush=True)
+        try:
+            t0 = time.time()
+            cache = torch.load(args.teacher_logits, map_location="cpu", weights_only=False)
+            cached_n_prompts = len(cache.get("full_sequences", []))
+            cached_prompts_hash = cache.get("prompts_hash")
+            cache_valid = (cached_n_prompts == len(prompts) and
+                           cached_prompts_hash == prompts_hash)
+            if cache_valid:
+                full_sequences = [s.to(device) for s in cache["full_sequences"]]
+                teacher_logits_list = cache["teacher_logits"]  # keep on CPU
+                prompt_lens = cache["prompt_lens"]
+                timings["teacher_load"] = time.time() - t0
+                print(f"[eval] ✓ Loaded cached logits in {timings['teacher_load']:.1f}s ({len(full_sequences)} prompts, hash={cached_prompts_hash})", flush=True)
+                timings["teacher_generation"] = 0.0
+                teacher_cache_loaded = True
+            else:
+                print(f"[eval] ✗ Cache stale (cached: {cached_n_prompts} prompts/hash={cached_prompts_hash}, "
+                      f"need: {len(prompts)} prompts/hash={prompts_hash}). Re-running teacher.", flush=True)
+        except Exception as e:
+            print(f"[eval] ✗ Cache load failed: {e}. Re-running teacher.", flush=True)
+
+    if not teacher_cache_loaded:
         # Run teacher inference
         print(f"\n[eval] Loading teacher: {args.teacher}", flush=True)
         t0 = time.time()
@@ -272,20 +293,38 @@ def main():
         timings["teacher_generation"] = time.time() - t0
         print(f"[eval] Generation complete in {timings['teacher_generation']:.1f}s", flush=True)
 
-        # Save teacher logits if requested (for parallel GPU eval)
-        if args.save_teacher_logits:
-            print(f"[eval] Saving teacher logits to {args.save_teacher_logits}", flush=True)
-            torch.save({
-                "full_sequences": [s.cpu() for s in full_sequences],
-                "teacher_logits": teacher_logits_list,
-                "prompt_lens": prompt_lens,
-            }, args.save_teacher_logits)
+        # Always save teacher logits so eval can resume after a crash
+        teacher_cache_path = args.save_teacher_logits or os.path.join(
+            os.path.dirname(args.output), "teacher_cache.pt"
+        )
+        print(f"[eval] Saving teacher logits to {teacher_cache_path}", flush=True)
+        torch.save({
+            "full_sequences": [s.cpu() for s in full_sequences],
+            "teacher_logits": teacher_logits_list,
+            "prompt_lens": prompt_lens,
+            "block_seed": args.block_seed,
+            "prompts_hash": prompts_hash,
+        }, teacher_cache_path)
 
         del teacher
         free_gpu()
         print(f"[eval] Teacher unloaded, VRAM: {gpu_mem_str()}", flush=True)
 
-    # Evaluate students
+    # Evaluate students — resume from existing results if --resume and output exists
+    prior_results = {}
+    if args.resume and os.path.exists(args.output):
+        try:
+            with open(args.output) as f:
+                prior = json.load(f)
+            prior_results = prior.get("students", {})
+            if prior_results:
+                scored = [name for name, data in prior_results.items()
+                          if data.get("status") != "load_failed" and data.get("kl_global_avg") is not None]
+                print(f"[eval] Resuming: {len(scored)} students already scored — {scored}", flush=True)
+        except Exception as e:
+            print(f"[eval] Could not load prior results for resume: {e}", flush=True)
+            prior_results = {}
+
     results = {
         "teacher": args.teacher,
         "max_new_tokens": args.max_new_tokens,
@@ -294,6 +333,10 @@ def main():
         "n_prompts": len(prompts),
         "students": {},
     }
+    # Carry forward prior scored students
+    for name, data in prior_results.items():
+        if data.get("status") != "load_failed" and data.get("kl_global_avg") is not None:
+            results["students"][name] = data
 
     # Live progress file — written after every prompt for real-time dashboard updates
     progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
@@ -326,6 +369,22 @@ def main():
     logit_fingerprints: dict[str, torch.Tensor] = {}  # student_name -> flattened KL vector
 
     for student_idx, student_name in enumerate(students):
+        # Skip already-scored students (from --resume)
+        if student_name in results["students"]:
+            prior = results["students"][student_name]
+            kl = prior.get("kl_global_avg")
+            print(f"\n{'=' * 60}", flush=True)
+            print(f"[eval] Student: {student_name} — SKIPPED (already scored: KL={kl})", flush=True)
+            live_progress["completed"].append({
+                "student_name": student_name,
+                "status": "scored",
+                "status_detail": f"KL={kl:.6f} (resumed)" if kl else "resumed",
+            })
+            _write_progress()
+            if kl is not None and (best_kl_so_far is None or kl < best_kl_so_far):
+                best_kl_so_far = kl
+            continue
+
         print(f"\n{'=' * 60}", flush=True)
         print(f"[eval] Student: {student_name}", flush=True)
 

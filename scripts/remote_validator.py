@@ -594,6 +594,8 @@ else:
                 result = {"exit_code": 0}
             else:
                 # Single GPU: original sequential eval
+                # --resume + --teacher-logits: if a prior eval crashed mid-round,
+                # reuse teacher logits and skip already-scored students.
                 cmd = (
                     f"cd /home && python3 pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -602,7 +604,10 @@ else:
                     f"--output eval_results.json "
                     f"--max-prompt-len {MAX_PROMPT_TOKENS} "
                     f"--max-new-tokens {MAX_NEW_TOKENS} "
-                    f"--max-params-b {max_params_b}"
+                    f"--max-params-b {max_params_b} "
+                    f"--teacher-logits /home/teacher_cache.pt "
+                    f"--save-teacher-logits /home/teacher_cache.pt "
+                    f"--resume"
                 )
                 print(f"[VALIDATOR] Running eval on Lium pod ({len(models_to_eval)} models, {n_prompts} prompts)...", flush=True)
 
