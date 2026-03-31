@@ -535,7 +535,17 @@ def health():
         "last_eval_block": last_eval_block,
         "last_eval_age_min": last_eval_age_min,
         "eval_active": eval_active,
-        "eval_progress": f"{eval_students_done}/{eval_students_total}" if eval_active else None,
+        "eval_progress": {
+            "phase": prog.get("phase"),
+            "students_total": prog.get("students_total"),
+            "students_done": len(prog.get("completed", [])),
+            "prompts_total": prog.get("prompts_total"),
+            "current_student": prog.get("current", {}).get("student_name") if isinstance(prog.get("current"), dict) else None,
+            "current_prompt": prog.get("current", {}).get("prompts_done") if isinstance(prog.get("current"), dict) else None,
+            "current_kl": prog.get("current", {}).get("kl_running_mean") if isinstance(prog.get("current"), dict) else None,
+            "current_best": prog.get("current", {}).get("best_kl_so_far") if isinstance(prog.get("current"), dict) else None,
+            "teacher_prompts_done": prog.get("teacher_prompts_done"),
+        } if eval_active else None,
     }
 
 
