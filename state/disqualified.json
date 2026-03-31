@@ -29,5 +29,6 @@
   "5Dtq5LhJHe5atmgFEferFc8aXHLgUmfepWWUncUrHtWe9Hv6": "copy: functional copy of Qwen/Qwen3.5-4B (UID 179) \u2014 identical logit distribution",
   "5DD7T2CpH5KAekkhk5VATvHAvDaUnR9LCCLa2jjsQvhTt2yQ": "copy: functional copy of Qwen/Qwen3.5-0.8B (UID 181) \u2014 identical logit distribution",
   "220": "fraud: Submitted fake 1.3KB model file with teacher config (256 experts MoE). Not a real 4B student model.",
-  "5GEFSdx4oJoYtZvNNXhU9GMMqcGVGG1S1KyzhAYFnQRQXM83": "fraud: Submitted fake 1.3KB model file with teacher config (256 experts MoE). Not a real 4B student model."
+  "5GEFSdx4oJoYtZvNNXhU9GMMqcGVGG1S1KyzhAYFnQRQXM83": "fraud: Submitted fake 1.3KB model file with teacher config (256 experts MoE). Not a real 4B student model.",
+  "5He5zeM3CxrxfwA9zp1e5Wqj5J4UKvrKH5tPB8Av1RewHyrG": "arch: FRAUD: Model weights total 16.8GB \u2014 too large for 5.2B params (max ~11.6GB in bf16)"
 }

@@ -170,6 +170,90 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     def save_evaluated():
         evaluated_file.write_text(json.dumps(list(evaluated_uids)))
 
+    def validate_state_consistency(scores, evaluated_uids, uid_to_hotkey, commitments, dq_reasons):
+        """
+        Pre-flight state validation. Catches inconsistencies BEFORE they waste GPU time.
+        Returns (fixed_scores, fixed_evaluated, issues_found).
+
+        Checks:
+        1. Every scored UID must be in evaluated_uids (and vice versa)
+        2. Every scored UID must have a valid commitment on-chain
+        3. No DQ'd UIDs in scores
+        4. No recycled UIDs (hotkey changed since last scoring)
+        5. King must exist in scores and not be DQ'd
+        """
+        issues = []
+        fixed_scores = dict(scores)
+        fixed_evaluated = set(evaluated_uids)
+
+        # Load hotkey map for recycling detection
+        hotkey_map_file = state_path / "uid_hotkey_map.json"
+        prev_hotkey_map = {}
+        if hotkey_map_file.exists():
+            try:
+                prev_hotkey_map = json.loads(hotkey_map_file.read_text())
+            except Exception:
+                pass
+
+        # Check 1: Scored UIDs must be evaluated
+        scored_uids = set(fixed_scores.keys())
+        for uid_str in scored_uids - fixed_evaluated:
+            issues.append(f"UID {uid_str} has score but NOT in evaluated_uids — adding")
+            fixed_evaluated.add(uid_str)
+        for uid_str in fixed_evaluated - scored_uids:
+            # Evaluated but no score is OK (could have failed/DQ'd during eval)
+            pass
+
+        # Check 2: No DQ'd UIDs in scores
+        for uid_str in list(fixed_scores.keys()):
+            uid = int(uid_str)
+            hotkey = uid_to_hotkey.get(uid, uid_to_hotkey.get(uid_str, ""))
+            if is_disqualified(uid, hotkey, dq_reasons):
+                issues.append(f"UID {uid_str} is DQ'd but has score {fixed_scores[uid_str]:.6f} — removing")
+                fixed_scores.pop(uid_str)
+
+        # Check 3: Recycled UIDs (hotkey changed)
+        for uid_str in list(fixed_scores.keys()):
+            hotkey = str(uid_to_hotkey.get(int(uid_str), uid_to_hotkey.get(uid_str, "")))
+            prev = prev_hotkey_map.get(uid_str, "")
+            if prev and hotkey and prev != hotkey:
+                issues.append(f"UID {uid_str} hotkey changed ({prev[:8]}→{hotkey[:8]}) — clearing stale score")
+                fixed_scores.pop(uid_str)
+                fixed_evaluated.discard(uid_str)
+
+        # Check 4: Scored UIDs must have a commitment on-chain
+        commitment_uids = set()
+        for c in commitments:
+            commitment_uids.add(str(c.get("uid", "")))
+        for uid_str in list(fixed_scores.keys()):
+            if uid_str not in commitment_uids:
+                issues.append(f"UID {uid_str} has score but no on-chain commitment — removing")
+                fixed_scores.pop(uid_str)
+                fixed_evaluated.discard(uid_str)
+
+        # Check 5: Validate h2h_latest king
+        h2h_file = state_path / "h2h_latest.json"
+        if h2h_file.exists():
+            try:
+                h2h = json.loads(h2h_file.read_text())
+                king_uid = h2h.get("king_uid")
+                new_king = h2h.get("new_king_uid")
+                if new_king is not None and str(new_king) not in fixed_scores:
+                    issues.append(f"h2h_latest.new_king_uid={new_king} has no valid score — this is stale")
+                if king_uid is not None and str(king_uid) not in fixed_scores:
+                    issues.append(f"h2h_latest.king_uid={king_uid} has no valid score — king may be stale")
+            except Exception:
+                pass
+
+        if issues:
+            print(f"[VALIDATOR] ⚠️ STATE VALIDATION found {len(issues)} issues:", flush=True)
+            for issue in issues:
+                print(f"  • {issue}", flush=True)
+        else:
+            print("[VALIDATOR] ✅ State validation passed", flush=True)
+
+        return fixed_scores, fixed_evaluated, issues
+
     # ── Upload eval script (with retry — SFTP can be flaky on Lium pods) ──
     for _upload_attempt in range(5):
         try:
@@ -220,6 +304,17 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     break
                 time.sleep(tempo)
                 continue
+
+            # ══════════════════════════════════════════════════════════════
+            # STATE VALIDATION: Catch inconsistencies before they waste GPU
+            # ══════════════════════════════════════════════════════════════
+            scores, evaluated_uids, state_issues = validate_state_consistency(
+                scores, evaluated_uids, uid_to_hotkey, commitments, dq_reasons
+            )
+            if state_issues:
+                save_scores(scores, state_path)
+                save_evaluated()
+                print(f"[VALIDATOR] State auto-repaired ({len(state_issues)} issues fixed)", flush=True)
 
             # ══════════════════════════════════════════════════════════════
             # STALE SCORE CLEANUP: Clear scores for recycled UIDs
