@@ -470,6 +470,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     else:
                         raise
 
+            # Clear stale results from previous eval round (prevents --resume from reusing old scores)
+            try:
+                lium.exec(pod, command="rm -f /home/eval_results.json /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
+                print("[VALIDATOR] Cleared stale pod cache", flush=True)
+            except Exception:
+                pass
+
             # Kill any background GPU processes to free VRAM for eval
             try:
                 lium.exec(pod, command="for s in distil train; do tmux kill-session -t $s 2>/dev/null; done; sleep 2; echo 'GPU cleared'")
@@ -785,7 +792,11 @@ else:
                 # appear to beat the king unfairly.
                 if uid == king_uid:
                     king_h2h_kl = kl  # Store for epsilon comparison
-                    print(f"[VALIDATOR] UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score preserved at {scores.get(str(uid), 'N/A')})", flush=True)
+                    # Update king's global score with H2H score so compute_winner_weights
+                    # sees the real performance, not a stale score from an old prompt set
+                    scores[str(uid)] = kl
+                    evaluated_uids.add(str(uid))
+                    print(f"[VALIDATOR] UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)", flush=True)
                 else:
                     scores[str(uid)] = kl
                     evaluated_uids.add(str(uid))
