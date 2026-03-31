@@ -222,6 +222,37 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 continue
 
             # ══════════════════════════════════════════════════════════════
+            # STALE SCORE CLEANUP: Clear scores for recycled UIDs
+            # When a UID gets a new hotkey, its old score is invalid.
+            # ══════════════════════════════════════════════════════════════
+            hotkey_map_file = state_path / "uid_hotkey_map.json"
+            prev_hotkey_map = {}
+            if hotkey_map_file.exists():
+                try:
+                    prev_hotkey_map = json.loads(hotkey_map_file.read_text())
+                except Exception:
+                    pass
+
+            stale_cleared = 0
+            for uid_str, hotkey in uid_to_hotkey.items():
+                uid_s = str(uid_str)
+                prev_hotkey = prev_hotkey_map.get(uid_s)
+                if prev_hotkey and prev_hotkey != hotkey and uid_s in scores:
+                    old_score = scores.pop(uid_s)
+                    evaluated_uids.discard(uid_s)
+                    stale_cleared += 1
+                    print(f"[VALIDATOR] UID {uid_s}: hotkey changed ({prev_hotkey[:8]}→{hotkey[:8]}), "
+                          f"cleared stale score {old_score:.6f}", flush=True)
+
+            if stale_cleared:
+                save_scores(scores, state_path)
+                save_evaluated()
+                print(f"[VALIDATOR] Cleared {stale_cleared} stale scores from recycled UIDs", flush=True)
+
+            # Save current hotkey map for next epoch
+            hotkey_map_file.write_text(json.dumps({str(k): v for k, v in uid_to_hotkey.items()}))
+
+            # ══════════════════════════════════════════════════════════════
             # PHASE 1: Pre-check ALL models (no GPU needed)
             # ══════════════════════════════════════════════════════════════
             valid_models = {}  # uid -> {model, revision, params_b}
@@ -360,13 +391,11 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             if not challengers:
                 print(f"[VALIDATOR] No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds", flush=True)
-                # Still set weights periodically to keep tempo
-                weights, winner_uid, winner_kl = compute_winner_weights(
-                    scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
-                    state_dir=state_path,
-                )
-                if winner_uid is not None:
-                    _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
+                # Still set weights periodically to keep tempo — use king directly
+                if king_uid is not None:
+                    weights = [0.0] * max(n_uids, king_uid + 1)
+                    weights[king_uid] = 1.0
+                    _set_weights(subtensor, wallet, netuid, n_uids, weights, king_uid)
                 save_scores(scores, state_path)
                 save_failures(failures, state_path)
                 save_disqualified(dq_reasons, state_path)
@@ -955,14 +984,38 @@ else:
                                 print(f"[VALIDATOR] UID {uid}: epsilon-pinned score to {scores[uid_str]:.8f} "
                                       f"(actual was {challenger_kl:.6f})", flush=True)
 
-            # ── Compute winner & set weights ──
-            weights, winner_uid, winner_kl = compute_winner_weights(
-                scores, failures, n_uids, max_kl=MAX_KL_THRESHOLD,
-                epsilon=EPSILON, state_dir=state_path,
-            )
+            # ── Determine winner from H2H round results ONLY ──
+            # DO NOT use compute_winner_weights on global scores — scores from
+            # different prompt sets are not comparable. The H2H winner is whoever
+            # got the lowest KL in THIS round (same prompts for all models).
+            h2h_candidates = []
+            all_round_uids = set([king_uid] + challengers) if king_uid is not None else set(challengers)
+            for uid in all_round_uids:
+                uid_str = str(uid)
+                if uid in disqualified:
+                    continue
+                if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
+                    h2h_candidates.append((uid, scores[uid_str]))
 
-            # Leaderboard
-            print(f"\n[VALIDATOR] LEADERBOARD (block {current_block}):", flush=True)
+            if h2h_candidates:
+                h2h_candidates.sort(key=lambda x: x[1])
+                winner_uid, winner_kl = h2h_candidates[0]
+            else:
+                winner_uid, winner_kl = None, float("inf")
+
+            # Build weights array (winner-take-all)
+            weights = [0.0] * max(n_uids, (winner_uid or 0) + 1)
+            if winner_uid is not None:
+                weights[winner_uid] = 1.0
+
+            # Leaderboard (show H2H round results + full global scores)
+            print(f"\n[VALIDATOR] H2H ROUND RESULTS (block {current_block}):", flush=True)
+            for rank, (uid, kl) in enumerate(h2h_candidates, 1):
+                marker = " ← WINNER" if uid == winner_uid else ""
+                is_king = " (king)" if uid == king_uid else ""
+                print(f"  #{rank}  UID {uid}: KL={kl:.6f}{marker}{is_king}", flush=True)
+
+            print(f"\n[VALIDATOR] GLOBAL LEADERBOARD:", flush=True)
             sorted_scores = sorted(
                 [(uid_str, kl) for uid_str, kl in scores.items()],
                 key=lambda x: x[1]
@@ -970,9 +1023,9 @@ else:
             for rank, (uid_str, kl) in enumerate(sorted_scores, 1):
                 uid = int(uid_str)
                 dq = " ⛔ DQ" if uid in disqualified else ""
-                marker = " ← KING" if uid == winner_uid else ""
-                new = " (NEW)" if uid_str in [str(u) for u in challengers] else ""
-                print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{new}{dq}", flush=True)
+                marker = " ← H2H WINNER" if uid == winner_uid else ""
+                in_round = " (in round)" if uid in all_round_uids else ""
+                print(f"  #{rank}  UID {uid_str}: KL={kl:.6f}{marker}{in_round}{dq}", flush=True)
 
             if winner_uid is not None:
                 _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
