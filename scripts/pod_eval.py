@@ -394,6 +394,23 @@ def main():
         # Per-model total timeout (load + scoring + cleanup)
         PER_MODEL_TIMEOUT = 600  # 10 minutes max per model (load ~60s + scoring ~15s + buffer)
 
+        # Pre-load disk check — emergency cleanup if disk is getting full
+        try:
+            disk_stat = os.statvfs('/')
+            disk_pct = 100 - (disk_stat.f_bavail * 100 // disk_stat.f_blocks)
+            if disk_pct > 85:
+                print(f"  [disk] {disk_pct}% full — emergency cleanup before loading {student_name}", flush=True)
+                cache_hub = Path.home() / ".cache" / "huggingface" / "hub"
+                if cache_hub.exists():
+                    for d in cache_hub.iterdir():
+                        if d.name.startswith("models--") and "Qwen3.5-35B-A3B" not in d.name:
+                            shutil.rmtree(d, ignore_errors=True)
+                disk_stat2 = os.statvfs('/')
+                disk_pct2 = 100 - (disk_stat2.f_bavail * 100 // disk_stat2.f_blocks)
+                print(f"  [disk] After cleanup: {disk_pct2}%", flush=True)
+        except Exception as e:
+            print(f"  [disk] Check failed: {e}", flush=True)
+
         # Update live progress: loading model
         live_progress["current"] = {
             "student_idx": student_idx,
