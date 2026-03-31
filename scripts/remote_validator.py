@@ -836,8 +836,8 @@ else:
                 except Exception as e:
                     print(f"[VALIDATOR] Merge failed: {e}", flush=True)
 
-                # Fake result for downstream code
-                result = {"exit_code": 0}
+                # Fake result for downstream code — must include all keys accessed later
+                result = {"exit_code": 0, "stdout": "", "stderr": "", "success": True}
             else:
                 # Single GPU: original sequential eval
                 # --resume + --teacher-logits: if a prior eval crashed mid-round,
@@ -872,6 +872,7 @@ else:
                 # Background thread: poll live progress from pod every 10s
                 import threading
                 poll_stop = threading.Event()
+                progress_lock = threading.Lock()
 
                 def _poll_pod_progress():
                     while not poll_stop.is_set():
@@ -882,24 +883,25 @@ else:
                             with open(tmp_path) as f:
                                 pod_progress = json.load(f)
                             os.unlink(tmp_path)
-                            progress["pod"] = pod_progress
-                            pod_phase = pod_progress.get("phase", "scoring")
-                            progress["phase"] = pod_phase
-                            if pod_phase == "teacher_generation":
-                                progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
-                                progress["prompts_total"] = pod_progress.get("prompts_total", n_prompts)
-                            elif pod_progress.get("current"):
-                                cur = pod_progress["current"]
-                                progress["current_student"] = cur.get("student_name")
-                                progress["current_prompt"] = cur.get("prompts_done", 0)
-                                progress["current_kl"] = cur.get("kl_running_mean")
-                                progress["current_se"] = cur.get("kl_running_se")
-                                progress["current_ci"] = cur.get("ci_95")
-                                progress["current_best"] = cur.get("best_kl_so_far")
-                                progress["students_done"] = cur.get("student_idx", 0)
-                            progress["completed"] = pod_progress.get("completed", [])
-                            with open(progress_path, "w") as f:
-                                json.dump(progress, f)
+                            with progress_lock:
+                                progress["pod"] = pod_progress
+                                pod_phase = pod_progress.get("phase", "scoring")
+                                progress["phase"] = pod_phase
+                                if pod_phase == "teacher_generation":
+                                    progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
+                                    progress["prompts_total"] = pod_progress.get("prompts_total", n_prompts)
+                                elif pod_progress.get("current"):
+                                    cur = pod_progress["current"]
+                                    progress["current_student"] = cur.get("student_name")
+                                    progress["current_prompt"] = cur.get("prompts_done", 0)
+                                    progress["current_kl"] = cur.get("kl_running_mean")
+                                    progress["current_se"] = cur.get("kl_running_se")
+                                    progress["current_ci"] = cur.get("ci_95")
+                                    progress["current_best"] = cur.get("best_kl_so_far")
+                                    progress["students_done"] = cur.get("student_idx", 0)
+                                progress["completed"] = pod_progress.get("completed", [])
+                                with open(progress_path, "w") as f:
+                                    json.dump(progress, f)
                         except Exception:
                             pass
                         poll_stop.wait(5)
@@ -941,11 +943,13 @@ else:
                     poll_stop.set()
                     poll_thread.join(timeout=5)
 
-            if result['stdout'].strip():
-                for line in result['stdout'].strip().split('\n')[-30:]:
+            stdout = result.get('stdout', '') or ''
+            stderr = result.get('stderr', '') or ''
+            if stdout.strip():
+                for line in stdout.strip().split('\n')[-30:]:
                     print(f"  GPU: {line[:200]}", flush=True)
-            if result['stderr'].strip():
-                for line in result['stderr'].strip().split('\n')[-10:]:
+            if stderr.strip():
+                for line in stderr.strip().split('\n')[-10:]:
                     print(f"  GPU ERR: {line[:200]}", flush=True)
             # ── Download results (try even on failure — partial results may exist) ──
             results_local = str(state_path / "last_eval.json")
@@ -961,7 +965,7 @@ else:
                         time.sleep(5)
             if not download_ok:
                 logger.error("Failed to download results after 3 attempts")
-                if not result['success']:
+                if not result.get('success', False):
                     print(f"[VALIDATOR] Eval failed and no results to recover, skipping", flush=True)
                     with open(progress_path, "w") as f:
                         json.dump({"active": False}, f)
@@ -970,7 +974,7 @@ else:
                     time.sleep(tempo)
                     continue
 
-            if not result['success']:
+            if not result.get('success', False):
                 # Check if partial results are usable
                 try:
                     with open(results_local) as f:
@@ -1115,10 +1119,8 @@ else:
             all_round_uids = set([king_uid] + list(challengers.keys())) if king_uid is not None else set(challengers.keys())
             for uid in all_round_uids:
                 uid_str = str(uid)
-                if uid in dq_reasons or str(uid) in dq_reasons:
-                    continue
                 hotkey = uid_to_hotkey.get(uid, "")
-                if hotkey in dq_reasons:
+                if is_disqualified(uid, hotkey, dq_reasons):
                     continue
                 if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
                     h2h_candidates.append((uid, scores[uid_str]))

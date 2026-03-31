@@ -894,17 +894,16 @@ def main():
         json.dump(results, f, indent=2)
     print(f"\n[eval] Results saved to {args.output}", flush=True)
 
-    # Clean all student HF caches AFTER eval completes (not per-student).
-    # Per-student cleanup caused re-downloads from HF which could hang
-    # indefinitely when rate-limited (no HF_TOKEN on pod).
+    # Per-student cleanup already runs after each model (line ~866).
+    # This final sweep catches any leftovers from early exits or errors.
     for student_name in students:
         try:
-            import shutil
             cache_name = f"models--{student_name.replace('/', '--')}"
-            cache_path = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub", cache_name)
-            if os.path.isdir(cache_path):
+            cache_path = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+            if cache_path.exists():
+                import shutil
                 shutil.rmtree(cache_path)
-                print(f"  [cleanup] Removed cache: {cache_name}", flush=True)
+                print(f"  [cleanup] Final sweep: removed {cache_name}", flush=True)
         except Exception:
             pass
 
