@@ -1312,16 +1312,19 @@ def _set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid):
     uids = list(range(n_uids))
     for attempt in range(3):
         try:
-            success = subtensor.set_weights(
+            result = subtensor.set_weights(
                 wallet=wallet, netuid=netuid,
                 uids=uids, weights=weights,
                 wait_for_inclusion=True,
                 wait_for_finalization=True,
             )
-            if success:
+            # set_weights returns (bool, str) tuple
+            ok = result[0] if isinstance(result, (tuple, list)) else bool(result)
+            if ok:
                 print("[VALIDATOR] ✓ Weights set on-chain!", flush=True)
                 return
-            logger.warning(f"Attempt {attempt + 1}: rejected")
+            err_msg = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else str(result)
+            logger.warning(f"Attempt {attempt + 1}: rejected — {err_msg}")
         except Exception as e:
             logger.error(f"Attempt {attempt + 1}: {e}")
         time.sleep(30)
