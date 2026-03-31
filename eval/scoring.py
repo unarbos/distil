@@ -82,10 +82,26 @@ def save_disqualified(dq: dict[str, str], state_dir: Path = STATE_DIR):
     _save_json(state_dir / "disqualified.json", dq)
 
 
-def disqualify(hotkey: str, reason: str, dq: dict[str, str]):
+def disqualify(hotkey: str, reason: str, dq: dict[str, str],
+               coldkey: str = None, hf_username: str = None):
     """Record a disqualification by hotkey (ss58 address).
-    UIDs get recycled — hotkeys are the stable identity."""
+    UIDs get recycled — hotkeys are the stable identity.
+
+    Optionally flags the coldkey and HF username as suspicious.
+    These flags don't auto-DQ (to avoid false positives on shared orgs)
+    but trigger enhanced scrutiny on future submissions.
+    """
     dq[hotkey] = reason
+    # Flag associated coldkey (prefix: "flag:coldkey:")
+    if coldkey:
+        flag_key = f"flag:coldkey:{coldkey}"
+        if flag_key not in dq:
+            dq[flag_key] = f"Associated with DQ'd hotkey {hotkey[:12]}... — {reason}"
+    # Flag HF username (prefix: "flag:hf:")
+    if hf_username:
+        flag_key = f"flag:hf:{hf_username}"
+        if flag_key not in dq:
+            dq[flag_key] = f"Associated with DQ'd hotkey {hotkey[:12]}... — {reason}"
 
 
 def is_disqualified(uid: int, hotkey: str, dq: dict[str, str]) -> bool:
@@ -96,6 +112,20 @@ def is_disqualified(uid: int, hotkey: str, dq: dict[str, str]) -> bool:
     if str(uid) in dq:
         return True
     return False
+
+
+def is_flagged(coldkey: str = None, hf_username: str = None,
+               dq: dict[str, str] = None) -> str | None:
+    """Check if a coldkey or HF username is flagged as suspicious.
+    Returns the flag reason if flagged, None otherwise.
+    Flagged miners aren't auto-DQ'd but get logged for scrutiny."""
+    if dq is None:
+        return None
+    if coldkey and f"flag:coldkey:{coldkey}" in dq:
+        return dq[f"flag:coldkey:{coldkey}"]
+    if hf_username and f"flag:hf:{hf_username}" in dq:
+        return dq[f"flag:hf:{hf_username}"]
+    return None
 
 
 def get_dq_reason(uid: int, hotkey: str, dq: dict[str, str]) -> str:
