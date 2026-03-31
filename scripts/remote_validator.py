@@ -691,45 +691,9 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             except Exception:
                 pass
 
-            # ── Start vLLM teacher server for fast generation ──
-            # vLLM with tensor parallelism is 3-5x faster than HF for 35B teacher.
-            # Greedy decoding (temp=0) is deterministic and reproducible by miners.
-            VLLM_PORT = 9100
-            VLLM_URL = f"http://localhost:{VLLM_PORT}"
-            use_vllm = True
-            try:
-                vllm_start_cmd = (
-                    f"tmux new-session -d -s vllm-teacher '"
-                    f"python3 -m vllm.entrypoints.openai.api_server "
-                    f"--model {TEACHER_MODEL} "
-                    f"--served-model-name teacher "
-                    f"--dtype bfloat16 "
-                    f"--trust-remote-code "
-                    f"--port {VLLM_PORT} "
-                    f"--disable-log-requests "
-                    f"2>&1 | tee /home/vllm_teacher.log'"
-                )
-                lium.exec(pod, command=vllm_start_cmd)
-                print(f"[VALIDATOR] Starting vLLM teacher server on port {VLLM_PORT}...", flush=True)
-
-                # Wait for vLLM to be ready (check /health endpoint)
-                for wait_i in range(90):  # up to 4.5 min
-                    time.sleep(3)
-                    try:
-                        health = lium.exec(pod, command=f"curl -s -o /dev/null -w '%{{http_code}}' {VLLM_URL}/health")
-                        code = health.get("stdout", "").strip()
-                        if code == "200":
-                            print(f"[VALIDATOR] vLLM teacher ready after {(wait_i+1)*3}s", flush=True)
-                            break
-                    except Exception:
-                        pass
-                else:
-                    print("[VALIDATOR] vLLM teacher startup timed out, falling back to HF", flush=True)
-                    lium.exec(pod, command="tmux kill-session -t vllm-teacher 2>/dev/null")
-                    use_vllm = False
-            except Exception as e:
-                print(f"[VALIDATOR] vLLM startup failed ({e}), falling back to HF", flush=True)
-                use_vllm = False
+            # vLLM integration disabled — needs testing before production use.
+            # TODO: Re-enable once tmux/nohup startup is verified on Lium pods.
+            use_vllm = False
 
             # Run eval — king first, then challengers by commit block (earliest first).
             # Earlier commits are more established → likely lower KL → sets best_kl_so_far
@@ -962,14 +926,6 @@ else:
             if result['stderr'].strip():
                 for line in result['stderr'].strip().split('\n')[-10:]:
                     print(f"  GPU ERR: {line[:200]}", flush=True)
-            # ── Kill vLLM teacher server to free VRAM ──
-            if use_vllm:
-                try:
-                    lium.exec(pod, command="tmux kill-session -t vllm-teacher 2>/dev/null")
-                    print("[VALIDATOR] Killed vLLM teacher server", flush=True)
-                except Exception:
-                    pass
-
             # ── Download results (try even on failure — partial results may exist) ──
             results_local = str(state_path / "last_eval.json")
             download_ok = False
