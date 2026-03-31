@@ -82,15 +82,25 @@ def save_disqualified(dq: dict[str, str], state_dir: Path = STATE_DIR):
 
 
 def disqualify(hotkey: str, reason: str, dq: dict[str, str],
-               coldkey: str = None, hf_username: str = None):
-    """Record a disqualification by hotkey (ss58 address).
-    UIDs get recycled — hotkeys are the stable identity.
+               coldkey: str = None, hf_username: str = None,
+               commit_block: int = None):
+    """Record a disqualification by hotkey + commit_block.
+
+    DQ is per-commitment: if a miner re-registers with a new commit,
+    the old DQ doesn't carry over (they get a fresh chance).
+
+    Key format: "hotkey:block" when commit_block is provided.
+    Falls back to bare hotkey for legacy compatibility.
 
     Optionally flags the coldkey and HF username as suspicious.
     These flags don't auto-DQ (to avoid false positives on shared orgs)
     but trigger enhanced scrutiny on future submissions.
     """
-    dq[hotkey] = reason
+    if commit_block is not None:
+        dq_key = f"{hotkey}:{commit_block}"
+    else:
+        dq_key = hotkey
+    dq[dq_key] = reason
     # Flag associated coldkey (prefix: "flag:coldkey:")
     if coldkey:
         flag_key = f"flag:coldkey:{coldkey}"
@@ -103,13 +113,24 @@ def disqualify(hotkey: str, reason: str, dq: dict[str, str],
             dq[flag_key] = f"Associated with DQ'd hotkey {hotkey[:12]}... — {reason}"
 
 
-def is_disqualified(uid: int, hotkey: str, dq: dict[str, str]) -> bool:
-    """Check if a miner is disqualified by hotkey (preferred) or legacy UID."""
-    if hotkey in dq:
+def is_disqualified(uid: int, hotkey: str, dq: dict[str, str],
+                    commit_block: int = None) -> bool:
+    """Check if a miner is disqualified for their current commitment.
+
+    Checks (in order):
+    1. hotkey:block (current commitment — precise match)
+    2. bare hotkey (legacy entries)
+    3. UID string (legacy entries from before hotkey migration)
+    """
+    if commit_block is not None and f"{hotkey}:{commit_block}" in dq:
         return True
+    if hotkey in dq:
+        # Legacy bare-hotkey entry — but if the miner has a NEWER commit_block,
+        # check if the DQ was for an older commit (don't carry over)
+        return commit_block is None  # only match if we don't know the block
     # Legacy: check by UID string (for old entries before hotkey migration)
     if str(uid) in dq:
-        return True
+        return commit_block is None
     return False
 
 
@@ -127,8 +148,13 @@ def is_flagged(coldkey: str = None, hf_username: str = None,
     return None
 
 
-def get_dq_reason(uid: int, hotkey: str, dq: dict[str, str]) -> str:
-    """Get disqualification reason by hotkey or legacy UID."""
+def get_dq_reason(uid: int, hotkey: str, dq: dict[str, str],
+                  commit_block: int = None) -> str:
+    """Get disqualification reason by hotkey:block, hotkey, or legacy UID."""
+    if commit_block is not None:
+        key = f"{hotkey}:{commit_block}"
+        if key in dq:
+            return dq[key]
     if hotkey in dq:
         return dq[hotkey]
     return dq.get(str(uid), "")
