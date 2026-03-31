@@ -324,7 +324,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     try:
         print("[VALIDATOR] Ensuring pod dependencies...", flush=True)
         dep_result = lium.exec(pod, command=(
-            "pip install --upgrade transformers -q 2>&1 | tail -1 && "
+            "pip install --break-system-packages 'transformers>=5.0' -q 2>&1 | tail -1 && "
             "python3 -c 'import torch; import transformers; "
             "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
             "cuda={torch.cuda.is_available()}\")'"
