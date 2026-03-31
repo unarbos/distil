@@ -499,11 +499,11 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                         raise
 
             if resuming_round:
-                # Keep eval_results.json on pod — --resume will skip already-scored students
-                # Only clear teacher cache (forces fresh teacher logits on same prompts)
+                # Keep eval_results.json AND teacher_cache.pt on pod — --resume skips
+                # already-scored students and reuses cached teacher logits for consistency
                 try:
-                    lium.exec(pod, command="rm -f /home/teacher_cache.pt /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_teacher_only.json /home/eval_progress.json")
-                    print("[VALIDATOR] Cleared teacher cache (keeping eval_results.json for resume)", flush=True)
+                    lium.exec(pod, command="rm -f /home/eval_gpu0.json /home/eval_gpu1.json /home/eval_progress.json")
+                    print("[VALIDATOR] Resuming round (keeping eval_results.json + teacher_cache.pt)", flush=True)
                 except Exception:
                     pass
             else:
