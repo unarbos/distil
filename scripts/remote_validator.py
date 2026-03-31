@@ -289,16 +289,27 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             epoch_start = time.time()
             epoch_count += 1
             print(f"\n[VALIDATOR] === EPOCH {epoch_count} ===", flush=True)
-            print(f"[VALIDATOR] Fetching metagraph...", flush=True)
-            metagraph = subtensor.metagraph(netuid)
-            current_block = subtensor.block
-            n_uids = int(metagraph.n)
-            print(f"[VALIDATOR] Block {current_block}, n={n_uids}", flush=True)
+            # ── Fetch chain state (with retry — Bittensor RPCs can be flaky) ──
+            for _chain_attempt in range(3):
+                try:
+                    print(f"[VALIDATOR] Fetching metagraph...", flush=True)
+                    metagraph = subtensor.metagraph(netuid)
+                    current_block = subtensor.block
+                    n_uids = int(metagraph.n)
+                    print(f"[VALIDATOR] Block {current_block}, n={n_uids}", flush=True)
 
-            # ── Read commitments ──
-            print(f"[VALIDATOR] Reading commitments...", flush=True)
-            revealed = subtensor.get_all_revealed_commitments(netuid)
-            print(f"[VALIDATOR] Got {len(revealed)} revealed entries", flush=True)
+                    print(f"[VALIDATOR] Reading commitments...", flush=True)
+                    revealed = subtensor.get_all_revealed_commitments(netuid)
+                    print(f"[VALIDATOR] Got {len(revealed)} revealed entries", flush=True)
+                    break
+                except Exception as chain_err:
+                    print(f"[VALIDATOR] Chain RPC error (attempt {_chain_attempt + 1}/3): {chain_err}", flush=True)
+                    if _chain_attempt < 2:
+                        time.sleep(30)
+                    else:
+                        print("[VALIDATOR] Chain unreachable after 3 attempts, sleeping 5min", flush=True)
+                        time.sleep(300)
+                        continue
             commitments = {}
             uid_to_hotkey = {}
             for uid in range(n_uids):
@@ -472,6 +483,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 uid: info for uid, info in valid_models.items()
                 if str(uid) not in evaluated_uids or str(uid) not in scores
             }
+
+            # Sanity check: if too many challengers, something may be wrong with state
+            MAX_REASONABLE_CHALLENGERS = 20
+            if len(challengers) > MAX_REASONABLE_CHALLENGERS:
+                print(f"[VALIDATOR] ⚠️ {len(challengers)} challengers detected — this seems high.", flush=True)
+                print(f"  evaluated_uids: {len(evaluated_uids)}, scores: {len(scores)}, valid_models: {len(valid_models)}", flush=True)
+                # Don't block — just log the warning. The eval will handle it.
 
             if not challengers:
                 print(f"[VALIDATOR] No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds", flush=True)

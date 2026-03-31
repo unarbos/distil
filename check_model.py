@@ -327,7 +327,12 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         from transformers import AutoTokenizer
 
         teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
-        student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
+        try:
+            student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
+        except Exception:
+            # Some tokenizers need trust_remote_code or have custom backends
+            # The validator also allows this with a warning, so we do the same
+            student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=True)
 
         test_strings = [
             "The quick brown fox jumps over the lazy dog.",
