@@ -155,8 +155,22 @@ def disk_check_and_clean(teacher_name, threshold=85):
 VLLM_PORT = 9100
 VLLM_URL = f"http://localhost:{VLLM_PORT}"
 
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=4096):
-    """Start vLLM server via subprocess. Returns True on success."""
+def is_vllm_running():
+    """Check if vLLM server is already running and healthy."""
+    import requests
+    try:
+        r = requests.get(f"{VLLM_URL}/health", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=4096, persistent=False):
+    """Start vLLM server via subprocess. Returns True on success.
+    If persistent=True, reuses an already-running server."""
+    if persistent and is_vllm_running():
+        print(f"\n[vllm] Server already running — reusing (persistent mode)", flush=True)
+        return True
     print(f"\n[vllm] Starting server for {model_name}...", flush=True)
     stop_vllm_server()
 
@@ -301,7 +315,10 @@ def main():
     parser.add_argument("--gpu", type=int, default=None, help="GPU device index (for compatibility)")
     parser.add_argument("--sequential", action="store_true", help="Ignored — for compatibility")
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
-    parser.add_argument("--vllm-gpu-util", type=float, default=0.90)
+    parser.add_argument("--persistent-vllm", action="store_true",
+                        help="Keep vLLM running between rounds — reuse if already up, don't kill after generation")
+    parser.add_argument("--vllm-gpu-util", type=float, default=0.45,
+                        help="vLLM GPU memory utilization (default 0.45 to leave room for students)")
     parser.add_argument("--vllm-max-model-len", type=int, default=4096)
     args = parser.parse_args()
 
@@ -386,7 +403,8 @@ def main():
 
         _write_phase("vllm_starting")
         t0 = time.time()
-        vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len)
+        vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len,
+                                     persistent=args.persistent_vllm)
         timings["vllm_startup"] = time.time() - t0
 
         sequences_data = None
@@ -399,7 +417,10 @@ def main():
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
-            stop_vllm_server()
+            if not args.persistent_vllm:
+                stop_vllm_server()
+            else:
+                print(f"[eval] vLLM kept alive (persistent mode)", flush=True)
         else:
             print(f"[eval] vLLM failed to start — falling back to HF", flush=True)
 

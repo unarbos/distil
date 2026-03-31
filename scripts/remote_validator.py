@@ -826,7 +826,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             # Kill any background GPU processes to free VRAM for eval
             try:
-                lium.exec(pod, command="for s in distil train vllm-teacher; do tmux kill-session -t $s 2>/dev/null; done; sleep 2; echo 'GPU cleared'")
+                lium.exec(pod, command="for s in distil train; do tmux kill-session -t $s 2>/dev/null; done; sleep 2; echo 'GPU cleared'")
                 print("[VALIDATOR] Cleared GPU for eval", flush=True)
             except Exception:
                 pass
@@ -957,9 +957,12 @@ else:
                 # reuse teacher logits and skip already-scored students.
                 # Build eval command — use vLLM script if enabled
                 king_flag = ""
+                vllm_persistent_flag = ""
                 if use_vllm and king_uid is not None and king_uid in models_to_eval:
                     king_model_name = models_to_eval[king_uid]["model"]
                     king_flag = f" --king {king_model_name}"
+                if use_vllm:
+                    vllm_persistent_flag = " --persistent-vllm --vllm-gpu-util 0.45"
                 eval_cmd_core = (
                     f"cd /home && python3 -u pod_eval.py "
                     f"--teacher {TEACHER_MODEL} "
@@ -973,6 +976,7 @@ else:
                     f"--save-teacher-logits /home/teacher_cache.pt "
                     f"--resume"
                     f"{king_flag}"
+                    f"{vllm_persistent_flag}"
                 )
                 # Tee output to log file for live streaming to dashboard
                 cmd = f"{eval_cmd_core} 2>&1 | tee /home/eval_output.log"
