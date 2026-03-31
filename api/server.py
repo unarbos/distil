@@ -545,22 +545,25 @@ def gpu_logs(lines: int = 50):
     Returns the last N lines of GPU-related output for transparency."""
     try:
         import subprocess
+        import re
         result = subprocess.run(
             ["pm2", "logs", "distill-validator", "--lines", str(min(lines, 200)), "--nostream"],
             capture_output=True, text=True, timeout=5
         )
         raw = result.stdout + result.stderr
+        ansi_re = re.compile(r'\x1b\[[0-9;]*m')
         # Filter to interesting lines (GPU output, validator events, errors)
         log_lines = []
         for line in raw.split('\n'):
-            # Strip PM2 prefix
-            cleaned = line
+            # Strip ANSI codes
+            cleaned = ansi_re.sub('', line)
+            # Strip PM2 prefix (id|name |)
             if '|' in cleaned:
                 cleaned = cleaned.split('|', 1)[-1].strip()
             if not cleaned:
                 continue
-            # Skip noisy SSH/SFTP lines
-            if any(skip in cleaned for skip in ['sftp', 'Authentication', 'Connected (version', 'chan 0']):
+            # Skip noisy lines
+            if any(skip in cleaned for skip in ['sftp', 'Authentication', 'Connected (version', 'chan 0', 'TAILING', 'last 50 lines', 'last 10 lines', 'last 20 lines']):
                 continue
             log_lines.append(cleaned)
         return {
