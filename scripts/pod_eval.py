@@ -594,8 +594,8 @@ def main():
                     running_se = math.sqrt(running_var / n)
 
                     # Student's lower 90% CI bound (best case for student)
-                    # Using 1.645 z-score for 90% CI (faster early stopping)
-                    student_lower = running_mean - 1.645 * running_se
+                    # Using 1.96 z-score for 95% CI
+                    student_lower = running_mean - 1.96 * running_se
                     # Best student's upper 90% CI bound (worst case for best)
                     best_upper = best_kl_so_far  # best_kl_so_far already stores the mean; use generous comparison
 
