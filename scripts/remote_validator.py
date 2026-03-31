@@ -222,9 +222,10 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 fixed_evaluated.discard(uid_str)
 
         # Check 4: Scored UIDs must have a commitment on-chain
+        # commitments is a dict keyed by UID (int)
         commitment_uids = set()
-        for c in commitments:
-            commitment_uids.add(str(c.get("uid", "")))
+        for uid in commitments:
+            commitment_uids.add(str(uid))
         for uid_str in list(fixed_scores.keys()):
             if uid_str not in commitment_uids:
                 issues.append(f"UID {uid_str} has score but no on-chain commitment — removing")
