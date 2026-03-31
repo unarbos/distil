@@ -38,14 +38,22 @@ def compute_moe_params(config: dict) -> dict:
         - num_active_experts: experts active per token
     """
     # Support nested configs (e.g. text_config for multimodal models)
+    # Merge text_config into a flat lookup: text_config values are used as fallback
     text_cfg = config.get("text_config", {})
-    hidden = config.get("hidden_size", 0) or text_cfg.get("hidden_size", 0)
-    layers = config.get("num_hidden_layers", 0) or text_cfg.get("num_hidden_layers", 0)
-    vocab = config.get("vocab_size", 0) or text_cfg.get("vocab_size", 0)
-    intermediate = config.get("intermediate_size", hidden * 4)
-    num_heads = config.get("num_attention_heads", 0)
-    kv_heads = config.get("num_key_value_heads", num_heads)
-    head_dim = config.get("head_dim", hidden // num_heads if num_heads else 0)
+    def _get(key, default=0):
+        """Get from top-level config first, then text_config, then default."""
+        v = config.get(key)
+        if v is None or v == 0:
+            v = text_cfg.get(key)
+        return v if v is not None else default
+
+    hidden = _get("hidden_size", 0)
+    layers = _get("num_hidden_layers", 0)
+    vocab = _get("vocab_size", 0)
+    intermediate = _get("intermediate_size", hidden * 4)
+    num_heads = _get("num_attention_heads", 0)
+    kv_heads = _get("num_key_value_heads", num_heads)
+    head_dim = _get("head_dim", hidden // num_heads if num_heads else 0)
 
     if not all([hidden, layers, vocab]):
         return {"total_params": 0, "active_params": 0, "is_moe": False}
@@ -66,20 +74,20 @@ def compute_moe_params(config: dict) -> dict:
     # Layer norms, biases, etc. (rough estimate)
     norm_params = layers * hidden * 4  # 2 norms per layer, 2 params each
 
-    # MoE detection
-    num_experts = config.get("num_local_experts", config.get("num_experts", 1))
-    num_active = config.get("num_experts_per_tok", config.get("num_active_experts", num_experts))
+    # MoE detection — check both top-level and text_config
+    num_experts = _get("num_local_experts", 0) or _get("num_experts", 1)
+    num_active = _get("num_experts_per_tok", 0) or _get("num_active_experts", num_experts)
     is_moe = num_experts > 1
 
     # FFN params per expert (SwiGLU: gate + up + down)
     # Some models use moe_intermediate_size for expert FFN
-    expert_intermediate = config.get("moe_intermediate_size", intermediate)
+    expert_intermediate = _get("moe_intermediate_size", intermediate)
     ffn_per_expert = hidden * expert_intermediate * 2 + expert_intermediate * hidden
 
     if is_moe:
         # Some layers may be dense (shared experts)
-        num_shared = config.get("num_shared_experts", 0)
-        shared_intermediate = config.get("shared_expert_intermediate_size", intermediate)
+        num_shared = _get("num_shared_experts", 0)
+        shared_intermediate = _get("shared_expert_intermediate_size", intermediate)
         shared_ffn = hidden * shared_intermediate * 2 + shared_intermediate * hidden if num_shared else 0
 
         router_per_layer = hidden * num_experts
@@ -359,6 +367,26 @@ def check_model_architecture(
                 }
         except Exception as e:
             logger.warning(f"Could not check repo files for {model_repo}: {e}")
+
+        # 0b. SECURITY: Check minimum safetensors file size.
+        # A real 1B+ param model in bf16 is at least ~2GB. Tiny files are fake.
+        MIN_SAFETENSORS_BYTES = 500_000_000  # 500MB — even a 0.5B model is bigger than this
+        try:
+            total_st_bytes = 0
+            for sibling in (info.siblings or []):
+                if sibling.rfilename.endswith('.safetensors'):
+                    if hasattr(sibling, 'size') and sibling.size is not None:
+                        total_st_bytes += sibling.size
+                    elif hasattr(sibling, 'lfs') and sibling.lfs:
+                        total_st_bytes += sibling.lfs.get('size', 0)
+            if 0 < total_st_bytes < MIN_SAFETENSORS_BYTES:
+                return {
+                    "pass": False,
+                    "reason": f"FRAUD: Safetensors total size {total_st_bytes:,} bytes is impossibly small for a real model (min {MIN_SAFETENSORS_BYTES:,})",
+                    "params_b": 0,
+                }
+        except Exception as e:
+            logger.warning(f"Could not check safetensors file sizes for {model_repo}: {e}")
 
         # 1. Get safetensors-verified param count
         safetensors_params_b = get_safetensors_param_count(model_repo, revision)
