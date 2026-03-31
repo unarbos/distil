@@ -539,6 +539,38 @@ def health():
     }
 
 
+@app.get("/api/gpu-logs")
+def gpu_logs(lines: int = 50):
+    """Stream recent GPU eval logs from the validator PM2 process.
+    Returns the last N lines of GPU-related output for transparency."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["pm2", "logs", "distill-validator", "--lines", str(min(lines, 200)), "--nostream"],
+            capture_output=True, text=True, timeout=5
+        )
+        raw = result.stdout + result.stderr
+        # Filter to interesting lines (GPU output, validator events, errors)
+        log_lines = []
+        for line in raw.split('\n'):
+            # Strip PM2 prefix
+            cleaned = line
+            if '|' in cleaned:
+                cleaned = cleaned.split('|', 1)[-1].strip()
+            if not cleaned:
+                continue
+            # Skip noisy SSH/SFTP lines
+            if any(skip in cleaned for skip in ['sftp', 'Authentication', 'Connected (version', 'chan 0']):
+                continue
+            log_lines.append(cleaned)
+        return {
+            "lines": log_lines[-min(lines, 200):],
+            "count": len(log_lines),
+        }
+    except Exception as e:
+        return {"lines": [f"Error reading logs: {e}"], "count": 0}
+
+
 # ── Startup: prime caches ────────────────────────────────────────────────────
 
 @app.on_event("startup")
