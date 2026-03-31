@@ -611,6 +611,15 @@ def main():
             except NameError:
                 pass
             free_gpu()
+            # Clean disk cache for failed model
+            try:
+                cache_name = f"models--{student_name.replace('/', '--')}"
+                cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+                    print(f"  [cleanup] Removed {cache_name}", flush=True)
+            except Exception:
+                pass
             continue
         load_time = time.time() - t0
         # Measure VRAM DELTA — only the student's footprint, NOT including teacher
@@ -633,10 +642,17 @@ def main():
                 "vram_gb": round(student_vram_gb, 1),
                 "kl_global_avg": float('inf'),
             }
-            # Unload and continue
+            # Unload model + clean disk cache
             del student
-            gc.collect()
-            torch.cuda.empty_cache()
+            free_gpu()
+            try:
+                cache_name = f"models--{student_name.replace('/', '--')}"
+                cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+                    print(f"  [cleanup] Removed {cache_name}", flush=True)
+            except Exception:
+                pass
             continue
 
         # --- Per-prompt sequential scoring with early stopping ---
