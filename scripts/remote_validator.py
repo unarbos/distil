@@ -694,14 +694,36 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     p1_candidates.append((uid, global_kl, model_name))
 
                 if p1_candidates:
-                    # Sort by global KL ascending (best first), pick top 1
-                    p1_candidates.sort(key=lambda x: x[1])
-                    p1_uid, p1_kl, p1_model = p1_candidates[0]
-                    challengers[p1_uid] = valid_models[p1_uid]
-                    smart_challenger_added += 1
-                    print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: UID {p1_uid} ({p1_model}) selected "
-                          f"— Priority 1: best untested model vs current king (global KL={p1_kl:.6f}, "
-                          f"{len(p1_candidates)} untested remain)", flush=True)
+                    p1_candidates.sort(key=lambda x: x[1])  # best KL first
+                    
+                    # Check if we're in initial_eval phase — batch more models
+                    top4_file = state_path / "top4_leaderboard.json"
+                    in_initial_eval = True
+                    if top4_file.exists():
+                        try:
+                            t4 = json.loads(top4_file.read_text())
+                            in_initial_eval = t4.get("phase") == "initial_eval"
+                        except Exception:
+                            pass
+                    
+                    if in_initial_eval:
+                        # Batch up to 15 untested models per round during full eval
+                        INITIAL_EVAL_BATCH = 15
+                        batch = p1_candidates[:INITIAL_EVAL_BATCH]
+                        for p1_uid, p1_kl, p1_model in batch:
+                            challengers[p1_uid] = valid_models[p1_uid]
+                            smart_challenger_added += 1
+                        print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: {len(batch)} models batched for initial eval "
+                              f"(best: UID {batch[0][0]} KL={batch[0][1]:.6f}, "
+                              f"{len(p1_candidates)} untested total)", flush=True)
+                    else:
+                        # Maintenance mode: pick top 1 per round
+                        p1_uid, p1_kl, p1_model = p1_candidates[0]
+                        challengers[p1_uid] = valid_models[p1_uid]
+                        smart_challenger_added += 1
+                        print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: UID {p1_uid} ({p1_model}) selected "
+                              f"— Priority 1: best untested model vs current king (global KL={p1_kl:.6f}, "
+                              f"{len(p1_candidates)} untested remain)", flush=True)
 
                 # Priority 2: New submissions are already in challengers from the
                 # main loop above (models not in evaluated_uids/scores).
@@ -746,7 +768,7 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                     print(f"[VALIDATOR] Smart selection added {smart_challenger_added} challenger(s) to eval", flush=True)
 
             # Sanity check: if too many challengers, something may be wrong with state
-            MAX_REASONABLE_CHALLENGERS = 20
+            MAX_REASONABLE_CHALLENGERS = 50  # Higher during initial full eval
             if len(challengers) > MAX_REASONABLE_CHALLENGERS:
                 print(f"[VALIDATOR] ⚠️ {len(challengers)} challengers detected — this seems high.", flush=True)
                 print(f"  evaluated_uids: {len(evaluated_uids)}, scores: {len(scores)}, valid_models: {len(valid_models)}", flush=True)
