@@ -981,6 +981,42 @@ def gpu_logs(lines: int = 50):
 # ── Miner lookup endpoints ────────────────────────────────────────────────────
 
 
+@app.get("/api/eval-status", tags=["Evaluation"], summary="Eval status for all miners",
+         description="""Returns why each miner is or isn't being evaluated.
+Statuses: king, queued, tested, stale, untested, disqualified.""")
+def get_eval_status():
+    scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
+    dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
+    h2h_tracker = _safe_json_load(os.path.join(STATE_DIR, "h2h_tested_against_king.json"), {})
+    h2h_latest = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
+    current_king_uid = h2h_latest.get("king_uid")
+    current_block = h2h_latest.get("block", 0)
+    stale_threshold = 50
+
+    result = {}
+    for uid_str in scores:
+        if uid_str in dq:
+            result[uid_str] = {"status": "disqualified"}
+            continue
+        if current_king_uid is not None and int(uid_str) == current_king_uid:
+            result[uid_str] = {"status": "king"}
+            continue
+        tracker_entry = h2h_tracker.get(uid_str, {})
+        if tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
+            last_block = tracker_entry["block"]
+            epochs_since = (current_block - last_block) // 360 if current_block > last_block else 0
+            if epochs_since < stale_threshold:
+                result[uid_str] = {"status": "tested", "epochs_ago": epochs_since}
+            else:
+                result[uid_str] = {"status": "stale", "epochs_ago": epochs_since}
+        else:
+            result[uid_str] = {"status": "untested"}
+    return JSONResponse(
+        content={"king_uid": current_king_uid, "block": current_block, "statuses": result},
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
 @app.get("/api/miner/{uid}", tags=["Miners"], summary="Full miner details by UID",
          description="""Returns everything known about a specific miner UID.
 
@@ -1047,6 +1083,42 @@ def get_miner(uid: int):
         if c.get("uid") is not None:
             top5_uids.add(c["uid"])
     result["in_top5"] = uid in top5_uids
+
+    # Eval status: why (not) evaluated
+    h2h_tracker = _safe_json_load(os.path.join(STATE_DIR, "h2h_tested_against_king.json"), {})
+    h2h_latest = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
+    current_king_uid = h2h_latest.get("king_uid")
+    current_block = h2h_latest.get("block", 0)
+    tracker_entry = h2h_tracker.get(uid_str, {})
+    eval_status = {}
+    if result.get("disqualified"):
+        eval_status["status"] = "disqualified"
+        eval_status["reason"] = "Model is disqualified and won't be evaluated"
+    elif result.get("is_king"):
+        eval_status["status"] = "king"
+        eval_status["reason"] = "Evaluated every round as the defending king"
+    elif not result.get("kl_score"):
+        eval_status["status"] = "queued"
+        eval_status["reason"] = "Waiting for first evaluation — new submissions get priority"
+    elif tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
+        last_block = tracker_entry["block"]
+        epochs_since = (current_block - last_block) // 360 if current_block > last_block else 0
+        stale_threshold = 50
+        if epochs_since < stale_threshold:
+            eval_status["status"] = "tested"
+            eval_status["reason"] = f"Already tested against current king ({epochs_since} epochs ago, re-test after {stale_threshold})"
+            eval_status["last_test_block"] = last_block
+            eval_status["epochs_since"] = epochs_since
+            eval_status["stale_after"] = stale_threshold
+        else:
+            eval_status["status"] = "stale"
+            eval_status["reason"] = f"Due for re-test ({epochs_since} epochs since last H2H, threshold is {stale_threshold})"
+            eval_status["last_test_block"] = last_block
+            eval_status["epochs_since"] = epochs_since
+    else:
+        eval_status["status"] = "untested"
+        eval_status["reason"] = "Not yet tested against the current king — will be scheduled"
+    result["eval_status"] = eval_status
 
     # H2H history (last 10 rounds involving this UID)
     h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
