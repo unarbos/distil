@@ -1718,7 +1718,7 @@ else:
                     "king_global_kl": round(king_kl, 6),
                     "epsilon": EPSILON,
                     "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
-                    "n_prompts": EVAL_PROMPTS,
+                    "n_prompts": n_prompts,
                     "results": h2h_results,
                     "king_changed": king_changed,
                     "new_king_uid": winner_uid if king_changed else None,
