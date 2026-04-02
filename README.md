@@ -131,6 +131,56 @@ To change models, register a new hotkey.
 
 These are *untrained baselines* — purpose-built distillations should do significantly better. Models with KL > 2.0 are disqualified.
 
+## Training Guide
+
+Want to train your own distilled model? Check out the community-contributed training script in [`examples/`](examples/).
+
+### KL Distillation Training Script
+
+> **Credit:** [caseus / @winglian](https://github.com/winglian) — contributed via [PR #1](https://github.com/unarbos/distil/pull/1).  
+> **Original gist:** https://gist.github.com/winglian/a8fe6b859ca1f23abcdd550fd5cfa0c5
+
+The script [`examples/distil_kl_train.py`](examples/distil_kl_train.py) trains a student model to match the teacher's output distribution using forward KL divergence on raw text from `karpathy/climbmix-400b-shuffle`.
+
+### GPU Requirements
+
+- **Full teacher (Qwen3.5-35B-A3B unquantized):** 2× A100 80GB+ recommended (one for teacher, one for student)
+- **Local dev with smaller models:** 2× 24GB GPUs (e.g. RTX 3090/4090)
+
+### Usage
+
+**Standard training (2 GPUs — teacher + student):**
+```bash
+python examples/distil_kl_train.py --teacher_gpu 0 --student_gpu 1
+```
+
+**Start from a leaderboard model:**
+```bash
+python examples/distil_kl_train.py --student some_user/their_model --teacher_gpu 0 --student_gpu 1
+```
+
+**Local dev with smaller models (e.g. 2× 24GB GPUs):**
+```bash
+python examples/distil_kl_train.py \
+    --teacher Qwen/Qwen3.5-4B \
+    --student Qwen/Qwen3.5-0.8B \
+    --teacher_gpu 0 --student_gpu 1
+```
+
+### Key Hyperparameters
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lr` | `1e-4` | Learning rate |
+| `--warmup_steps` | `10` | LR warmup steps |
+| `--samples_per_step` | `100` | Samples per optimizer step |
+| `--max_seq_len` | `640` | Max sequence length |
+| `--kl_start_pos` | `128` | Compute KL from this position onward |
+| `--save_every` | `500` | Checkpoint save interval |
+| `--no_wandb` | — | Disable W&B logging |
+
+See the script's docstring and `--help` for the full list of options.
+
 ## Validator Guide
 
 ### Requirements
@@ -228,6 +278,14 @@ The validator runs as a split architecture across two machines:
 - **Lium GPU pod** (remote): Teacher/student forward passes, KL computation, vLLM inference. This machine has the GPU but **no chain access** — it cannot set weights or read wallet keys.
 
 Wallet keys never leave the Hetzner server. The GPU pod receives evaluation tasks and returns scores. This separation ensures that even a compromised GPU pod cannot steal funds or manipulate weights directly.
+
+## Community Contributions
+
+SN97 welcomes contributions from the community! Notable contributions so far:
+
+- **caseus ([@winglian](https://github.com/winglian))** — KL distillation training script ([PR #1](https://github.com/unarbos/distil/pull/1)), plus the suggestion to use top-k=128 shadow KL for more efficient evaluation
+
+PRs are welcome — whether it's training scripts, evaluation tools, documentation, or ideas for improving the subnet.
 
 ## License
 
