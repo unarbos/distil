@@ -537,6 +537,59 @@ def check_model_architecture(
             logger.warning(f"Tokenizer check failed for {model_repo}: {tok_err} (allowing)")
             # Don't block on tokenizer download failure — vocab_size check is the primary gate
 
+        # 8. Verify chat_template matches the official Qwen template
+        # Prevents exploits via modified chat templates and blocks derivative models
+        # that copy templates from other miners (e.g., slowsnake copying caseus's watermarked template)
+        REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        try:
+            import hashlib
+            tok_config_path = hf_hub_download(
+                repo_id=model_repo, filename="tokenizer_config.json", revision=revision,
+            )
+            with open(tok_config_path) as f:
+                tok_config = json.load(f)
+            student_template = tok_config.get("chat_template", "")
+            if isinstance(student_template, list):
+                student_template = json.dumps(student_template)
+
+            # Also check standalone chat_template.jinja if tokenizer_config has no template
+            if not student_template:
+                try:
+                    jinja_path = hf_hub_download(
+                        repo_id=model_repo, filename="chat_template.jinja", revision=revision,
+                    )
+                    with open(jinja_path) as f:
+                        student_template = f.read()
+                except Exception:
+                    pass  # No standalone template file
+
+            if student_template:
+                # Strip leading/trailing whitespace and any comment-only first lines
+                # (catches watermarks like "{# model distilled by caseus #}")
+                import re
+                cleaned = re.sub(r'^\s*\{#.*?#\}\s*\n?', '', student_template, flags=re.MULTILINE).strip()
+                template_hash = hashlib.sha256(cleaned.encode()).hexdigest()
+
+                if template_hash != REFERENCE_TEMPLATE_HASH:
+                    # Also check the raw template (without stripping comments)
+                    raw_hash = hashlib.sha256(student_template.encode()).hexdigest()
+                    if raw_hash != REFERENCE_TEMPLATE_HASH:
+                        return {
+                            "pass": False,
+                            "reason": f"Chat template modified from reference Qwen template. "
+                                      f"Students must use the original Qwen3.5 chat template unmodified. "
+                                      f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)",
+                            "params_b": total_params_b,
+                            "vocab_size": vocab_size,
+                        }
+                    # Raw matches but cleaned doesn't — template has injected comments
+                    logger.warning(f"Chat template for {model_repo} has injected comments but base template matches")
+            else:
+                # No chat template at all — this is fine, the base tokenizer will be used
+                pass
+        except Exception as tmpl_err:
+            logger.warning(f"Chat template check failed for {model_repo}: {tmpl_err} (allowing)")
+
         # Log MoE info for transparency
         if moe_info["is_moe"]:
             logger.info(
