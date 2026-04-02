@@ -1865,13 +1865,24 @@ else:
 
             if n_challenger_results > 0:
                 king_changed = winner_uid != king_uid if king_uid is not None else False
+                # If king changed, use winner's H2H KL for the new king_h2h_kl
+                effective_king_uid = winner_uid if winner_uid is not None else king_uid
+                effective_king_kl = king_h2h_kl  # default to old king's H2H KL
+                effective_king_model = uid_to_model.get(effective_king_uid, valid_models.get(effective_king_uid, {}).get("model", ""))
+                if king_changed and winner_uid is not None:
+                    # Find winner's KL from H2H results
+                    for r in h2h_results:
+                        if r["uid"] == winner_uid:
+                            effective_king_kl = r.get("kl", king_h2h_kl)
+                            break
                 h2h_round = {
                     "block": current_block,
                     "timestamp": time.time(),
                     # king_uid = the winner (for next round to pick up correctly)
-                    "king_uid": winner_uid if winner_uid is not None else king_uid,
+                    "king_uid": effective_king_uid,
+                    "king_model": effective_king_model,
                     "prev_king_uid": king_uid,
-                    "king_h2h_kl": round(king_h2h_kl, 6) if king_h2h_kl else None,
+                    "king_h2h_kl": round(effective_king_kl, 6) if effective_king_kl else None,
                     "king_global_kl": round(king_kl, 6),
                     "epsilon": EPSILON,
                     "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
@@ -2002,41 +2013,54 @@ else:
                     else:
                         print(f"[VALIDATOR] 📊 Initial eval progress: {len(tested_results)} tested, {untested_count} remaining", flush=True)
 
-                elif top4.get("phase") == "maintenance" and h2h_round.get("results"):
-                    # Maintenance mode: check if any challenger beat king or a contender
-                    king_kl = top4["king"]["h2h_kl"]
-                    epsilon = 0.01  # 1%
-                    for r in h2h_round["results"]:
-                        if r["uid"] == king_uid:
+                elif top4.get("phase") == "maintenance":
+                    # Maintenance mode: rebuild top-4 from actual scores.
+                    # Uses winner_uid (already determined by paired t-test) as king.
+                    # Contenders are the next best scores, excluding DQ'd models.
+                    actual_king = winner_uid if winner_uid is not None else king_uid
+                    actual_king_str = str(actual_king)
+
+                    # Build sorted list of (uid_str, kl) from scores, excluding DQ'd
+                    valid_entries = []
+                    for uid_str, score in scores.items():
+                        if score <= 0 or score > MAX_KL_THRESHOLD:
                             continue
-                        challenger_kl = r.get("kl", 999)
-                        if challenger_kl <= 0 or challenger_kl > MAX_KL_THRESHOLD:
+                        if uid_str in disqualified:
                             continue
-                        # Check if beats king by epsilon
-                        if challenger_kl < king_kl * (1 - epsilon):
-                            # Dethrone! New king, old king → contender #2
-                            old_king = top4["king"]
-                            top4["king"] = {
-                                "uid": r["uid"],
-                                "model": r.get("model", ""),
-                                "h2h_kl": round(challenger_kl, 6),
-                                "block": current_block,
-                            }
-                            # Insert old king as #2, drop #4
-                            top4["contenders"] = [old_king] + top4["contenders"][:2]
-                            print(f"[VALIDATOR] 👑 DETHRONE! UID {r['uid']} (KL={challenger_kl:.6f}) beats king by >{epsilon*100}%", flush=True)
-                        else:
-                            # Check if beats any contender (no epsilon needed for contender replacement)
-                            for ci, contender in enumerate(top4.get("contenders", [])):
-                                if challenger_kl < contender["h2h_kl"]:
-                                    top4["contenders"][ci] = {
-                                        "uid": r["uid"],
-                                        "model": r.get("model", ""),
-                                        "h2h_kl": round(challenger_kl, 6),
-                                        "block": current_block,
-                                    }
-                                    print(f"[VALIDATOR] 🔄 UID {r['uid']} (KL={challenger_kl:.6f}) replaces contender #{ci+2}", flush=True)
-                                    break  # only replace the worst contender they beat
+                        valid_entries.append((uid_str, score))
+                    valid_entries.sort(key=lambda x: x[1])  # best KL first
+
+                    # King is always the actual winner
+                    king_score = scores.get(actual_king_str, 999)
+                    king_model_name = uid_to_model.get(actual_king, valid_models.get(actual_king, {}).get("model", "unknown"))
+                    top4["king"] = {
+                        "uid": actual_king,
+                        "model": king_model_name,
+                        "h2h_kl": round(king_score, 6),
+                        "block": current_block,
+                    }
+
+                    # Contenders are the next 3 best (excluding king)
+                    contenders = []
+                    for uid_str, score in valid_entries:
+                        if int(uid_str) == actual_king:
+                            continue
+                        c_model = uid_to_model.get(int(uid_str), valid_models.get(int(uid_str), {}).get("model", ""))
+                        contenders.append({
+                            "uid": int(uid_str),
+                            "model": c_model,
+                            "h2h_kl": round(score, 6),
+                            "block": current_block,
+                        })
+                        if len(contenders) >= 3:
+                            break
+                    top4["contenders"] = contenders
+
+                    top4_str = ", ".join(
+                        f"#{i+1} UID {e['uid']} (KL={e['h2h_kl']})"
+                        for i, e in enumerate([top4['king']] + top4['contenders'])
+                    )
+                    print(f"[VALIDATOR] 📊 TOP-4 LEADERBOARD: {top4_str}", flush=True)
 
                 atomic_json_write(top4_file, top4, indent=2)
             except Exception as e:

@@ -1,14 +1,14 @@
 {
   "type": "new_king",
-  "timestamp": 1775090250.9978225,
-  "posted": true,
-  "message": "## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 172** has dethroned **UID 7**\n\n\ud83d\udcca **KL: 0.090636** (previous king scored 0.091634 last eval)\n\ud83e\udd17 Model: [slowsnake/qwen35-4b-kd-v10](<https://huggingface.co/slowsnake/qwen35-4b-kd-v10>)\n\ud83d\udc51 Previous king: [aidonuts/corpulent-quail-step1000-v0](<https://huggingface.co/aidonuts/corpulent-quail-step1000-v0>)\n\n\ud83d\udcb0 **Winner earns ~133.9 \u03c4/day ($41,787/day)** \u2014 winner takes all!\n\nThink you can beat **0.089730 KL** (1% epsilon)? Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
+  "timestamp": 1775170434.453506,
+  "posted": false,
+  "message": "<@&1482026585358991571>\n## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 34** has dethroned **UID 30**\n\n\ud83d\udcca **KL: 0.091654** (previous king scored 0.093214 last eval)\n\ud83e\udd17 Model: [aidonuts/punctured_vesicle_s1000_a063-v2](<https://huggingface.co/aidonuts/punctured_vesicle_s1000_a063-v2>)\n\ud83d\udc51 Previous king: [RLStepone/distil-1](<https://huggingface.co/RLStepone/distil-1>)\n\n\ud83d\udcb0 **Winner earns ~122.4 \u03c4/day ($36,626/day)** \u2014 winner takes all!\n\nDethronement uses paired t-test (p<0.05) on 120 prompts. Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
   "data": {
-    "new_uid": 172,
-    "new_model": "slowsnake/qwen35-4b-kd-v10",
-    "new_kl": 0.090636,
-    "old_uid": 7,
-    "old_model": "aidonuts/corpulent-quail-step1000-v0",
-    "old_kl": 0.091634
+    "new_uid": 34,
+    "new_model": "aidonuts/punctured_vesicle_s1000_a063-v2",
+    "new_kl": 0.091654,
+    "old_uid": 30,
+    "old_model": "RLStepone/distil-1",
+    "old_kl": 0.093214
   }
 }
