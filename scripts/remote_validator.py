@@ -71,7 +71,8 @@ MAX_PROMPT_TOKENS = 1024
 
 # Prompts per head-to-head evaluation (king + challenger on same prompts)
 # Bumped from 60 → 120 to halve variance (per Arbos: "I could bump to 120+ without much pain")
-EVAL_PROMPTS = 120
+EVAL_PROMPTS_FULL = 60   # Full eval: many models, need speed
+EVAL_PROMPTS_H2H = 120   # Maintenance H2H: fewer models, need precision
 # Epsilon: challenger must beat king by this relative margin to dethrone
 # e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
 EPSILON = 0.01
@@ -817,7 +818,16 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(60)
                 continue
 
-            n_prompts = EVAL_PROMPTS
+            # Use fewer prompts during full eval (speed), more during maintenance (precision)
+            top4_check = state_path / "top4_leaderboard.json"
+            in_initial = True
+            if top4_check.exists():
+                try:
+                    t4 = json.loads(top4_check.read_text())
+                    in_initial = t4.get("phase") == "initial_eval"
+                except Exception:
+                    pass
+            n_prompts = EVAL_PROMPTS_FULL if in_initial else EVAL_PROMPTS_H2H
             chall_str = ", ".join(f"UID {u}" for u in challengers)
             king_str = f"UID {king_uid}" if king_uid else "none"
             print(f"[VALIDATOR] Head-to-head: king={king_str} vs challengers=[{chall_str}] ({n_prompts} prompts)", flush=True)
