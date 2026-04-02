@@ -548,6 +548,31 @@ def main():
     print(f"[eval] Teacher logits: {len(teacher_logits_list)} prompts on CPU, chunked GPU processing enabled, VRAM: {gpu_mem_str()}", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
+    # PHASE 1d: Filter short-completion prompts
+    # ═══════════════════════════════════════════════════════════════════
+    # Prompts where the teacher generated <MIN_COMPLETION_TOKENS tokens are
+    # degenerate (teacher hit EOS early). KL on 1-23 tokens is pure noise
+    # and inflates variance. Remove for ALL models equally so paired
+    # comparisons remain valid.
+    MIN_COMPLETION_TOKENS = 64
+    completion_lens = [full_sequences[i].shape[1] - prompt_lens[i] for i in range(len(prompts))]
+    keep_mask = [cl >= MIN_COMPLETION_TOKENS for cl in completion_lens]
+    n_filtered = sum(1 for k in keep_mask if not k)
+    if n_filtered > 0:
+        filtered_indices = [i for i, k in enumerate(keep_mask) if not k]
+        print(f"[eval] Filtering {n_filtered} prompts with <{MIN_COMPLETION_TOKENS} completion tokens: {filtered_indices}", flush=True)
+        for idx in filtered_indices:
+            print(f"  prompt {idx}: {completion_lens[idx]} tokens", flush=True)
+        # Rebuild arrays keeping only valid prompts
+        full_sequences = [full_sequences[i] for i in range(len(prompts)) if keep_mask[i]]
+        teacher_logits_list = [teacher_logits_list[i] for i in range(len(prompts)) if keep_mask[i]]
+        prompt_lens = [prompt_lens[i] for i in range(len(prompts)) if keep_mask[i]]
+        prompts = [prompts[i] for i in range(len(prompts)) if keep_mask[i]]
+        print(f"[eval] {len(prompts)} prompts remaining after filter", flush=True)
+    else:
+        print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens — no filtering needed", flush=True)
+
+    # ═══════════════════════════════════════════════════════════════════
     # PHASE 2: Student scoring
     # ═══════════════════════════════════════════════════════════════════
 
@@ -575,6 +600,8 @@ def main():
         "max_prompt_len": args.max_prompt_len,
         "block_seed": args.block_seed,
         "n_prompts": len(prompts),
+        "n_prompts_filtered": n_filtered,
+        "min_completion_tokens": MIN_COMPLETION_TOKENS,
         "students": {},
     }
     for name, data in prior_results.items():
