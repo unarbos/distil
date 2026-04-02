@@ -285,14 +285,22 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             except Exception:
                 pass
 
-        # Check 6: Remove garbage/sentinel scores
+        # Check 6: Remove garbage/sentinel scores (but keep UIDs in evaluated set)
         import math
         for uid_str in list(fixed_scores.keys()):
             kl = fixed_scores[uid_str]
-            if not isinstance(kl, (int, float)) or math.isnan(kl) or math.isinf(kl) or kl < 0 or kl >= MAX_KL_THRESHOLD:
-                issues.append(f"UID {uid_str} has garbage score {kl} — removing")
+            if not isinstance(kl, (int, float)) or math.isnan(kl) or math.isinf(kl) or kl < 0:
+                issues.append(f"UID {uid_str} has garbage score {kl} — removing from scores")
                 fixed_scores.pop(uid_str)
                 fixed_evaluated.discard(uid_str)
+            elif kl >= MAX_KL_THRESHOLD:
+                # High-KL models: cap the score as sentinel but DON'T remove from evaluated_uids.
+                # This prevents infinite re-evaluation of models that score terribly.
+                capped = MAX_KL_THRESHOLD + 1
+                issues.append(f"UID {uid_str} has high KL {kl:.4f} >= {MAX_KL_THRESHOLD} — capping to {capped} (stays evaluated)")
+                fixed_scores[uid_str] = capped
+                # Ensure it stays in evaluated set
+                fixed_evaluated.add(uid_str)
 
         if issues:
             print(f"[VALIDATOR] ⚠️ STATE VALIDATION found {len(issues)} issues:", flush=True)
@@ -603,28 +611,44 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 except Exception:
                     pass
 
+            # ── Load permanently bad models list (belt-and-suspenders) ──
+            permanently_bad_file = state_path / "permanently_bad_models.json"
+            permanently_bad_models = set()
+            if permanently_bad_file.exists():
+                try:
+                    permanently_bad_models = set(json.loads(permanently_bad_file.read_text()))
+                except Exception:
+                    pass
+
             # Challengers = valid models that haven't been successfully evaluated yet
             challengers = {}
             skipped_known_bad = 0
+            skipped_permanently_bad = 0
             for uid, info in valid_models.items():
                 uid_str = str(uid)
+                model_name = info["model"]
                 # Already scored in THIS round's scoring context — skip
                 if uid_str in evaluated_uids and uid_str in scores:
+                    continue
+                # Check permanently bad list first (fastest check)
+                if model_name in permanently_bad_models:
+                    skipped_permanently_bad += 1
+                    evaluated_uids.add(uid_str)
                     continue
                 # Check persistent model history — if this model scored > 2x king's KL
                 # on ANY previous evaluation, don't waste GPU time re-evaluating it.
                 # It's clearly not competitive regardless of prompt set variance.
-                model_name = info["model"]
                 best_ever = model_score_history.get(model_name, {}).get("best_kl")
                 if best_ever is not None and king_kl < float("inf"):
                     skip_threshold = max(king_kl * 2.0, king_kl + 0.05)  # 2x king or king+0.05, whichever is larger
                     if best_ever > skip_threshold:
                         skipped_known_bad += 1
-                        if not evaluated_uids.__contains__(uid_str):
-                            evaluated_uids.add(uid_str)
+                        evaluated_uids.add(uid_str)
                         continue
                 challengers[uid] = info
 
+            if skipped_permanently_bad:
+                print(f"[VALIDATOR] Skipped {skipped_permanently_bad} permanently bad models (>10x king KL historically)", flush=True)
             if skipped_known_bad:
                 print(f"[VALIDATOR] Skipped {skipped_known_bad} models with historically bad scores (>2x king KL)", flush=True)
 
@@ -1075,7 +1099,9 @@ else:
                         except Exception:
                             pass
 
-                        poll_stop.wait(5)
+                        # Use longer poll interval (15s) during steady state to reduce
+                        # SFTP connection noise. The progress data is informational only.
+                        poll_stop.wait(15)
 
                 poll_thread = threading.Thread(target=_poll_pod_progress, daemon=True)
                 poll_thread.start()
@@ -1374,18 +1400,54 @@ else:
             for uid, info in models_to_eval.items():
                 uid_str = str(uid)
                 model_name = info["model"]
-                if uid_str in scores and 0 < scores[uid_str] <= MAX_KL_THRESHOLD:
+                if uid_str in scores and scores[uid_str] > 0:
                     kl = scores[uid_str]
                     prev = model_score_history.get(model_name, {})
-                    prev_best = prev.get("best_kl", float("inf"))
-                    if kl < prev_best:
-                        model_score_history[model_name] = {
-                            "best_kl": round(kl, 6),
-                            "uid": uid,
-                            "block": current_block,
-                            "timestamp": time.time(),
-                        }
+                    if kl <= MAX_KL_THRESHOLD:
+                        # Good score: track best_kl as before
+                        prev_best = prev.get("best_kl", float("inf"))
+                        if kl < prev_best:
+                            model_score_history[model_name] = {
+                                **prev,
+                                "best_kl": round(kl, 6),
+                                "uid": uid,
+                                "block": current_block,
+                                "timestamp": time.time(),
+                            }
+                    else:
+                        # Bad score (above threshold): record as worst_kl so
+                        # challenger skip logic knows this model was evaluated
+                        prev_worst = prev.get("worst_kl", 0)
+                        if kl > prev_worst:
+                            model_score_history[model_name] = {
+                                **prev,
+                                "worst_kl": round(kl, 6),
+                                "uid": uid,
+                                "block": current_block,
+                                "timestamp": time.time(),
+                            }
+                        # Ensure best_kl exists for skip logic (use worst as floor)
+                        if "best_kl" not in model_score_history.get(model_name, {}):
+                            model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
             model_history_file.write_text(json.dumps(model_score_history, indent=2))
+
+            # ── Update permanently bad models list ──
+            # Models scoring >10x king's KL are clearly broken/adversarial.
+            if king_kl > 0 and king_kl < float("inf"):
+                perm_bad_threshold = king_kl * 10.0
+                newly_banned = []
+                for uid, info in models_to_eval.items():
+                    uid_str = str(uid)
+                    if uid_str in scores and scores[uid_str] > perm_bad_threshold:
+                        model_name = info["model"]
+                        if model_name not in permanently_bad_models:
+                            permanently_bad_models.add(model_name)
+                            newly_banned.append(f"{model_name} (UID {uid}, KL={scores[uid_str]:.4f})")
+                if newly_banned:
+                    print(f"[VALIDATOR] 🚫 Added {len(newly_banned)} models to permanently_bad_models:", flush=True)
+                    for m in newly_banned:
+                        print(f"  • {m}", flush=True)
+                    permanently_bad_file.write_text(json.dumps(sorted(permanently_bad_models), indent=2))
 
             # ── Append score history (non-DQ scores only) ──
             valid_scores = {

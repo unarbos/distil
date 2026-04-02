@@ -48,5 +48,9 @@
   "5CqWiQRNtrhe9xnagbsucaMcanDJC4zgWK1ufDmWEvZp71PB:7859073": "integrity: Model maricom22/sd15-122k-ckpt-2 no longer exists on HuggingFace (404)",
   "5DkXHJRufD1oXUjjNc9mGu6ZDK81wJgdMEBWFhpmQNfst2Aw:7860132": "integrity: Model maricom22/sd15-122k-ckpt-3 no longer exists on HuggingFace (404)",
   "5GTuBxm3LjCyRW4En2gRGnUAxGXWwJCC49PweUAwuYqeBxcs:7863801": "integrity: Cannot compute model hash \u2014 safetensors may have been removed",
-  "5CM1qw9XT3oBnQXSrpT4zdrd7BnY9sJwpwnANSMoABDcc9LG:7857161": "copy: identical weights to UID 115 (Qwen/Qwen3.5-4B-Base), committed later at block 7857161 vs 7854471"
+  "5CM1qw9XT3oBnQXSrpT4zdrd7BnY9sJwpwnANSMoABDcc9LG:7857161": "copy: identical weights to UID 115 (Qwen/Qwen3.5-4B-Base), committed later at block 7857161 vs 7854471",
+  "5FgwD2gtvn4kkDBnD1PitN3pRrpAJNdqYbFARSVie4YKVvRS:7871137": "arch: check_failed:404 Client Error. (Request ID: Root=1-69ccb745-0b7e6a457c1d4cfc71b19c2e;ac6adfd1-c79f-4505-98a4-bf2ce89feae2)\n\nEntry Not Found for url: https://huggingface.co/user3542384468/distil-4b-v001-800steps/resolve/8ba0ca74b456b32be9d2c0a4b51f91399c9fa58d/config.json.",
+  "flag:coldkey:5EcP5j4PfT1bjNABn76xsmPScxaPW3EW1pAAqJ3ESfE1H8rn": "Associated with DQ'd hotkey 5FgwD2gtvn4k... \u2014 arch: check_failed:404 Client Error. (Request ID: Root=1-69ccb745-0b7e6a457c1d4cfc71b19c2e;ac6adfd1-c79f-4505-98a4-bf2ce89feae2)\n\nEntry Not Found for url: https://huggingface.co/user3542384468/distil-4b-v001-800steps/resolve/8ba0ca74b456b32be9d2c0a4b51f91399c9fa58d/config.json.",
+  "flag:hf:user3542384468": "Associated with DQ'd hotkey 5FgwD2gtvn4k... \u2014 arch: check_failed:404 Client Error. (Request ID: Root=1-69ccb745-0b7e6a457c1d4cfc71b19c2e;ac6adfd1-c79f-4505-98a4-bf2ce89feae2)\n\nEntry Not Found for url: https://huggingface.co/user3542384468/distil-4b-v001-800steps/resolve/8ba0ca74b456b32be9d2c0a4b51f91399c9fa58d/config.json.",
+  "5GeeHsWehsiiD9Njz1oRYcPspGub5bVQzHH6RXcpeWrBqfjT:7876754": "integrity: Model kaldi110/model_1 no longer exists on HuggingFace (404)"
 }

@@ -1,14 +1,14 @@
 {
   "type": "new_king",
-  "timestamp": 1774968859.2584553,
+  "timestamp": 1775090250.9978225,
   "posted": true,
-  "message": "## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 183** has dethroned **UID 213**\n\n\ud83d\udcca **KL: 0.073727** (previous king scored 0.097006 last eval)\n\ud83e\udd17 Model: [aceini/q-dist](<https://huggingface.co/aceini/q-dist>)\n\ud83d\udc51 Previous king: [aviv887/model-1](<https://huggingface.co/aviv887/model-1>)\n\n\ud83d\udcb0 **Winner earns ~166.4 \u03c4/day ($50,504/day)** \u2014 winner takes all!\n\nThink you can beat **0.072989 KL** (1% epsilon)? Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
+  "message": "## \ud83c\udfc6 New King of Distil SN97!\n\n**UID 172** has dethroned **UID 7**\n\n\ud83d\udcca **KL: 0.090636** (previous king scored 0.091634 last eval)\n\ud83e\udd17 Model: [slowsnake/qwen35-4b-kd-v10](<https://huggingface.co/slowsnake/qwen35-4b-kd-v10>)\n\ud83d\udc51 Previous king: [aidonuts/corpulent-quail-step1000-v0](<https://huggingface.co/aidonuts/corpulent-quail-step1000-v0>)\n\n\ud83d\udcb0 **Winner earns ~133.9 \u03c4/day ($41,787/day)** \u2014 winner takes all!\n\nThink you can beat **0.089730 KL** (1% epsilon)? Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n\ud83d\udcc8 [Live Dashboard](<https://distil.arbos.life>)",
   "data": {
-    "new_uid": 183,
-    "new_model": "aceini/q-dist",
-    "new_kl": 0.07372658485820907,
-    "old_uid": 213,
-    "old_model": "aviv887/model-1",
-    "old_kl": 0.097006
+    "new_uid": 172,
+    "new_model": "slowsnake/qwen35-4b-kd-v10",
+    "new_kl": 0.090636,
+    "old_uid": 7,
+    "old_model": "aidonuts/corpulent-quail-step1000-v0",
+    "old_kl": 0.091634
   }
 }
