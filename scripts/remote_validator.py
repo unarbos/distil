@@ -708,13 +708,18 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                             pass
                     
                     if in_initial_eval:
-                        # Full eval: ALL untested models in one round on the SAME prompts
-                        for p1_uid, p1_kl, p1_model in p1_candidates:
+                        # Full eval: ALL models with global KL <= 0.12 in one round
+                        # No king advantage — pure comparison, lowest KL wins
+                        FULL_EVAL_KL_CUTOFF = 0.12
+                        eligible = [(u, k, m) for u, k, m in p1_candidates if k <= FULL_EVAL_KL_CUTOFF]
+                        excluded = len(p1_candidates) - len(eligible)
+                        for p1_uid, p1_kl, p1_model in eligible:
                             challengers[p1_uid] = valid_models[p1_uid]
                             smart_challenger_added += 1
-                        print(f"[VALIDATOR] 🏆 FULL EVAL: {len(p1_candidates)} models in one round "
-                              f"(best: UID {p1_candidates[0][0]} KL={p1_candidates[0][1]:.6f}, "
-                              f"worst: UID {p1_candidates[-1][0]} KL={p1_candidates[-1][1]:.6f})", flush=True)
+                        print(f"[VALIDATOR] \U0001f3c6 FULL EVAL: {len(eligible)} models in one round "
+                              f"(excluded {excluded} with KL>{FULL_EVAL_KL_CUTOFF}, "
+                              f"best: UID {eligible[0][0]} KL={eligible[0][1]:.6f}, "
+                              f"worst: UID {eligible[-1][0]} KL={eligible[-1][1]:.6f})", flush=True)
                     else:
                         # Maintenance mode: pick top 1 per round
                         p1_uid, p1_kl, p1_model = p1_candidates[0]
@@ -800,13 +805,26 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             # King's weights are permanent so its score is stable — but we need
             # the head-to-head comparison on the SAME prompt set for a fair test.
             models_to_eval = {}
-            if king_uid is not None and king_uid in valid_models:
+            # During initial full eval: no king privilege — all models are equal
+            # During maintenance: king is always included for fair H2H comparison
+            top4_check2 = state_path / "top4_leaderboard.json"
+            is_full_eval = True
+            if top4_check2.exists():
+                try:
+                    t4 = json.loads(top4_check2.read_text())
+                    is_full_eval = t4.get("phase") == "initial_eval"
+                except Exception:
+                    pass
+            if not is_full_eval and king_uid is not None and king_uid in valid_models:
                 models_to_eval[king_uid] = valid_models[king_uid]
             for uid, info in challengers.items():
                 models_to_eval[uid] = info
 
-            # Skip eval if only the king is in models_to_eval (no challengers survived filtering)
-            # This wastes compute and produces useless king-only H2H rounds on the dashboard
+            # During full eval, king is in challengers already (or excluded if KL > cutoff)
+            if is_full_eval:
+                print(f"[VALIDATOR] \U0001f3c6 FULL EVAL MODE: {len(models_to_eval)} models, no king advantage", flush=True)
+
+            # Skip eval if no models to evaluate
             n_challengers_in_eval = sum(1 for uid in models_to_eval if uid != king_uid)
             if n_challengers_in_eval == 0:
                 print(f"[VALIDATOR] No challengers in eval batch — skipping (king UID {king_uid} holds)", flush=True)
@@ -1120,9 +1138,10 @@ else:
                 vllm_flag = ""
                 if use_vllm:
                     vllm_flag = " --persistent-vllm --vllm-gpu-util 0.45"
-                    if king_uid is not None and king_uid in models_to_eval:
+                    if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
                         king_model_name = models_to_eval[king_uid]["model"]
                         king_flag = f" --king {king_model_name}"
+                    # Full eval: no --king flag, all models treated equally
                 else:
                     vllm_flag = " --no-vllm"
                 eval_cmd_core = (
