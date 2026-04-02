@@ -76,10 +76,8 @@ EVAL_PROMPTS = 120
 # e.g., 0.01 = challenger KL must be < king_kl * 0.99 (1% better)
 EPSILON = 0.01
 
-# Re-challenge: every N epochs, re-evaluate top historical models against the king.
-# This catches models that were scored on different prompt sets and may actually be better.
-RE_CHALLENGE_INTERVAL = 30  # epochs between periodic re-challenges
-RE_CHALLENGE_TOP_N = 3  # how many top models to re-challenge
+# Smart challenger selection: stale H2H re-test threshold
+STALE_H2H_EPOCHS = 50  # re-test if last H2H was >N epochs ago
 
 
 def _announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl, state_dir):
@@ -658,61 +656,94 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             if skipped_known_bad:
                 print(f"[VALIDATOR] Skipped {skipped_known_bad} models with historically bad scores (>2x king KL)", flush=True)
 
-            # ── Periodic re-challenge: re-evaluate top historical models ──
-            # Models are scored once and never re-evaluated against a new king on
-            # fresh prompts. Every RE_CHALLENGE_INTERVAL epochs, force the top N
-            # historically best models back into the challenger pool.
-            rechallenge_history_file = state_path / "rechallenge_history.json"
-            rechallenge_history = {}
-            if rechallenge_history_file.exists():
+            # ── Smart challenger selection ──
+            # Instead of periodic re-challenge (wasteful), use priority-based selection:
+            #   P1: Best untested models (never H2H'd vs CURRENT king)
+            #   P2: New submissions (already in challengers from above)
+            #   P3: Stale re-tests (>50 epochs ago, within 2x king KL)
+            h2h_king_tracker_file = state_path / "h2h_tested_against_king.json"
+            h2h_tested_against_king = {}
+            if h2h_king_tracker_file.exists():
                 try:
-                    rechallenge_history = json.loads(rechallenge_history_file.read_text())
+                    h2h_tested_against_king = json.loads(h2h_king_tracker_file.read_text())
                 except Exception:
                     pass
 
-            if epoch_count > 0 and epoch_count % RE_CHALLENGE_INTERVAL == 0 and king_uid is not None:
-                # Find top N models from history (lowest best_kl, excluding current king)
+            if king_uid is not None:
                 king_model_name = valid_models.get(king_uid, {}).get("model", "")
-                candidates = []
-                for model_name, hist in model_score_history.items():
-                    if model_name == king_model_name:
-                        continue
-                    best_kl = hist.get("best_kl")
-                    if best_kl is not None and best_kl < float("inf"):
-                        candidates.append((model_name, best_kl))
-                candidates.sort(key=lambda x: x[1])
-                rechallenge_models = candidates[:RE_CHALLENGE_TOP_N]
+                smart_challenger_added = 0
 
-                if rechallenge_models:
-                    print(f"[VALIDATOR] \U0001f504 PERIODIC RE-CHALLENGE (epoch {epoch_count}): "
-                          f"re-evaluating top {len(rechallenge_models)} historical models", flush=True)
-                    rechallenge_added = 0
-                    for rc_model_name, rc_best_kl in rechallenge_models:
-                        # Find a UID currently hosting this model
-                        rc_uid = None
-                        for uid, info in valid_models.items():
-                            if info["model"] == rc_model_name and uid not in challengers:
-                                rc_uid = uid
-                                break
-                        if rc_uid is not None:
-                            challengers[rc_uid] = valid_models[rc_uid]
-                            rechallenge_added += 1
-                            print(f"[VALIDATOR] \U0001f504 PERIODIC RE-CHALLENGE: "
-                                  f"Re-evaluating {rc_model_name} (UID {rc_uid}, best_kl={rc_best_kl:.4f})", flush=True)
-                            # Track re-challenge in history
-                            if rc_model_name not in rechallenge_history:
-                                rechallenge_history[rc_model_name] = []
-                            rechallenge_history[rc_model_name].append({
-                                "epoch": epoch_count,
-                                "timestamp": time.time(),
-                                "uid": rc_uid,
-                                "best_kl_at_time": rc_best_kl,
-                                "king_model": king_model_name,
-                                "king_kl": king_kl,
-                            })
-                    if rechallenge_added:
-                        rechallenge_history_file.write_text(json.dumps(rechallenge_history, indent=2))
-                        print(f"[VALIDATOR] Added {rechallenge_added} re-challenge models to eval", flush=True)
+                # Priority 1: Best untested models — never H2H'd against current king
+                # Models with global scores that haven't faced this king yet
+                p1_candidates = []
+                for uid, info in valid_models.items():
+                    if uid == king_uid or uid in challengers:
+                        continue
+                    model_name = info["model"]
+                    if model_name in permanently_bad_models:
+                        continue
+                    uid_str = str(uid)
+                    # Must have a global score
+                    global_kl = scores.get(uid_str)
+                    if global_kl is None or global_kl <= 0 or global_kl > MAX_KL_THRESHOLD:
+                        continue
+                    # Check if already H2H tested against current king
+                    h2h_record = h2h_tested_against_king.get(uid_str, {})
+                    if h2h_record.get("king_uid") == king_uid:
+                        continue  # already tested against this king
+                    p1_candidates.append((uid, global_kl, model_name))
+
+                if p1_candidates:
+                    # Sort by global KL ascending (best first), pick top 1
+                    p1_candidates.sort(key=lambda x: x[1])
+                    p1_uid, p1_kl, p1_model = p1_candidates[0]
+                    challengers[p1_uid] = valid_models[p1_uid]
+                    smart_challenger_added += 1
+                    print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: UID {p1_uid} ({p1_model}) selected "
+                          f"— Priority 1: best untested model vs current king (global KL={p1_kl:.6f}, "
+                          f"{len(p1_candidates)} untested remain)", flush=True)
+
+                # Priority 2: New submissions are already in challengers from the
+                # main loop above (models not in evaluated_uids/scores).
+                p2_count = sum(1 for uid in challengers if str(uid) not in scores)
+                if p2_count:
+                    print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: {p2_count} new submission(s) "
+                          f"— Priority 2: not yet evaluated", flush=True)
+
+                # Priority 3: Stale re-tests — last H2H was >STALE_H2H_EPOCHS ago
+                # AND global score within 2x of king's KL (might have been unlucky)
+                if king_kl > 0 and king_kl < float("inf"):
+                    p3_candidates = []
+                    stale_threshold = king_kl * 2.0
+                    for uid, info in valid_models.items():
+                        if uid == king_uid or uid in challengers:
+                            continue
+                        model_name = info["model"]
+                        if model_name in permanently_bad_models:
+                            continue
+                        uid_str = str(uid)
+                        global_kl = scores.get(uid_str)
+                        if global_kl is None or global_kl <= 0 or global_kl > stale_threshold:
+                            continue
+                        # Must have been tested against current king (P1 handles untested)
+                        h2h_record = h2h_tested_against_king.get(uid_str, {})
+                        if h2h_record.get("king_uid") != king_uid:
+                            continue  # untested — handled by P1
+                        epochs_since = epoch_count - h2h_record.get("epoch", 0)
+                        if epochs_since > STALE_H2H_EPOCHS:
+                            p3_candidates.append((uid, global_kl, model_name, epochs_since))
+
+                    if p3_candidates:
+                        p3_candidates.sort(key=lambda x: x[1])  # best global KL first
+                        p3_uid, p3_kl, p3_model, p3_age = p3_candidates[0]
+                        challengers[p3_uid] = valid_models[p3_uid]
+                        smart_challenger_added += 1
+                        print(f"[VALIDATOR] \U0001f3af SMART CHALLENGER: UID {p3_uid} ({p3_model}) selected "
+                              f"— Priority 3: stale re-test ({p3_age} epochs since last H2H, "
+                              f"global KL={p3_kl:.6f})", flush=True)
+
+                if smart_challenger_added:
+                    print(f"[VALIDATOR] Smart selection added {smart_challenger_added} challenger(s) to eval", flush=True)
 
             # Sanity check: if too many challengers, something may be wrong with state
             MAX_REASONABLE_CHALLENGERS = 20
@@ -1593,6 +1624,30 @@ else:
                 history = history[-50:]
                 with open(h2h_history_path, "w") as f:
                     json.dump(history, f, indent=2)
+
+            # ── Update h2h_tested_against_king tracker ──
+            # Record that each challenger in this round was H2H tested against the current king.
+            if king_uid is not None and challengers:
+                h2h_king_tracker_file = state_path / "h2h_tested_against_king.json"
+                h2h_tested_against_king = {}
+                if h2h_king_tracker_file.exists():
+                    try:
+                        h2h_tested_against_king = json.loads(h2h_king_tracker_file.read_text())
+                    except Exception:
+                        pass
+                for uid in challengers:
+                    uid_str = str(uid)
+                    if uid_str in scores and scores[uid_str] > 0:
+                        h2h_tested_against_king[uid_str] = {
+                            "king_uid": king_uid,
+                            "epoch": epoch_count,
+                            "block": current_block,
+                            "kl": round(scores[uid_str], 6),
+                            "model": challengers[uid].get("model", ""),
+                            "timestamp": time.time(),
+                        }
+                h2h_king_tracker_file.write_text(json.dumps(h2h_tested_against_king, indent=2))
+                print(f"[VALIDATOR] Updated h2h_tested_against_king: {len(challengers)} challengers tracked vs king UID {king_uid}", flush=True)
 
             # ── Round complete — clear round state so next epoch starts fresh ──
             round_file = state_path / "current_round.json"

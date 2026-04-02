@@ -319,17 +319,17 @@ def get_metagraph():
     # Fast: return cache immediately, refresh in background if stale
     cached = _get_cached("metagraph", CACHE_TTL)
     if cached:
-        return cached
+        return JSONResponse(content=cached, headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
     # No fresh cache — return stale if available, and refresh in background
     stale = _get_stale("metagraph")
     if stale:
         _bg_refresh("metagraph", _fetch_metagraph)
-        return stale
+        return JSONResponse(content=stale, headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
     # No cache at all — must block (first ever request)
     try:
         result = _fetch_metagraph()
         _set_cached("metagraph", result)
-        return result
+        return JSONResponse(content=result, headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
     except Exception as e:
         return {"error": str(e), "traceback": traceback.format_exc()}
 
@@ -371,7 +371,7 @@ Response includes:
 - `last_eval_time`: Unix timestamp of last eval
 - `tempo_seconds`: Seconds between evaluation rounds (currently 600)
 """)
-def get_scores():
+def get_scores(fields: str = ""):
     result = {"scores": {}, "ema_scores": {}, "disqualified": {}, "last_eval": None, "last_eval_time": None, "tempo_seconds": 600}
     scores_path = os.path.join(STATE_DIR, "scores.json")
     s = _safe_json_load(scores_path, {})
@@ -384,7 +384,14 @@ def get_scores():
     if last_eval is not None:
         result["last_eval"] = last_eval
         result["last_eval_time"] = os.path.getmtime(eval_path)
-    return result
+    # Filter fields if requested
+    if fields:
+        requested = set(f.strip() for f in fields.split(","))
+        result = {k: v for k, v in result.items() if k in requested}
+    return JSONResponse(
+        content=result,
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
 
 
 @app.get("/api/price", tags=["Market"], summary="Token price and market data",
@@ -404,15 +411,15 @@ Response includes:
 def get_price():
     cached = _get_cached("price", 30)
     if cached:
-        return cached
+        return JSONResponse(content=cached, headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"})
     stale = _get_stale("price")
     if stale:
         _bg_refresh("price", _fetch_price)
-        return stale
+        return JSONResponse(content=stale, headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"})
     try:
         result = _fetch_price()
         _set_cached("price", result)
-        return result
+        return JSONResponse(content=result, headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"})
     except Exception as e:
         return {"error": str(e)}
 
@@ -597,16 +604,31 @@ def get_h2h_latest():
 
 
 @app.get("/api/h2h-history", tags=["Evaluation"], summary="Head-to-head round history",
-         description="Returns the last 50 evaluation rounds. Each entry has the same structure as `/api/h2h-latest`.")
-def get_h2h_history():
+         description="Returns evaluation rounds with pagination. Supports `?limit=N` (default 50, max 200) and `?page=N` (1-indexed, default 1). Returns newest rounds first when paginated.")
+def get_h2h_history(limit: int = 50, page: int = 1):
+    limit = max(1, min(limit, 200))
+    page = max(1, page)
     path = os.path.join(STATE_DIR, "h2h_history.json")
     if os.path.exists(path):
         try:
             with open(path) as f:
-                return json.load(f)
+                data = json.load(f)
+            total = len(data)
+            # Reverse so newest first, then paginate
+            data_rev = list(reversed(data))
+            start = (page - 1) * limit
+            end = start + limit
+            page_data = data_rev[start:end]
+            return JSONResponse(
+                content={"rounds": page_data, "total": total, "page": page, "limit": limit, "has_more": end < total},
+                headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+            )
         except Exception:
             pass
-    return []
+    return JSONResponse(
+        content={"rounds": [], "total": 0, "page": 1, "limit": limit, "has_more": False},
+        headers={"Cache-Control": "public, max-age=10"},
+    )
 
 
 @app.get("/api/king-history", tags=["Evaluation"], summary="King dethronement history",
@@ -663,16 +685,23 @@ def get_tmc_config():
 
 
 @app.get("/api/history", tags=["Evaluation"], summary="Score history over time",
-         description="Returns historical KL scores for all miners over time. Used by the dashboard trendline chart. Each entry contains a timestamp and UID → score mapping.")
-def get_history():
+         description="Returns historical KL scores for all miners over time. Supports `?limit=N` (default 50) to return only the latest N entries.")
+def get_history(limit: int = 50):
+    limit = max(1, min(limit, 500))
     history_path = os.path.join(STATE_DIR, "score_history.json")
     if os.path.exists(history_path):
         try:
             with open(history_path) as f:
-                return json.load(f)
+                data = json.load(f)
+            # Return latest N entries
+            entries = data[-limit:] if len(data) > limit else data
+            return JSONResponse(
+                content=entries,
+                headers={"Cache-Control": "public, max-age=60, stale-while-revalidate=120"},
+            )
         except Exception:
-            return []
-    return []
+            return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=60"})
+    return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=60"})
 
 
 @app.get("/api/health", tags=["Overview"], summary="Service health and quick status",
