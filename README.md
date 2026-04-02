@@ -21,29 +21,34 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
    - **Duplicate detection** — SHA256 hash of safetensors weights; identical weights to an existing model → blacklisted for that commitment. Earlier commitment (by block number) owns the hash.
    - **Integrity** — Model must still be public and unchanged on HuggingFace
    - Models that fail pre-checks are **never sent to GPU** — no wasted compute
-   - `check_model.py` runs 13 pre-GPU + 4 GPU checks — the same checks the validator uses
+   - `check_model.py` and `test_miner.py` run 15 validator checks — the same checks the validator uses
 
 2. **King identification** — The miner with the lowest KL score from state is the "king" (current emissions winner)
 
 3. **Challenger detection** — Only models that haven't been evaluated yet are challengers. Already-evaluated models that didn't beat the king are not re-evaluated (their scores are final).
 
-4. **Head-to-head GPU eval** — The king and all new challengers are scored together on the **same 60 ClimbMix-400B prompts** (block-hash seeded). Both models see identical teacher continuations, making the comparison fair. The king is only put on GPU when there's a challenger — no wasted compute on idle re-evaluation.
+4. **Head-to-head GPU eval** — The king, top-4 contenders, and all new challengers are scored together on the **same 120 ClimbMix-400B prompts** (block-hash seeded). All models see identical teacher continuations, making the comparison fair. The king is only put on GPU when there's a challenger — no wasted compute on idle re-evaluation.
 
-5. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. The validator uses a hybrid approach: vLLM for fast teacher text generation, then HF for full-vocab logit extraction. Teacher logits are precomputed as softmax and cached on GPU, staying resident in VRAM during scoring.
+   **Min-token filter**: Prompts where the teacher generates fewer than 64 tokens are filtered out before scoring. This ensures all models are evaluated on substantive continuations. The filter is applied equally to all models.
 
-6. **Early stopping** — Models clearly worse than the king are stopped early (`MIN_PROMPTS_EARLY_STOP=7`) to save GPU time. The king model also stays loaded in VRAM to avoid repeated loading.
+5. **Top-5 always included** — The king plus the 4 best contenders are evaluated every round alongside new submissions, ensuring the leaderboard stays accurate even without new challengers.
 
-7. **Epsilon threshold (1%)** — A challenger must achieve KL divergence **more than 1% lower** than the king's to dethrone it. For example, if the king has KL=0.097, a challenger needs KL < 0.096 (= 0.097 × 0.99). This prevents noisy near-ties from flipping the winner every epoch and rewards meaningful improvements.
+6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. The validator uses a hybrid approach: vLLM for fast teacher text generation, then HF for full-vocab logit extraction. Teacher logits are precomputed as softmax and cached on GPU, staying resident in VRAM during scoring.
 
-8. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
+7. **Early stopping** — Models clearly worse than the king are stopped early (`MIN_PROMPTS_EARLY_STOP=7`) to save GPU time. The king model also stays loaded in VRAM to avoid repeated loading.
+
+8. **Paired t-test dethronement** — A challenger dethrones the king if a **paired t-test** on per-prompt KL deltas is statistically significant (p < 0.05). All 120 prompt-level data points are used, not just mean scores. This replaces arbitrary fixed thresholds with a rigorous statistical test — dethronement happens when the challenger is *reliably* better across prompts, not just better on average by some margin.
+
+9. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
 **Why this is better than evaluating all models every epoch:**
-- **More prompts per model** (60 vs 20) → tighter confidence intervals (95% CI, z=1.96), lower variance
-- **GPU only runs when needed** — no challengers means no GPU eval at all
-- **Fair comparison** — king and challenger scored on identical prompts in the same run
-- **Epsilon prevents flip-flopping** — the king holds unless clearly beaten
-- **Scales to many miners** — 100 miners with 1 new challenger = 2 models evaluated, not 100
+- **120 prompts per model** → tight confidence intervals and reliable statistical testing
+- **Top-5 always evaluated** — leaderboard stays fresh even without new challengers
+- **Fair comparison** — all models scored on identical prompts in the same run
+- **Paired t-test prevents flip-flopping** — the king holds unless a challenger is *statistically significantly* better
+- **Scales to many miners** — 100 miners with 1 new challenger = top-5 + 1 new model evaluated, not 100
 - **Early stopping** saves GPU time on clearly inferior models
+- **Min-token filter** ensures evaluation quality by excluding trivially short continuations
 
 ### Disqualification
 
@@ -60,6 +65,7 @@ Disqualification reasons are shown on the dashboard and available via the API.
 
 - **SHA256 hash duplicate detection**: Model weight hashes tracked forever; copies blacklisted for that commitment
 - **Logit fingerprinting**: Even if hashes differ, models with identical KL distributions on the first 2 prompts are flagged as functional copies (cosine similarity > 0.9999 on per-position KL vectors)
+- **Cosine similarity tool**: `scripts/cosine_similarity_check.py` provides offline near-copy detection between any two models
 - **Commitment block priority**: Earlier on-chain commitment wins hash ownership
 - **Integrity verification**: Models verified public + unchanged before every weight-set
 - **MoE-aware param counting**: Total params from safetensors metadata (not config estimates)
@@ -87,22 +93,25 @@ Your model must:
 
 ### Pre-Submission Check (Recommended)
 
-Before committing, run the checker to verify your model passes ALL validator checks:
+Before committing, run the validation tools to verify your model passes ALL validator checks:
 
 ```bash
 pip install click huggingface_hub transformers safetensors
 
-# Quick check (no GPU needed) — runs 13 pre-GPU checks:
+# Recommended: test_miner.py runs all 15 validator checks locally
+python test_miner.py --model-repo your-username/your-model
+
+# Alternative: check_model.py (quick pre-GPU checks)
 python check_model.py --model-repo your-username/your-model
 
-# Full eval with KL scoring (requires GPU) — runs 13 pre-GPU + 4 GPU checks:
+# Full eval with KL scoring (requires GPU):
 python check_model.py --model-repo your-username/your-model --eval
 
 # Compare against current king:
 python check_model.py --model-repo your-username/your-model --eval --king-repo aceini/q-dist
 ```
 
-This runs the same checks the validator uses. Save your TAO — fix issues before committing.
+`test_miner.py` is the recommended pre-submission tool — it runs the same 15 checks the validator uses. Save your TAO — fix issues before committing.
 
 ### Submit Your Model
 
@@ -111,6 +120,16 @@ This runs the same checks the validator uses. Save your TAO — fix issues befor
 ```bash
 pip install -e .
 
+# Dry run first (validates everything without committing):
+python miner.py \
+    --network finney \
+    --netuid 97 \
+    --wallet-name my_wallet \
+    --hotkey-name my_hotkey \
+    --model-repo your-username/your-distilled-model \
+    --dry-run
+
+# Commit (PERMANENT — interactive confirmation required):
 python miner.py \
     --network finney \
     --netuid 97 \
@@ -119,7 +138,7 @@ python miner.py \
     --model-repo your-username/your-distilled-model
 ```
 
-To change models, register a new hotkey.
+The miner script includes `--dry-run`/`--test-only` flags, interactive confirmation before committing, and post-commit verification. To change models, register a new hotkey.
 
 ### KL Ranges (baseline, no distillation training)
 
@@ -215,9 +234,9 @@ pip install "bittensor>=8.0.0" "bittensor-wallet>=2.0.0" "click>=8.0.0" \
 ### What It Does
 
 1. Loads the teacher model (Qwen3.5-35B-A3B) via vLLM for fast generation (~67GB VRAM)
-2. Draws 60 prompts from ClimbMix-400B (`karpathy/climbmix-400b-shuffle`, 6542 shards), seeded by on-chain block hash
+2. Draws 120 prompts from ClimbMix-400B (`karpathy/climbmix-400b-shuffle`, 6542 shards), seeded by on-chain block hash
 3. Polls for new challengers every epoch (~10 min)
-4. Head-to-head KL evaluation: king vs challengers on identical prompts, with early stopping for clearly worse models
+4. Head-to-head KL evaluation: king + top-4 contenders vs challengers on identical prompts, with early stopping for clearly worse models. Dethronement uses a paired t-test (p < 0.05) on per-prompt KL deltas.
 5. Teacher logits are precomputed and cached on GPU for fast scoring
 6. Sets weights on-chain: king = 1.0, everyone else = 0.0
 
@@ -253,19 +272,21 @@ All endpoints are public, no authentication required.
 ## Architecture
 
 ```
-├── miner.py                  # One-shot commitment script
+├── miner.py                  # One-shot commitment script (--dry-run, interactive confirm)
+├── test_miner.py             # Pre-submission validator (runs all 15 checks locally)
 ├── check_model.py            # Pre-submission checker (13 pre-GPU + 4 GPU checks)
 ├── eval/
 │   ├── kl_divergence.py      # Full-distribution KL on GPU
 │   ├── model_checker.py      # Param counting, integrity, hash, duplicate detection
-│   ├── dataset.py            # ClimbMix-400B dataset loader (60 prompts, block-hash seeded shard selection)
-│   └── scoring.py            # Winner-take-all + disqualification tracking
+│   ├── dataset.py            # ClimbMix-400B dataset loader (120 prompts, block-hash seeded shard selection)
+│   └── scoring.py            # Winner-take-all + paired t-test dethronement
 ├── api/
-│   └── server.py             # FastAPI dashboard backend
+│   └── server.py             # FastAPI dashboard backend (runs on separate API server behind Cloudflare)
 ├── scripts/
 │   ├── pod_eval_vllm.py      # GPU eval runner: vLLM teacher generation + HF logit extraction,
 │   │                         #   GPU-resident teacher logits, early stopping, king-in-VRAM
 │   ├── remote_validator.py   # King-of-the-hill validator (Hetzner + Lium GPU)
+│   ├── cosine_similarity_check.py  # Near-copy detection between models
 │   └── run_validator.sh      # PM2 wrapper
 └── state/                    # Persistent scores, hashes, disqualifications
 ```
@@ -276,6 +297,7 @@ The validator runs as a split architecture across two machines:
 
 - **Hetzner server** (secure): Wallet keys, chain access, weight setting, commitment monitoring. This machine has no GPU but holds all sensitive credentials.
 - **Lium GPU pod** (remote): Teacher/student forward passes, KL computation, vLLM inference. This machine has the GPU but **no chain access** — it cannot set weights or read wallet keys.
+- **Dedicated API server**: Dashboard and API run on a separate server behind **Cloudflare DDoS protection** (origin IP hidden via proxied DNS). State is synced from the validator every 15 seconds.
 
 Wallet keys never leave the Hetzner server. The GPU pod receives evaluation tasks and returns scores. This separation ensures that even a compromised GPU pod cannot steal funds or manipulate weights directly.
 
