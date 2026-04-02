@@ -1,11 +1,36 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import time
 import json
 import traceback
 import os
 import threading
 import requests as req
+from collections import defaultdict
+import time as _rate_time
+
+
+# ── Rate Limiting ──────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    def __init__(self, max_requests: int = 60, window_sec: int = 60):
+        self.max_requests = max_requests
+        self.window_sec = window_sec
+        self._requests = defaultdict(list)
+
+    def is_allowed(self, key: str) -> bool:
+        now = _rate_time.time()
+        window_start = now - self.window_sec
+        self._requests[key] = [t for t in self._requests[key] if t > window_start]
+        if len(self._requests[key]) >= self.max_requests:
+            return False
+        self._requests[key].append(now)
+        return True
+
+_rate_limiter = RateLimiter(max_requests=60, window_sec=60)
+_chat_rate_limiter = RateLimiter(max_requests=10, window_sec=60)  # Stricter for chat
 
 # Load .env from repo root
 _env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
@@ -64,7 +89,7 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://distil.arbos.life", "http://localhost:3000", "http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -272,7 +297,6 @@ def _fetch_price():
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-from fastapi.responses import RedirectResponse
 
 @app.get("/", include_in_schema=False)
 def root():
@@ -585,6 +609,49 @@ def get_h2h_history():
     return []
 
 
+@app.get("/api/king-history", tags=["Evaluation"], summary="King dethronement history",
+         description="Returns the chain of king changes (dethronements). Each entry shows the block, new king, and the dethroned UID with margin of victory.")
+def get_king_history():
+    """Extract all king changes from h2h_history.json."""
+    path = os.path.join(STATE_DIR, "h2h_history.json")
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            history = json.load(f)
+    except Exception:
+        return []
+
+    changes = []
+    for entry in history:
+        if not entry.get("king_changed"):
+            continue
+        new_king_uid = entry.get("new_king_uid") or entry.get("king_uid")
+        prev_king_uid = entry.get("prev_king_uid")
+        # Find king model name from results
+        king_model = None
+        king_kl = None
+        prev_kl = None
+        for r in entry.get("results", []):
+            if r.get("uid") == new_king_uid:
+                king_model = r.get("model")
+                king_kl = r.get("kl")
+            if r.get("uid") == prev_king_uid:
+                prev_kl = r.get("kl")
+        margin = None
+        if king_kl is not None and prev_kl is not None and prev_kl > 0:
+            margin = round((prev_kl - king_kl) / prev_kl, 6)
+        changes.append({
+            "block": entry.get("block"),
+            "timestamp": entry.get("timestamp"),
+            "king_uid": new_king_uid,
+            "king_model": king_model,
+            "dethroned_uid": prev_king_uid,
+            "margin": margin,
+        })
+    return changes
+
+
 @app.get("/api/tmc-config", tags=["Market"], summary="TaoMarketCap SSE config",
          description="Returns SSE (Server-Sent Events) URLs for real-time price and subnet data from TaoMarketCap. Used by the dashboard for live price updates.")
 def get_tmc_config():
@@ -679,8 +746,8 @@ def health():
 
 import re as _re
 _ANSI_RE = _re.compile(r'\x1b\[[0-9;]*m')
-_SECRET_RE = _re.compile(r'hf_[a-zA-Z0-9]{6,}|sk-[a-zA-Z0-9]{6,}|key-[a-zA-Z0-9]{6,}')
-_SENSITIVE_KW = ("Authorization:", "Bearer ", "token=", "api_key=", "API_KEY=", "password", "secret")
+_SECRET_RE = _re.compile(r'hf_[a-zA-Z0-9]{6,}|sk-[a-zA-Z0-9]{6,}|key-[a-zA-Z0-9]{6,}|ssh-(?:rsa|ed25519|dss|ecdsa)\s+[A-Za-z0-9+/=]{20,}|AAAA[A-Za-z0-9+/=]{50,}')
+_SENSITIVE_KW = ("Authorization:", "Bearer ", "token=", "api_key=", "API_KEY=", "password", "secret", "PRIVATE KEY", "ssh-rsa", "ssh-ed25519", "credentials")
 _INTERNAL_PATHS = ("/root/", "/home/pod/", "/home/openclaw/")
 _ALLOWED_PREFIXES = ("[GPU]", "[eval]", "[VALIDATOR]", "[pod_eval]", "[vLLM]", "[PHASE]", "[Cache]", "#")
 
@@ -755,7 +822,6 @@ def gpu_logs(lines: int = 50):
 
 # ── Chat with king model ──────────────────────────────────────────────────────
 
-from fastapi import Request
 
 # Chat server runs on the GPU pod at port 8100 (scripts/chat_server.py).
 # We proxy requests via Lium SSH exec + curl.
@@ -815,12 +881,15 @@ def _lium_pod(name_hint="chat-king"):
     return None, None
 
 
-from fastapi.responses import StreamingResponse
-
 
 @app.post("/api/chat")
 async def chat_with_king(request: Request):
     """Proxy chat to the king model running on the GPU pod. Supports streaming via stream=true."""
+    # Rate limit: 10 req/min per IP for chat
+    client_ip = request.client.host if request.client else "unknown"
+    if not _chat_rate_limiter.is_allowed(client_ip):
+        return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+
     body = await request.json()
     messages = body.get("messages", [])
     max_tokens = body.get("max_tokens", 2048)
@@ -828,6 +897,22 @@ async def chat_with_king(request: Request):
 
     if not messages:
         return {"error": "messages required"}
+
+    # Input validation
+    if not isinstance(messages, list) or len(messages) > 50:
+        return JSONResponse(status_code=400, content={"error": "messages must be an array with at most 50 entries"})
+    for msg in messages:
+        content = msg.get("content", "") if isinstance(msg, dict) else ""
+        if isinstance(content, str) and len(content) > 10000:
+            return JSONResponse(status_code=400, content={"error": "message content too long (max 10000 chars)"})
+    if not isinstance(max_tokens, (int, float)) or max_tokens < 1 or max_tokens > 4096:
+        max_tokens = min(max(int(max_tokens) if isinstance(max_tokens, (int, float)) else 2048, 1), 4096)
+    temperature = body.get("temperature", 0.7)
+    if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
+        temperature = 0.7
+    top_p = body.get("top_p", 0.9)
+    if not isinstance(top_p, (int, float)) or top_p < 0 or top_p > 1:
+        top_p = 0.9
 
     king_uid, king_model = _get_king_info()
     if king_uid is None:
@@ -841,8 +926,8 @@ async def chat_with_king(request: Request):
         pod_payload = {
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": body.get("temperature", 0.7),
-            "top_p": body.get("top_p", 0.9),
+            "temperature": temperature,
+            "top_p": top_p,
             "stream": stream,
         }
 
@@ -858,8 +943,10 @@ async def chat_with_king(request: Request):
 def _sync_chat(lium, pod, payload, king_uid, king_model):
     """Non-streaming chat proxy."""
     payload["stream"] = False
-    payload_str = json.dumps(payload).replace("'", "'\\''")
-    cmd = f"curl -s -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{payload_str}'"
+    # Write payload to pod temp file to avoid shell injection
+    payload_json = json.dumps(payload)
+    lium.exec(pod, command=f"cat > /tmp/_chat_payload.json << 'CHATEOF'\n{payload_json}\nCHATEOF")
+    cmd = f"curl -s -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d @/tmp/_chat_payload.json"
     result = lium.exec(pod, command=cmd)
     stdout = result.get("stdout", "") if isinstance(result, dict) else str(result)
 
@@ -883,8 +970,9 @@ def _sync_chat(lium, pod, payload, king_uid, king_model):
 
 def _stream_chat(lium, pod, payload, king_uid, king_model):
     """Streaming chat proxy via SSE. Uses lium.stream_exec to pipe pod SSE → client."""
-    payload_str = json.dumps(payload).replace("'", "'\\''")
-    cmd = f"curl -sN -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d '{payload_str}'"
+    # Write payload to pod temp file to avoid shell injection
+    lium.exec(pod, command=f"cat > /tmp/_chat_payload_stream.json << 'CHATEOF'\n{json.dumps(payload)}\nCHATEOF")
+    cmd = f"curl -sN -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d @/tmp/_chat_payload_stream.json"
 
     def generate():
         try:
@@ -979,6 +1067,24 @@ def chat_status():
 
 
 # ── Startup: prime caches ────────────────────────────────────────────────────
+
+# ── Rate limiting middleware for all endpoints ────────────────────────────────────────
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # Skip rate limiting for docs
+        if request.url.path in ("/docs", "/redoc", "/openapi.json"):
+            return await call_next(request)
+        # Chat endpoint has its own stricter limiter applied in the handler
+        if request.url.path == "/api/chat":
+            return await call_next(request)
+        client_ip = request.client.host if request.client else "unknown"
+        if not _rate_limiter.is_allowed(client_ip):
+            return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
+        return await call_next(request)
+
+app.add_middleware(RateLimitMiddleware)
+
 
 @app.on_event("startup")
 def prime_caches():
