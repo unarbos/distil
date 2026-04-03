@@ -368,12 +368,27 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     try:
         print("[VALIDATOR] Ensuring pod dependencies...", flush=True)
         dep_result = lium.exec(pod, command=(
-            "pip install --break-system-packages 'transformers>=5.0' accelerate vllm flash-attn --no-build-isolation -q 2>&1 | tail -1 && "
+            "pip install --break-system-packages 'vllm>=0.19' accelerate -q 2>&1 | tail -1 && "
+            "pip install --break-system-packages 'transformers>=4.50' -q 2>&1 | tail -1 && "
             "python3 -c 'import torch; import transformers; import vllm; "
             "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
             "vllm={vllm.__version__} cuda={torch.cuda.is_available()}\")'"
         ))
         print(f"[VALIDATOR] Pod deps: {dep_result.get('stdout', '').strip()}", flush=True)
+        # Patch grouped_mm for B200 sm_100 (torch._grouped_mm crashes)
+        lium.exec(pod, command=(
+            'python3 -c "import torch; cap=torch.cuda.get_device_capability(0); '
+            'print(f\"GPU compute capability: {cap}\")" && '
+            'grep -q PATCHED /usr/local/lib/python3.12/dist-packages/transformers/integrations/moe.py 2>/dev/null || '
+            'sed -i \'s/return hasattr(torch.nn.functional, "grouped_mm") or hasattr(torch, "_grouped_mm")/'
+            '# PATCHED: force fallback on sm_100 (B200)\n'
+            '    cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0)\n'
+            '    if cap[0] >= 10:\n'
+            '        return hasattr(torch.nn.functional, "grouped_mm")\n'
+            '    return hasattr(torch.nn.functional, "grouped_mm") or hasattr(torch, "_grouped_mm")/\' '
+            '/usr/local/lib/python3.12/dist-packages/transformers/integrations/moe.py'
+        ))
+        print("[VALIDATOR] Applied grouped_mm B200 patch", flush=True)
     except Exception as e:
         print(f"[VALIDATOR] Pod dep check failed (non-fatal): {e}", flush=True)
 
