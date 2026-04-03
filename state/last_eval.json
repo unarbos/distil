@@ -142,7 +142,7 @@
       "status": "fraud_vram",
       "reason": "FRAUD: student VRAM delta 24.5GB > 20.0GB",
       "vram_gb": 24.5,
-      "kl_global_avg": Infinity
+      "kl_global_avg": null
     },
     "cosmosfast/97-2": {
       "status": "early_stopped",

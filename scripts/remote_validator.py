@@ -36,12 +36,24 @@ logger.setLevel(logging.DEBUG)
 import re as _re
 
 
+def _sanitize_for_json(obj):
+    """Replace inf/nan floats with None so JSON serialization never fails."""
+    import math
+    if isinstance(obj, float):
+        return None if (math.isinf(obj) or math.isnan(obj)) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def atomic_json_write(path, data, indent=None):
     """Write JSON atomically: write to .tmp then os.replace (atomic on Linux)."""
     path = str(path)
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
-        json.dump(data, f, indent=indent)
+        json.dump(_sanitize_for_json(data), f, indent=indent)
     os.replace(tmp, path)
 
 # Patterns for sanitizing GPU logs before public exposure
