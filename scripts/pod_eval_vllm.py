@@ -523,20 +523,27 @@ def main():
             print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
             del sequences_data
 
-            # Save cache (atomic: write to tmp then rename)
-            cache_path = args.save_teacher_logits or os.path.join(
-                os.path.dirname(args.output), "teacher_cache.pt")
-            cache_tmp = cache_path + ".tmp"
-            torch.save({
-                "full_sequences": [s.cpu() for s in full_sequences],
-                "teacher_logits": teacher_logits_list,
-                "prompt_lens": prompt_lens,
-                "block_seed": args.block_seed,
-                "prompts_hash": prompts_hash,
-                "generation_method": "vllm+hf",
-            }, cache_tmp)
-            os.replace(cache_tmp, cache_path)
-            print(f"[eval] Cache saved to {cache_path}", flush=True)
+            # Save cache only if explicitly requested AND enough disk
+            if args.save_teacher_logits:
+                cache_path = args.save_teacher_logits
+                st = os.statvfs(os.path.dirname(cache_path) or '/')
+                free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+                if free_gb > 50:  # need ~45GB for cache
+                    cache_tmp = cache_path + ".tmp"
+                    torch.save({
+                        "full_sequences": [s.cpu() for s in full_sequences],
+                        "teacher_logits": teacher_logits_list,
+                        "prompt_lens": prompt_lens,
+                        "block_seed": args.block_seed,
+                        "prompts_hash": prompts_hash,
+                        "generation_method": "vllm+hf",
+                    }, cache_tmp)
+                    os.replace(cache_tmp, cache_path)
+                    print(f"[eval] Cache saved to {cache_path}", flush=True)
+                else:
+                    print(f"[eval] Skipped cache save ({free_gb:.0f}GB free, need 50GB)", flush=True)
+            else:
+                print(f"[eval] No cache save requested", flush=True)
 
             # Unload teacher — free ~67GB VRAM for students
             del teacher
