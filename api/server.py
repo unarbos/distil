@@ -1448,6 +1448,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/api/chat":
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
+        # Exempt localhost — dashboard SSR makes many internal requests
+        if client_ip in ("127.0.0.1", "::1", "localhost"):
+            return await call_next(request)
         if not _rate_limiter.is_allowed(client_ip):
             return JSONResponse(status_code=429, content={"error": "rate limit exceeded"})
         return await call_next(request)

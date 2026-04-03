@@ -14,6 +14,8 @@ rsync -az --timeout=10 \
   --temp-dir=/tmp \
   --delay-updates \
   --include='*.json' \
+  --include='api_cache/' \
+  --include='api_cache/*.json' \
   --exclude='*.tmp' \
   --exclude='*' \
   "$LOCAL_STATE" "$REMOTE:$REMOTE_STATE" 2>/dev/null
