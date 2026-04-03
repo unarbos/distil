@@ -793,13 +793,12 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                               f"best: UID {eligible[0][0]} KL={eligible[0][1]:.6f}, "
                               f"worst: UID {eligible[-1][0]} KL={eligible[-1][1]:.6f})", flush=True)
                     else:
-                        # Maintenance mode: pick top 1 per round
-                        p1_uid, p1_kl, p1_model = p1_candidates[0]
-                        challengers[p1_uid] = valid_models[p1_uid]
-                        smart_challenger_added += 1
-                        print(f"[VALIDATOR] 🎯 SMART CHALLENGER: UID {p1_uid} ({p1_model}) selected "
-                              f"— Priority 1: best untested model vs current king (global KL={p1_kl:.6f}, "
-                              f"{len(p1_candidates)} untested remain)", flush=True)
+                        # Maintenance mode: ALL untested models in every round
+                        for p1_uid, p1_kl, p1_model in p1_candidates:
+                            challengers[p1_uid] = valid_models[p1_uid]
+                            smart_challenger_added += 1
+                        print(f"[VALIDATOR] 🎯 SMART CHALLENGER: {len(p1_candidates)} untested model(s) added "
+                              f"— Priority 1: all untested vs current king", flush=True)
 
                 # Priority 2: New submissions are already in challengers from the
                 # main loop above (models not in evaluated_uids/scores).
