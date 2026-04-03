@@ -137,8 +137,15 @@ def _safe_filename(name: str) -> str:
 def _disk_read(name: str):
     path = os.path.join(DISK_CACHE_DIR, f"{_safe_filename(name)}.json")
     if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            # Corrupt cache file — delete it silently
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     return None
 
 def _disk_write(name: str, data):
