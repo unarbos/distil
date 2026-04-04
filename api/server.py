@@ -1313,7 +1313,7 @@ def get_commitment_by_hotkey(hotkey: str):
 CHAT_POD_PORT = 8100
 CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "91.224.44.81")
 CHAT_POD_SSH_PORT = int(os.environ.get("CHAT_POD_SSH_PORT", "20300"))
-CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
+CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", "/home/distil/.ssh/id_ed25519")
 
 
 def _get_king_info():
