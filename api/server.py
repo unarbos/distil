@@ -1372,7 +1372,7 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 2048)
+    max_tokens = body.get("max_tokens", 8192)
     stream = body.get("stream", False)
 
     if not messages:
@@ -1385,8 +1385,8 @@ async def chat_with_king(request: Request):
         content = msg.get("content", "") if isinstance(msg, dict) else ""
         if isinstance(content, str) and len(content) > 10000:
             return JSONResponse(status_code=400, content={"error": "message content too long (max 10000 chars)"})
-    if not isinstance(max_tokens, (int, float)) or max_tokens < 1 or max_tokens > 4096:
-        max_tokens = min(max(int(max_tokens) if isinstance(max_tokens, (int, float)) else 2048, 1), 4096)
+    if not isinstance(max_tokens, (int, float)) or max_tokens < 1:
+        max_tokens = 8192
     temperature = body.get("temperature", 0.7)
     if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
         temperature = 0.7
@@ -1413,7 +1413,11 @@ async def chat_with_king(request: Request):
             return _sync_chat(pod_payload, king_uid, king_model)
 
     except Exception as e:
-        return {"error": f"chat error: {str(e)[:200]}"}
+        # Sanitize error — don't leak SSH commands/paths to frontend
+        err = str(e)
+        if "ssh" in err.lower() or "root@" in err or ".ssh/" in err:
+            return {"error": "chat server connection failed — try again in a moment"}
+        return {"error": f"chat error: {err[:200]}"}
 
 
 def _sync_chat(payload, king_uid, king_model):
@@ -1437,9 +1441,9 @@ def _sync_chat(payload, king_uid, king_model):
             if "usage" in data:
                 resp["usage"] = data["usage"]
             return resp
-        return {"error": "unexpected response", "details": stdout[:300]}
+        return {"error": "unexpected response from chat server"}
     except json.JSONDecodeError:
-        return {"error": "chat server not responding — may be starting up", "details": stdout[:300]}
+        return {"error": "chat server not responding — may be starting up"}
 
 
 def _stream_chat(payload, king_uid, king_model):
@@ -1473,7 +1477,10 @@ def _stream_chat(payload, king_uid, king_model):
                         yield f"data: {raw}\n\n"
             proc.wait(timeout=5)
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)[:200]})}\n\n"
+            err = str(e)
+            if "ssh" in err.lower() or "root@" in err or ".ssh/" in err:
+                err = "chat server connection failed"
+            yield f"data: {json.dumps({'error': err[:200]})}\n\n"
 
     return StreamingResponse(
         generate(),
