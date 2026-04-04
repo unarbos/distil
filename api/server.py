@@ -1544,6 +1544,89 @@ def chat_status():
     }
 
 
+# ── OpenAI-compatible endpoints (for Open WebUI etc.) ─────────────────────────
+
+
+@app.get("/v1/models")
+def openai_models():
+    """OpenAI-compatible models list. Returns the current king model."""
+    king_uid, king_model = _get_king_info()
+    model_id = king_model or "distil-king"
+    return {
+        "object": "list",
+        "data": [{
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": f"distil-sn97-uid{king_uid}" if king_uid else "distil-sn97",
+        }],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI-compatible chat completions endpoint. Proxies to the king model.
+    Used by Open WebUI and other OpenAI-compatible clients."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _chat_rate_limiter.is_allowed(client_ip):
+        return JSONResponse(status_code=429, content={"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}})
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    if not messages:
+        return JSONResponse(status_code=400, content={"error": {"message": "messages required"}})
+
+    king_uid, king_model = _get_king_info()
+    if king_uid is None:
+        return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
+
+    # Forward the request as-is to the chat server (it already speaks OpenAI format)
+    import base64
+    stream = body.get("stream", False)
+    payload_b64 = base64.b64encode(json.dumps(body).encode()).decode()
+
+    try:
+        if stream:
+            # Stream SSE directly from chat server
+            import subprocess
+            cmd = f"echo '{payload_b64}' | base64 -d | curl -sN -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d @-"
+            ssh_cmd = [
+                "ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
+                "-i", CHAT_POD_SSH_KEY, "-p", str(CHAT_POD_SSH_PORT),
+                f"root@{CHAT_POD_HOST}", cmd,
+            ]
+
+            def generate():
+                try:
+                    proc = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    for line in proc.stdout:
+                        line = line.strip()
+                        if line.startswith("data: "):
+                            yield f"{line}\n\n"
+                            if line == "data: [DONE]":
+                                break
+                    proc.wait(timeout=5)
+                except Exception:
+                    yield 'data: {"error": "stream interrupted"}\n\n'
+
+            return StreamingResponse(
+                generate(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+            )
+        else:
+            # Non-streaming: return raw OpenAI response
+            cmd = f"echo '{payload_b64}' | base64 -d | curl -s -X POST http://localhost:{CHAT_POD_PORT}/v1/chat/completions -H 'Content-Type: application/json' -d @-"
+            stdout = _ssh_exec(cmd, timeout=120)
+            try:
+                data = json.loads(stdout)
+                return JSONResponse(content=data)
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=502, content={"error": {"message": "chat server not responding"}})
+    except Exception:
+        return JSONResponse(status_code=502, content={"error": {"message": "chat server connection failed"}})
+
+
 # ── Startup: prime caches ────────────────────────────────────────────────────
 
 # ── Rate limiting middleware for all endpoints ────────────────────────────────────────
@@ -1553,8 +1636,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Skip rate limiting for docs
         if request.url.path in ("/docs", "/redoc", "/openapi.json"):
             return await call_next(request)
-        # Chat endpoint has its own stricter limiter applied in the handler
-        if request.url.path == "/api/chat":
+        # Chat/OpenAI endpoints have their own stricter limiter applied in the handler
+        if request.url.path in ("/api/chat", "/v1/chat/completions", "/v1/models"):
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
         # Exempt localhost — dashboard SSR makes many internal requests
