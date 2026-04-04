@@ -437,6 +437,9 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
     # ══════════════════════════════════════════════════════════════════════
     # OPTIONAL: GPU-based evaluation
     # ══════════════════════════════════════════════════════════════════════
+    # This matches the production eval pipeline in pod_eval_vllm.py
+    # Key: scores CONTINUATION positions only (not prompt), uses fp32 casting,
+    # uses F.kl_div with log_target=True, and tokenizes full_text as one string.
     banner("GPU EVALUATION", char="█")
     print(f"  Running {prompts}-prompt eval against teacher")
     if king_repo:
@@ -445,6 +448,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
 
     try:
         import torch
+        import torch.nn.functional as F
         if not torch.cuda.is_available():
             check_fail("GPU check", "No CUDA GPU available. --eval requires a GPU.")
             sys.exit(1)
@@ -454,21 +458,58 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         check_info("GPU", f"{gpu_name} ({gpu_mem:.0f}GB)")
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from datasets import load_dataset
 
         # ── Load teacher ──────────────────────────────────────────────
         banner("Loading Teacher Model")
         teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
 
-        teacher_logits = None
+        # ── Sample prompts using the same pipeline as production ──────
+        banner("Sampling Eval Prompts")
+        from eval.dataset import sample_prompts_from_dataset, format_prompt
+
+        # Use a deterministic block for local testing
+        raw_prompts = sample_prompts_from_dataset(
+            n=prompts, block_number=12345, block_hash=None,
+            dataset_name=dataset,
+        )
+        eval_prompts = []
+        for text in raw_prompts:
+            formatted = format_prompt(text)
+            if formatted:
+                eval_prompts.append(formatted)
+            if len(eval_prompts) >= prompts:
+                break
+        print(f"  Sampled {len(eval_prompts)} prompts (format_prompt filtered from {len(raw_prompts)})")
+
+        if len(eval_prompts) == 0:
+            check_fail("Prompt sampling", "No valid prompts after filtering")
+            sys.exit(1)
+
+        MAX_NEW_TOKENS = 512
+
+        teacher_loaded = False
+        teacher_logits_list = []  # continuation-only logits per prompt
+        full_sequences = []       # full token sequences (prompt + continuation)
+        prompt_lens_list = []     # prompt token length per prompt
+
         if teacher_cache and Path(teacher_cache).exists():
-            print(f"  Loading cached teacher logits from {teacher_cache}...")
-            cache_data = torch.load(teacher_cache, map_location="cpu", weights_only=True)
-            teacher_logits = cache_data.get("logits")
-            cached_prompts = cache_data.get("prompts", [])
-            print(f"  Loaded {len(cached_prompts)} cached prompts")
-        
-        if teacher_logits is None:
+            print(f"  Loading cached teacher data from {teacher_cache}...")
+            try:
+                cache_data = torch.load(teacher_cache, map_location="cpu", weights_only=False)
+                if (len(cache_data.get("full_sequences", [])) >= len(eval_prompts)
+                    and cache_data.get("teacher_logits")
+                    and cache_data.get("prompt_lens")):
+                    full_sequences = [s.to("cuda") for s in cache_data["full_sequences"][:len(eval_prompts)]]
+                    teacher_logits_list = cache_data["teacher_logits"][:len(eval_prompts)]
+                    prompt_lens_list = cache_data["prompt_lens"][:len(eval_prompts)]
+                    teacher_loaded = True
+                    print(f"  Loaded {len(full_sequences)} cached prompt sequences")
+                else:
+                    print(f"  Cache incompatible, will regenerate")
+            except Exception as e:
+                print(f"  Cache load failed: {e}, will regenerate")
+
+        if not teacher_loaded:
             print(f"  Loading {TEACHER_MODEL}...")
             t0 = time.time()
             teacher = AutoModelForCausalLM.from_pretrained(
@@ -482,31 +523,41 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
             teacher_vram = torch.cuda.memory_allocated() / 1024**3
             print(f"  Teacher VRAM: {teacher_vram:.1f}GB")
 
-        # ── Load dataset & sample prompts ─────────────────────────────
-        banner("Sampling Eval Prompts")
-        ds = load_dataset(dataset, split="train", streaming=True)
-        eval_prompts = []
-        for i, row in enumerate(ds):
-            text = row.get("text", "")
-            if len(text) > 100:
-                eval_prompts.append(text[:2048])
-            if len(eval_prompts) >= prompts:
-                break
-        print(f"  Sampled {len(eval_prompts)} prompts from {dataset}")
+            # ── Generate teacher continuations & extract logits ────────
+            # Matches production: generate continuation, then forward pass
+            # to get logits, extract continuation-only positions.
+            banner("Generating Teacher Continuations + Logits")
+            with torch.no_grad():
+                for i, prompt_text in enumerate(eval_prompts):
+                    prompt_ids = teacher_tok(prompt_text, return_tensors="pt", truncation=False).input_ids.to(teacher.device)
+                    prompt_len = prompt_ids.shape[1]
 
-        # ── Generate teacher logits if not cached ─────────────────────
-        if teacher_logits is None:
-            banner("Generating Teacher Logits")
-            teacher_logits = []
-            for i, prompt_text in enumerate(eval_prompts):
-                ids = teacher_tok(prompt_text, return_tensors="pt", truncation=True,
-                                  max_length=512).input_ids.to(teacher.device)
-                with torch.no_grad():
-                    out = teacher(ids)
-                teacher_logits.append(out.logits.cpu())
-                if (i + 1) % 5 == 0:
-                    print(f"  Teacher: {i + 1}/{len(eval_prompts)} prompts", flush=True)
+                    # Generate continuation
+                    output_ids = teacher.generate(
+                        prompt_ids, max_new_tokens=MAX_NEW_TOKENS,
+                        do_sample=False, use_cache=True,
+                    )
+                    gen_len = output_ids.shape[1] - prompt_len
+
+                    # Forward pass to get logits for the full sequence
+                    logits = teacher(output_ids).logits.float()
+                    # Extract continuation-only logits: positions prompt_len-1 to -1
+                    # (shifted by 1 because logits[t] predicts token[t+1])
+                    cont_logits = logits[:, prompt_len - 1:-1, :]
+
+                    full_sequences.append(output_ids.cpu())
+                    teacher_logits_list.append(cont_logits.cpu())
+                    prompt_lens_list.append(prompt_len)
+
+                    del logits, cont_logits
+                    if (i + 1) % 5 == 0 or i == len(eval_prompts) - 1:
+                        print(f"  Teacher: {i + 1}/{len(eval_prompts)} prompts "
+                              f"({prompt_len}+{gen_len} tokens)", flush=True)
+
             print(f"  Teacher logits generated for {len(eval_prompts)} prompts")
+
+            # Move full_sequences to cuda
+            full_sequences = [s.to("cuda") for s in full_sequences]
 
             # Unload teacher to free VRAM for student
             del teacher
@@ -560,28 +611,42 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         except Exception as e:
             check_warn("Generation speed", f"Benchmark failed: {e}")
 
-        # ── Score KL divergence ───────────────────────────────────────
+        # ── Score KL divergence (continuation-only, matches production) ──
+        # This matches the production eval pipeline in pod_eval_vllm.py:
+        # - Forward pass on full sequence (prompt + teacher continuation)
+        # - Extract student logits at continuation positions only
+        # - Cast to fp32 before log_softmax
+        # - Use F.kl_div with log_target=True
         banner("CHECK 10: KL Divergence Scoring")
-        import torch.nn.functional as F
 
         kl_scores = []
-        for i, prompt_text in enumerate(eval_prompts):
-            ids = teacher_tok(prompt_text, return_tensors="pt", truncation=True,
-                              max_length=512).input_ids.to(student.device)
+        for i in range(len(eval_prompts)):
+            full_seq = full_sequences[i]
+            prompt_len = prompt_lens_list[i]
+
+            # Teacher: compute log_softmax on-the-fly in fp32 (matches production)
+            t_logits = teacher_logits_list[i].to(student.device).float()
+            t_log_p = F.log_softmax(t_logits, dim=-1)
+
             with torch.no_grad():
-                student_out = student(ids)
+                # Student forward pass on full sequence
+                s_logits = student(full_seq).logits.float()
+                # Extract continuation-only positions (same slice as production)
+                cont_s = s_logits[:, prompt_len - 1:-1, :]
 
-            t_logits = teacher_logits[i].to(student_out.logits.device)
+            # Align lengths (in case of minor mismatch)
+            min_len = min(cont_s.shape[1], t_log_p.shape[1])
+            t_lp_slice = t_log_p[:, :min_len, :]
+            s_lp_slice = F.log_softmax(cont_s[:, :min_len, :], dim=-1)
 
-            # Align lengths
-            min_len = min(t_logits.shape[1], student_out.logits.shape[1])
-            t_log_probs = F.log_softmax(t_logits[:, :min_len, :], dim=-1)
-            s_log_probs = F.log_softmax(student_out.logits[:, :min_len, :], dim=-1)
-
-            # KL(teacher || student) per position, then mean
-            kl_per_pos = F.kl_div(s_log_probs, t_log_probs.exp(), reduction='none').sum(dim=-1)
+            # KL(teacher || student) using log_target=True (matches production)
+            kl_per_pos = F.kl_div(
+                s_lp_slice, t_lp_slice, log_target=True, reduction='none'
+            ).sum(dim=-1)
             kl_mean = kl_per_pos.mean().item()
             kl_scores.append(kl_mean)
+
+            del s_logits, cont_s, t_logits, t_log_p, t_lp_slice, s_lp_slice, kl_per_pos
 
             if (i + 1) % 5 == 0:
                 running_avg = sum(kl_scores) / len(kl_scores)
@@ -617,7 +682,6 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         if king_repo:
             banner("KING COMPARISON")
             print(f"  Loading king: {king_repo}...")
-            # Unload student
             del student
             torch.cuda.empty_cache()
 
@@ -631,18 +695,22 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
             king.eval()
 
             king_kl_scores = []
-            for i, prompt_text in enumerate(eval_prompts):
-                ids = teacher_tok(prompt_text, return_tensors="pt", truncation=True,
-                                  max_length=512).input_ids.to(king.device)
-                with torch.no_grad():
-                    king_out = king(ids)
-
-                t_logits = teacher_logits[i].to(king_out.logits.device)
-                min_len = min(t_logits.shape[1], king_out.logits.shape[1])
-                t_log_probs = F.log_softmax(t_logits[:, :min_len, :], dim=-1)
-                k_log_probs = F.log_softmax(king_out.logits[:, :min_len, :], dim=-1)
-                kl_per_pos = F.kl_div(k_log_probs, t_log_probs.exp(), reduction='none').sum(dim=-1)
-                king_kl_scores.append(kl_per_pos.mean().item())
+            with torch.no_grad():
+                for i in range(len(eval_prompts)):
+                    full_seq = full_sequences[i]
+                    prompt_len = prompt_lens_list[i]
+                    t_logits = teacher_logits_list[i].to(king.device).float()
+                    t_log_p = F.log_softmax(t_logits, dim=-1)
+                    k_logits = king(full_seq).logits.float()
+                    cont_k = k_logits[:, prompt_len - 1:-1, :]
+                    min_len = min(cont_k.shape[1], t_log_p.shape[1])
+                    t_lp_slice = t_log_p[:, :min_len, :]
+                    k_lp_slice = F.log_softmax(cont_k[:, :min_len, :], dim=-1)
+                    kl_per_pos = F.kl_div(
+                        k_lp_slice, t_lp_slice, log_target=True, reduction='none'
+                    ).sum(dim=-1)
+                    king_kl_scores.append(kl_per_pos.mean().item())
+                    del t_logits, t_log_p, k_logits, cont_k, t_lp_slice, k_lp_slice, kl_per_pos
 
             king_kl = sum(king_kl_scores) / len(king_kl_scores)
 
@@ -664,7 +732,6 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
                 if h2h_file.exists():
                     h2h = json.loads(h2h_file.read_text())
                     king_uid = h2h.get("king_uid")
-                    # Find king model in results
                     for r in h2h.get("results", []):
                         if r.get("uid") == king_uid:
                             king_kl_est = r.get("kl", 0)
