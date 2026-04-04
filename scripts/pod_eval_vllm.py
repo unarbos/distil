@@ -257,7 +257,10 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=409
     print(f"[vllm] PID: {proc.pid}", flush=True)
 
     import requests
-    for elapsed in range(0, 900, 5):
+    start_time = time.time()
+    VLLM_STARTUP_TIMEOUT = 900  # 15 min — enough for fresh pod model download + load
+    while time.time() - start_time < VLLM_STARTUP_TIMEOUT:
+        elapsed = int(time.time() - start_time)
         try:
             if requests.get(f"{VLLM_URL}/health", timeout=3).status_code == 200:
                 print(f"[vllm] Ready in {elapsed}s", flush=True)
@@ -273,9 +276,11 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=409
             except Exception:
                 pass
             return False
-        time.sleep(3)
+        if elapsed % 60 == 0 and elapsed > 0:
+            print(f"[vllm] Still starting... ({elapsed}s)", flush=True)
+        time.sleep(5)
 
-    print(f"[vllm] Timeout after 300s", flush=True)
+    print(f"[vllm] Timeout after {VLLM_STARTUP_TIMEOUT}s", flush=True)
     stop_vllm_server()
     return False
 
