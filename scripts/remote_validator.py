@@ -397,7 +397,9 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 continue
             h2h_record = state.h2h_tested_against_king.get(uid_str, {})
             if h2h_record.get("king_uid") != king_uid:
-                continue  # untested — handled by P1
+                # Tested against OLD king — needs re-test against current king
+                p3_candidates.append((uid, global_kl, STALE_H2H_EPOCHS + 1))
+                continue
             epochs_since = epoch_count - h2h_record.get("epoch", 0)
             if epochs_since > STALE_H2H_EPOCHS:
                 p3_candidates.append((uid, global_kl, epochs_since))
@@ -1320,11 +1322,13 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             challengers = select_challengers(valid_models, state, king_uid, king_kl, epoch_count)
             challengers_before_top5 = set(challengers.keys())
+            log_event(f"select_challengers returned {len(challengers)} (P1/P3), king={king_uid}", state_dir=state_dir)
             _add_top5_contenders(challengers, valid_models, state, king_uid)
             _cap_challengers(challengers, state, king_uid)
 
             has_new_challengers = len(challengers_before_top5) > 0
             if not challengers or not has_new_challengers:
+                log_event(f"No new challengers (before_top5={len(challengers_before_top5)}, after_all={len(challengers)})", state_dir=state_dir)
                 logger.info(f"No new challengers, king UID {king_uid} (KL={king_kl:.6f}) holds")
                 if king_uid is not None:
                     weights = [0.0] * max(n_uids, king_uid + 1)
