@@ -30,6 +30,9 @@ import click
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
+# Silence noisy libraries
+for _lib in ("paramiko", "paramiko.transport", "paramiko.sftp", "urllib3", "httpx"):
+    logging.getLogger(_lib).setLevel(logging.WARNING)
 logger = logging.getLogger("distillation.remote_validator")
 logger.setLevel(logging.DEBUG)
 
