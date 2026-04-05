@@ -257,8 +257,22 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
 
-        # Integrity check
+        # Integrity check — reset expected hash if miner re-committed
         expected_hash = state.model_hashes.get(str(uid))
+        stored_commit_block = state.model_hashes.get(f"{uid}_block")
+        if this_commit_block and stored_commit_block and this_commit_block != stored_commit_block:
+            # Miner made a new commitment — accept new weights
+            logger.info(f"UID {uid}: New commitment at block {this_commit_block} (was {stored_commit_block}), resetting hash")
+            expected_hash = None
+            state.model_hashes.pop(str(uid), None)
+            state.model_hashes.pop(f"{uid}_block", None)
+            # Clear old DQ for this commitment
+            old_dq_key = f"{hotkey}:{stored_commit_block}"
+            if old_dq_key in state.dq_reasons:
+                del state.dq_reasons[old_dq_key]
+            # Clear from evaluated_uids so they get re-evaluated
+            state.evaluated_uids.discard(str(uid))
+            state.scores.pop(str(uid), None)
         integrity = verify_model_integrity(model_repo, revision, expected_hash)
         if integrity.get("transient"):
             logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
@@ -272,6 +286,8 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             continue
         if integrity["current_hash"]:
             state.model_hashes[str(uid)] = integrity["current_hash"]
+            if this_commit_block:
+                state.model_hashes[f"{uid}_block"] = this_commit_block
             state.save_model_hashes()
 
         valid_models[uid] = {
