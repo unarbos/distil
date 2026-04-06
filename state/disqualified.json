@@ -92,5 +92,6 @@
   "5EyL5i1Ca7nmViiynRdAFJZPVpU6DzEYcPAWA9V23nWzq683:7871814": "integrity: Model rlinprogress/sn97-distilled-V17 no longer exists on HuggingFace (404)",
   "5Ckxy2NLmMG5NrHAwXsUEhs1x37x2PRkBwszmGhudXA9vQZL:7871958": "integrity: Model rlinprogress/sn97-distilled-V18 no longer exists on HuggingFace (404)",
   "5G1smogJaYmRxWdm3BMBrkg8RBiLTf2ab16AWcLbA7Q3krdH:7885329": "integrity: Model rlinprogress/sn97-distilled-V23 no longer exists on HuggingFace (404)",
-  "5GeHWBH7Y4U1bjeWrPiZhCZ2azRc7MpxwJVyRmAs4br7B9ao:7904489": "integrity: Model weights changed since commitment! hash 7b62ba7664cc157e... \u2260 expected c91722d2cfc7123d..."
+  "5GeHWBH7Y4U1bjeWrPiZhCZ2azRc7MpxwJVyRmAs4br7B9ao:7904489": "integrity: Model weights changed since commitment! hash 7b62ba7664cc157e... \u2260 expected c91722d2cfc7123d...",
+  "5Fn1VWmjf2NPgDHpMWnB2tpSVcM2dLTUaTMFYkh5UUnWUk3d:7905589": "integrity: Model weights changed since commitment! hash 5e036799cd479913... \u2260 expected 0c573bcae3330372..."
 }

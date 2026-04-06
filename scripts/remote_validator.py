@@ -257,19 +257,29 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
 
-        # Integrity check — reset expected hash if miner re-committed
+        # Integrity check — reset expected hash if miner re-committed or UID recycled
         expected_hash = state.model_hashes.get(str(uid))
         stored_commit_block = state.model_hashes.get(f"{uid}_block")
-        if this_commit_block and stored_commit_block and this_commit_block != stored_commit_block:
-            # Miner made a new commitment — accept new weights
-            logger.info(f"UID {uid}: New commitment at block {this_commit_block} (was {stored_commit_block}), resetting hash")
+        stored_hotkey = state.model_hashes.get(f"{uid}_hotkey")
+        # Detect UID recycling (new hotkey) or re-commitment (new block)
+        hotkey_changed = stored_hotkey is not None and stored_hotkey != hotkey
+        block_changed = this_commit_block and stored_commit_block and this_commit_block != stored_commit_block
+        # Also reset if we have a hash but no stored block (legacy data)
+        legacy_no_block = expected_hash is not None and stored_commit_block is None and this_commit_block
+        if hotkey_changed or block_changed or legacy_no_block:
+            # Miner made a new commitment or UID recycled — accept new weights
+            reason = "hotkey changed (UID recycled)" if hotkey_changed else "new commitment" if block_changed else "legacy hash (no block stored)"
+            logger.info(f"UID {uid}: {reason} at block {this_commit_block} (was {stored_commit_block}), resetting hash")
             expected_hash = None
             state.model_hashes.pop(str(uid), None)
             state.model_hashes.pop(f"{uid}_block", None)
-            # Clear old DQ for this commitment
-            old_dq_key = f"{hotkey}:{stored_commit_block}"
-            if old_dq_key in state.dq_reasons:
-                del state.dq_reasons[old_dq_key]
+            state.model_hashes.pop(f"{uid}_hotkey", None)
+            # Clear old DQ for this commitment (try both old and new hotkey keys)
+            for dq_hk in [hotkey, stored_hotkey] if stored_hotkey else [hotkey]:
+                for dq_key in [f"{dq_hk}:{stored_commit_block}", dq_hk]:
+                    if dq_key and dq_key in state.dq_reasons:
+                        logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
+                        del state.dq_reasons[dq_key]
             # Clear from evaluated_uids so they get re-evaluated
             state.evaluated_uids.discard(str(uid))
             state.scores.pop(str(uid), None)
@@ -288,6 +298,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             state.model_hashes[str(uid)] = integrity["current_hash"]
             if this_commit_block:
                 state.model_hashes[f"{uid}_block"] = this_commit_block
+            state.model_hashes[f"{uid}_hotkey"] = hotkey
             state.save_model_hashes()
 
         valid_models[uid] = {
