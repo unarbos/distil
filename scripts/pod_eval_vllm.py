@@ -305,15 +305,19 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
     return kl_per_pos
 
 
-def load_model(name, device="cuda", dtype=torch.bfloat16):
+def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     """Load a HuggingFace model for inference.
 
     Uses flash_attention_2 when available, falls back to default attention.
     Teacher models get trust_remote_code=True; students don't (security).
+    When revision is set, pins to that exact HF commit hash.
     """
     from transformers import AutoModelForCausalLM
     is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
     kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+    if revision and revision != "main":
+        kwargs["revision"] = revision
+        print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
     try:
         m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
         print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -324,12 +328,15 @@ def load_model(name, device="cuda", dtype=torch.bfloat16):
         return m
 
 
-def prefetch_model(name):
+def prefetch_model(name, revision=None):
     """Download model files to HF cache without loading to GPU. Runs in background."""
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(name, ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot"])
-        print(f"  [prefetch] {name} cached", flush=True)
+        dl_kwargs = dict(ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot"])
+        if revision and revision != "main":
+            dl_kwargs["revision"] = revision
+        snapshot_download(name, **dl_kwargs)
+        print(f"  [prefetch] {name} cached (rev={revision or 'main'})", flush=True)
     except Exception as e:
         print(f"  [prefetch] {name} failed: {e}", flush=True)
 
@@ -527,6 +534,7 @@ def main():
     parser = argparse.ArgumentParser(description="vLLM-accelerated SN97 evaluation v3")
     parser.add_argument("--teacher", default="Qwen/Qwen3.5-35B-A3B")
     parser.add_argument("--students", required=True, help="Comma-separated student models")
+    parser.add_argument("--revisions", default=None, help="Comma-separated revisions matching --students order")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt texts")
     parser.add_argument("--output", default="/home/eval_results.json")
     parser.add_argument("--max-prompt-len", type=int, default=1024)
@@ -549,6 +557,16 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     students = [s.strip() for s in args.students.split(",") if s.strip()]
+    # Parse revision pins (prevents weight-swap attacks between precheck and eval)
+    if args.revisions:
+        revisions = [r.strip() for r in args.revisions.split(",")]
+        if len(revisions) != len(students):
+            print(f"[eval] WARNING: {len(revisions)} revisions for {len(students)} students, ignoring revisions", flush=True)
+            student_revisions = {s: "main" for s in students}
+        else:
+            student_revisions = dict(zip(students, revisions))
+    else:
+        student_revisions = {s: "main" for s in students}
     timings = {}
 
     with open(args.prompts) as f:
@@ -847,6 +865,7 @@ def main():
     vram_before_students = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
 
     for student_idx, student_name in enumerate(students):
+        student_rev = student_revisions.get(student_name, "main")
         # Skip already scored
         if student_name in results["students"]:
             prior = results["students"][student_name]
@@ -874,8 +893,9 @@ def main():
         # Prefetch next student
         if student_idx + 1 < len(students):
             next_name = students[student_idx + 1]
+            next_rev = student_revisions.get(next_name, "main")
             if next_name not in results["students"] and next_name != king_name:
-                prefetch_future = prefetch_executor.submit(prefetch_model, next_name)
+                prefetch_future = prefetch_executor.submit(prefetch_model, next_name, next_rev)
 
         # Load student (or reuse king)
         live_progress["phase"] = "loading_student"
@@ -892,7 +912,7 @@ def main():
         else:
             try:
                 t0 = time.time()
-                student = load_model(student_name, device)
+                student = load_model(student_name, device, revision=student_rev)
                 student.eval()
                 load_time = time.time() - t0
                 student_vram_gb = (torch.cuda.memory_allocated() - vram_before_students) / 1024**3

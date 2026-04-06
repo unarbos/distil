@@ -686,8 +686,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         log_event(f"Pod disk cleanup failed: {str(e)[:100]}", level="warn", state_dir=str(state.state_dir))
     pod.clear_gpu()
 
-    # Build eval command
+    # Build eval command — pin revisions to prevent weight-swap attacks
     student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
+    revision_list = ",".join(models_to_eval[uid].get("revision", "main") for uid in ordered_uids)
     king_flag = ""
     vllm_flag = " --no-vllm"
     if use_vllm:
@@ -699,6 +700,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"cd /home && python3 -u pod_eval.py "
         f"--teacher {TEACHER_MODEL} "
         f"--students {student_list} "
+        f"--revisions {revision_list} "
         f"--prompts prompts.json "
         f"--output eval_results.json "
         f"--max-prompt-len {MAX_PROMPT_TOKENS} "

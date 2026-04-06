@@ -51,7 +51,6 @@
   "flag:hf:dsaddsaf": "Associated with DQ'd hotkey 5Cd7EVZxN2cP... \u2014 arch: check_failed:404 Client Error. (Request ID: Root=1-69cf0008-09f6ff5416088b052a93b758;a764b780-222c-4a5f-8ebe-a74401c8d1fe)\n\nEntry Not Found for url: https://huggingface.co/dsaddsaf/Qwen3.5-4B/resolve/f20529e79b40018fb642babdf596379b1d9d18c7/config.json.",
   "5H6kXPM3WNiRnpQKwEMqVB2rdv6FbFDRgEu4h8Lea8ejEAKh:7854471": "copy: identical weights to UID 97 (dasLOL/distilled-qwen35-4b-base), committed later",
   "7": "Model aidonuts/corpulent-quail-step1000-v0 is inaccessible (401). DQd.",
-  "5CDsLvJkZbgHws65MfP6EfZtoRp1nsY4LesTnLMT6yxsoNba:7884961": "copy: identical weights to UID 40 (aidonuts/screaming-porcupine-s4000-a025-v9), committed later at block 7884961 vs 7884956",
   "5GWLDWiuRR88XsMmmdRsfUHKXxA6dZpKfqjR92Z1cApT96oC:7885371": "FRAUD: student VRAM delta 24.5GB > 20.0GB",
   "5FW4kBjSWLGiVQDRCpVtHNRJKKaz3UyHfMqBRC5gHuHT1D9F:7894718": "copy: identical weights to UID 63 (rlinprogress/sn97-distilled-V26), committed later at block 7894718 vs 7894687",
   "5EsYErrmsqVPNZqevnXrC7Nq1hRT6d1A7d6LR1iAAvjAHP8P:7899226": "integrity: Model weights changed since commitment! hash 8acb504f3aa470b1... \u2260 expected 8a0ce275cbf533b3...",
@@ -93,5 +92,7 @@
   "5Ckxy2NLmMG5NrHAwXsUEhs1x37x2PRkBwszmGhudXA9vQZL:7871958": "integrity: Model rlinprogress/sn97-distilled-V18 no longer exists on HuggingFace (404)",
   "5G1smogJaYmRxWdm3BMBrkg8RBiLTf2ab16AWcLbA7Q3krdH:7885329": "integrity: Model rlinprogress/sn97-distilled-V23 no longer exists on HuggingFace (404)",
   "5GeHWBH7Y4U1bjeWrPiZhCZ2azRc7MpxwJVyRmAs4br7B9ao:7904489": "integrity: Model weights changed since commitment! hash 7b62ba7664cc157e... \u2260 expected c91722d2cfc7123d...",
-  "5Fn1VWmjf2NPgDHpMWnB2tpSVcM2dLTUaTMFYkh5UUnWUk3d:7905589": "integrity: Model weights changed since commitment! hash 5e036799cd479913... \u2260 expected 0c573bcae3330372..."
+  "5Fn1VWmjf2NPgDHpMWnB2tpSVcM2dLTUaTMFYkh5UUnWUk3d:7905589": "integrity: Model weights changed since commitment! hash 5e036799cd479913... \u2260 expected 0c573bcae3330372...",
+  "5CDsLvJkZbgHws65MfP6EfZtoRp1nsY4LesTnLMT6yxsoNba:7895331": "copy: identical weights to UID 75 (aidonuts/floudering-domino-s7000-a040-a057), committed later at block 7895331 vs 7895330",
+  "5DXGxLWT52M4tCs97uFa1vxStz3cfzFRsDiqcXurtaSiJX5t": "integrity: 404 repo + revision swap (Troiaaa/m-zdbke5oe). Reported by community 2026-04-06"
 }
