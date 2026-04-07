@@ -292,8 +292,11 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
         except Exception:
             pass
 
-    if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs and preproc_present:
-        return True, "native_qwen3_5_wrapper"
+    if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
+        # preprocessor_config.json is nice-to-have (for full vLLM vision pipeline)
+        # but not required — chat_server.py copies it from base model at serving time
+        suffix = "native_qwen3_5_wrapper" if preproc_present else "native_qwen3_5_wrapper_no_preproc"
+        return True, suffix
     if model_type == "qwen3_5_text" and "Qwen3_5ForCausalLM" in archs:
         return False, "text_only_qwen3_5_checkpoint"
     return False, f"unsupported_or_unknown:{model_type}:{','.join(archs) if archs else 'none'}"
