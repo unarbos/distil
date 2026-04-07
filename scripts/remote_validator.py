@@ -548,8 +548,25 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
 
 
 def _add_top5_contenders(challengers, valid_models, state: ValidatorState, king_uid):
-    """DISABLED — models are evaluated once, not re-tested."""
-    return
+    """Always include top-4 contenders (by KL score) in every eval round."""
+    if king_uid is None:
+        return
+    contenders_added = 0
+    # Get all scored models sorted by KL, pick top 4 that aren't king
+    scored = []
+    for uid, info in valid_models.items():
+        if uid == king_uid or uid in challengers:
+            continue
+        uid_str = str(uid)
+        kl = state.scores.get(uid_str)
+        if kl is not None and 0 < kl < float('inf'):
+            scored.append((uid, kl))
+    scored.sort(key=lambda x: x[1])  # best KL first
+    for uid, kl in scored[:TOP_N_ALWAYS_INCLUDE - 1]:  # top 4 (king is the 5th)
+        challengers[uid] = valid_models[uid]
+        contenders_added += 1
+    if contenders_added:
+        logger.info(f"🏆 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) to eval")
 
 
 def _cap_challengers(challengers, state: ValidatorState, king_uid):
