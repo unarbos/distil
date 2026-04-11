@@ -991,25 +991,47 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
         # King MUST produce a fresh score every round. If it fails (deleted repo,
         # download error, etc.), it loses the crown to the best challenger.
         # Falling back to cached scores would let a 404'd king retain the crown forever.
+        # IMPORTANT: Only consider challengers that produced a FRESH score this round.
+        # Using cached scores from previous rounds would let 401'd models win without
+        # actually being evaluated.
         logger.warning(f"King UID {king_uid} did not produce a score — will lose crown to best challenger")
+        # Get UIDs that actually produced results THIS round
+        this_round_scored = set()
+        for model_name, student_data in results.get("students", {}).items():
+            if "error" not in student_data and student_data.get("kl_global_avg") is not None:
+                for uid, info in models_to_eval.items():
+                    if info.get("model") == model_name:
+                        this_round_scored.add(uid)
+                        break
         best_challenger_uid = None
         best_challenger_kl = float("inf")
-        for uid in (uid for uid in models_to_eval if uid != king_uid):
+        for uid in (uid for uid in models_to_eval if uid != king_uid and uid in this_round_scored):
             uid_str = str(uid)
             if uid_str in state.scores and 0 < state.scores[uid_str] <= MAX_KL_THRESHOLD:
                 if state.scores[uid_str] < best_challenger_kl:
                     best_challenger_kl = state.scores[uid_str]
                     best_challenger_uid = uid
         if best_challenger_uid is not None:
-            logger.info(f"King failed eval — promoting best challenger UID {best_challenger_uid} (KL={best_challenger_kl:.6f})")
+            logger.info(f"King failed eval — promoting best challenger UID {best_challenger_uid} (KL={best_challenger_kl:.6f}) [fresh score this round]")
             log_event(f"King UID {king_uid} failed to produce score — promoting UID {best_challenger_uid}",
                       level="warning", state_dir=str(state.state_dir))
-            return best_challenger_uid, best_challenger_kl, [], None, None, set(models_to_eval.keys())
+            # Build minimal h2h_results for state recording
+            king_fail_results = []
+            for uid in this_round_scored:
+                uid_str = str(uid)
+                model_name = uid_to_model.get(uid, "")
+                kl = state.scores.get(uid_str)
+                if kl and kl > 0:
+                    king_fail_results.append({"uid": uid, "model": model_name, "kl": round(kl, 6),
+                                              "is_king": False, "vs_king": "king_failed"})
+            king_fail_results.sort(key=lambda x: x["kl"])
+            return best_challenger_uid, best_challenger_kl, king_fail_results, None, None, set(models_to_eval.keys())
         else:
-            logger.error(f"King failed eval and no valid challengers — no king this round")
-            log_event(f"King UID {king_uid} failed and no valid challengers",
+            logger.error(f"King failed eval and no valid challengers produced fresh scores — king retains crown by default")
+            log_event(f"King UID {king_uid} failed and no valid challengers with fresh scores",
                       level="error", state_dir=str(state.state_dir))
-            # Fall through with inf so any challenger can win
+            # King retains crown — don't dethrone with stale scores
+            return king_uid, king_kl, [], king_h2h_kl, None, set(models_to_eval.keys())
 
     king_new_kl = king_h2h_kl if king_h2h_kl is not None else state.scores.get(str(king_uid), king_kl) if king_uid else float("inf")
     epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
@@ -1227,19 +1249,27 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     """Update H2H state files: latest, history, tested-against-king."""
 
     n_challenger_results = sum(1 for r in h2h_results if not r.get("is_king"))
-    if n_challenger_results == 0:
-        logger.info("All challengers failed — skipping H2H round save")
-        return
-
     king_changed = winner_uid != king_uid if king_uid is not None else False
+    if n_challenger_results == 0 and not king_changed:
+        logger.info("All challengers failed and king unchanged — skipping H2H round save")
+        return
     effective_king_uid = winner_uid if winner_uid is not None else king_uid
     effective_king_kl = king_h2h_kl
     effective_king_model = uid_to_model.get(effective_king_uid, valid_models.get(effective_king_uid, {}).get("model", ""))
     if king_changed and winner_uid is not None:
+        # Try to get KL from h2h_results first, then state.scores
+        found_kl = False
         for r in h2h_results:
             if r["uid"] == winner_uid:
                 effective_king_kl = r.get("kl", king_h2h_kl)
+                found_kl = True
                 break
+        if not found_kl:
+            # Winner not in h2h_results (e.g. king-failed promotion) — use global score
+            winner_kl_from_scores = state.scores.get(str(winner_uid))
+            if winner_kl_from_scores and winner_kl_from_scores > 0:
+                effective_king_kl = winner_kl_from_scores
+                logger.info(f"Using global score {effective_king_kl:.6f} for new king UID {winner_uid} (not in h2h_results)")
 
     _king_h2h_kl = round(effective_king_kl, 6) if effective_king_kl else None
     h2h_round = {
