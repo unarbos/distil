@@ -62,7 +62,7 @@ MAX_PROMPT_TOKENS = 1024
 EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
 EVAL_PROMPTS_H2H = 300    # Head-to-head: 300 prompts with min_chars=500 pre-filter
 EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
-PAIRED_TEST_ALPHA = 0.05   # Significance level for paired t-test dethronement
+PAIRED_TEST_ALPHA = 0.01   # Significance level for paired t-test dethronement (tightened from 0.05 per community feedback)
 STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
 TOP_N_ALWAYS_INCLUDE = 5   # king + 4 contenders always in eval
 
@@ -330,6 +330,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
         uid_str = str(uid)
         if (uid_str in state.evaluated_uids and uid_str in state.scores
                 and state.scores[uid_str] <= MAX_KL_THRESHOLD):
+            # Re-verify architecture (lightweight config.json check)
             try:
                 from huggingface_hub import hf_hub_download
                 cfg_path = hf_hub_download(model_repo, "config.json", revision=revision)
@@ -349,6 +350,19 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
                     continue
             except Exception:
                 pass  # Transient HF error — allow through, catch next epoch
+            # Re-verify integrity: still public, weights unchanged
+            expected_hash = state.model_hashes.get(str(uid))
+            integrity = verify_model_integrity(model_repo, revision, expected_hash)
+            if integrity.get("transient"):
+                pass  # Transient error — allow through
+            elif not integrity["pass"]:
+                logger.info(f"UID {uid} ({model_repo}): INTEGRITY FAIL — {integrity['reason']}")
+                state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                disqualify(hotkey, f"integrity: {integrity['reason']}", state.dq_reasons,
+                           commit_block=this_commit_block)
+                disqualified.add(uid)
+                state.evaluated_uids.discard(uid_str)
+                continue
             valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None, "hotkey": hotkey}
             continue
 
