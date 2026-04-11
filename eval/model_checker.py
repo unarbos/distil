@@ -188,12 +188,13 @@ def verify_model_integrity(
     """
     Pre-weight-setting integrity check:
     1. Model is still publicly accessible on HuggingFace
-    2. Model weights haven't changed since commitment (SHA256 match)
+    2. Repo revision hasn't changed since commitment (git SHA match)
+    3. Falls back to weight hash if no stored revision SHA
 
     Returns dict with:
       pass: bool
       reason: str
-      current_hash: str or None
+      current_hash: str or None  (git SHA of repo HEAD, or weight hash for legacy)
     """
     try:
         # 1. Check model is still public (HEAD request to repo)
@@ -239,7 +240,60 @@ def verify_model_integrity(
             "current_hash": None,
         }
 
-    # 2. Verify weights haven't changed (SHA256 of first shard)
+    # 2. Check repo revision hasn't changed (cheap: git SHA comparison)
+    # The HF API returns info.sha = git commit SHA of the resolved revision.
+    # If the miner committed a specific revision, info.sha should match.
+    # If revision is "main", info.sha gives current HEAD — we store it on
+    # first check and compare on subsequent checks.
+    current_repo_sha = getattr(info, 'sha', None)
+
+    if expected_hash and current_repo_sha:
+        # Check if expected_hash looks like a git SHA (40 hex chars) vs weight hash
+        is_git_sha = len(expected_hash) == 40 and all(c in '0123456789abcdef' for c in expected_hash)
+        if is_git_sha:
+            if current_repo_sha != expected_hash:
+                return {
+                    "pass": False,
+                    "reason": f"Model repo has new commits since evaluation! revision {current_repo_sha[:12]}... ≠ expected {expected_hash[:12]}...",
+                    "current_hash": current_repo_sha,
+                }
+            return {
+                "pass": True,
+                "reason": "ok",
+                "current_hash": current_repo_sha,
+            }
+
+    # 3. Legacy path: fall back to weight hash comparison if no git SHA stored
+    if expected_hash and not (len(expected_hash) == 40 and all(c in '0123456789abcdef' for c in expected_hash)):
+        # expected_hash is a weight hash — use old method
+        current_hash = compute_model_hash(model_repo, revision)
+        if not current_hash:
+            return {
+                "pass": False,
+                "reason": f"Cannot compute model hash — safetensors may have been removed",
+                "current_hash": None,
+            }
+        if current_hash != expected_hash:
+            return {
+                "pass": False,
+                "reason": f"Model weights changed since commitment! hash {current_hash[:16]}... ≠ expected {expected_hash[:16]}...",
+                "current_hash": current_hash,
+            }
+        return {
+            "pass": True,
+            "reason": "ok",
+            "current_hash": current_hash,
+        }
+
+    # 4. No expected hash — first check. Prefer git SHA over weight hash.
+    if current_repo_sha:
+        return {
+            "pass": True,
+            "reason": "ok",
+            "current_hash": current_repo_sha,
+        }
+
+    # Fallback: compute weight hash for models where SHA is unavailable
     current_hash = compute_model_hash(model_repo, revision)
     if not current_hash:
         return {
@@ -247,14 +301,6 @@ def verify_model_integrity(
             "reason": f"Cannot compute model hash — safetensors may have been removed",
             "current_hash": None,
         }
-
-    if expected_hash and current_hash != expected_hash:
-        return {
-            "pass": False,
-            "reason": f"Model weights changed since commitment! hash {current_hash[:16]}... ≠ expected {expected_hash[:16]}...",
-            "current_hash": current_hash,
-        }
-
     return {
         "pass": True,
         "reason": "ok",

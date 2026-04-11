@@ -4,6 +4,8 @@ A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.5-35B-A3B*
 
 **Dashboard**: [distil.arbos.life](https://distil.arbos.life)  
 **API**: [api.arbos.life](https://api.arbos.life)  
+**Chat with the King**: [chat.arbos.life](https://chat.arbos.life) — try the current best distilled model  
+**Benchmarks Paper**: [KL vs Performance Analysis](paper/benchmark_kl_vs_performance.md)  
 **Subnet**: Finney netuid 97
 
 ## How It Works
@@ -27,28 +29,23 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
 
 3. **Challenger detection** — Only models that haven't been evaluated yet are challengers. Already-evaluated models that didn't beat the king are not re-evaluated (their scores are final).
 
-4. **Head-to-head GPU eval** — The king, top-4 contenders, and all new challengers are scored together on the **same 120 ClimbMix-400B prompts** (block-hash seeded). All models see identical teacher continuations, making the comparison fair. The king is only put on GPU when there's a challenger — no wasted compute on idle re-evaluation.
+4. **Head-to-head GPU eval** — The king, top-4 contenders, and all new challengers are scored together on the **same ~300 ClimbMix-400B prompts** (block-hash seeded, `min_chars=500`). All models see identical teacher continuations, making the comparison fair.
 
-   **Min-token filter**: Prompts where the teacher generates fewer than 64 tokens are filtered out before scoring. This ensures all models are evaluated on substantive continuations. The filter is applied equally to all models.
+5. **Top-5 always included** — The king plus the 4 best contenders are evaluated every round alongside new submissions, ensuring the leaderboard stays accurate.
 
-5. **Top-5 always included** — The king plus the 4 best contenders are evaluated every round alongside new submissions, ensuring the leaderboard stays accurate even without new challengers.
+6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. Teacher logits are precomputed and cached on GPU.
 
-6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. The validator uses a hybrid approach: vLLM for fast teacher text generation, then HF for full-vocab logit extraction. Teacher logits are precomputed as softmax and cached on GPU, staying resident in VRAM during scoring.
-
-7. **Early stopping** — Models clearly worse than the king are stopped early (`MIN_PROMPTS_EARLY_STOP=7`) to save GPU time. The king model also stays loaded in VRAM to avoid repeated loading.
-
-8. **Paired t-test dethronement** — A challenger dethrones the king if a **paired t-test** on per-prompt KL deltas is statistically significant (p < 0.05). All 120 prompt-level data points are used, not just mean scores. This replaces arbitrary fixed thresholds with a rigorous statistical test — dethronement happens when the challenger is *reliably* better across prompts, not just better on average by some margin.
+7. **Paired t-test dethronement (p < 0.01)** — A challenger dethrones the king if a one-sided paired t-test on per-prompt KL deltas is statistically significant at p < 0.01. All ~300 prompt-level data points are used, not just mean scores. Minimum 20 paired observations required. This prevents noise spammers from getting lucky wins with random weight perturbations.
 
 9. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
 **Why this is better than evaluating all models every epoch:**
-- **120 prompts per model** → tight confidence intervals and reliable statistical testing
+- **~300 prompts per model** → tight confidence intervals and reliable statistical testing
 - **Top-5 always evaluated** — leaderboard stays fresh even without new challengers
 - **Fair comparison** — all models scored on identical prompts in the same run
-- **Paired t-test prevents flip-flopping** — the king holds unless a challenger is *statistically significantly* better
+- **Paired t-test at p<0.01** — the king holds unless a challenger is *statistically significantly* better
 - **Scales to many miners** — 100 miners with 1 new challenger = top-5 + 1 new model evaluated, not 100
-- **Early stopping** saves GPU time on clearly inferior models
-- **Min-token filter** ensures evaluation quality by excluding trivially short continuations
+- **Revision pinning** — models evaluated at the specific committed revision; new HF commits = DQ
 
 ### Disqualification
 
@@ -67,7 +64,8 @@ Disqualification reasons are shown on the dashboard and available via the API.
 - **Logit fingerprinting**: Even if hashes differ, models with identical KL distributions on the first 2 prompts are flagged as functional copies (cosine similarity > 0.9999 on per-position KL vectors)
 - **Cosine similarity tool**: `scripts/cosine_similarity_check.py` provides offline near-copy detection between any two models
 - **Commitment block priority**: Earlier on-chain commitment wins hash ownership
-- **Integrity verification**: Models verified public + unchanged before every weight-set
+- **Revision-pinned integrity**: Models checked for new HF commits (git SHA comparison) — any change after commitment = DQ. Much cheaper than re-hashing weights every epoch.
+- **Continuous integrity checks**: Every epoch, all models verified public + unchanged
 - **MoE-aware param counting**: Total params from safetensors metadata (not config estimates)
 - **Quantization rejected**: GPTQ/AWQ/FP8 all blocked — architecture distillation only
 - **Block-hash seeded prompts**: Deterministic from on-chain block hash, unpredictable before block finalization
@@ -87,7 +85,9 @@ Your model must:
 - Use **same tokenizer** as Qwen3.5-35B-A3B (vocab_size=248,320)
 - Have ≤ **5.25B total parameters** (15% of teacher's 35B)
 - Be in **safetensors** format (bf16/fp16)
+- Use **`Qwen3_5ForConditionalGeneration`** architecture (model_type=`qwen3_5`) — required for vLLM compatibility
 - Be loadable via `AutoModelForCausalLM.from_pretrained()`
+- Stay **public and unchanged** on HuggingFace — making a repo private or pushing new commits = DQ
 - **No quantized models** (GPTQ/AWQ/GGUF rejected)
 - **Unique weights** — Cannot be identical to any previously committed model
 
