@@ -91,11 +91,8 @@ def disqualify(hotkey: str, reason: str, dq: dict[str, str],
     else:
         dq_key = hotkey
     dq[dq_key] = reason
-    # Flag associated coldkey (prefix: "flag:coldkey:")
-    if coldkey:
-        flag_key = f"flag:coldkey:{coldkey}"
-        if flag_key not in dq:
-            dq[flag_key] = f"Associated with DQ'd hotkey {hotkey[:12]}... — {reason}"
+    # NOTE: No coldkey or HF username flags — policy is per-hotkey per-submission ONLY.
+    # Miners must be able to re-register on a fresh hotkey without inheriting bans.
     # HF username flags removed — anyone can commit any HF account name,
     # so flagging by HF username punishes innocent people. Only hotkey and
     # coldkey are cryptographically tied to the committer.

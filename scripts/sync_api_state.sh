@@ -17,6 +17,10 @@ rsync -az --timeout=10 \
   --include='*.json' \
   --include='api_cache/' \
   --include='api_cache/*.json' \
+  --include='pod_logs/' \
+  --include='pod_logs/*.log' \
+  --include='eval_data/' \
+  --include='eval_data/*.json' \
   --exclude='*.tmp' \
   --exclude='*' \
   "$LOCAL_STATE" "$REMOTE:$REMOTE_STATE" 2>/dev/null
