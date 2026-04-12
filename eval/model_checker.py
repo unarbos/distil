@@ -451,13 +451,21 @@ def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     """
     from transformers import AutoTokenizer
 
-    teacher_tok = _get_teacher_tokenizer()
-    # NEVER trust_remote_code for students — blocks custom tokenizer.py code execution exploits
-    student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
+    from tokenizers import Tokenizer as RawTokenizer
+    from huggingface_hub import hf_hub_download as _hf_dl
+
+    # Load tokenizer.json directly via the `tokenizers` library.
+    # This bypasses AutoTokenizer class resolution issues (e.g., TokenizersBackend)
+    # while still verifying identical encoding behavior.
+    teacher_path = _hf_dl(TEACHER_MODEL, "tokenizer.json")
+    teacher_tok = RawTokenizer.from_file(teacher_path)
+
+    student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
+    student_tok = RawTokenizer.from_file(student_path)
 
     for test_str in TOKENIZER_TEST_STRINGS:
-        teacher_ids = teacher_tok.encode(test_str)
-        student_ids = student_tok.encode(test_str)
+        teacher_ids = teacher_tok.encode(test_str).ids
+        student_ids = student_tok.encode(test_str).ids
         if teacher_ids != student_ids:
             return {
                 "match": False,
