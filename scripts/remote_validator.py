@@ -64,7 +64,7 @@ EVAL_PROMPTS_H2H = 300    # Head-to-head: 300 prompts with min_chars=500 pre-fil
 EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
 PAIRED_TEST_ALPHA = 0.01   # Significance level for paired t-test dethronement (tightened from 0.05 per community feedback)
 STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
-TOP_N_ALWAYS_INCLUDE = 5   # king + 4 contenders always in eval
+TOP_N_ALWAYS_INCLUDE = 2   # king + 1 top contender always in eval
 
 # Activation fingerprint copy detection
 ACTIVATION_COPY_THRESHOLD = 0.9999  # Cosine similarity above this = functional copy
@@ -562,7 +562,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
 
 
 def _add_top5_contenders(challengers, valid_models, state: ValidatorState, king_uid):
-    """Always include top-4 contenders (by KL score) in every eval round."""
+    """Always include top-1 contender (by KL score) in every eval round."""
     if king_uid is None:
         return
     contenders_added = 0
