@@ -709,7 +709,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     king_flag = ""
     vllm_flag = " --no-vllm"
     if use_vllm:
-        vllm_flag = " --vllm-gpu-util 0.45"
+        vllm_flag = " --vllm-gpu-util 0.90"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
 
