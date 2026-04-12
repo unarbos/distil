@@ -855,7 +855,7 @@ def main():
         "max_prompt_len": args.max_prompt_len,
         "block_seed": args.block_seed,
         "n_prompts": len(prompts),
-        "n_prompts_filtered": n_filtered,
+        "n_prompts_filtered": 0,  # No post-generation filtering in v3
         "min_completion_tokens": MIN_COMPLETION_TOKENS,
         "students": {},
     }
