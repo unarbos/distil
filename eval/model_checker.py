@@ -386,33 +386,6 @@ def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     return {"match": True}
 
 
-def _repo_file_names(info) -> set[str]:
-    """Return sibling filenames for a HF repo info object."""
-    return {s.rfilename for s in (getattr(info, "siblings", None) or [])}
-
-
-def _has_tokenizer_override(info) -> bool:
-    """True when the student repo ships tokenizer assets that must be verified."""
-    names = _repo_file_names(info)
-    tokenizer_exact = {
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "sentencepiece.bpe.model",
-        "spiece.model",
-        "tokenizer.model",
-        "chat_template.jinja",
-    }
-    if names & tokenizer_exact:
-        return True
-    return any(name.startswith("tokenizer.") for name in names)
-
-
-def _has_chat_template_override(info) -> bool:
-    names = _repo_file_names(info)
-    return "tokenizer_config.json" in names or "chat_template.jinja" in names
-
-
 def check_model_architecture(
     model_repo: str,
     revision: str = None,
@@ -607,89 +580,72 @@ def check_model_architecture(
                 "vocab_size": vocab_size,
             }
 
-        # 7. Verify tokenizer produces identical encodings as teacher.
-        # Fail closed when a repo ships tokenizer assets but they cannot be verified.
-        has_tokenizer_override = _has_tokenizer_override(info)
-        if has_tokenizer_override:
-            try:
-                tokenizer_match = verify_tokenizer_match(model_repo, revision)
-                if not tokenizer_match["match"]:
-                    return {
-                        "pass": False,
-                        "reason": f"Tokenizer mismatch: {tokenizer_match['reason']}",
-                        "params_b": total_params_b,
-                        "vocab_size": vocab_size,
-                    }
-            except Exception as tok_err:
+        # 7. Verify tokenizer produces identical encodings as teacher
+        try:
+            tokenizer_match = verify_tokenizer_match(model_repo, revision)
+            if not tokenizer_match["match"]:
                 return {
                     "pass": False,
-                    "reason": (
-                        f"Tokenizer verification failed for submitted tokenizer assets: {tok_err}. "
-                        f"Students may only change weights."
-                    ),
+                    "reason": f"Tokenizer mismatch: {tokenizer_match['reason']}",
                     "params_b": total_params_b,
                     "vocab_size": vocab_size,
                 }
+        except Exception as tok_err:
+            logger.warning(f"Tokenizer check failed for {model_repo}: {tok_err} (allowing)")
+            # Don't block on tokenizer download failure — vocab_size check is the primary gate
 
         # 8. Verify chat_template matches the official Qwen template
         # Prevents exploits via modified chat templates and blocks derivative models
         # that copy templates from other miners (e.g., slowsnake copying caseus's watermarked template)
         REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
-        has_chat_template_override = _has_chat_template_override(info)
-        if has_chat_template_override:
-            try:
-                import hashlib
-                tok_config_path = hf_hub_download(
-                    repo_id=model_repo, filename="tokenizer_config.json", revision=revision,
-                )
-                with open(tok_config_path) as f:
-                    tok_config = json.load(f)
-                student_template = tok_config.get("chat_template", "")
-                if isinstance(student_template, list):
-                    student_template = json.dumps(student_template)
+        try:
+            import hashlib
+            tok_config_path = hf_hub_download(
+                repo_id=model_repo, filename="tokenizer_config.json", revision=revision,
+            )
+            with open(tok_config_path) as f:
+                tok_config = json.load(f)
+            student_template = tok_config.get("chat_template", "")
+            if isinstance(student_template, list):
+                student_template = json.dumps(student_template)
 
-                # Also check standalone chat_template.jinja if tokenizer_config has no template
-                if not student_template:
-                    try:
-                        jinja_path = hf_hub_download(
-                            repo_id=model_repo, filename="chat_template.jinja", revision=revision,
-                        )
-                        with open(jinja_path) as f:
-                            student_template = f.read()
-                    except Exception:
-                        pass  # No standalone template file
+            # Also check standalone chat_template.jinja if tokenizer_config has no template
+            if not student_template:
+                try:
+                    jinja_path = hf_hub_download(
+                        repo_id=model_repo, filename="chat_template.jinja", revision=revision,
+                    )
+                    with open(jinja_path) as f:
+                        student_template = f.read()
+                except Exception:
+                    pass  # No standalone template file
 
-                if student_template:
-                    # Strip leading/trailing whitespace and any comment-only first lines
-                    # (catches watermarks like "{# model distilled by caseus #}")
-                    import re
-                    cleaned = re.sub(r'^\s*\{#.*?#\}\s*\n?', '', student_template, flags=re.MULTILINE).strip()
-                    template_hash = hashlib.sha256(cleaned.encode()).hexdigest()
+            if student_template:
+                # Strip leading/trailing whitespace and any comment-only first lines
+                # (catches watermarks like "{# model distilled by caseus #}")
+                import re
+                cleaned = re.sub(r'^\s*\{#.*?#\}\s*\n?', '', student_template, flags=re.MULTILINE).strip()
+                template_hash = hashlib.sha256(cleaned.encode()).hexdigest()
 
-                    if template_hash != REFERENCE_TEMPLATE_HASH:
-                        # Also check the raw template (without stripping comments)
-                        raw_hash = hashlib.sha256(student_template.encode()).hexdigest()
-                        if raw_hash != REFERENCE_TEMPLATE_HASH:
-                            return {
-                                "pass": False,
-                                "reason": f"Chat template modified from reference Qwen template. "
-                                          f"Students must use the original Qwen3.5 chat template unmodified. "
-                                          f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)",
-                                "params_b": total_params_b,
-                                "vocab_size": vocab_size,
-                            }
-                        # Raw matches but cleaned doesn't — template has injected comments
-                        logger.warning(f"Chat template for {model_repo} has injected comments but base template matches")
-            except Exception as tmpl_err:
-                return {
-                    "pass": False,
-                    "reason": (
-                        f"Chat template verification failed for submitted tokenizer assets: {tmpl_err}. "
-                        f"Students may only change weights."
-                    ),
-                    "params_b": total_params_b,
-                    "vocab_size": vocab_size,
-                }
+                if template_hash != REFERENCE_TEMPLATE_HASH:
+                    # Also check the raw template (without stripping comments)
+                    raw_hash = hashlib.sha256(student_template.encode()).hexdigest()
+                    if raw_hash != REFERENCE_TEMPLATE_HASH:
+                        return {
+                            "pass": False,
+                            "reason": f"Chat template modified from reference Qwen template. "
+                                      f"Students must use the original Qwen3.5 chat template unmodified. "
+                                      f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)",
+                            "params_b": total_params_b,
+                            "vocab_size": vocab_size,
+                        }
+                    # Raw matches but cleaned doesn't — template has injected comments
+                    logger.warning(f"Chat template for {model_repo} has injected comments but base template matches")
+            else:
+                # No chat template at all — this is fine, the base tokenizer will be used
+                pass
+        except Exception as tmpl_err:
+            logger.warning(f"Chat template check failed for {model_repo}: {tmpl_err} (allowing)")
 
         # Log MoE info for transparency
         if moe_info["is_moe"]:

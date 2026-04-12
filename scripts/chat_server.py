@@ -35,7 +35,6 @@ def run(cmd, **kwargs):
 
 
 def download_model():
-    write_health(status="starting", phase="downloading", detail=f"downloading {MODEL_NAME}")
     if MODEL_DIR.exists():
         shutil.rmtree(MODEL_DIR)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,7 +43,6 @@ def download_model():
 
 
 def patch_config_and_tokenizer():
-    write_health(status="starting", phase="patching", detail="patching config and tokenizer for chat serving")
     from huggingface_hub import hf_hub_download
 
     config_path = MODEL_DIR / "config.json"
@@ -105,7 +103,6 @@ def patch_config_and_tokenizer():
 
 
 def inject_visual_weights():
-    write_health(status="starting", phase="grafting_visual", detail="grafting visual weights into the served checkpoint")
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -140,18 +137,14 @@ def inject_visual_weights():
     log(f"wrote sharded index with {len(index['weight_map'])} keys")
 
 
-def write_health(status="starting", phase=None, detail=None):
+def write_health():
     payload = {
-        "status": status,
+        "status": "starting",
         "backend": "vllm",
         "model": MODEL_NAME,
         "port": PORT,
         "ts": time.time(),
     }
-    if phase is not None:
-        payload["phase"] = phase
-    if detail is not None:
-        payload["detail"] = detail
     with open("/root/chat_health.json", "w") as f:
         json.dump(payload, f)
     with open("/root/model_name.txt", "w") as f:
@@ -159,7 +152,7 @@ def write_health(status="starting", phase=None, detail=None):
 
 
 def exec_vllm():
-    write_health(status="starting", phase="starting_vllm", detail="starting vLLM server")
+    write_health()
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", str(MODEL_DIR),
