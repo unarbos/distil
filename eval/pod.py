@@ -105,11 +105,32 @@ class PodManager:
         _retry(_do, max_attempts=max_attempts, delay=5, label=f"Download {remote}")
 
     def exec(self, command: str, env: dict = None, timeout: int = None):
-        """Execute a command on the pod. Returns the result dict."""
+        """Execute a command on the pod. Returns the result dict.
+
+        If timeout is specified, raises TimeoutError if the command
+        doesn't complete within that many seconds.
+        """
+        import concurrent.futures
         kwargs = {"command": command}
         if env:
             kwargs["env"] = env
+        if timeout is not None:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(self.lium.exec, self.pod, **kwargs)
+                try:
+                    return future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    logger.error(f"Pod exec timed out after {timeout}s: {command[:80]}")
+                    raise TimeoutError(f"Pod exec timed out after {timeout}s")
         return self.lium.exec(self.pod, **kwargs)
+
+    def is_alive(self, timeout: int = 15) -> bool:
+        """Quick liveness check — returns True if the pod responds."""
+        try:
+            result = self.exec("echo alive", timeout=timeout)
+            return "alive" in result.get("stdout", "")
+        except Exception:
+            return False
 
     def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-35B-A3B"):
         """Install required packages on the pod and apply B200 patches.

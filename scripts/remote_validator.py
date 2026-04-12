@@ -779,7 +779,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 pass
 
             try:
-                log_result = pod.exec("tail -100 /home/eval_output.log 2>/dev/null || echo ''")
+                log_result = pod.exec("tail -100 /home/eval_output.log 2>/dev/null || echo ''", timeout=30)
                 log_text = log_result.get("stdout", "")
                 if log_text.strip():
                     gpu_log_path.write_text(sanitize_gpu_log(log_text))
@@ -806,14 +806,24 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             except concurrent.futures.TimeoutError:
                 logger.error(f"Eval timed out after {EVAL_TIMEOUT}s — killing")
                 try:
-                    pod.exec("pkill -9 -f pod_eval.py; echo killed")
+                    pod.exec("pkill -9 -f pod_eval.py; echo killed", timeout=30)
                 except Exception:
                     pass
+                # Connection may be dead — reconnect for result retrieval
+                try:
+                    pod.reconnect()
+                except Exception as re_err:
+                    logger.error(f"Reconnect failed after timeout: {re_err}")
                 result = {"stdout": "", "stderr": "timeout", "exit_code": -1, "success": False}
     except Exception as e:
         logger.error(f"lium.exec EXCEPTION: {e}")
         import traceback
         traceback.print_exc()
+        # Try to reconnect for future operations
+        try:
+            pod.reconnect()
+        except Exception:
+            pass
         return None
     finally:
         poll_stop.set()
