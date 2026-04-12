@@ -309,6 +309,291 @@ def compute_kl_from_precomputed(t_log_p, t_p, student_logits):
     return kl_per_pos
 
 
+def _build_token_to_id_map(tokenizer):
+    """Build mapping from token text to token ID for vLLM logprobs decoding."""
+    vocab = tokenizer.get_vocab()  # {token_str: token_id}
+    text_to_id = {}
+    for tok_str, tok_id in vocab.items():
+        # Store raw vocab entry
+        text_to_id[tok_str] = tok_id
+        # Store decoded form as fallback
+        decoded = tokenizer.decode([tok_id])
+        if decoded not in text_to_id:
+            text_to_id[decoded] = tok_id
+    return text_to_id
+
+
+def vllm_logprobs_to_sparse(top_logprobs_list, token_to_id, tokenizer, k=128):
+    """Convert vLLM top_logprobs response to sparse tensor format.
+
+    Args:
+        top_logprobs_list: list of dicts (one per generated token),
+            each mapping token_str -> logprob for top-k tokens.
+        token_to_id: pre-built mapping from token text to token ID.
+        tokenizer: tokenizer for fallback encoding.
+        k: number of top logprobs to keep per position.
+
+    Returns:
+        dict with 'indices' [1, seq_len, k] and 'values' [1, seq_len, k]
+        where values are logprobs (from vLLM log-softmax).
+    """
+    seq_len = len(top_logprobs_list)
+    indices = torch.zeros(1, seq_len, k, dtype=torch.long)
+    values = torch.full((1, seq_len, k), -100.0, dtype=torch.float32)
+
+    for pos, top_lp in enumerate(top_logprobs_list):
+        sorted_items = sorted(top_lp.items(), key=lambda x: x[1], reverse=True)[:k]
+        for j, (token_str, logprob) in enumerate(sorted_items):
+            token_id = token_to_id.get(token_str)
+            if token_id is None:
+                try:
+                    encoded = tokenizer.encode(token_str, add_special_tokens=False)
+                    token_id = encoded[0] if encoded else 0
+                except Exception:
+                    token_id = 0
+            indices[0, pos, j] = token_id
+            values[0, pos, j] = logprob
+
+    return {"indices": indices, "values": values}
+
+
+def dense_to_sparse_topk(logits, k=128):
+    """Convert dense logits tensor to sparse top-k format.
+
+    Args:
+        logits: [1, seq_len, vocab_size] or [seq_len, vocab_size] tensor.
+        k: number of top logits to keep.
+
+    Returns:
+        dict with 'indices' [1, seq_len, k] and 'values' [1, seq_len, k]
+        where values are raw logits (not log-softmax).
+    """
+    if logits.dim() == 2:
+        logits = logits.unsqueeze(0)
+    topk_values, topk_indices = logits.float().topk(k, dim=-1)
+    return {"indices": topk_indices.cpu(), "values": topk_values.cpu()}
+
+
+def _is_sparse_logits(entry):
+    """Check whether a teacher_logits_list entry is sparse (dict) or dense (tensor)."""
+    return isinstance(entry, dict) and "indices" in entry and "values" in entry
+
+
+def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
+                           values_are_logprobs=False):
+    """KL divergence using sparse top-k teacher logits/logprobs.
+
+    For teacher: renormalize the top-k values into a proper distribution.
+    For student: compute full-vocab log_softmax, gather the same k positions,
+    then renormalize over those k positions.
+    KL = sum_k P_teacher_k * (log P_teacher_k - log Q_student_k)
+
+    Args:
+        teacher_indices: [1, seq_len, k] token IDs.
+        teacher_values:  [1, seq_len, k] logits or logprobs.
+        student_logits:  [1, seq_len, vocab_size] raw student logits.
+        values_are_logprobs: if True, teacher_values are already log-probs.
+
+    Returns:
+        KL per position, shape [1, seq_len] or [seq_len].
+    """
+    device = student_logits.device
+    t_idx = teacher_indices.to(device)
+    t_vals = teacher_values.to(device).float()
+
+    # Teacher: renormalized log-probs over top-k tokens
+    if values_are_logprobs:
+        t_log_p = t_vals - t_vals.logsumexp(dim=-1, keepdim=True)
+    else:
+        t_log_p = F.log_softmax(t_vals, dim=-1)
+
+    # Student: full-vocab log_softmax, then gather the k positions
+    s_log_p_full = F.log_softmax(student_logits.float(), dim=-1)
+    s_log_p_k = s_log_p_full.gather(-1, t_idx)
+    # Renormalize student over the same k tokens for proper KL
+    s_log_p_k_norm = s_log_p_k - s_log_p_k.logsumexp(dim=-1, keepdim=True)
+
+    del s_log_p_full
+
+    # Chunked KL over positions for memory efficiency
+    n_pos = t_log_p.shape[1] if t_log_p.dim() >= 3 else t_log_p.shape[0]
+    if t_log_p.dim() >= 3:
+        kl_per_pos = torch.empty(t_log_p.shape[0], n_pos, device=device)
+        for i in range(0, n_pos, KL_CHUNK_SIZE):
+            j = min(i + KL_CHUNK_SIZE, n_pos)
+            kl_per_pos[:, i:j] = F.kl_div(
+                s_log_p_k_norm[:, i:j, :], t_log_p[:, i:j, :],
+                log_target=True, reduction="none"
+            ).sum(dim=-1)
+    else:
+        kl_per_pos = torch.empty(n_pos, device=device)
+        for i in range(0, n_pos, KL_CHUNK_SIZE):
+            j = min(i + KL_CHUNK_SIZE, n_pos)
+            kl_per_pos[i:j] = F.kl_div(
+                s_log_p_k_norm[i:j, :], t_log_p[i:j, :],
+                log_target=True, reduction="none"
+            ).sum(dim=-1)
+
+    return kl_per_pos
+
+
+def hf_batched_forward(teacher, sequences_data, device, batch_size=2, logprobs_k=128,
+                       progress_cb=None):
+    """Batched HF forward pass for teacher logit extraction.
+
+    Groups prompts by similar sequence length, pads within each batch,
+    runs the forward pass, then unpads and extracts continuation logits.
+
+    For sequences longer than HF_CHUNK_SIZE, falls back to per-sequence
+    chunked forward pass (batching long-context sequences is wasteful due
+    to extreme padding).
+
+    Args:
+        teacher: HF model (already on device, eval mode).
+        sequences_data: list of dicts with 'full_ids' [1, seq_len], 'prompt_len'.
+        device: torch device.
+        batch_size: number of sequences per batch.
+        logprobs_k: if >0, store only top-k logits (sparse). 0 = full vocab.
+        progress_cb: optional callback(i) called after each prompt is processed.
+
+    Returns:
+        (teacher_logits_list, prompt_lens, full_sequences, n_chunked)
+        teacher_logits_list: list of sparse dicts or dense tensors.
+    """
+    # Separate long sequences (chunked path) from short ones (batched path)
+    short_items = []  # (original_idx, data)
+    long_items = []   # (original_idx, data)
+    for idx, data in enumerate(sequences_data):
+        seq_len = data["full_ids"].shape[1]
+        if seq_len > HF_CHUNK_SIZE:
+            long_items.append((idx, data))
+        else:
+            short_items.append((idx, data))
+
+    # Sort short items by sequence length for efficient batching
+    short_items.sort(key=lambda x: x[1]["full_ids"].shape[1])
+
+    # Pre-allocate result arrays
+    n_total = len(sequences_data)
+    teacher_logits_list = [None] * n_total
+    prompt_lens = [0] * n_total
+    full_sequences = [None] * n_total
+    n_chunked = 0
+    processed = 0
+
+    with torch.no_grad():
+        # ── Batched path for short sequences ──
+        for batch_start in range(0, len(short_items), batch_size):
+            batch = short_items[batch_start:batch_start + batch_size]
+            if len(batch) == 1:
+                # Single item — no padding needed
+                orig_idx, data = batch[0]
+                full_ids = data["full_ids"].to(device)
+                prompt_len = data["prompt_len"]
+                prompt_lens[orig_idx] = prompt_len
+                full_sequences[orig_idx] = full_ids
+
+                logits = teacher(full_ids).logits.float()
+                cont_logits = logits[:, prompt_len - 1:-1, :]
+                if logprobs_k > 0:
+                    teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
+                else:
+                    teacher_logits_list[orig_idx] = cont_logits.cpu()
+                del logits, cont_logits
+                processed += 1
+                if progress_cb:
+                    progress_cb(processed)
+            else:
+                # Pad batch to max length
+                max_len = max(d["full_ids"].shape[1] for _, d in batch)
+                batch_ids = []
+                attention_masks = []
+                for _, data in batch:
+                    ids = data["full_ids"]  # [1, seq_len]
+                    seq_len = ids.shape[1]
+                    if seq_len < max_len:
+                        # Left-pad (standard for causal LMs)
+                        pad_len = max_len - seq_len
+                        pad = torch.zeros(1, pad_len, dtype=ids.dtype, device=ids.device)
+                        ids_padded = torch.cat([pad, ids], dim=1)
+                        mask = torch.cat([
+                            torch.zeros(1, pad_len, dtype=torch.long, device=ids.device),
+                            torch.ones(1, seq_len, dtype=torch.long, device=ids.device),
+                        ], dim=1)
+                    else:
+                        ids_padded = ids
+                        mask = torch.ones(1, seq_len, dtype=torch.long, device=ids.device)
+                    batch_ids.append(ids_padded)
+                    attention_masks.append(mask)
+
+                batch_tensor = torch.cat(batch_ids, dim=0).to(device)  # [B, max_len]
+                mask_tensor = torch.cat(attention_masks, dim=0).to(device)  # [B, max_len]
+
+                outputs = teacher(batch_tensor, attention_mask=mask_tensor)
+                batch_logits = outputs.logits.float()  # [B, max_len, vocab]
+                del outputs
+
+                # Unpad and extract continuation logits per item
+                for b_idx, (orig_idx, data) in enumerate(batch):
+                    full_ids = data["full_ids"].to(device)
+                    prompt_len = data["prompt_len"]
+                    seq_len = full_ids.shape[1]
+                    pad_len = max_len - seq_len
+                    prompt_lens[orig_idx] = prompt_len
+                    full_sequences[orig_idx] = full_ids
+
+                    # Extract this item's logits (remove padding offset)
+                    item_logits = batch_logits[b_idx:b_idx+1, pad_len:, :]  # [1, seq_len, vocab]
+                    cont_logits = item_logits[:, prompt_len - 1:-1, :]
+                    if logprobs_k > 0:
+                        teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
+                    else:
+                        teacher_logits_list[orig_idx] = cont_logits.cpu()
+                    del item_logits, cont_logits
+                    processed += 1
+                    if progress_cb:
+                        progress_cb(processed)
+
+                del batch_tensor, mask_tensor, batch_logits
+                torch.cuda.empty_cache()
+
+        # ── Chunked path for long sequences ──
+        for orig_idx, data in long_items:
+            n_chunked += 1
+            full_ids = data["full_ids"].to(device)
+            prompt_len = data["prompt_len"]
+            seq_len = full_ids.shape[1]
+            prompt_lens[orig_idx] = prompt_len
+            full_sequences[orig_idx] = full_ids
+
+            all_logit_chunks = []
+            past_key_values = None
+            for chunk_start in range(0, seq_len, HF_CHUNK_SIZE):
+                chunk_end = min(chunk_start + HF_CHUNK_SIZE, seq_len)
+                chunk_ids = full_ids[:, chunk_start:chunk_end]
+                outputs = teacher(
+                    chunk_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                all_logit_chunks.append(outputs.logits.float().cpu())
+                past_key_values = outputs.past_key_values
+                del outputs
+            all_logits = torch.cat(all_logit_chunks, dim=1)
+            cont_logits = all_logits[:, prompt_len - 1:-1, :]
+            if logprobs_k > 0:
+                teacher_logits_list[orig_idx] = dense_to_sparse_topk(cont_logits, k=logprobs_k)
+            else:
+                teacher_logits_list[orig_idx] = cont_logits.cpu()
+            del all_logits, all_logit_chunks, past_key_values, cont_logits
+            torch.cuda.empty_cache()
+            processed += 1
+            if progress_cb:
+                progress_cb(processed)
+
+    return teacher_logits_list, prompt_lens, full_sequences, n_chunked
+
+
 def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     """Load a HuggingFace model for inference.
 
@@ -398,6 +683,7 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--max-model-len", str(max_model_len),
         "--enable-prefix-caching",
         "--no-enable-log-requests",
+        "--reasoning-parser", "qwen3",
     ]
 
     log_f = open("/tmp/vllm_teacher.log", "w")
@@ -464,10 +750,16 @@ def stop_vllm_server():
     time.sleep(2)
 
 
-def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None):
+def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
+                      logprobs_k=128, token_to_id=None):
     """Generate teacher continuations via vLLM API.
 
-    Returns list of dicts with full_ids, prompt_len, gen_len.
+    When logprobs_k > 0, requests top-k logprobs from vLLM per generated token
+    and converts them to sparse tensor format, eliminating the need for a
+    separate HF forward pass (Phase 1b).
+
+    Returns list of dicts with full_ids, prompt_len, gen_len, and optionally
+    'sparse_logprobs' (dict with 'indices' and 'values' tensors).
     """
     import requests
 
@@ -482,23 +774,39 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None):
         }
         if block_seed is not None:
             payload["seed"] = block_seed + idx
+        # Request top-k logprobs during generation (eliminates Phase 1b)
+        if logprobs_k > 0:
+            payload["logprobs"] = logprobs_k
+            payload["prompt_logprobs"] = 0
 
         for attempt in range(3):
             try:
-                resp = requests.post(f"{VLLM_URL}/v1/completions", json=payload, timeout=120)
+                resp = requests.post(f"{VLLM_URL}/v1/completions", json=payload, timeout=300)
                 resp.raise_for_status()
                 data = resp.json()
-                cont_text = data["choices"][0]["text"]
+                choice = data["choices"][0]
+                cont_text = choice["text"]
                 full_text = prompt_text + cont_text
                 full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
                 prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=False).input_ids
-                results.append({
+                result = {
                     "full_ids": full_ids,
                     "prompt_len": prompt_ids.shape[1],
                     "gen_len": full_ids.shape[1] - prompt_ids.shape[1],
-                })
+                }
+                # Extract sparse logprobs if available
+                if logprobs_k > 0 and "logprobs" in choice and choice["logprobs"]:
+                    lp_data = choice["logprobs"]
+                    top_lp_list = lp_data.get("top_logprobs")
+                    if top_lp_list and token_to_id is not None:
+                        result["sparse_logprobs"] = vllm_logprobs_to_sparse(
+                            top_lp_list, token_to_id, tokenizer, k=logprobs_k
+                        )
+                results.append(result)
                 if idx % 10 == 0 or idx == len(prompts) - 1:
-                    print(f"  [{idx+1}/{len(prompts)}] {prompt_ids.shape[1]}+{full_ids.shape[1]-prompt_ids.shape[1]} tokens", flush=True)
+                    has_lp = "sparse_logprobs" in result
+                    print(f"  [{idx+1}/{len(prompts)}] {prompt_ids.shape[1]}+{full_ids.shape[1]-prompt_ids.shape[1]} tokens"
+                          f"{' (logprobs✓)' if has_lp else ''}", flush=True)
                 break
             except Exception as e:
                 if attempt < 2:
@@ -553,6 +861,10 @@ def main():
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
     parser.add_argument("--vllm-max-model-len", type=int, default=16384)
+    parser.add_argument("--logprobs-k", type=int, default=128,
+                        help="Top-k logprobs to store (128=sparse, 0=full vocab). Default 128.")
+    parser.add_argument("--hf-batch-size", type=int, default=2,
+                        help="Batch size for HF forward pass (default 2). Helps on H200 with 140GB VRAM.")
     # Backward-compatible args (ignored)
     parser.add_argument("--max-logit-len", type=int, default=None,
                         help="DEPRECATED: ignored. Chunked forward pass replaces truncation.")
@@ -650,12 +962,18 @@ def main():
         vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len)
         timings["vllm_startup"] = time.time() - t0
 
+        # Build token-to-id mapping for vLLM logprobs decoding
+        token_to_id = _build_token_to_id_map(tokenizer) if args.logprobs_k > 0 else None
+
         sequences_data = None
         if vllm_ok:
             _write_phase(progress_path, students, "vllm_generating", prompts_total=len(prompts))
             t0 = time.time()
             try:
-                sequences_data = generate_via_vllm(prompts, tokenizer, args.max_new_tokens, args.block_seed)
+                sequences_data = generate_via_vllm(
+                    prompts, tokenizer, args.max_new_tokens, args.block_seed,
+                    logprobs_k=args.logprobs_k, token_to_id=token_to_id,
+                )
                 timings["vllm_generation"] = time.time() - t0
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
             except Exception as e:
@@ -665,97 +983,102 @@ def main():
             print(f"[eval] vLLM failed to start — falling back to HF", flush=True)
 
         if sequences_data:
-            # ── HF forward pass for logits ──
-            print(f"\n{'='*60}", flush=True)
-            print(f"PHASE 1b: HF teacher logit extraction", flush=True)
-            print(f"{'='*60}", flush=True)
+            # Check if vLLM returned logprobs for all prompts
+            has_vllm_logprobs = all("sparse_logprobs" in d for d in sequences_data)
 
-            ensure_disk_space(args.teacher, threshold=70)
-            t0 = time.time()
-            teacher = load_model(args.teacher, device)
-            teacher.eval()
-            timings["teacher_hf_load"] = time.time() - t0
-            print(f"[eval] HF teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
+            if has_vllm_logprobs:
+                # ── vLLM logprobs path: skip Phase 1b entirely ──
+                print(f"\n{'='*60}", flush=True)
+                print(f"PHASE 1b: SKIPPED — vLLM logprobs available (top-{args.logprobs_k})", flush=True)
+                print(f"{'='*60}", flush=True)
 
-            _write_phase(progress_path, students, "teacher_logits", teacher_done=0, prompts_total=len(prompts))
-            n_chunked = 0
-            t0 = time.time()
-            with torch.no_grad():
                 for i, data in enumerate(sequences_data):
                     full_ids = data["full_ids"].to(device)
-                    prompt_len = data["prompt_len"]
-                    seq_len = full_ids.shape[1]
-                    prompt_lens.append(prompt_len)
+                    prompt_lens.append(data["prompt_len"])
                     full_sequences.append(full_ids)
+                    teacher_logits_list.append(data["sparse_logprobs"])  # sparse dict on CPU
 
-                    if seq_len <= HF_CHUNK_SIZE:
-                        # Short sequence — single forward pass
-                        logits = teacher(full_ids).logits.float()
-                        cont_logits = logits[:, prompt_len - 1:-1, :]
-                        teacher_logits_list.append(cont_logits.cpu())
-                        del logits, cont_logits
-                    else:
-                        # Long sequence — chunked forward pass with KV cache
-                        n_chunked += 1
-                        all_logit_chunks = []
-                        past_key_values = None
-                        for chunk_start in range(0, seq_len, HF_CHUNK_SIZE):
-                            chunk_end = min(chunk_start + HF_CHUNK_SIZE, seq_len)
-                            chunk_ids = full_ids[:, chunk_start:chunk_end]
-                            outputs = teacher(
-                                chunk_ids,
-                                past_key_values=past_key_values,
-                                use_cache=True,
-                            )
-                            all_logit_chunks.append(outputs.logits.float().cpu())
-                            past_key_values = outputs.past_key_values
-                            del outputs
-                        # Concatenate all logit chunks: shape [1, seq_len, vocab]
-                        all_logits = torch.cat(all_logit_chunks, dim=1)
-                        cont_logits = all_logits[:, prompt_len - 1:-1, :]
-                        teacher_logits_list.append(cont_logits)
-                        del all_logits, all_logit_chunks, past_key_values, cont_logits
-                        torch.cuda.empty_cache()
+                timings["teacher_logits_pass"] = 0.0  # included in vllm_generation
+                timings["teacher_hf_load"] = 0.0
+                print(f"[eval] ✓ {len(sequences_data)} prompts with top-{args.logprobs_k} logprobs from vLLM", flush=True)
+            else:
+                # ── HF forward pass fallback for logits (batched) ──
+                n_with_lp = sum(1 for d in sequences_data if "sparse_logprobs" in d)
+                print(f"\n{'='*60}", flush=True)
+                print(f"PHASE 1b: HF teacher logit extraction (batched, batch_size={args.hf_batch_size})", flush=True)
+                if n_with_lp > 0:
+                    print(f"  ({n_with_lp}/{len(sequences_data)} had vLLM logprobs — using HF for all for consistency)", flush=True)
+                print(f"{'='*60}", flush=True)
 
-                    if (i + 1) % 10 == 0 or i == len(sequences_data) - 1:
-                        print(f"  Logits [{i+1}/{len(sequences_data)}], VRAM: {gpu_mem_str()}", flush=True)
-                    _write_phase(progress_path, students, "teacher_logits", teacher_done=i + 1, prompts_total=len(prompts))
-            if n_chunked:
-                print(f"[eval] Chunked forward pass used for {n_chunked}/{len(sequences_data)} sequences (chunk_size={HF_CHUNK_SIZE})", flush=True)
+                ensure_disk_space(args.teacher, threshold=70)
+                t0 = time.time()
+                teacher = load_model(args.teacher, device)
+                teacher.eval()
+                timings["teacher_hf_load"] = time.time() - t0
+                print(f"[eval] HF teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
-            timings["teacher_logits_pass"] = time.time() - t0
-            print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
+                _write_phase(progress_path, students, "teacher_logits", teacher_done=0, prompts_total=len(prompts))
+
+                def _hf_progress(n_done):
+                    if n_done % 10 == 0 or n_done == len(sequences_data):
+                        print(f"  Logits [{n_done}/{len(sequences_data)}], VRAM: {gpu_mem_str()}", flush=True)
+                    _write_phase(progress_path, students, "teacher_logits",
+                                 teacher_done=n_done, prompts_total=len(prompts))
+
+                t0 = time.time()
+                teacher_logits_list, prompt_lens_out, full_seqs_out, n_chunked = hf_batched_forward(
+                    teacher, sequences_data, device,
+                    batch_size=args.hf_batch_size,
+                    logprobs_k=args.logprobs_k,
+                    progress_cb=_hf_progress,
+                )
+                prompt_lens = prompt_lens_out
+                full_sequences = full_seqs_out
+
+                if n_chunked:
+                    print(f"[eval] Chunked forward pass used for {n_chunked}/{len(sequences_data)} sequences (chunk_size={HF_CHUNK_SIZE})", flush=True)
+
+                timings["teacher_logits_pass"] = time.time() - t0
+                print(f"[eval] Logits extracted in {timings['teacher_logits_pass']:.1f}s", flush=True)
+
+                # Unload teacher
+                del teacher
+                free_gpu()
+                print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}", flush=True)
+
             del sequences_data
 
             # Save cache if requested and enough disk
             if args.save_teacher_logits:
                 st = os.statvfs(os.path.dirname(args.save_teacher_logits) or '/')
                 free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
-                if free_gb > 50:
+                # Sparse caches are tiny (~tens of MB) — lower threshold
+                min_free = 5 if args.logprobs_k > 0 else 50
+                if free_gb > min_free:
                     cache_tmp = args.save_teacher_logits + ".tmp"
+                    gen_method = "vllm_logprobs" if has_vllm_logprobs else "vllm+hf"
                     torch.save({
                         "full_sequences": [s.cpu() for s in full_sequences],
                         "teacher_logits": teacher_logits_list,
                         "prompt_lens": prompt_lens,
                         "block_seed": args.block_seed,
                         "prompts_hash": prompts_hash,
-                        "generation_method": "vllm+hf",
+                        "generation_method": gen_method,
+                        "logprobs_k": args.logprobs_k,
+                        "sparse": any(_is_sparse_logits(tl) for tl in teacher_logits_list),
                     }, cache_tmp)
                     os.replace(cache_tmp, args.save_teacher_logits)
-                    print(f"[eval] Cache saved", flush=True)
+                    cache_size = os.path.getsize(args.save_teacher_logits) / (1024**2)
+                    print(f"[eval] Cache saved ({cache_size:.1f}MB, method={gen_method})", flush=True)
                 else:
-                    print(f"[eval] Skipped cache save ({free_gb:.0f}GB free, need 50GB)", flush=True)
+                    print(f"[eval] Skipped cache save ({free_gb:.0f}GB free, need {min_free}GB)", flush=True)
 
-            # Unload teacher
-            del teacher
-            free_gpu()
-            print(f"[eval] Teacher unloaded. VRAM: {gpu_mem_str()}", flush=True)
             teacher_cache_loaded = True
 
     if not teacher_cache_loaded:
         # ── Pure HF fallback ──
         print(f"\n{'='*60}", flush=True)
-        print(f"PHASE 1 FALLBACK: HF teacher generation", flush=True)
+        print(f"PHASE 1 FALLBACK: HF teacher generation + logit extraction", flush=True)
         print(f"{'='*60}", flush=True)
 
         ensure_disk_space(args.teacher, threshold=70)
@@ -767,11 +1090,13 @@ def main():
         print(f"[eval] Teacher loaded in {timings['teacher_hf_load']:.1f}s, VRAM: {gpu_mem_str()}", flush=True)
 
         _write_phase(progress_path, students, "teacher_generation", teacher_done=0, prompts_total=len(prompts))
+
+        # Step 1: Generate continuations
         t0 = time.time()
+        hf_sequences_data = []
         with torch.no_grad():
             for i, ids in enumerate(input_ids_list):
                 prompt_len = ids.shape[1]
-                prompt_lens.append(prompt_len)
                 gen_kwargs = dict(max_new_tokens=args.max_new_tokens, use_cache=True)
                 if args.block_seed is not None:
                     torch.manual_seed(args.block_seed + i)
@@ -781,16 +1106,38 @@ def main():
                 else:
                     gen_kwargs.update(do_sample=False)
                 output_ids = teacher.generate(ids, **gen_kwargs)
-                full_sequences.append(output_ids)
-                logits = teacher(output_ids).logits.float()
-                cont_logits = logits[:, prompt_len - 1:-1, :]
-                teacher_logits_list.append(cont_logits.cpu())
-                del logits, cont_logits
                 gen_len = output_ids.shape[1] - prompt_len
-                print(f"  Prompt {i}: {prompt_len}+{gen_len} tokens, VRAM: {gpu_mem_str()}", flush=True)
+                hf_sequences_data.append({
+                    "full_ids": output_ids,
+                    "prompt_len": prompt_len,
+                    "gen_len": gen_len,
+                })
+                print(f"  Gen [{i+1}/{len(input_ids_list)}]: {prompt_len}+{gen_len} tokens, VRAM: {gpu_mem_str()}", flush=True)
                 _write_phase(progress_path, students, "teacher_generation", teacher_done=i + 1, prompts_total=len(prompts))
-
         timings["teacher_generation"] = time.time() - t0
+
+        # Step 2: Batched forward pass for logit extraction
+        print(f"\n[eval] HF logit extraction (batched, batch_size={args.hf_batch_size})", flush=True)
+        _write_phase(progress_path, students, "teacher_logits", teacher_done=0, prompts_total=len(prompts))
+
+        def _hf_fb_progress(n_done):
+            if n_done % 10 == 0 or n_done == len(hf_sequences_data):
+                print(f"  Logits [{n_done}/{len(hf_sequences_data)}], VRAM: {gpu_mem_str()}", flush=True)
+            _write_phase(progress_path, students, "teacher_logits",
+                         teacher_done=n_done, prompts_total=len(prompts))
+
+        t0_logits = time.time()
+        teacher_logits_list, prompt_lens, full_sequences, n_chunked = hf_batched_forward(
+            teacher, hf_sequences_data, device,
+            batch_size=args.hf_batch_size,
+            logprobs_k=args.logprobs_k,
+            progress_cb=_hf_fb_progress,
+        )
+        timings["teacher_logits_pass"] = time.time() - t0_logits
+        if n_chunked:
+            print(f"[eval] Chunked forward pass used for {n_chunked}/{len(hf_sequences_data)} sequences", flush=True)
+        del hf_sequences_data
+
         cache_path = args.save_teacher_logits or os.path.join(os.path.dirname(args.output), "teacher_cache.pt")
         torch.save({
             "full_sequences": [s.cpu() for s in full_sequences],
@@ -799,16 +1146,20 @@ def main():
             "block_seed": args.block_seed,
             "prompts_hash": prompts_hash,
             "generation_method": "hf",
+            "logprobs_k": args.logprobs_k,
+            "sparse": any(_is_sparse_logits(tl) for tl in teacher_logits_list),
         }, cache_path)
         del teacher
         free_gpu()
-        print(f"[eval] HF generation done in {timings['teacher_generation']:.1f}s", flush=True)
+        print(f"[eval] HF generation done in {timings['teacher_generation']:.1f}s, logits in {timings['teacher_logits_pass']:.1f}s", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1c: Chunked GPU processing setup
     # ═══════════════════════════════════════════════════════════════════
     _write_phase(progress_path, students, "gpu_precompute", teacher_done=len(prompts), prompts_total=len(prompts))
-    print(f"\n[eval] Teacher logits: {len(teacher_logits_list)} prompts on CPU, chunked GPU processing enabled", flush=True)
+    n_sparse = sum(1 for tl in teacher_logits_list if _is_sparse_logits(tl))
+    storage_mode = "sparse" if n_sparse == len(teacher_logits_list) else ("mixed" if n_sparse > 0 else "dense")
+    print(f"\n[eval] Teacher logits: {len(teacher_logits_list)} prompts on CPU ({storage_mode}, {n_sparse}/{len(teacher_logits_list)} sparse)", flush=True)
     # Keep teacher logits on CPU, compute softmax per-chunk during student scoring
     teacher_log_probs = None
     teacher_probs = None
@@ -1030,44 +1381,69 @@ def main():
                 try:
                     full_seq = full_sequences[i]
                     prompt_len = prompt_lens[i]
-                    # Teacher side: compute softmax on-the-fly per prompt (chunked to avoid OOM)
-                    tl = teacher_logits_list[i].to(device).float()
-                    t_log_p = F.log_softmax(tl, dim=-1)
-                    t_p = t_log_p.exp()
-                    del tl
+                    tl_entry = teacher_logits_list[i]
+                    is_sparse = _is_sparse_logits(tl_entry)
 
                     # Student forward pass
                     s_logits = student(full_seq).logits.float()
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
-                    min_len = min(cont_s.shape[1], t_log_p.shape[1])
-                    t_lp_slice = t_log_p[:, :min_len, :]
-                    t_p_slice = t_p[:, :min_len, :]
-                    s_cont_slice = cont_s[:, :min_len, :]
-                    kl_per_pos = compute_kl_from_precomputed(
-                        t_lp_slice, t_p_slice, s_cont_slice
-                    ).squeeze(0)
-                    kl_mean = kl_per_pos.mean().item()
 
-                    # Shadow top-k KL metrics (logged but not used for scoring)
                     topk_shadow = {}
-                    try:
-                        s_log_p_full = F.log_softmax(s_cont_slice.float(), dim=-1)
-                        for k_val in (100, 1000):
-                            _, topk_idx = t_p_slice.topk(k_val, dim=-1)
-                            t_topk = t_lp_slice.gather(-1, topk_idx)
-                            s_topk = s_log_p_full.gather(-1, topk_idx)
-                            t_topk_norm = F.log_softmax(t_topk, dim=-1)
-                            s_topk_norm = F.log_softmax(s_topk, dim=-1)
-                            topk_kl = F.kl_div(s_topk_norm, t_topk_norm,
-                                               log_target=True, reduction="none").sum(dim=-1).squeeze(0)
-                            topk_shadow[f"kl_top{k_val}"] = round(topk_kl.mean().item(), 6)
-                            del topk_idx, t_topk, s_topk, t_topk_norm, s_topk_norm, topk_kl
-                        del s_log_p_full
-                    except Exception:
-                        pass
 
-                    del s_logits, cont_s, kl_per_pos, t_lp_slice, t_p_slice, s_cont_slice
-                    del t_log_p, t_p
+                    if is_sparse:
+                        # ── Sparse teacher logits path (top-k from vLLM or HF) ──
+                        t_indices = tl_entry["indices"]  # [1, seq_len, k]
+                        t_values = tl_entry["values"]    # [1, seq_len, k]
+                        min_len = min(cont_s.shape[1], t_indices.shape[1])
+                        s_cont_slice = cont_s[:, :min_len, :]
+                        # Detect if values are logprobs (from vLLM) or raw logits (from HF top-k)
+                        # vLLM logprobs are negative and typically < 0; raw logits can be positive
+                        # Heuristic: if max value > 0, they're logits; if all <= 0, they're logprobs
+                        max_val = t_values[:, :min_len, :].max().item()
+                        are_logprobs = (max_val <= 0.0)
+                        kl_per_pos = compute_kl_from_sparse(
+                            t_indices[:, :min_len, :], t_values[:, :min_len, :],
+                            s_cont_slice, values_are_logprobs=are_logprobs
+                        ).squeeze(0)
+                        kl_mean = kl_per_pos.mean().item()
+                        del t_indices, t_values, s_cont_slice, kl_per_pos
+                    else:
+                        # ── Dense teacher logits path (legacy / full-vocab) ──
+                        tl = tl_entry.to(device).float()
+                        t_log_p = F.log_softmax(tl, dim=-1)
+                        t_p = t_log_p.exp()
+                        del tl
+
+                        min_len = min(cont_s.shape[1], t_log_p.shape[1])
+                        t_lp_slice = t_log_p[:, :min_len, :]
+                        t_p_slice = t_p[:, :min_len, :]
+                        s_cont_slice = cont_s[:, :min_len, :]
+                        kl_per_pos = compute_kl_from_precomputed(
+                            t_lp_slice, t_p_slice, s_cont_slice
+                        ).squeeze(0)
+                        kl_mean = kl_per_pos.mean().item()
+
+                        # Shadow top-k KL metrics (logged but not used for scoring)
+                        try:
+                            s_log_p_full = F.log_softmax(s_cont_slice.float(), dim=-1)
+                            for k_val in (100, 1000):
+                                _, topk_idx = t_p_slice.topk(k_val, dim=-1)
+                                t_topk = t_lp_slice.gather(-1, topk_idx)
+                                s_topk = s_log_p_full.gather(-1, topk_idx)
+                                t_topk_norm = F.log_softmax(t_topk, dim=-1)
+                                s_topk_norm = F.log_softmax(s_topk, dim=-1)
+                                topk_kl = F.kl_div(s_topk_norm, t_topk_norm,
+                                                   log_target=True, reduction="none").sum(dim=-1).squeeze(0)
+                                topk_shadow[f"kl_top{k_val}"] = round(topk_kl.mean().item(), 6)
+                                del topk_idx, t_topk, s_topk, t_topk_norm, s_topk_norm, topk_kl
+                            del s_log_p_full
+                        except Exception:
+                            pass
+
+                        del kl_per_pos, t_lp_slice, t_p_slice, s_cont_slice
+                        del t_log_p, t_p
+
+                    del s_logits, cont_s
                     if i % 20 == 0:
                         torch.cuda.empty_cache()
 
