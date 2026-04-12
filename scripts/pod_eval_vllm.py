@@ -546,8 +546,8 @@ def main():
     parser.add_argument("--save-teacher-logits", default=None)
     parser.add_argument("--king", default=None, help="King model name — stays in VRAM between rounds")
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
-    parser.add_argument("--vllm-gpu-util", type=float, default=0.45,
-                        help="vLLM GPU memory utilization (default 0.45)")
+    parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
+                        help="vLLM GPU memory utilization (default 0.90)")
     parser.add_argument("--vllm-max-model-len", type=int, default=4096)
     # Backward-compatible args (ignored)
     parser.add_argument("--gpu", type=int, default=None, help="Ignored — kept for backward compat")
