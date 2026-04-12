@@ -1198,9 +1198,9 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl,
 
 # ── Chat server management ────────────────────────────────────────────────
 
-# Eval pod config (serves both eval and chat via vLLM)
-CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "213.13.7.110")
-CHAT_POD_SSH_PORT = os.environ.get("CHAT_POD_SSH_PORT", "6039")
+# Separate chat-bench pod (dedicated GPU for chat + benchmarks)
+CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "66.153.184.222")
+CHAT_POD_SSH_PORT = os.environ.get("CHAT_POD_SSH_PORT", "3039")
 CHAT_POD_APP_PORT = 8100
 
 

@@ -639,15 +639,6 @@ def main():
         print(f"PHASE 1a: vLLM teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
 
-        # Stop any chat/inference vLLM server to free VRAM for teacher generation
-        import subprocess as _sp
-        _chat_procs = _sp.run("pgrep -f 'vllm.entrypoints.openai.api_server.*8100'", shell=True, capture_output=True, text=True)
-        if _chat_procs.stdout.strip():
-            print(f"[eval] Stopping chat vLLM server to free VRAM for teacher...", flush=True)
-            _sp.run("pkill -f 'vllm.entrypoints.openai.api_server.*8100'", shell=True)
-            time.sleep(5)  # Wait for VRAM to be freed
-            print(f"[eval] Chat server stopped", flush=True)
-
         _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts))
         t0 = time.time()
         vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len)
@@ -1199,18 +1190,6 @@ def main():
     for k, v in sorted(timings.items()):
         print(f"  {k}: {v:.1f}s", flush=True)
     print(f"{'='*60}", flush=True)
-
-    # Restart chat server if it was stopped for eval
-    try:
-        import subprocess as _sp
-        _chat_check = _sp.run("pgrep -f 'vllm.entrypoints.openai.api_server.*8100'", shell=True, capture_output=True, text=True)
-        if not _chat_check.stdout.strip() and os.path.exists("/root/chat_server.py"):
-            king_arg = args.king if hasattr(args, 'king') and args.king else ""
-            if king_arg:
-                print(f"[eval] Restarting chat server with king: {king_arg}", flush=True)
-                _sp.Popen(f"nohup python3 /root/chat_server.py '{king_arg}' 8100 > /root/chat.log 2>&1 &", shell=True)
-    except Exception as e:
-        print(f"[eval] Chat server restart failed (non-fatal): {e}", flush=True)
 
     prefetch_executor.shutdown(wait=False)
 
