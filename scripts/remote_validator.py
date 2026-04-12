@@ -67,7 +67,7 @@ STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
 TOP_N_ALWAYS_INCLUDE = 2   # king + 1 top contender always in eval
 
 # Reference model (base, undistilled) — included in every eval for baseline comparison
-REFERENCE_MODEL = "Qwen/Qwen3.5-35B-A3B"  # Same as teacher — KL should be 0
+REFERENCE_MODEL = "Qwen/Qwen3.5-4B"  # Undistilled 4B base — shows how much distillation helps
 REFERENCE_UID = -1  # Synthetic UID, never written to scores/weights
 
 # Activation fingerprint copy detection
