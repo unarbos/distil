@@ -56,7 +56,7 @@ from eval.dataset import sample_prompts_from_dataset, format_prompt
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
 NETUID = 97
 MAX_KL_THRESHOLD = 2.0
-MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS = 2048
 MAX_PROMPT_TOKENS = 1024
 
 EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
