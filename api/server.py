@@ -869,6 +869,61 @@ def get_history(limit: int = 50):
     )
 
 
+@app.get("/api/pod-logs", tags=["Debugging"], summary="Pod eval logs",
+         description="Access pod eval logs. Use `?list_files=true` to list available logs, or `?file=<name>&lines=N&offset=N` to read.")
+def get_pod_logs(list_files: bool = False, file: str = None, lines: int = 200, offset: int = 0):
+    logs_dir = os.path.join(STATE_DIR, "pod_logs")
+    if not os.path.exists(logs_dir):
+        return {"files": [], "error": "No logs directory"}
+    if list_files:
+        files = sorted([f for f in os.listdir(logs_dir) if f.endswith(".log")], reverse=True)
+        return {"files": files, "count": len(files)}
+    if not file:
+        return {"error": "Specify ?file=<name> or ?list_files=true"}
+    # Sanitize filename
+    safe_name = os.path.basename(file)
+    path = os.path.join(logs_dir, safe_name)
+    if not os.path.exists(path):
+        return JSONResponse(content={"error": "File not found"}, status_code=404)
+    try:
+        with open(path) as f:
+            all_lines = f.readlines()
+        total = len(all_lines)
+        if offset > 0:
+            selected = all_lines[offset:offset + lines]
+        else:
+            selected = all_lines[-lines:] if lines < total else all_lines
+        return {"file": safe_name, "lines": [l.rstrip() for l in selected], "count": len(selected), "total": total, "offset": offset}
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.get("/api/eval-data", tags=["Evaluation"], summary="Eval data (prompts + completions)",
+         description="Returns eval round data. Use `?list=true` for available files, or `?file=<name>` for a specific round.")
+def get_eval_data(list: bool = False, file: str = None):
+    data_dir = os.path.join(STATE_DIR, "eval_data")
+    latest = os.path.join(STATE_DIR, "eval_data_latest.json")
+    if list:
+        if not os.path.exists(data_dir):
+            return {"files": []}
+        files = sorted([f for f in os.listdir(data_dir) if f.endswith(".json")], reverse=True)
+        return {"files": files, "count": len(files)}
+    if file:
+        safe_name = os.path.basename(file)
+        path = os.path.join(data_dir, safe_name)
+        if not os.path.exists(path):
+            return JSONResponse(content={"error": "File not found"}, status_code=404)
+    else:
+        path = latest
+    if not os.path.exists(path):
+        return JSONResponse(content={"error": "No eval data available"}, status_code=404)
+    try:
+        with open(path) as f:
+            return JSONResponse(content=json.load(f), headers={"Cache-Control": "public, max-age=60"})
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
 @app.get("/api/benchmarks", tags=["Evaluation"], summary="Benchmark results for king models",
          description="Returns benchmark scores for evaluated king models. Scores are from lm-eval-harness full eval sets.")
 def get_benchmarks():
