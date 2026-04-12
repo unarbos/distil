@@ -778,22 +778,12 @@ def main():
     teacher_probs = None
 
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1d: Filter short-completion prompts
+    # PHASE 1d: Log completion lengths (no filtering — all prompts kept)
     # ═══════════════════════════════════════════════════════════════════
-    MIN_COMPLETION_TOKENS = 64
     completion_lens = [full_sequences[i].shape[1] - prompt_lens[i] for i in range(len(prompts))]
-    keep_mask = [cl >= MIN_COMPLETION_TOKENS for cl in completion_lens]
-    n_filtered = sum(1 for k in keep_mask if not k)
-    if n_filtered > 0:
-        filtered_indices = [i for i, k in enumerate(keep_mask) if not k]
-        print(f"[eval] Filtering {n_filtered} prompts with <{MIN_COMPLETION_TOKENS} completion tokens: {filtered_indices}", flush=True)
-        full_sequences = [full_sequences[i] for i in range(len(prompts)) if keep_mask[i]]
-        teacher_logits_list = [teacher_logits_list[i] for i in range(len(prompts)) if keep_mask[i]]
-        prompt_lens = [prompt_lens[i] for i in range(len(prompts)) if keep_mask[i]]
-        prompts = [prompts[i] for i in range(len(prompts)) if keep_mask[i]]
-        print(f"[eval] {len(prompts)} prompts remaining", flush=True)
-    else:
-        print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens", flush=True)
+    min_cl, max_cl = min(completion_lens), max(completion_lens)
+    avg_cl = sum(completion_lens) / len(completion_lens)
+    print(f"[eval] Completion tokens: min={min_cl} max={max_cl} avg={avg_cl:.0f} across {len(prompts)} prompts", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1e: Save eval data for reproducibility

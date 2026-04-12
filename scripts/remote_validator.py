@@ -60,7 +60,7 @@ MAX_NEW_TOKENS = 8192
 MAX_PROMPT_TOKENS = 1024
 
 EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
-EVAL_PROMPTS_H2H = 300    # Head-to-head: 300 prompts with min_chars=500 pre-filter
+EVAL_PROMPTS_H2H = 100    # Head-to-head: 100 prompts, pre-filtered, exact count
 EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
 PAIRED_TEST_ALPHA = 0.01   # Significance level for paired t-test dethronement (tightened from 0.05 per community feedback)
 STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
