@@ -448,6 +448,8 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey,
             # Clear from evaluated_uids so they get re-evaluated
             state.evaluated_uids.discard(str(uid))
             state.scores.pop(str(uid), None)
+            # Reset failure counter so stale UIDs get a fresh chance
+            reset_failures(uid, state.failures)
         integrity = verify_model_integrity(model_repo, revision, expected_hash)
         if integrity.get("transient"):
             logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
