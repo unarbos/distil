@@ -629,10 +629,22 @@ def get_leaderboard():
         "completed_at": top4.get("completed_at"),
     }
 
+    # Reference model baseline (Qwen3.5-4B, UID -1)
+    ref_kl = None
+    for r in h2h_latest.get("results", []):
+        if r.get("uid") == -1:
+            ref_kl = r.get("kl")
+            break
+
     return JSONResponse(
         content=_sanitize_floats({
             "leaderboard": leaderboard,
             "phase": leaderboard["phase"],
+            "reference_baseline": {
+                "model": "Qwen/Qwen3.5-4B",
+                "kl": ref_kl,
+                "description": "Undistilled base model (no training)",
+            } if ref_kl else None,
         }),
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
     )
