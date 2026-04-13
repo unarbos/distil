@@ -1137,9 +1137,31 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
             winner_kl = state.scores.get(str(king_uid), king_kl)
             logger.info(f"King UID {king_uid} retains crown (no challenger passed epsilon)")
         elif epsilon_dethroned_by is not None:
-            winner_uid = epsilon_dethroned_by
-            winner_kl = state.scores.get(str(epsilon_dethroned_by), best_kl)
-            logger.info(f"UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA})")
+            # Pre-dethronement integrity check: verify challenger model is still public on HuggingFace
+            challenger_model = uid_to_model.get(epsilon_dethroned_by, "")
+            try:
+                from huggingface_hub import HfApi
+                _hf = HfApi()
+                _info = _hf.model_info(challenger_model)
+                if _info.private:
+                    logger.warning(f"BLOCKED dethronement: UID {epsilon_dethroned_by} model {challenger_model} is now private!")
+                    winner_uid = king_uid
+                    winner_kl = state.scores.get(str(king_uid), king_kl)
+                    logger.info(f"King UID {king_uid} retains crown (challenger failed integrity check)")
+                    # DQ the cheater
+                    state.dq_reasons[str(epsilon_dethroned_by)] = f"Model went private after scoring"
+                    epsilon_dethroned_by = None
+                else:
+                    winner_uid = epsilon_dethroned_by
+                    winner_kl = state.scores.get(str(epsilon_dethroned_by), best_kl)
+                    logger.info(f"UID {winner_uid} is new king (paired t-test p<{PAIRED_TEST_ALPHA}), integrity check passed")
+            except Exception as e:
+                logger.warning(f"BLOCKED dethronement: UID {epsilon_dethroned_by} model {challenger_model} integrity check failed: {e}")
+                winner_uid = king_uid
+                winner_kl = state.scores.get(str(king_uid), king_kl)
+                logger.info(f"King UID {king_uid} retains crown (challenger failed integrity check)")
+                state.dq_reasons[str(epsilon_dethroned_by)] = f"Model not accessible on HuggingFace"
+                epsilon_dethroned_by = None
         else:
             winner_uid, winner_kl = best_uid, best_kl
 
