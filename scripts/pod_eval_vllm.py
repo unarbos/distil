@@ -858,72 +858,125 @@ def stop_vllm_server():
     time.sleep(2)
 
 
+def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
+                            logprobs_k, tokenizer, token_to_id):
+    """Generate a single prompt via vLLM. Used by both sequential and concurrent paths."""
+    import requests
+
+    payload = {
+        "model": "teacher",
+        "prompt": prompt_text,
+        "max_tokens": max_new_tokens,
+        "temperature": 0.7 if block_seed is not None else 0.0,
+        "top_p": 0.9 if block_seed is not None else 1.0,
+    }
+    if block_seed is not None:
+        payload["seed"] = block_seed + idx
+    if logprobs_k > 0:
+        payload["logprobs"] = logprobs_k
+        payload["prompt_logprobs"] = 0
+
+    for attempt in range(3):
+        try:
+            resp = requests.post(f"{VLLM_URL}/v1/completions", json=payload, timeout=300)
+            resp.raise_for_status()
+            data = resp.json()
+            choice = data["choices"][0]
+            cont_text = choice["text"]
+            full_text = prompt_text + cont_text
+            full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
+            prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=False).input_ids
+            result = {
+                "full_ids": full_ids,
+                "prompt_len": prompt_ids.shape[1],
+                "gen_len": full_ids.shape[1] - prompt_ids.shape[1],
+            }
+            if logprobs_k > 0 and "logprobs" in choice and choice["logprobs"]:
+                lp_data = choice["logprobs"]
+                top_lp_list = lp_data.get("top_logprobs")
+                if top_lp_list and token_to_id is not None:
+                    result["sparse_logprobs"] = vllm_logprobs_to_sparse(
+                        top_lp_list, token_to_id, tokenizer, k=logprobs_k
+                    )
+            return idx, result
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise RuntimeError(f"vLLM generation failed for prompt {idx}: {e}")
+
+
 def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
-                      logprobs_k=128, token_to_id=None, progress_cb=None):
+                      logprobs_k=128, token_to_id=None, progress_cb=None,
+                      concurrency=4):
     """Generate teacher continuations via vLLM API.
 
     When logprobs_k > 0, requests top-k logprobs from vLLM per generated token
     and converts them to sparse tensor format, eliminating the need for a
     separate HF forward pass (Phase 1b).
 
+    Uses concurrent requests to vLLM for significantly faster teacher generation.
+    vLLM's continuous batching handles the internal scheduling — we just need to
+    send multiple requests in parallel.
+
+    Args:
+        concurrency: Number of parallel requests to vLLM (default 4).
+            vLLM batches these internally. Higher values use more VRAM for KV cache
+            but significantly speed up total generation time.
+
     Returns list of dicts with full_ids, prompt_len, gen_len, and optionally
     'sparse_logprobs' (dict with 'indices' and 'values' tensors).
     """
-    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    results = []
-    for idx, prompt_text in enumerate(prompts):
-        payload = {
-            "model": "teacher",
-            "prompt": prompt_text,
-            "max_tokens": max_new_tokens,
-            "temperature": 0.7 if block_seed is not None else 0.0,
-            "top_p": 0.9 if block_seed is not None else 1.0,
-        }
-        if block_seed is not None:
-            payload["seed"] = block_seed + idx
-        # Request top-k logprobs during generation (eliminates Phase 1b)
-        if logprobs_k > 0:
-            payload["logprobs"] = logprobs_k
-            payload["prompt_logprobs"] = 0
+    if concurrency <= 1:
+        # Sequential fallback
+        results = []
+        for idx, prompt_text in enumerate(prompts):
+            _, result = _generate_single_prompt(
+                idx, prompt_text, max_new_tokens, block_seed,
+                logprobs_k, tokenizer, token_to_id
+            )
+            results.append(result)
+            if idx % 10 == 0 or idx == len(prompts) - 1:
+                has_lp = "sparse_logprobs" in result
+                print(f"  [{idx+1}/{len(prompts)}] {result['prompt_len']}+{result['gen_len']} tokens"
+                      f"{' (logprobs✓)' if has_lp else ''}", flush=True)
+            if progress_cb:
+                progress_cb(idx + 1, len(prompts))
+        return results
 
-        for attempt in range(3):
-            try:
-                resp = requests.post(f"{VLLM_URL}/v1/completions", json=payload, timeout=300)
-                resp.raise_for_status()
-                data = resp.json()
-                choice = data["choices"][0]
-                cont_text = choice["text"]
-                full_text = prompt_text + cont_text
-                full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
-                prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=False).input_ids
-                result = {
-                    "full_ids": full_ids,
-                    "prompt_len": prompt_ids.shape[1],
-                    "gen_len": full_ids.shape[1] - prompt_ids.shape[1],
-                }
-                # Extract sparse logprobs if available
-                if logprobs_k > 0 and "logprobs" in choice and choice["logprobs"]:
-                    lp_data = choice["logprobs"]
-                    top_lp_list = lp_data.get("top_logprobs")
-                    if top_lp_list and token_to_id is not None:
-                        result["sparse_logprobs"] = vllm_logprobs_to_sparse(
-                            top_lp_list, token_to_id, tokenizer, k=logprobs_k
-                        )
-                results.append(result)
-                if idx % 10 == 0 or idx == len(prompts) - 1:
-                    has_lp = "sparse_logprobs" in result
-                    print(f"  [{idx+1}/{len(prompts)}] {prompt_ids.shape[1]}+{full_ids.shape[1]-prompt_ids.shape[1]} tokens"
-                          f"{' (logprobs✓)' if has_lp else ''}", flush=True)
-                if progress_cb:
-                    progress_cb(idx + 1, len(prompts))
-                break
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(2)
-                else:
-                    raise RuntimeError(f"vLLM generation failed for prompt {idx}: {e}")
-    return results
+    # Concurrent generation
+    print(f"  [vllm] Concurrent generation: {concurrency} parallel requests", flush=True)
+    result_slots = [None] * len(prompts)
+    completed = 0
+    last_log = 0
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {}
+        for idx, prompt_text in enumerate(prompts):
+            fut = executor.submit(
+                _generate_single_prompt, idx, prompt_text, max_new_tokens,
+                block_seed, logprobs_k, tokenizer, token_to_id
+            )
+            futures[fut] = idx
+
+        for fut in as_completed(futures):
+            orig_idx, result = fut.result()
+            result_slots[orig_idx] = result
+            completed += 1
+
+            # Log every 10 completions or at the end
+            if completed - last_log >= 10 or completed == len(prompts):
+                has_lp = "sparse_logprobs" in result
+                print(f"  [{completed}/{len(prompts)}] latest: {result['prompt_len']}+{result['gen_len']} tokens"
+                      f"{' (logprobs✓)' if has_lp else ''}", flush=True)
+                last_log = completed
+
+            if progress_cb:
+                progress_cb(completed, len(prompts))
+
+    return result_slots
 
 
 def _parse_vllm_prompt_logprobs(prompt_logprobs_raw, token_to_id, tokenizer, k=128):
@@ -1257,6 +1310,9 @@ def main():
                         help="Batch size for HF forward pass (default 2). Helps on H200 with 140GB VRAM.")
     parser.add_argument("--vllm-student-scoring", action="store_true", default=False,
                         help="Use vLLM prompt_logprobs for student scoring instead of HF forward pass (experimental)")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="Number of parallel requests to vLLM for teacher generation (default 4). "
+                             "vLLM batches internally — higher values speed up generation but use more KV cache VRAM.")
     # Backward-compatible args (ignored)
     parser.add_argument("--max-logit-len", type=int, default=None,
                         help="DEPRECATED: ignored. Chunked forward pass replaces truncation.")
@@ -1368,7 +1424,7 @@ def main():
                 sequences_data = generate_via_vllm(
                     prompts, tokenizer, args.max_new_tokens, args.block_seed,
                     logprobs_k=args.logprobs_k, token_to_id=token_to_id,
-                    progress_cb=_vllm_progress,
+                    progress_cb=_vllm_progress, concurrency=args.concurrency,
                 )
                 timings["vllm_generation"] = time.time() - t0
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
