@@ -961,20 +961,43 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
             )
             futures[fut] = idx
 
+        failed = []
         for fut in as_completed(futures):
-            orig_idx, result = fut.result()
-            result_slots[orig_idx] = result
-            completed += 1
+            orig_idx = futures[fut]
+            try:
+                _, result = fut.result()
+                result_slots[orig_idx] = result
+                completed += 1
 
-            # Log every 10 completions or at the end
-            if completed - last_log >= 10 or completed == len(prompts):
-                has_lp = "sparse_logprobs" in result
-                print(f"  [{completed}/{len(prompts)}] latest: {result['prompt_len']}+{result['gen_len']} tokens"
-                      f"{' (logprobs✓)' if has_lp else ''}", flush=True)
-                last_log = completed
+                # Log every 10 completions or at the end
+                if completed - last_log >= 10 or completed == len(prompts):
+                    has_lp = "sparse_logprobs" in result
+                    print(f"  [{completed}/{len(prompts)}] latest: {result['prompt_len']}+{result['gen_len']} tokens"
+                          f"{' (logprobs✓)' if has_lp else ''}", flush=True)
+                    last_log = completed
 
-            if progress_cb:
-                progress_cb(completed, len(prompts))
+                if progress_cb:
+                    progress_cb(completed, len(prompts))
+            except Exception as e:
+                failed.append((orig_idx, str(e)))
+                print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
+
+    # Retry failed prompts sequentially
+    if failed:
+        print(f"  [vllm] Retrying {len(failed)} failed prompts sequentially...", flush=True)
+        for idx, err in failed:
+            try:
+                _, result = _generate_single_prompt(
+                    idx, prompts[idx], max_new_tokens, block_seed,
+                    logprobs_k, tokenizer, token_to_id
+                )
+                result_slots[idx] = result
+                completed += 1
+                print(f"  [vllm] Retry prompt {idx}: OK", flush=True)
+                if progress_cb:
+                    progress_cb(completed, len(prompts))
+            except Exception as e2:
+                raise RuntimeError(f"vLLM generation failed for prompt {idx} after retry: {e2}")
 
     return result_slots
 
