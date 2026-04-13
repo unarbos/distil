@@ -37,6 +37,11 @@ import torch
 # Chunk size for HF forward pass with KV cache on long sequences.
 # Sequences longer than this are processed in chunks to avoid truncation gaming.
 HF_CHUNK_SIZE = 4096
+
+# Minimum completion tokens for teacher generation.
+# Prompts producing fewer tokens are skipped to prevent near-empty
+# completions from polluting KL scores.
+MIN_COMPLETION_TOKENS = 10
 import torch.nn.functional as F
 import json
 import time
@@ -1177,12 +1182,30 @@ def main():
     teacher_probs = None
 
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1d: Log completion lengths (no filtering — all prompts kept)
+    # PHASE 1d: Filter short completions & log completion lengths
     # ═══════════════════════════════════════════════════════════════════
     completion_lens = [full_sequences[i].shape[1] - prompt_lens[i] for i in range(len(prompts))]
     min_cl, max_cl = min(completion_lens), max(completion_lens)
     avg_cl = sum(completion_lens) / len(completion_lens)
     print(f"[eval] Completion tokens: min={min_cl} max={max_cl} avg={avg_cl:.0f} across {len(prompts)} prompts", flush=True)
+
+    # Filter out prompts with fewer than MIN_COMPLETION_TOKENS
+    n_filtered = 0
+    if MIN_COMPLETION_TOKENS > 0:
+        keep_indices = [i for i, cl in enumerate(completion_lens) if cl >= MIN_COMPLETION_TOKENS]
+        n_filtered = len(prompts) - len(keep_indices)
+        if n_filtered > 0:
+            skipped_lens = [completion_lens[i] for i in range(len(prompts)) if i not in set(keep_indices)]
+            print(f"[eval] Filtered {n_filtered}/{len(prompts)} prompts with <{MIN_COMPLETION_TOKENS} completion tokens "
+                  f"(skipped lens: {skipped_lens})", flush=True)
+            full_sequences = [full_sequences[i] for i in keep_indices]
+            teacher_logits_list = [teacher_logits_list[i] for i in keep_indices]
+            prompt_lens = [prompt_lens[i] for i in keep_indices]
+            prompts = [prompts[i] for i in keep_indices]
+            completion_lens = [completion_lens[i] for i in keep_indices]
+            print(f"[eval] Remaining: {len(prompts)} prompts after filtering", flush=True)
+        else:
+            print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens — no filtering needed", flush=True)
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1e: Save eval data for reproducibility
@@ -1241,8 +1264,8 @@ def main():
         "max_prompt_len": args.max_prompt_len,
         "block_seed": args.block_seed,
         "n_prompts": len(prompts),
-        "n_prompts_filtered": 0,  # No post-generation filtering in v3
-        "min_completion_tokens": 0,  # No post-generation filtering in v3
+        "n_prompts_filtered": n_filtered,
+        "min_completion_tokens": MIN_COMPLETION_TOKENS,
         "students": {},
     }
     for name, data in prior_results.items():

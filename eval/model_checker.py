@@ -125,22 +125,32 @@ def get_safetensors_param_count(model_repo: str, revision: str = None) -> float:
 def compute_model_hash(model_repo: str, revision: str = None) -> Optional[str]:
     """
     Get a stable identity hash for a model using HuggingFace API metadata.
-    Uses the SHA256 from safetensors file info (no download needed).
+    Hashes ALL safetensor shard SHA256s together — catches re-sharded copies
+    that have different individual file hashes but identical total weights.
     Returns hex digest or None if unavailable.
     """
+    import hashlib
     try:
         info = model_info(model_repo, revision=revision, files_metadata=True)
-        # Find first safetensors shard and use its SHA from HF API
+        # Collect SHA256 from ALL safetensors files (sorted by filename for stability)
+        shard_hashes = []
         for sibling in sorted(info.siblings or [], key=lambda s: s.rfilename):
             if sibling.rfilename.endswith(".safetensors"):
-                # HF provides lfs sha256 for each file
+                sha = None
                 if hasattr(sibling, "lfs") and sibling.lfs:
-                    return sibling.lfs.get("sha256", sibling.lfs.get("oid", None))
-                # Fallback: use the blob_id (git SHA) as identity
-                if hasattr(sibling, "blob_id") and sibling.blob_id:
-                    return sibling.blob_id
-        # No safetensors found
-        return None
+                    sha = sibling.lfs.get("sha256") or sibling.lfs.get("oid")
+                if not sha and hasattr(sibling, "blob_id") and sibling.blob_id:
+                    sha = sibling.blob_id
+                if sha:
+                    shard_hashes.append(f"{sibling.rfilename}:{sha}")
+        if not shard_hashes:
+            return None
+        # If single shard, return its hash directly (backward compatible)
+        if len(shard_hashes) == 1:
+            return shard_hashes[0].split(":", 1)[1]
+        # Multiple shards: hash the combined sorted list
+        combined = "\n".join(shard_hashes)
+        return hashlib.sha256(combined.encode()).hexdigest()
     except Exception as e:
         logger.warning(f"Hash computation failed for {model_repo}: {e}")
         return None
@@ -180,6 +190,54 @@ def register_model_hash(
             pass
     hashes[str(miner_uid)] = model_hash
     hash_file.write_text(json.dumps(hashes, indent=2))
+
+
+def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optional[str]:
+    """
+    Compute a shard-invariant hash from safetensors tensor metadata.
+
+    Downloads only the header of each .safetensors file (not the weights),
+    extracts tensor names, shapes, and dtypes, sorts them, and SHA256s
+    the result. Two models with identical weights but different sharding
+    will produce the same hash because the tensor metadata is identical.
+
+    Returns hex digest or None on failure.
+    """
+    try:
+        info = model_info(model_repo, revision=revision, files_metadata=True)
+        st_files = sorted(
+            [s.rfilename for s in (info.siblings or []) if s.rfilename.endswith(".safetensors")]
+        )
+        if not st_files:
+            logger.warning(f"No safetensors files in {model_repo}")
+            return None
+
+        all_tensors = []  # list of (name, shape_tuple, dtype_str)
+        for fname in st_files:
+            header_path = hf_hub_download(
+                repo_id=model_repo, filename=fname, revision=revision,
+            )
+            # safetensors header: first 8 bytes = little-endian u64 header size,
+            # then header_size bytes of JSON with tensor metadata
+            import struct
+            with open(header_path, "rb") as f:
+                header_size = struct.unpack("<Q", f.read(8))[0]
+                header_json = json.loads(f.read(header_size))
+            for tensor_name, tensor_info in header_json.items():
+                if tensor_name == "__metadata__":
+                    continue
+                dtype = tensor_info.get("dtype", "")
+                shape = tuple(tensor_info.get("shape", []))
+                all_tensors.append((tensor_name, shape, dtype))
+
+        # Sort by tensor name for deterministic ordering
+        all_tensors.sort(key=lambda t: t[0])
+        # Hash the canonical representation
+        canonical = json.dumps(all_tensors, separators=(",", ":"), sort_keys=False)
+        return hashlib.sha256(canonical.encode()).hexdigest()
+    except Exception as e:
+        logger.warning(f"Tensor metadata hash failed for {model_repo}: {e}")
+        return None
 
 
 def verify_model_integrity(

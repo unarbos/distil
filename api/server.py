@@ -1215,6 +1215,14 @@ def get_miner(uid: int):
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {})
     hotkey = result.get("hotkey")
+    # Fallback: if metagraph hotkey is stale/missing, try uid_hotkey_map.json
+    # (maintained by the validator every epoch — always current)
+    if not hotkey or hotkey not in commitments:
+        uid_hk_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
+        mapped_hk = uid_hk_map.get(str(uid))
+        if mapped_hk and mapped_hk in commitments:
+            hotkey = mapped_hk
+            result["hotkey"] = hotkey  # update result with fresh hotkey
     if hotkey and hotkey in commitments:
         result["commitment"] = commitments[hotkey]
     else:
@@ -1308,6 +1316,88 @@ def get_miner(uid: int):
     return JSONResponse(
         content=result,
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+@app.get("/api/evaluated_uids", tags=["Miners"], summary="All evaluated UIDs with scores",
+         description="""Returns all UIDs that have been evaluated, with their latest KL scores.
+
+Response: `{uids: [{uid, kl_score, model_id?}], count: int}`
+""")
+def get_evaluated_uids():
+    evaluated = _safe_json_load(os.path.join(STATE_DIR, "evaluated_uids.json"), [])
+    scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
+    uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
+    commitments_data = _get_stale("commitments") or {}
+    commitments = commitments_data.get("commitments", {})
+    result = []
+    for uid_str in evaluated:
+        uid = int(uid_str) if isinstance(uid_str, str) else uid_str
+        entry = {"uid": uid, "kl_score": scores.get(str(uid))}
+        hotkey = uid_map.get(str(uid))
+        if hotkey and hotkey in commitments:
+            c = commitments[hotkey]
+            entry["model_id"] = c.get("model") or c.get("repo")
+        result.append(entry)
+    result.sort(key=lambda x: x.get("kl_score") or 999)
+    return JSONResponse(
+        content=_sanitize_floats({"uids": result, "count": len(result)}),
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+@app.get("/api/dq_reasons", tags=["Miners"], summary="Disqualified UIDs with reasons",
+         description="""Returns all disqualified entries with reasons.
+
+Entries may be keyed by UID, hotkey, or hotkey:block. Response normalizes to a list.
+""")
+def get_dq_reasons():
+    dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
+    uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
+    # Build reverse map: hotkey -> uid
+    hk_to_uid = {v: k for k, v in uid_map.items()}
+    result = []
+    for key, reason in dq.items():
+        entry = {"key": key, "reason": reason}
+        # Try to resolve UID
+        if key.isdigit():
+            entry["uid"] = int(key)
+        elif ":" in key:
+            hotkey = key.split(":")[0]
+            if hotkey in hk_to_uid:
+                entry["uid"] = int(hk_to_uid[hotkey])
+            entry["hotkey"] = hotkey
+            entry["block"] = key.split(":")[1]
+        elif key in hk_to_uid:
+            entry["uid"] = int(hk_to_uid[key])
+            entry["hotkey"] = key
+        result.append(entry)
+    return JSONResponse(
+        content={"disqualified": result, "count": len(result)},
+        headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"},
+    )
+
+
+@app.get("/api/model_hashes", tags=["Miners"], summary="Model weight hashes for integrity",
+         description="""Returns model weight hashes (SHA256 of safetensor metadata) for all tracked UIDs.
+
+Used for transparency — anyone can verify a miner's model hasn't changed since evaluation.
+""")
+def get_model_hashes():
+    hashes_raw = _safe_json_load(os.path.join(STATE_DIR, "model_hashes.json"), {})
+    # Restructure: group by UID (skip _block and _hotkey auxiliary keys)
+    result = {}
+    for key, value in hashes_raw.items():
+        if "_" in key:
+            continue  # skip auxiliary keys like 174_block, 174_hotkey
+        result[key] = {
+            "hash": value,
+            "block": hashes_raw.get(f"{key}_block"),
+            "hotkey": hashes_raw.get(f"{key}_hotkey"),
+        }
+    return JSONResponse(
+        content={"hashes": result, "count": len(result)},
+        headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"},
     )
 
 
@@ -1410,6 +1500,84 @@ def get_commitment_by_hotkey(hotkey: str):
 
     return JSONResponse(
         content=result,
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+# ── Transparency endpoints ────────────────────────────────────────────────────
+
+
+@app.get("/api/evaluated_uids", tags=["Evaluation"], summary="Evaluated UIDs with scores",
+         description="""Returns all UIDs that have been evaluated, with their latest KL scores.
+
+Useful for monitoring which miners have been scored and their relative performance.
+""")
+def get_evaluated_uids():
+    evaluated = _safe_json_load(os.path.join(STATE_DIR, "evaluated_uids.json"), [])
+    scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
+    result = []
+    for uid_str in evaluated:
+        result.append({
+            "uid": int(uid_str) if uid_str.isdigit() else uid_str,
+            "kl_score": scores.get(uid_str),
+        })
+    # Sort by score ascending (best first)
+    result.sort(key=lambda x: x["kl_score"] if x["kl_score"] is not None else float("inf"))
+    return JSONResponse(
+        content=_sanitize_floats({"evaluated_uids": result, "count": len(result)}),
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+@app.get("/api/dq_reasons", tags=["Evaluation"], summary="Disqualified UIDs with reasons",
+         description="""Returns all disqualified UIDs/hotkeys with their disqualification reasons.
+
+Entries may be keyed by UID, hotkey, or hotkey:block (for per-commitment DQs).
+""")
+def get_dq_reasons():
+    dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
+    result = []
+    for key, reason in dq.items():
+        entry = {"key": key, "reason": reason}
+        # Try to extract UID if key is numeric
+        if key.isdigit():
+            entry["uid"] = int(key)
+        elif ":" in key:
+            # hotkey:block format
+            parts = key.split(":")
+            entry["hotkey"] = parts[0]
+            if len(parts) > 1 and parts[1].isdigit():
+                entry["commit_block"] = int(parts[1])
+        else:
+            entry["hotkey"] = key
+        result.append(entry)
+    return JSONResponse(
+        content={"disqualified": result, "count": len(result)},
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+@app.get("/api/model_hashes", tags=["Evaluation"], summary="Model hashes for integrity verification",
+         description="""Returns the stored model hash for each UID.
+
+Used for transparency — anyone can verify that a miner’s model hasn’t changed
+since evaluation by comparing against these hashes.
+""")
+def get_model_hashes():
+    raw = _safe_json_load(os.path.join(STATE_DIR, "model_hashes.json"), {})
+    # Restructure: group UID data (hash, block, hotkey) into clean objects
+    hashes = {}
+    for key, value in raw.items():
+        if key.endswith("_block") or key.endswith("_hotkey"):
+            continue  # metadata keys handled below
+        uid_str = key
+        hashes[uid_str] = {
+            "hash": value,
+            "block": raw.get(f"{uid_str}_block"),
+            "hotkey": raw.get(f"{uid_str}_hotkey"),
+        }
+    return JSONResponse(
+        content={"model_hashes": hashes, "count": len(hashes)},
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
     )
 
