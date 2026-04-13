@@ -65,7 +65,7 @@ EVAL_PROMPTS_H2H = 300    # Head-to-head prompts per round
 EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
 PAIRED_TEST_ALPHA = 0.03   # Significance level for paired t-test dethronement
 STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago
-TOP_N_ALWAYS_INCLUDE = 2   # king + 1 top contender always in eval
+TOP_N_ALWAYS_INCLUDE = 5   # king + top 4 contenders always in eval
 
 # Reference model (base, undistilled) — included in every eval for baseline comparison
 REFERENCE_MODEL = "Qwen/Qwen3.5-4B"  # Undistilled 4B base — shows how much distillation helps
@@ -570,7 +570,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
 
 
 def _add_top5_contenders(challengers, valid_models, state: ValidatorState, king_uid):
-    """Always include top-1 contender (by KL score) in every eval round."""
+    """Always include top contenders (by KL score) in every eval round."""
     if king_uid is None:
         return
     contenders_added = 0
@@ -693,6 +693,16 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
 
     # Re-upload eval script
     pod.upload(eval_script, eval_script_remote, max_attempts=5)
+
+    # Kill any existing eval process before starting a new one
+    try:
+        existing = pod.exec("pgrep -c -f pod_eval 2>/dev/null || echo 0", timeout=10)
+        count = int(existing.strip().split('\n')[-1])
+        if count > 0:
+            logger.warning(f"Found {count} existing eval process(es) on pod — killing before new round")
+            pod.exec("pkill -9 -f pod_eval; sleep 2", timeout=15)
+    except Exception as e:
+        logger.debug(f"Pre-check for existing eval: {e}")
 
     # Clean ALL stale artifacts — every round starts fresh, no resume
     try:
