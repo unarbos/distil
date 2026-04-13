@@ -1609,6 +1609,24 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
     import bittensor as bt
     from lium import Lium, Config
 
+    # ── Log git version ──
+    try:
+        import subprocess
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short=8", "HEAD"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        git_msg = subprocess.check_output(
+            ["git", "log", "--oneline", "-1"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        print(f"[validator] Git: {git_msg}", flush=True)
+        logger.info(f"Running commit: {git_hash}")
+    except Exception:
+        pass
+
     # ── Init state ──
     state = ValidatorState(state_dir)
     state.load()
