@@ -57,7 +57,7 @@ if os.path.exists(_env_path):
                 os.environ.setdefault(k.strip(), v.strip())
 
 API_DESCRIPTION = """
-# Distil — Subnet 97 API
+# Distil - Subnet 97 API
 
 Public API for [Distil](https://distil.arbos.life), a Bittensor subnet where miners compete to produce the best knowledge-distilled small language models.
 
@@ -87,14 +87,14 @@ curl https://api.arbos.life/api/price
 """
 
 app = FastAPI(
-    title="Distil — Subnet 97 API",
+    title="Distil - Subnet 97 API",
     description=API_DESCRIPTION,
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_tags=[
         {"name": "Overview", "description": "API info and health checks"},
-        {"name": "Metagraph", "description": "On-chain subnet data — UIDs, stakes, weights, incentive"},
+        {"name": "Metagraph", "description": "On-chain subnet data - UIDs, stakes, weights, incentive"},
         {"name": "Miners", "description": "Miner model commitments and scores"},
         {"name": "Evaluation", "description": "Live eval progress, head-to-head rounds, and score history"},
         {"name": "Market", "description": "Token pricing, emission, and market data"},
@@ -141,7 +141,7 @@ def _disk_read(name: str):
             with open(path) as f:
                 return json.load(f)
         except (json.JSONDecodeError, ValueError):
-            # Corrupt cache file — delete it silently
+            # Corrupt cache file - delete it silently
             try:
                 os.remove(path)
             except OSError:
@@ -186,7 +186,7 @@ def _set_cached(name: str, data: dict):
     _disk_write(name, data)
 
 def _get_stale(name: str):
-    """Return ANY cached data, even stale — for fallback."""
+    """Return ANY cached data, even stale - for fallback."""
     if name not in _mem:
         _mem[name] = {"data": None, "ts": 0}
     mc = _mem[name]
@@ -360,7 +360,7 @@ def root():
 @app.get("/api/metagraph", tags=["Metagraph"], summary="Full subnet metagraph",
          description="""Returns all 256 UIDs with on-chain data: hotkey, coldkey, stake, trust, consensus, incentive, emission, and dividends.
 
-**Cached for 60s** — background refreshes keep data fresh without blocking requests.
+**Cached for 60s** - background refreshes keep data fresh without blocking requests.
 
 Response includes:
 - `block`: Current Bittensor block number
@@ -373,12 +373,12 @@ def get_metagraph():
     cached = _get_cached("metagraph", CACHE_TTL)
     if cached:
         return JSONResponse(content=cached, headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
-    # No fresh cache — return stale if available, and refresh in background
+    # No fresh cache - return stale if available, and refresh in background
     stale = _get_stale("metagraph")
     if stale:
         _bg_refresh("metagraph", _fetch_metagraph)
         return JSONResponse(content=stale, headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
-    # No cache at all — must block (first ever request)
+    # No cache at all - must block (first ever request)
     try:
         result = _fetch_metagraph()
         _set_cached("metagraph", result)
@@ -570,7 +570,7 @@ print(json.dumps(result))
 
 
 @app.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Returns the top-4 leaderboard — current king and contenders. Dethronement uses paired t-test (p < 0.05).")
+         description="Returns the top-4 leaderboard - current king and contenders. Dethronement uses paired t-test (p < 0.05).")
 def get_leaderboard():
     top4 = _safe_json_load(os.path.join(STATE_DIR, "top4_leaderboard.json"), {}) or {}
 
@@ -650,7 +650,7 @@ def claim_announcement():
             if not ann.get("posted", True) and not _is_announcement_claimed(ann):
                 # Record the claim FIRST (idempotent protection)
                 _record_announcement_claim(ann)
-                # Also mark posted in the file (best effort — rsync may overwrite)
+                # Also mark posted in the file (best effort - rsync may overwrite)
                 ann["posted"] = True
                 with open(ann_path, "w") as f:
                     json.dump(ann, f, indent=2)
@@ -661,7 +661,7 @@ def claim_announcement():
 
 
 @app.post("/api/announcement/posted", tags=["Evaluation"], summary="Mark announcement as posted",
-          description="Marks the current announcement as posted. Legacy endpoint — prefer `/api/announcement/claim`.")
+          description="Marks the current announcement as posted. Legacy endpoint - prefer `/api/announcement/claim`.")
 def mark_announcement_posted():
     ann_path = os.path.join(STATE_DIR, "announcement.json")
     if os.path.exists(ann_path):
@@ -974,7 +974,7 @@ Response includes:
 - `eval_active`: Whether an evaluation round is in progress right now
 - `eval_progress`: Detailed progress if eval is active (phase, students done, current KL, etc.)
 
-This is the best endpoint to start with — gives you a quick overview of the entire subnet state.
+This is the best endpoint to start with - gives you a quick overview of the entire subnet state.
 """)
 def health():
     import time as _time
@@ -1087,7 +1087,7 @@ def get_validator_logs(limit: int = 50):
 Query parameters:
 - `lines`: Number of log lines to return (default 50, max 200)
 
-Logs are sanitized — API keys, internal paths, and sensitive data are stripped. Lines are prefixed with source tags like `[GPU]`, `[eval]`, `[VALIDATOR]`.
+Logs are sanitized - API keys, internal paths, and sensitive data are stripped. Lines are prefixed with source tags like `[GPU]`, `[eval]`, `[VALIDATOR]`.
 """)
 def gpu_logs(lines: int = 50):
     import subprocess
@@ -1216,7 +1216,7 @@ def get_miner(uid: int):
     commitments = commitments_data.get("commitments", {})
     hotkey = result.get("hotkey")
     # Fallback: if metagraph hotkey is stale/missing, try uid_hotkey_map.json
-    # (maintained by the validator every epoch — always current)
+    # (maintained by the validator every epoch - always current)
     if not hotkey or hotkey not in commitments:
         uid_hk_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
         mapped_hk = uid_hk_map.get(str(uid))
@@ -1233,7 +1233,7 @@ def get_miner(uid: int):
     uid_str = str(uid)
     result["kl_score"] = scores.get(uid_str)
 
-    # Disqualification — check per-commit key first, fall back to legacy keys
+    # Disqualification - check per-commit key first, fall back to legacy keys
     # only if no commit_block is known (same logic as eval/scoring.py is_disqualified)
     dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
     commit_block = result.get("commitment", {}).get("block") if result.get("commitment") else None
@@ -1273,7 +1273,7 @@ def get_miner(uid: int):
         eval_status["reason"] = "Evaluated every round as the defending king"
     elif not result.get("kl_score"):
         eval_status["status"] = "queued"
-        eval_status["reason"] = "Waiting for first evaluation — new submissions get priority"
+        eval_status["reason"] = "Waiting for first evaluation - new submissions get priority"
     elif tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
         last_block = tracker_entry["block"]
         epochs_since = (current_block - last_block) // 360 if current_block > last_block else 0
@@ -1291,7 +1291,7 @@ def get_miner(uid: int):
             eval_status["epochs_since"] = epochs_since
     else:
         eval_status["status"] = "untested"
-        eval_status["reason"] = "Not yet tested against the current king — will be scheduled"
+        eval_status["reason"] = "Not yet tested against the current king - will be scheduled"
     result["eval_status"] = eval_status
 
     # H2H history (last 10 rounds involving this UID)
@@ -1381,7 +1381,7 @@ def get_dq_reasons():
 @app.get("/api/model_hashes", tags=["Miners"], summary="Model weight hashes for integrity",
          description="""Returns model weight hashes (SHA256 of safetensor metadata) for all tracked UIDs.
 
-Used for transparency — anyone can verify a miner's model hasn't changed since evaluation.
+Used for transparency - anyone can verify a miner's model hasn't changed since evaluation.
 """)
 def get_model_hashes():
     hashes_raw = _safe_json_load(os.path.join(STATE_DIR, "model_hashes.json"), {})
@@ -1504,84 +1504,6 @@ def get_commitment_by_hotkey(hotkey: str):
     )
 
 
-# ── Transparency endpoints ────────────────────────────────────────────────────
-
-
-@app.get("/api/evaluated_uids", tags=["Evaluation"], summary="Evaluated UIDs with scores",
-         description="""Returns all UIDs that have been evaluated, with their latest KL scores.
-
-Useful for monitoring which miners have been scored and their relative performance.
-""")
-def get_evaluated_uids():
-    evaluated = _safe_json_load(os.path.join(STATE_DIR, "evaluated_uids.json"), [])
-    scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
-    result = []
-    for uid_str in evaluated:
-        result.append({
-            "uid": int(uid_str) if uid_str.isdigit() else uid_str,
-            "kl_score": scores.get(uid_str),
-        })
-    # Sort by score ascending (best first)
-    result.sort(key=lambda x: x["kl_score"] if x["kl_score"] is not None else float("inf"))
-    return JSONResponse(
-        content=_sanitize_floats({"evaluated_uids": result, "count": len(result)}),
-        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
-    )
-
-
-@app.get("/api/dq_reasons", tags=["Evaluation"], summary="Disqualified UIDs with reasons",
-         description="""Returns all disqualified UIDs/hotkeys with their disqualification reasons.
-
-Entries may be keyed by UID, hotkey, or hotkey:block (for per-commitment DQs).
-""")
-def get_dq_reasons():
-    dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
-    result = []
-    for key, reason in dq.items():
-        entry = {"key": key, "reason": reason}
-        # Try to extract UID if key is numeric
-        if key.isdigit():
-            entry["uid"] = int(key)
-        elif ":" in key:
-            # hotkey:block format
-            parts = key.split(":")
-            entry["hotkey"] = parts[0]
-            if len(parts) > 1 and parts[1].isdigit():
-                entry["commit_block"] = int(parts[1])
-        else:
-            entry["hotkey"] = key
-        result.append(entry)
-    return JSONResponse(
-        content={"disqualified": result, "count": len(result)},
-        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
-    )
-
-
-@app.get("/api/model_hashes", tags=["Evaluation"], summary="Model hashes for integrity verification",
-         description="""Returns the stored model hash for each UID.
-
-Used for transparency — anyone can verify that a miner’s model hasn’t changed
-since evaluation by comparing against these hashes.
-""")
-def get_model_hashes():
-    raw = _safe_json_load(os.path.join(STATE_DIR, "model_hashes.json"), {})
-    # Restructure: group UID data (hash, block, hotkey) into clean objects
-    hashes = {}
-    for key, value in raw.items():
-        if key.endswith("_block") or key.endswith("_hotkey"):
-            continue  # metadata keys handled below
-        uid_str = key
-        hashes[uid_str] = {
-            "hash": value,
-            "block": raw.get(f"{uid_str}_block"),
-            "hotkey": raw.get(f"{uid_str}_hotkey"),
-        }
-    return JSONResponse(
-        content={"model_hashes": hashes, "count": len(hashes)},
-        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
-    )
-
-
 # ── Chat with king model ──────────────────────────────────────────────────────
 
 
@@ -1690,10 +1612,10 @@ async def chat_with_king(request: Request):
             return _sync_chat(pod_payload, king_uid, king_model)
 
     except Exception as e:
-        # Sanitize error — don't leak SSH commands/paths to frontend
+        # Sanitize error - don't leak SSH commands/paths to frontend
         err = str(e)
         if "ssh" in err.lower() or "root@" in err or ".ssh/" in err:
-            return {"error": "chat server connection failed — try again in a moment"}
+            return {"error": "chat server connection failed - try again in a moment"}
         return {"error": f"chat error: {err[:200]}"}
 
 
@@ -1720,7 +1642,7 @@ def _sync_chat(payload, king_uid, king_model):
             return resp
         return {"error": "unexpected response from chat server"}
     except json.JSONDecodeError:
-        return {"error": "chat server not responding — may be starting up"}
+        return {"error": "chat server not responding - may be starting up"}
 
 
 def _stream_chat(payload, king_uid, king_model):
@@ -1789,7 +1711,7 @@ def _ensure_chat_server(king_model=None):
             print(f"[chat] Auto-starting chat server for {model_name}", flush=True)
             _ssh_exec(f"nohup python3 /root/chat_server.py '{model_name}' {CHAT_POD_PORT} > /root/chat.log 2>&1 &", timeout=10)
         elif model_name != "unknown" and model_name not in stdout:
-            # Server running but wrong model — restart
+            # Server running but wrong model - restart
             print(f"[chat] Chat server running wrong model, restarting for {model_name}", flush=True)
             _ssh_exec("pkill -f 'vllm.entrypoints.openai.api_server|chat_server.py' || true", timeout=10)
             import time as _t; _t.sleep(2)
@@ -1812,7 +1734,7 @@ def chat_status():
         if stdout and (king_model is None or king_model in stdout):
             server_ok = True
         elif not eval_active:
-            # Server not responding and no eval in progress — auto-restart
+            # Server not responding and no eval in progress - auto-restart
             _ensure_chat_server(king_model)
     except Exception:
         pass
@@ -1928,7 +1850,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path in ("/api/chat", "/v1/chat/completions", "/v1/models"):
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
-        # Exempt localhost — dashboard SSR makes many internal requests
+        # Exempt localhost - dashboard SSR makes many internal requests
         if client_ip in ("127.0.0.1", "::1", "localhost"):
             return await call_next(request)
         if not _rate_limiter.is_allowed(client_ip):
