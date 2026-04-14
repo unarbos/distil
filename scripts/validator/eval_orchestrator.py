@@ -510,9 +510,10 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     try:
         existing = pod.exec("pgrep -c -f pod_eval 2>/dev/null || echo 0", timeout=10)
         if isinstance(existing, dict):
-            existing = existing.get('stdout', existing.get('output', '0'))
-        existing = str(existing)
-        count = int(existing.strip().split('\n')[-1])
+            existing = existing.get('stdout', '') or existing.get('output', '') or '0'
+        if isinstance(existing, dict):
+            existing = '0'  # nested dict fallback
+        count = int(str(existing).strip().split('\n')[-1])
         if count > 0:
             logger.warning(f"Found {count} existing eval process(es) on pod — killing before new round")
             pod.exec("pkill -9 -f pod_eval; sleep 2", timeout=15)
@@ -625,7 +626,10 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     EVAL_TIMEOUT = 2 * 60 * 60  # 2 hours
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={EVAL_TIMEOUT // 60}m)")
     log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
-    eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
+    eval_env = {
+        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+        "TOKENIZERS_PARALLELISM": "false",
+    }
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:

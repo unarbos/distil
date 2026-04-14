@@ -13,7 +13,7 @@ MAX_PROMPT_TOKENS = 1024
 # ── Eval Parameters ───────────────────────────────────────────────────────
 EVAL_PROMPTS_FULL = 60    # Full eval: many models, need speed
 EVAL_PROMPTS_H2H = 300    # Head-to-head prompts per round
-VLLM_CONCURRENCY = 4       # Parallel requests to vLLM for teacher generation
+VLLM_CONCURRENCY = 8       # Parallel requests to vLLM for teacher generation
 EPSILON = 0.01             # Legacy fallback if per-prompt data unavailable
 PAIRED_TEST_ALPHA = 0.03   # Significance level for paired t-test dethronement
 STALE_H2H_EPOCHS = 50      # Re-test if last H2H was >N epochs ago

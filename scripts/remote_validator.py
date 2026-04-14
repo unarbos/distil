@@ -243,7 +243,8 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 state.save()
                 if once:
                     break
-                time.sleep(60)
+                logger.info(f"No challengers — sleeping {tempo}s before next epoch")
+                time.sleep(tempo)
                 continue
 
             if top5_only:

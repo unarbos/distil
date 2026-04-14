@@ -26,12 +26,26 @@ function timeAgo(ts: number): string {
   return `${Math.round(diff / 86400)}d ago`;
 }
 
+function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
+}
+
 function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; defaultOpen: boolean; isLatest: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
-  const epsilonPct = (round.epsilon * 100).toFixed(0);
-  const king = round.results.find((r) => r.is_king);
-  const bestChallenger = round.results.find((r) => !r.is_king);
-  const nModels = round.results.length;
+  const epsilon = typeof round.epsilon === "number" && Number.isFinite(round.epsilon) ? round.epsilon : 0.01;
+  const epsilonPct = formatFixed(epsilon * 100, 0, "1");
+  const king = Array.isArray(round.results) ? round.results.find((r) => r.is_king) : undefined;
+  const bestChallenger = Array.isArray(round.results) ? round.results.find((r) => !r.is_king) : undefined;
+  const kingH2hKl = typeof round.king_h2h_kl === "number" && Number.isFinite(round.king_h2h_kl)
+    ? round.king_h2h_kl
+    : (typeof king?.kl === "number" && Number.isFinite(king.kl) ? king.kl : null);
+  const kingGlobalKl = typeof round.king_global_kl === "number" && Number.isFinite(round.king_global_kl)
+    ? round.king_global_kl
+    : null;
+  const epsilonThreshold = typeof round.epsilon_threshold === "number" && Number.isFinite(round.epsilon_threshold)
+    ? round.epsilon_threshold
+    : (kingH2hKl != null ? kingH2hKl * (1 - epsilon) : null);
+  const nModels = Array.isArray(round.results) ? round.results.length : 0;
 
   return (
     <div className={`rounded-xl border backdrop-blur-sm overflow-hidden transition-all ${
@@ -73,7 +87,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
           </span>
           {king && (
             <span className="text-[11px] font-mono text-yellow-400/70">
-              👑 {king.kl.toFixed(6)}
+              👑 {formatFixed(king.kl, 6)}
             </span>
           )}
           {round.king_changed && (
@@ -104,17 +118,17 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
             <span>ε = {epsilonPct}% (need &gt;{epsilonPct}% better to dethrone)</span>
             <span className="hidden sm:inline">·</span>
             <span className="hidden sm:inline">
-              King global: <span className="text-foreground/60">{round.king_global_kl.toFixed(6)}</span>
+              King global: <span className="text-foreground/60">{formatFixed(kingGlobalKl, 6)}</span>
             </span>
             <span className="hidden sm:inline">·</span>
             <span className="hidden sm:inline">
-              King H2H: <span className="text-foreground/60">{round.king_h2h_kl.toFixed(6)}</span>
+              King H2H: <span className="text-foreground/60">{formatFixed(kingH2hKl, 6)}</span>
             </span>
-            {round.epsilon_threshold && (
+            {epsilonThreshold != null && (
               <>
                 <span className="hidden sm:inline">·</span>
                 <span className="hidden sm:inline">
-                  Threshold: <span className="text-orange-400/70">&lt;{round.epsilon_threshold.toFixed(6)}</span>
+                  Threshold: <span className="text-orange-400/70">&lt;{formatFixed(epsilonThreshold, 6)}</span>
                 </span>
               </>
             )}
@@ -132,9 +146,8 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
           {round.results.map((result, idx) => {
             const isKing = result.is_king;
             const isClose = !isKing && result.vs_king.includes("not enough");
-            const isWorse = !isKing && (result.vs_king === "worse" || result.kl >= round.king_h2h_kl);
-            const epsilonThreshold = round.epsilon_threshold ?? round.king_h2h_kl * (1 - (round.epsilon ?? 0.01));
-            const isDethroner = round.king_changed && !isKing && result.kl < epsilonThreshold;
+            const isWorse = !isKing && (result.vs_king === "worse" || (kingH2hKl != null && result.kl >= kingH2hKl));
+            const isDethroner = round.king_changed && !isKing && epsilonThreshold != null && result.kl < epsilonThreshold;
 
             // Parse the percentage from vs_king
             const pctMatch = result.vs_king.match(/-(\d+\.\d+)%/);
@@ -191,7 +204,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                 <span className={`font-mono text-[13px] font-semibold tabular-nums text-right ${
                   isKing ? "text-yellow-400" : isDethroner ? "text-emerald-400" : "text-foreground/80"
                 }`}>
-                  {result.kl.toFixed(6)}
+                  {formatFixed(result.kl, 6)}
                 </span>
 
                 {/* vs King */}
@@ -222,7 +235,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
 
           {/* Footer */}
           <div className="px-5 py-2.5 border-t border-border/10 text-[10px] text-muted-foreground/40 font-mono">
-            KL variance is normal across prompt sets — king&apos;s global score ({round.king_global_kl.toFixed(6)}) may differ from this round&apos;s H2H score ({round.king_h2h_kl.toFixed(6)}).
+            KL variance is normal across prompt sets — king&apos;s global score ({formatFixed(kingGlobalKl, 6)}) may differ from this round&apos;s H2H score ({formatFixed(kingH2hKl, 6)}).
           </div>
         </div>
       )}
