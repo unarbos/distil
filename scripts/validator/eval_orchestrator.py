@@ -918,28 +918,37 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
             if challenger_model and challenger_model in results.get("students", {}):
                 challenger_per_prompt = results["students"][challenger_model].get("kl_per_prompt")
 
-            if (king_per_prompt and challenger_per_prompt
-                    and len(king_per_prompt) == len(challenger_per_prompt)
-                    and len(king_per_prompt) >= 20):
-                deltas = [k - c for k, c in zip(king_per_prompt, challenger_per_prompt)]
-                mean_delta = sum(deltas) / len(deltas)
-                t_stat, p_value = _scipy_stats.ttest_1samp(deltas, 0.0, alternative='greater')
-                n_test = len(deltas)
-                pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
+            # Use paired prompts (intersection) for t-test — handles early-stopped models
+            # that have fewer prompts than king
+            MIN_PROMPTS_DETHRONE = 100  # minimum prompts for dethronement consideration
+            if king_per_prompt and challenger_per_prompt:
+                # Use the shorter length (aligned prompts)
+                n_paired = min(len(king_per_prompt), len(challenger_per_prompt))
+                if n_paired >= MIN_PROMPTS_DETHRONE:
+                    deltas = [king_per_prompt[i] - challenger_per_prompt[i] for i in range(n_paired)]
+                    mean_delta = sum(deltas) / len(deltas)
+                    t_stat, p_value = _scipy_stats.ttest_1samp(deltas, 0.0, alternative='greater')
+                    n_test = len(deltas)
+                    pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
 
-                if p_value < PAIRED_TEST_ALPHA and mean_delta > 0:
-                    logger.info(f"UID {uid} DETHRONED king UID {king_uid}! "
-                                f"p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={n_test}")
-                    if epsilon_dethroned_by is None or challenger_kl < state.scores.get(str(epsilon_dethroned_by), float("inf")):
-                        epsilon_dethroned_by = uid
-                elif mean_delta > 0:
-                    logger.info(f"UID {uid}: better but not significant (p={p_value:.4f}, delta={mean_delta:.6f})")
+                    if p_value < PAIRED_TEST_ALPHA and mean_delta > 0:
+                        logger.info(f"UID {uid} DETHRONED king UID {king_uid}! "
+                                    f"p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={n_test}")
+                        if epsilon_dethroned_by is None or challenger_kl < state.scores.get(str(epsilon_dethroned_by), float("inf")):
+                            epsilon_dethroned_by = uid
+                    elif mean_delta > 0:
+                        logger.info(f"UID {uid}: better but not significant (p={p_value:.4f}, delta={mean_delta:.6f}, n={n_test})")
+                    else:
+                        logger.info(f"UID {uid}: worse than king (delta={mean_delta:.6f}, p={p_value:.4f}, n={n_test})")
                 else:
-                    logger.info(f"UID {uid}: worse than king (delta={mean_delta:.6f}, p={p_value:.4f})")
+                    logger.info(f"UID {uid}: insufficient prompts for dethronement ({n_paired} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}")
             else:
-                # Legacy epsilon fallback
-                if challenger_kl < epsilon_threshold:
-                    logger.info(f"UID {uid} DETHRONED king UID {king_uid}! KL={challenger_kl:.6f} < {epsilon_threshold:.6f} [legacy epsilon]")
+                # Legacy epsilon fallback — only if challenger has enough data
+                challenger_n = len(challenger_per_prompt) if challenger_per_prompt else 0
+                if challenger_n < MIN_PROMPTS_DETHRONE:
+                    logger.info(f"UID {uid}: insufficient prompts for legacy epsilon ({challenger_n} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}")
+                elif challenger_kl < epsilon_threshold:
+                    logger.info(f"UID {uid} DETHRONED king UID {king_uid}! KL={challenger_kl:.6f} < {epsilon_threshold:.6f} [legacy epsilon, n={challenger_n}]")
                     if epsilon_dethroned_by is None or challenger_kl < state.scores.get(str(epsilon_dethroned_by), float("inf")):
                         epsilon_dethroned_by = uid
 
