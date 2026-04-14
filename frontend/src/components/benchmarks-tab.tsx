@@ -82,7 +82,7 @@ export function BenchmarksTab() {
             {data.model.name}
           </div>
           <div className="text-xs text-muted-foreground/60 mt-0.5">
-            UID {data.model.uid} · KL {data.model.kl.toFixed(4)}
+            UID {data.model.uid} · KL {typeof data.model.kl === "number" ? data.model.kl.toFixed(4) : "—"}
           </div>
         </div>
 

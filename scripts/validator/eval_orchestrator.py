@@ -29,6 +29,8 @@ from scripts.validator.config import (
 
 logger = logging.getLogger("distillation.remote_validator")
 
+MIN_PROMPTS_DETHRONE = 100
+
 
 # ── Utility ───────────────────────────────────────────────────────────────
 
@@ -843,8 +845,17 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
             logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
             log_event(f"UID {uid}: KL={kl:.6f} (king)", state_dir=str(state.state_dir))
         else:
+            # Check if model was early-stopped with too few prompts
+            _per_prompt = student_result.get("per_prompt_kl", [])
+            _n_scored = len(_per_prompt) if isinstance(_per_prompt, list) and _per_prompt else student_result.get("prompts_scored", n_prompts)
+            _early_stopped = bool(student_result.get("early_stopped", False))
+
             state.scores[str(uid)] = kl
-            state.evaluated_uids.add(str(uid))
+            if _early_stopped and (_n_scored or 0) < MIN_PROMPTS_DETHRONE:
+                # Don't mark as fully evaluated — will be re-evaluated next round
+                logger.info(f"UID {uid} ({model_name}): KL={kl:.6f} (early-stopped, {_n_scored}/{n_prompts} prompts — NOT marking as evaluated, will retry)")
+            else:
+                state.evaluated_uids.add(str(uid))
             reset_failures(uid, state.failures)
             logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}")
             # Compute vs-king info for log
@@ -918,9 +929,8 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState,
             if challenger_model and challenger_model in results.get("students", {}):
                 challenger_per_prompt = results["students"][challenger_model].get("kl_per_prompt")
 
-            # Use paired prompts (intersection) for t-test — handles early-stopped models
+            # Use paired prompts (intersection) for t-test, handles early-stopped models
             # that have fewer prompts than king
-            MIN_PROMPTS_DETHRONE = 100  # minimum prompts for dethronement consideration
             if king_per_prompt and challenger_per_prompt:
                 # Use the shorter length (aligned prompts)
                 n_paired = min(len(king_per_prompt), len(challenger_per_prompt))
@@ -1086,6 +1096,7 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl,
     from scipy import stats as _scipy_stats
 
     h2h_results = []
+    prompts_total = results.get("n_prompts")
     for uid, info in models_to_eval.items():
         model_name = info["model"]
         student_data = results.get("students", {}).get(model_name, {})
@@ -1095,32 +1106,59 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl,
         is_king = (uid == king_uid)
         vs_king = ""
         t_test_info = None
+        challenger_per_prompt = student_data.get("kl_per_prompt")
+        prompts_scored = len(challenger_per_prompt) if isinstance(challenger_per_prompt, list) else student_data.get("prompts_scored")
+        paired_prompts = min(len(king_per_prompt), len(challenger_per_prompt)) if king_per_prompt and challenger_per_prompt else prompts_scored
+        dethrone_eligible = bool(is_king or (paired_prompts is not None and paired_prompts >= MIN_PROMPTS_DETHRONE))
         if king_h2h_kl is not None and not is_king and king_h2h_kl > 0:
             pct = (king_h2h_kl - kl) / king_h2h_kl * 100
-            c_per_prompt = student_data.get("kl_per_prompt")
-            if (king_per_prompt and c_per_prompt
-                    and len(king_per_prompt) == len(c_per_prompt)
-                    and len(king_per_prompt) >= 20):
-                deltas = [k - c for k, c in zip(king_per_prompt, c_per_prompt)]
-                mean_d = sum(deltas) / len(deltas)
-                t_s, p2 = _scipy_stats.ttest_1samp(deltas, 0.0)
-                p_val = p2 / 2 if t_s > 0 else 1.0 - p2 / 2
-                t_test_info = {"p": round(p_val, 6), "t": round(t_s, 3), "n": len(deltas), "mean_delta": round(mean_d, 6)}
-                if p_val < PAIRED_TEST_ALPHA and mean_d > 0:
-                    vs_king = f"-{pct:.3f}% (p={p_val:.4f} DETHRONED)"
+            if king_per_prompt and challenger_per_prompt:
+                n_paired = min(len(king_per_prompt), len(challenger_per_prompt))
+                deltas = [king_per_prompt[i] - challenger_per_prompt[i] for i in range(n_paired)]
+                mean_d = (sum(deltas) / len(deltas)) if deltas else 0.0
+                if n_paired > 1:
+                    t_s, p2 = _scipy_stats.ttest_1samp(deltas, 0.0)
+                    p_val = p2 / 2 if t_s > 0 else 1.0 - p2 / 2
+                    t_test_info = {"p": round(p_val, 6), "t": round(t_s, 3), "n": n_paired, "mean_delta": round(mean_d, 6)}
+                elif mean_d > 0:
+                    t_s, p_val = 0.0, 1.0
+                else:
+                    t_s, p_val = 0.0, 1.0
+
+                if n_paired < MIN_PROMPTS_DETHRONE:
+                    if mean_d > 0:
+                        vs_king = f"-{pct:.3f}% ({n_paired}p, need {MIN_PROMPTS_DETHRONE}p)"
+                    else:
+                        vs_king = "worse"
+                elif p_val < PAIRED_TEST_ALPHA and mean_d > 0:
+                    vs_king = f"-{pct:.3f}% (p={p_val:.4f} dethroned)"
                 elif mean_d > 0:
                     vs_king = f"-{pct:.3f}% (p={p_val:.4f}, not significant)"
                 else:
                     vs_king = "worse"
             else:
                 epsilon_threshold_h2h = king_h2h_kl * (1.0 - EPSILON)
-                if kl < epsilon_threshold_h2h:
-                    vs_king = f"-{pct:.3f}% (DETHRONED)"
+                challenger_n = prompts_scored or 0
+                if challenger_n < MIN_PROMPTS_DETHRONE and kl < king_h2h_kl:
+                    vs_king = f"-{pct:.3f}% ({challenger_n}p, need {MIN_PROMPTS_DETHRONE}p)"
+                elif kl < epsilon_threshold_h2h:
+                    vs_king = f"-{pct:.3f}% (dethroned)"
                 elif kl < king_h2h_kl:
                     vs_king = f"-{pct:.3f}% (not enough, need >{EPSILON * 100:.0f}%)"
                 else:
                     vs_king = "worse"
-        entry = {"uid": uid, "model": model_name, "kl": round(kl, 6), "is_king": is_king, "vs_king": vs_king}
+        entry = {
+            "uid": uid,
+            "model": model_name,
+            "kl": round(kl, 6),
+            "is_king": is_king,
+            "vs_king": vs_king,
+            "prompts_scored": prompts_scored,
+            "prompts_total": prompts_total,
+            "paired_prompts": paired_prompts,
+            "dethrone_eligible": dethrone_eligible,
+            "early_stopped": bool(student_data.get("early_stopped", False)),
+        }
         if t_test_info:
             entry["t_test"] = t_test_info
         if info.get("is_reference"):

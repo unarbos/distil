@@ -218,10 +218,22 @@ export async function fetchAllModelInfo(models: string[]): Promise<Record<string
 }
 
 export interface H2hResult {
+  uid?: number;
   model: string;
   kl: number;
   is_king: boolean;
   vs_king: string;
+  prompts_scored?: number;
+  prompts_total?: number;
+  paired_prompts?: number;
+  dethrone_eligible?: boolean;
+  early_stopped?: boolean;
+  t_test?: {
+    p?: number;
+    t?: number;
+    n?: number;
+    mean_delta?: number;
+  };
 }
 
 export interface H2hLatestResponse {
@@ -238,18 +250,44 @@ export interface H2hLatestResponse {
   new_king_uid: number | null;
 }
 
+export interface H2hHistoryResponse {
+  rounds: H2hLatestResponse[];
+  total: number;
+  page: number;
+  limit: number;
+  has_more: boolean;
+}
+
 export async function fetchH2hLatest(): Promise<H2hLatestResponse | null> {
   return safeFetch(`${API_BASE}/api/h2h-latest`);
 }
 
 export interface EvalProgress {
   active: boolean;
-  phase?: "pre-checks" | "loading-teacher" | "scoring";
+  phase?: string;
   current_student?: string;
   students_done?: number;
   students_total?: number;
   prompts_done?: number;
   prompts_total?: number;
+  current_prompt?: number;
+  current_kl?: number;
+  current_se?: number;
+  current_ci?: [number, number];
+  current_best?: number;
+  teacher_prompts_done?: number;
+  models?: Record<string, string>;
+  eval_order?: Array<{ uid: number; model: string; role: "king" | "challenger" }>;
+  completed?: Array<{
+    student_idx?: number;
+    student_name: string;
+    status: string;
+    status_detail?: string;
+    kl?: number;
+    prompts_scored?: number;
+    prompts_total?: number;
+    scoring_time_s?: number;
+  }>;
 }
 
 export async function fetchEvalProgress(): Promise<EvalProgress | null> {

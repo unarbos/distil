@@ -74,19 +74,19 @@ export default async function HomePage() {
             <div className="flex items-center gap-3 ml-auto rounded-lg border border-border/50 bg-card/30 backdrop-blur-md px-3 py-1.5">
               <div className="text-right">
                 <div className="text-lg font-bold font-mono tabular-nums tracking-tight leading-tight">
-                  ${alphaPriceUsd.toFixed(2)}
+                  ${Number.isFinite(alphaPriceUsd) ? alphaPriceUsd.toFixed(2) : "—"}
                 </div>
                 <div className="text-[10px] text-muted-foreground font-mono leading-tight">
-                  {alphaPrice.toFixed(4)}τ/{price?.symbol ?? "α"}
+                  {Number.isFinite(alphaPrice) ? alphaPrice.toFixed(4) : "—"}τ/{price?.symbol ?? "α"}
                 </div>
               </div>
               <div className="h-6 w-px bg-border/50" />
               <div className="flex flex-col items-end gap-0 text-[10px] font-mono">
                 <span className={change24h >= 0 ? "text-emerald-400" : "text-red-400"}>
-                  {change24h >= 0 ? "+" : ""}{change24h.toFixed(1)}% 24h
+                  {change24h >= 0 ? "+" : ""}{Number.isFinite(change24h) ? change24h.toFixed(1) : "0.0"}% 24h
                 </span>
                 {minersTaoDay > 0 && (
-                  <span className="text-muted-foreground">{minersTaoDay.toFixed(0)}τ/day</span>
+                  <span className="text-muted-foreground">{Number.isFinite(minersTaoDay) ? minersTaoDay.toFixed(0) : "0"}τ/day</span>
                 )}
               </div>
             </div>

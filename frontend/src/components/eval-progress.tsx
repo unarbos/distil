@@ -58,6 +58,10 @@ function formatEta(seconds: number): string {
   return `~${m}m ${s > 0 ? `${s}s` : ""}`;
 }
 
+function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
+}
+
 function statusColor(status: string): string {
   switch (status) {
     case "functional_copy": return "text-red-400";
@@ -116,7 +120,7 @@ export function EvalProgressBar() {
           </span>
         </div>
         <p className="text-xs text-muted-foreground/40 font-mono">
-          Validator is polling for new challengers every 60s.
+          Validator is waiting for the next eval round.
           When new models are committed on-chain, they&apos;ll appear here during evaluation.
         </p>
       </div>
@@ -139,7 +143,7 @@ export function EvalProgressBar() {
   const teacherFrac = isTeacherPhase && nPrompts > 0
     ? (progress.teacher_prompts_done ?? 0) / nPrompts
     : isTeacherPhase ? 0 : 1;
-  const currentPromptFrac = progress.current_prompt
+  const currentPromptFrac = progress.current_prompt && nPrompts > 0
     ? progress.current_prompt / nPrompts
     : 0;
   const totalUnits = 1 + nModels;
@@ -249,18 +253,18 @@ export function EvalProgressBar() {
           {progress.current_kl != null && (
             <div className="flex items-center gap-4 text-[11px] font-mono mt-1">
               <span className="text-foreground">
-                KL: <span className="text-blue-300 font-semibold">{progress.current_kl.toFixed(4)}</span>
+                KL: <span className="text-blue-300 font-semibold">{formatFixed(progress.current_kl, 4)}</span>
               </span>
-              {progress.current_ci && (
+              {Array.isArray(progress.current_ci) && progress.current_ci.length === 2 && (
                 <span className="text-muted-foreground/60">
-                  95% CI: [{progress.current_ci[0].toFixed(4)}, {progress.current_ci[1].toFixed(4)}]
+                  95% CI: [{formatFixed(progress.current_ci[0], 4)}, {formatFixed(progress.current_ci[1], 4)}]
                 </span>
               )}
               {progress.current_se != null && (
-                <span className="text-muted-foreground/50">±{progress.current_se.toFixed(4)}</span>
+                <span className="text-muted-foreground/50">±{formatFixed(progress.current_se, 4)}</span>
               )}
               {progress.current_best != null && (
-                <span className="text-yellow-400/70 ml-auto">king: {progress.current_best.toFixed(4)}</span>
+                <span className="text-yellow-400/70 ml-auto">king: {formatFixed(progress.current_best, 4)}</span>
               )}
             </div>
           )}

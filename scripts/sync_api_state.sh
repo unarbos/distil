@@ -26,3 +26,7 @@ rsync -az --timeout=10 \
   --exclude='*.tmp' \
   --exclude='*' \
   "$LOCAL_STATE" "$REMOTE:$REMOTE_STATE" 2>/dev/null
+
+# Sync code revision for /api/health display
+git -C /home/openclaw/distillation rev-parse --short HEAD 2>/dev/null > /tmp/distil-revision.txt \
+  && rsync -az /tmp/distil-revision.txt "$REMOTE:/opt/distil/REVISION" 2>/dev/null

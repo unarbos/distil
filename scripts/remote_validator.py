@@ -419,9 +419,14 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
                 new_king_model = uid_to_model.get(winner_uid, valid_models.get(winner_uid, {}).get("model", "unknown"))
                 old_king_model = uid_to_model.get(king_uid, valid_models.get(king_uid, {}).get("model", "unknown"))
                 old_kl = king_h2h_kl if king_h2h_kl is not None else king_kl
+                winner_entry = next((r for r in h2h_results if r.get("uid") == winner_uid), {})
+                winner_tt = winner_entry.get("t_test") if isinstance(winner_entry.get("t_test"), dict) else {}
                 try:
                     announce_new_king(winner_uid, new_king_model, winner_kl,
-                                      king_uid, old_king_model, old_kl, state)
+                                      king_uid, old_king_model, old_kl, state,
+                                      paired_prompts=winner_entry.get("paired_prompts") or winner_entry.get("prompts_scored"),
+                                      total_prompts=winner_entry.get("prompts_total") or n_prompts,
+                                      p_value=winner_tt.get("p"))
                 except Exception as ann_err:
                     logger.warning(f"Announcement failed: {ann_err}")
 

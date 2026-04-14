@@ -111,6 +111,10 @@ def free_gpu():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
         torch.cuda.synchronize()
 
 
@@ -722,7 +726,7 @@ def stop_vllm_server():
     except Exception:
         pass
     free_gpu()
-    time.sleep(2)
+    time.sleep(5)  # Allow CUDA driver time to reclaim GPU memory from killed process
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1795,7 +1799,9 @@ def main():
     # Early stopping state
     best_kl_so_far = None
     best_kl_per_prompt_cumulative = None
-    MIN_PROMPTS_EARLY_STOP = 7
+    # Early stopping disabled — all models run full prompt set.
+    # Was MIN_PROMPTS_EARLY_STOP = 7; set above max prompts to disable.
+    MIN_PROMPTS_EARLY_STOP = 999999
     PER_MODEL_TIMEOUT = 600
 
     # King stays in VRAM

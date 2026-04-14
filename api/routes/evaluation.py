@@ -249,7 +249,10 @@ def get_h2h_history(limit: int = 50, page: int = 1):
                     best_tt = None
                     for r in entry.get("results", []):
                         tt = r.get("t_test")
-                        if tt and isinstance(tt, dict) and tt.get("p") is not None:
+                        if (
+                            tt and isinstance(tt, dict) and tt.get("p") is not None
+                            and r.get("dethrone_eligible", True)
+                        ):
                             if best_tt is None or tt["p"] < best_tt["p"]:
                                 best_tt = tt
                     if best_tt:
@@ -281,12 +284,12 @@ def get_king_history():
     """Extract all king changes from h2h_history.json."""
     path = os.path.join(STATE_DIR, "h2h_history.json")
     if not os.path.exists(path):
-        return []
+        return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=10"})
     try:
         with open(path) as f:
             history = json.load(f)
     except Exception:
-        return []
+        return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=10"})
 
     changes = []
     for entry in history:
@@ -294,34 +297,49 @@ def get_king_history():
             continue
         new_king_uid = entry.get("new_king_uid") or entry.get("king_uid")
         prev_king_uid = entry.get("prev_king_uid")
-        # Find king model name from results
-        king_model = None
-        king_kl = None
-        prev_kl = None
+        new_king_model = entry.get("king_model")
+        new_king_kl = entry.get("king_h2h_kl") or entry.get("king_kl")
+        old_king_model = None
+        old_king_kl = None
+        winning_result = None
         for r in entry.get("results", []):
             if r.get("uid") == new_king_uid:
-                king_model = r.get("model")
-                king_kl = r.get("kl")
+                winning_result = r
+                new_king_model = r.get("model") or new_king_model
+                new_king_kl = r.get("kl", new_king_kl)
             if r.get("uid") == prev_king_uid:
-                prev_kl = r.get("kl")
+                old_king_model = r.get("model")
+                old_king_kl = r.get("kl")
         margin = None
-        if king_kl is not None and prev_kl is not None and prev_kl > 0:
-            margin = round((prev_kl - king_kl) / prev_kl, 6)
+        if new_king_kl is not None and old_king_kl is not None and old_king_kl > 0:
+            margin = round((old_king_kl - new_king_kl) / old_king_kl, 6)
         # Detect exploit rounds: new king not in results
         result_uids = [r.get("uid") for r in entry.get("results", [])]
         is_exploit = new_king_uid not in result_uids and entry.get("king_changed")
         change = {
             "block": entry.get("block"),
             "timestamp": entry.get("timestamp"),
-            "king_uid": new_king_uid,
-            "king_model": king_model,
-            "dethroned_uid": prev_king_uid,
+            "old_king_uid": prev_king_uid,
+            "new_king_uid": new_king_uid,
+            "old_king_model": old_king_model,
+            "new_king_model": new_king_model,
+            "old_king_kl": old_king_kl,
+            "new_king_kl": new_king_kl,
+            "n_prompts": entry.get("n_prompts"),
+            "paired_prompts": (winning_result or {}).get("paired_prompts"),
+            "prompts_scored": (winning_result or {}).get("prompts_scored"),
+            "dethrone_eligible": (winning_result or {}).get("dethrone_eligible"),
+            "p_value": ((winning_result or {}).get("t_test") or {}).get("p"),
             "margin": margin,
         }
         if is_exploit:
             change["_exploit"] = True
         changes.append(change)
-    return changes
+    changes.reverse()
+    return JSONResponse(
+        content=_sanitize_floats(changes),
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
 
 
 @router.get("/api/eval-stats", tags=["Evaluation"], summary="Eval round statistics",

@@ -293,7 +293,7 @@ export function MinersTab({
                         </div>
                         {miner.ci95 && (
                           <div className="text-[9px] text-muted-foreground/40 font-mono">
-                            [{miner.ci95[0].toFixed(3)},{miner.ci95[1].toFixed(3)}]
+                            [{Number.isFinite(miner.ci95[0]) ? miner.ci95[0].toFixed(3) : "?"},{Number.isFinite(miner.ci95[1]) ? miner.ci95[1].toFixed(3) : "?"}]
                           </div>
                         )}
                         {minerPromptCount > 0 && (

@@ -12,6 +12,7 @@ interface HealthData {
   last_eval_block: number;
   last_eval_age_min: number;
   eval_active: boolean;
+  code_revision?: string;
   eval_progress: null | {
     phase?: string;
     students_total?: number;
@@ -28,6 +29,7 @@ interface HealthData {
 interface ValidatorStatusProps {
   kingUid: number | null;
   kingModel?: string;
+  kingRevision?: string;
   onViewDetails?: () => void;
 }
 
@@ -42,9 +44,19 @@ const PHASE_LABELS: Record<string, string> = {
   scoring: "Scoring student",
 };
 
+function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
+}
+
+function shortRevision(revision?: string): string | null {
+  if (!revision) return null;
+  return revision.length > 12 ? revision.slice(0, 8) : revision;
+}
+
 export function ValidatorStatus({
   kingUid,
   kingModel,
+  kingRevision,
   onViewDetails,
 }: ValidatorStatusProps) {
   const [health, setHealth] = useState<HealthData | null>(null);
@@ -66,8 +78,21 @@ export function ValidatorStatus({
   const progress = health?.eval_progress;
   const phase = progress?.phase;
 
-  // Only show when eval is active
-  if (!isActive) return null;
+  const codeRev = health?.code_revision;
+
+  // When idle, show a minimal revision badge only
+  if (!isActive) {
+    if (!codeRev) return null;
+    return (
+      <div className="flex items-center gap-2 text-[10px] font-mono text-muted-foreground/40 px-1">
+        <span>validator rev</span>
+        <span className="text-muted-foreground/60" title={codeRev}>{codeRev}</span>
+        {health?.last_eval_age_min != null && (
+          <span>· last eval {formatFixed(health.last_eval_age_min, 0)}m ago</span>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="rounded-xl border border-blue-400/30 bg-blue-400/[0.04] px-4 py-3">
@@ -88,8 +113,13 @@ export function ValidatorStatus({
               <span className="text-yellow-400">👑</span>
               <span>UID {kingUid}</span>
               {kingModel && <span className="text-muted-foreground/40 hidden sm:inline">({kingModel.split("/").pop()})</span>}
+              {shortRevision(kingRevision) && (
+                <span className="text-muted-foreground/35 hidden md:inline" title={kingRevision}>
+                  @{shortRevision(kingRevision)}
+                </span>
+              )}
               {health?.king_kl != null && (
-                <span className="text-muted-foreground/40">KL {health.king_kl.toFixed(4)}</span>
+                <span className="text-muted-foreground/40">KL {formatFixed(health.king_kl, 4)}</span>
               )}
             </div>
           )}
@@ -120,12 +150,12 @@ export function ValidatorStatus({
             )}
             {progress.current_kl != null && (
               <span className="text-foreground/70">
-                KL {progress.current_kl.toFixed(4)}
+                KL {formatFixed(progress.current_kl, 4)}
               </span>
             )}
             {progress.current_best != null && (
               <span className="text-muted-foreground/40">
-                best {progress.current_best.toFixed(4)}
+                best {formatFixed(progress.current_best, 4)}
               </span>
             )}
             {onViewDetails && (
@@ -136,6 +166,12 @@ export function ValidatorStatus({
                 view details →
               </button>
             )}
+          </div>
+        )}
+        {/* Revision footer */}
+        {codeRev && (
+          <div className="text-[10px] font-mono text-muted-foreground/30 pl-4">
+            rev {codeRev}
           </div>
         )}
       </div>

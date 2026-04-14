@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { H2hLatestResponse } from "@/lib/api";
+import type { H2hHistoryResponse, H2hLatestResponse } from "@/lib/api";
 import { useRefreshKey } from "@/components/auto-refresh";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://api.arbos.life";
@@ -30,12 +30,21 @@ function formatFixed(value: number | null | undefined, digits: number, fallback 
   return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
 }
 
+function formatPromptCount(scored: number | null | undefined, total: number | null | undefined): string | null {
+  if (typeof scored !== "number" || !Number.isFinite(scored)) return null;
+  if (typeof total === "number" && Number.isFinite(total) && total > 0) {
+    return `${scored}/${total}p`;
+  }
+  return `${scored}p`;
+}
+
 function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; defaultOpen: boolean; isLatest: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
+  const results = Array.isArray(round.results) ? round.results : [];
   const epsilon = typeof round.epsilon === "number" && Number.isFinite(round.epsilon) ? round.epsilon : 0.01;
   const epsilonPct = formatFixed(epsilon * 100, 0, "1");
-  const king = Array.isArray(round.results) ? round.results.find((r) => r.is_king) : undefined;
-  const bestChallenger = Array.isArray(round.results) ? round.results.find((r) => !r.is_king) : undefined;
+  const king = results.find((r) => r.is_king);
+  const bestChallenger = results.find((r) => !r.is_king);
   const kingH2hKl = typeof round.king_h2h_kl === "number" && Number.isFinite(round.king_h2h_kl)
     ? round.king_h2h_kl
     : (typeof king?.kl === "number" && Number.isFinite(king.kl) ? king.kl : null);
@@ -45,7 +54,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
   const epsilonThreshold = typeof round.epsilon_threshold === "number" && Number.isFinite(round.epsilon_threshold)
     ? round.epsilon_threshold
     : (kingH2hKl != null ? kingH2hKl * (1 - epsilon) : null);
-  const nModels = Array.isArray(round.results) ? round.results.length : 0;
+  const nModels = results.length;
 
   return (
     <div className={`rounded-xl border backdrop-blur-sm overflow-hidden transition-all ${
@@ -143,14 +152,20 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
           </div>
 
           {/* Rows */}
-          {round.results.map((result, idx) => {
+          {results.map((result, idx) => {
             const isKing = result.is_king;
-            const isClose = !isKing && result.vs_king.includes("not enough");
-            const isWorse = !isKing && (result.vs_king === "worse" || (kingH2hKl != null && result.kl >= kingH2hKl));
-            const isDethroner = round.king_changed && !isKing && epsilonThreshold != null && result.kl < epsilonThreshold;
+            const vsKing = result.vs_king ?? "";
+            const promptCount = formatPromptCount(result.paired_prompts ?? result.prompts_scored, result.prompts_total ?? round.n_prompts);
+            const needsMorePrompts = !isKing && (result.dethrone_eligible === false || /need\s+100p/i.test(vsKing));
+            const isClose = !isKing && vsKing.includes("not enough");
+            const isWorse = !isKing && (vsKing === "worse" || (kingH2hKl != null && result.kl >= kingH2hKl));
+            const isDethroner = round.king_changed && !isKing && (
+              (result.uid != null && round.new_king_uid != null && result.uid === round.new_king_uid)
+              || /dethroned/i.test(vsKing)
+            );
 
             // Parse the percentage from vs_king
-            const pctMatch = result.vs_king.match(/-(\d+\.\d+)%/);
+            const pctMatch = vsKing.match(/-(\d+\.\d+)%/);
             const pctText = pctMatch ? `-${pctMatch[1]}%` : null;
 
             return (
@@ -162,7 +177,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                     : isDethroner
                     ? "bg-emerald-400/[0.04]"
                     : ""
-                } ${idx < round.results.length - 1 ? "border-b border-border/[0.06]" : ""}`}
+                } ${idx < results.length - 1 ? "border-b border-border/[0.06]" : ""}`}
               >
                 {/* Rank */}
                 <span className={`text-sm font-mono tabular-nums hidden sm:block ${
@@ -198,14 +213,26 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                       NEW KING
                     </span>
                   )}
+                  {!isKing && needsMorePrompts && (
+                    <span className="inline-flex items-center rounded-full bg-amber-400/10 border border-amber-400/20 px-1.5 py-0.5 text-[9px] text-amber-400 font-mono shrink-0">
+                      more prompts needed
+                    </span>
+                  )}
                 </div>
 
                 {/* KL Score */}
-                <span className={`font-mono text-[13px] font-semibold tabular-nums text-right ${
-                  isKing ? "text-yellow-400" : isDethroner ? "text-emerald-400" : "text-foreground/80"
-                }`}>
-                  {formatFixed(result.kl, 6)}
-                </span>
+                <div className="text-right">
+                  <span className={`font-mono text-[13px] font-semibold tabular-nums ${
+                    isKing ? "text-yellow-400" : isDethroner ? "text-emerald-400" : "text-foreground/80"
+                  }`}>
+                    {formatFixed(result.kl, 6)}
+                  </span>
+                  {promptCount && (
+                    <div className="text-[9px] text-muted-foreground/35 font-mono">
+                      {promptCount}{result.early_stopped ? " early" : ""}
+                    </div>
+                  )}
+                </div>
 
                 {/* vs King */}
                 <div className="text-right font-mono">
@@ -214,6 +241,10 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                   ) : isDethroner ? (
                     <span className="text-[11px] text-emerald-400 font-semibold">
                       {pctText} ✓ beat ε
+                    </span>
+                  ) : needsMorePrompts ? (
+                    <span className="text-[11px] text-amber-400/80">
+                      {pctText ?? "better"} <span className="text-amber-400/50">(need 100p)</span>
                     </span>
                   ) : isClose ? (
                     <span className="text-[11px] text-amber-400/80">
@@ -225,7 +256,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                     </span>
                   ) : (
                     <span className="text-[11px] text-muted-foreground/40">
-                      {result.vs_king}
+                      {vsKing || "—"}
                     </span>
                   )}
                 </div>
@@ -256,10 +287,14 @@ export function H2hHistory() {
       try {
         const res = await fetch(`${API_BASE}/api/h2h-history`, { cache: "no-store" });
         if (!res.ok) { if (!cancelled) setError(true); return; }
-        const data: H2hLatestResponse[] = await res.json();
+        const data: H2hHistoryResponse | H2hLatestResponse[] = await res.json();
+        const fetchedRounds = Array.isArray(data)
+          ? [...data].reverse()
+          : Array.isArray(data.rounds)
+            ? data.rounds
+            : [];
         if (!cancelled) {
-          // Show newest first
-          setRounds([...data].reverse());
+          setRounds(fetchedRounds);
           setError(false);
         }
       } catch {

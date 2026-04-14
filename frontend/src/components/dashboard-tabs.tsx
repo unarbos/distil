@@ -30,6 +30,11 @@ interface DashboardTabsProps {
   kingH2hKl: number | null;
 }
 
+function shortRevision(revision?: string): string | null {
+  if (!revision) return null;
+  return revision.length > 12 ? revision.slice(0, 8) : revision;
+}
+
 export function DashboardTabs({
   miners,
   scores,
@@ -56,6 +61,7 @@ export function DashboardTabs({
       <ValidatorStatus
         kingUid={kingUid}
         kingModel={kingMiner?.model}
+        kingRevision={kingMiner?.revision}
         onViewDetails={() => setActiveTab("live")}
       />
 
@@ -89,6 +95,17 @@ export function DashboardTabs({
         </TabsContent>
 
         <TabsContent value="live" className="pt-4 space-y-4">
+          {kingMiner && (
+            <div className="rounded-xl border border-border/20 bg-card/10 backdrop-blur-sm px-4 py-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-mono text-muted-foreground/60">
+              <span className="text-yellow-400">👑 UID {kingMiner.uid}</span>
+              <span className="text-foreground/70 truncate max-w-[320px]">{kingMiner.model}</span>
+              {shortRevision(kingMiner.revision) && (
+                <span className="rounded-md border border-blue-400/20 bg-blue-400/5 px-2 py-0.5 text-blue-300/80" title={kingMiner.revision}>
+                  commit {shortRevision(kingMiner.revision)}
+                </span>
+              )}
+            </div>
+          )}
           <EvalProgressBar />
           <GpuLogs />
         </TabsContent>

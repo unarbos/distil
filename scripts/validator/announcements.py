@@ -12,7 +12,8 @@ logger = logging.getLogger("distillation.remote_validator")
 
 
 def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
-                      state: ValidatorState):
+                      state: ValidatorState, paired_prompts=None, total_prompts=None,
+                      p_value=None):
     """Write a pending announcement to state for async Discord posting."""
     kl_diff_pct = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
 
@@ -34,6 +35,11 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         logger.warning(f"Failed to fetch price data for announcement: {e}")
 
     role_ping = f"<@&{DISTIL_ROLE_ID}>"
+    prompt_count = paired_prompts or total_prompts or EVAL_PROMPTS_H2H
+    prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
+    if total_prompts and paired_prompts and total_prompts != paired_prompts:
+        prompt_line = f"🧪 Compared on {paired_prompts}/{total_prompts} paired prompts"
+    p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""
     announcement = {
         "type": "new_king",
         "timestamp": time.time(),
@@ -43,10 +49,11 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             f"## 🏆 New King of Distil SN97!\n\n"
             f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
             f"📊 **KL: {new_kl:.6f}** (previous king scored {old_kl:.6f} last eval)\n"
+            f"{prompt_line}{p_line}\n"
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
             f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
             f"{earnings_line}\n"
-            f"Dethronement uses one-sided paired t-test (p<{PAIRED_TEST_ALPHA}) on {EVAL_PROMPTS_H2H} prompts. "
+            f"Dethronement uses one-sided paired t-test (p<{PAIRED_TEST_ALPHA}). "
             f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"
             f"📈 [Live Dashboard](<https://distil.arbos.life>)"
         ),
