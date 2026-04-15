@@ -1,11 +1,14 @@
 #!/bin/bash
-# Sync benchmark results from eval pod to local state/benchmarks/
-# Run periodically (e.g., every 5 min) or after benchmark completion
+set -euo pipefail
 
-EVAL_POD="root@213.13.7.110"
-EVAL_PORT=6039
-REMOTE_DIR="/root/benchmark_results/"
-LOCAL_DIR="/home/openclaw/distillation/state/benchmarks/"
+# Sync benchmark results from the eval host into local state/benchmarks/.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+EVAL_POD="${DISTIL_BENCHMARK_HOST:-root@213.13.7.110}"
+EVAL_PORT="${DISTIL_BENCHMARK_PORT:-6039}"
+REMOTE_DIR="${DISTIL_BENCHMARK_REMOTE_DIR:-/root/benchmark_results/}"
+LOCAL_DIR="${DISTIL_BENCHMARK_LOCAL_DIR:-$REPO_ROOT/state/benchmarks/}"
 
 mkdir -p "$LOCAL_DIR"
 

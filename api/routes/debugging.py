@@ -94,27 +94,42 @@ def gpu_logs(lines: int = 50):
         except Exception:
             pass
 
-    # Source 2: Validator PM2 logs (orchestrator events)
-    try:
-        result = subprocess.run(
-            ["pm2", "logs", "distill-validator", "--lines", str(max_lines), "--nostream"],
-            capture_output=True, text=True, timeout=5
-        )
-        raw = result.stdout + result.stderr
-        for line in raw.split('\n'):
-            cleaned = _ANSI_RE.sub('', line)
-            if '|' in cleaned:
-                cleaned = cleaned.split('|', 1)[-1].strip()
-            if not cleaned:
-                continue
-            # Only allow lines with known prefixes
-            if not any(cleaned.startswith(p) for p in _ALLOWED_PREFIXES):
-                continue
-            sanitized = _sanitize_log_line(cleaned)
-            if sanitized:
-                log_lines.append(sanitized)
-    except Exception:
-        pass
+    # Source 2: Validator service logs on the consolidated host.
+    raw = ""
+    for unit in ("distil-validator", "distill-validator"):
+        try:
+            result = subprocess.run(
+                ["journalctl", "-u", unit, "-n", str(max_lines), "--no-pager", "-o", "cat"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                raw = result.stdout
+                break
+        except Exception:
+            pass
+
+    if not raw:
+        try:
+            result = subprocess.run(
+                ["pm2", "logs", "distill-validator", "--lines", str(max_lines), "--nostream"],
+                capture_output=True, text=True, timeout=5
+            )
+            raw = result.stdout + result.stderr
+        except Exception:
+            raw = ""
+
+    for line in raw.split('\n'):
+        cleaned = _ANSI_RE.sub('', line)
+        if '|' in cleaned:
+            cleaned = cleaned.split('|', 1)[-1].strip()
+        if not cleaned:
+            continue
+        # Only allow lines with known prefixes
+        if not any(cleaned.startswith(p) for p in _ALLOWED_PREFIXES):
+            continue
+        sanitized = _sanitize_log_line(cleaned)
+        if sanitized:
+            log_lines.append(sanitized)
 
     return {
         "lines": log_lines[-max_lines:],

@@ -232,8 +232,7 @@ class ValidatorState:
         
         Skips write if an existing announcement for the same king change
         is already present (whether posted or not), to prevent duplicates.
-        Writes to both local and prod (announcement.json is excluded from rsync
-        to prevent sync from resetting posted=true back to posted=false).
+        In the single-host distil layout this only needs a local write.
         """
         existing = _load_json(self._path(ANNOUNCEMENT_FILE), {})
         if existing.get("type") == data.get("type"):
@@ -243,18 +242,7 @@ class ValidatorState:
                     existing_data.get("old_uid") == new_data.get("old_uid")):
                 return  # Same king change already recorded
         atomic_json_write(self._path(ANNOUNCEMENT_FILE), data, indent=2)
-        # Also write to prod since announcement.json is excluded from rsync
-        try:
-            import subprocess
-            json_str = json.dumps(data, indent=2)
-            subprocess.run(
-                ["ssh", "distil-api", f"cat > /opt/distil/state/announcement.json"],
-                input=json_str.encode(), timeout=10, check=True,
-                capture_output=True
-            )
-            logger.info("Announcement synced to prod")
-        except Exception as e:
-            logger.warning(f"Failed to sync announcement to prod: {e}")
+        logger.info("Announcement saved locally")
 
     def validate_consistency(
         self,

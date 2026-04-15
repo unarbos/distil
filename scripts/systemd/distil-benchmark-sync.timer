@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Distil benchmark sync periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=75s
+AccuracySec=15s
+Persistent=true
+Unit=distil-benchmark-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -26,7 +26,7 @@ os.makedirs(DISK_CACHE_DIR, exist_ok=True)
 CHAT_POD_PORT = 8100
 CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "91.224.44.207")
 CHAT_POD_SSH_PORT = int(os.environ.get("CHAT_POD_SSH_PORT", "40070"))
-CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", "/root/.ssh/id_ed25519")
+CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
 
 API_DESCRIPTION = """
 # Distil - Subnet 97 API

@@ -1,0 +1,19 @@
+[Unit]
+Description=Distil SN97 Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=distil
+WorkingDirectory=/opt/distil/repo/frontend
+Environment=HOME=/home/distil
+Environment=NODE_ENV=production
+Environment=NEXT_PUBLIC_API_URL=https://api.arbos.life
+Environment=API_URL=http://localhost:3710
+ExecStart=/usr/bin/node node_modules/.bin/next start -p 3720
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

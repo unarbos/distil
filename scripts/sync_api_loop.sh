@@ -1,12 +1,21 @@
 #!/bin/bash
-# Run sync 4 times per minute (every ~15s)
-# Benchmark sync runs every 5th iteration (~75s)
+set -euo pipefail
+
+# Legacy loop wrapper for optional split-host syncs.
+# In the single-host distil layout, sync_api_state.sh is a quick no-op and this
+# loop only matters if benchmark syncing is still enabled.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SYNC_INTERVAL="${DISTIL_SYNC_INTERVAL:-15}"
+BENCHMARK_EVERY="${DISTIL_BENCHMARK_SYNC_EVERY:-5}"
+ENABLE_BENCHMARK_SYNC="${DISTIL_ENABLE_BENCHMARK_SYNC:-1}"
+
 COUNT=0
 while true; do
-    /home/openclaw/distillation/scripts/sync_api_state.sh
+    "$SCRIPT_DIR/sync_api_state.sh"
     COUNT=$((COUNT + 1))
-    if [ $((COUNT % 5)) -eq 0 ]; then
-        /home/openclaw/distillation/scripts/sync_benchmarks.sh 2>/dev/null
+    if [ "$ENABLE_BENCHMARK_SYNC" = "1" ] && [ $((COUNT % BENCHMARK_EVERY)) -eq 0 ]; then
+        "$SCRIPT_DIR/sync_benchmarks.sh" 2>/dev/null || true
     fi
-    sleep 15
+    sleep "$SYNC_INTERVAL"
 done

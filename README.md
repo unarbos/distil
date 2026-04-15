@@ -293,13 +293,13 @@ All endpoints are public, no authentication required.
 
 ### Split Validator Architecture
 
-The validator runs as a split architecture across two machines:
+The validator now runs as a split architecture across two trust boundaries:
 
-- **Hetzner server** (secure): Wallet keys, chain access, weight setting, commitment monitoring. This machine has no GPU but holds all sensitive credentials.
+- **Dedicated `distil` host** (secure): Wallet keys, chain access, weight setting, validator orchestration, API, dashboard, and persistent state all live on one Distil-only Hetzner machine.
 - **Lium GPU pod** (remote): Teacher/student forward passes, KL computation, vLLM inference. This machine has the GPU but **no chain access** — it cannot set weights or read wallet keys.
-- **Dedicated API server**: Dashboard and API run on a separate server behind **Cloudflare DDoS protection** (origin IP hidden via proxied DNS). State is synced from the validator every 15 seconds.
+- **Optional external helpers**: Benchmark sync and chat inference can remain remote, but they do not hold wallet keys or perform weight setting.
 
-Wallet keys never leave the Hetzner server. The GPU pod receives evaluation tasks and returns scores. This separation ensures that even a compromised GPU pod cannot steal funds or manipulate weights directly.
+Wallet keys never leave the `distil` host. The GPU pod receives evaluation tasks and returns scores. This separation ensures that even a compromised GPU pod cannot steal funds or manipulate weights directly.
 
 ## Community Contributions
 

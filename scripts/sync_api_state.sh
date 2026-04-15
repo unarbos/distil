@@ -1,14 +1,28 @@
 #!/bin/bash
-# Sync state files to the separate API server every 15s
-# This runs on the main server (openclaw-shabor) and pushes to distil-api
-#
-# Uses --temp-dir and --delay-updates to prevent partial reads on remote:
-#   --temp-dir: writes to a temp dir first, not directly to target
-#   --delay-updates: moves all files into place at the end atomically
+set -euo pipefail
 
-REMOTE="distil-api"
-REMOTE_STATE="/opt/distil/state/"
-LOCAL_STATE="/home/openclaw/distillation/state/"
+# Optional legacy helper for split-host deployments.
+# In the consolidated distil layout, validator and API share one filesystem,
+# so this script only refreshes REVISION unless DISTIL_API_REMOTE is set.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+LOCAL_STATE="${DISTIL_STATE_DIR:-$REPO_ROOT/state/}"
+REVISION_FILE="${DISTIL_REVISION_FILE:-$REPO_ROOT/REVISION}"
+REMOTE="${DISTIL_API_REMOTE:-}"
+REMOTE_ROOT="${DISTIL_REMOTE_ROOT:-/opt/distil/repo}"
+REMOTE_STATE="${DISTIL_REMOTE_STATE:-$REMOTE_ROOT/state/}"
+
+mkdir -p "${LOCAL_STATE%/}"
+
+git -C "$REPO_ROOT" rev-parse --short HEAD > "$REVISION_FILE" 2>/dev/null || true
+
+if [ -z "$REMOTE" ] || [ "$REMOTE" = "localhost" ] || [ "$REMOTE" = "local" ] || [ "$REMOTE" = "self" ]; then
+  echo "distil API is local; state rsync skipped"
+  exit 0
+fi
+
+ssh "$REMOTE" "mkdir -p \"$REMOTE_STATE\""
 
 rsync -az --timeout=10 \
   --temp-dir=/tmp \
@@ -27,6 +41,4 @@ rsync -az --timeout=10 \
   --exclude='*' \
   "$LOCAL_STATE" "$REMOTE:$REMOTE_STATE" 2>/dev/null
 
-# Sync code revision for /api/health display
-git -C /home/openclaw/distillation rev-parse --short HEAD 2>/dev/null > /tmp/distil-revision.txt \
-  && rsync -az /tmp/distil-revision.txt "$REMOTE:/opt/distil/REVISION" 2>/dev/null
+rsync -az "$REVISION_FILE" "$REMOTE:$REMOTE_ROOT/REVISION" 2>/dev/null

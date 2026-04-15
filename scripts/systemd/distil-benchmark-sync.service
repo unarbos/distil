@@ -1,0 +1,11 @@
+[Unit]
+Description=Distil benchmark sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=distil
+WorkingDirectory=/opt/distil/repo
+Environment=HOME=/home/distil
+ExecStart=/bin/bash /opt/distil/repo/scripts/sync_benchmarks.sh

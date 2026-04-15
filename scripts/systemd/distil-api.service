@@ -1,0 +1,22 @@
+[Unit]
+Description=Distil SN97 API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=distil
+WorkingDirectory=/opt/distil/repo/api
+Environment=HOME=/home/distil
+ExecStart=/opt/distil/venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 3710 --log-level warning --limit-concurrency 100 --timeout-keep-alive 10 --backlog 128 --workers 2
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=distil-api
+LogRateLimitIntervalSec=10
+LogRateLimitBurst=50
+
+[Install]
+WantedBy=multi-user.target
