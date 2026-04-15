@@ -397,11 +397,32 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
 
 
 def add_top5_contenders(challengers, valid_models, state: ValidatorState, king_uid):
-    """Always include top contenders (by KL score) in every eval round."""
+    """Always include top contenders in every eval round.
+
+    Uses the latest round's H2H leaderboard (top4_leaderboard contenders)
+    instead of global state.scores, so contender selection reflects
+    per-round head-to-head performance on the same prompt set.
+    Falls back to state.scores only if no H2H leaderboard exists yet.
+    """
     if king_uid is None:
         return
     contenders_added = 0
-    # Get all scored models sorted by KL, pick top 4 that aren't king
+
+    # Prefer H2H leaderboard contenders (same-prompt-set ranking)
+    lb_contenders = state.top4_leaderboard.get("contenders", [])
+    if lb_contenders:
+        for entry in lb_contenders:
+            uid = entry.get("uid")
+            if uid is None or uid == king_uid or uid in challengers:
+                continue
+            if uid in valid_models:
+                challengers[uid] = valid_models[uid]
+                contenders_added += 1
+        if contenders_added:
+            logger.info(f"🏆 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) to eval (from H2H leaderboard)")
+        return
+
+    # Fallback: use global scores if no H2H leaderboard yet
     scored = []
     for uid, info in valid_models.items():
         if uid == king_uid or uid in challengers:
@@ -415,7 +436,7 @@ def add_top5_contenders(challengers, valid_models, state: ValidatorState, king_u
         challengers[uid] = valid_models[uid]
         contenders_added += 1
     if contenders_added:
-        logger.info(f"🏆 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) to eval")
+        logger.info(f"🏆 Added {contenders_added} top-{TOP_N_ALWAYS_INCLUDE} contender(s) to eval (from global scores - fallback)")
 
 
 def cap_challengers(challengers, state: ValidatorState, king_uid):
