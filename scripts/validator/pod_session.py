@@ -12,7 +12,7 @@ from scripts.validator.config import MAX_NEW_TOKENS, MAX_PROMPT_TOKENS, TEACHER_
 logger = logging.getLogger("distillation.remote_validator")
 
 
-def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, max_params_b: float, is_full_eval: bool, use_vllm: bool, eval_script: str, eval_script_remote: str):
+def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, max_params_b: float, is_full_eval: bool, use_vllm: bool, eval_script: str, eval_script_remote: str, block_seed: int | None = None):
     import shutil
     import threading
 
@@ -67,17 +67,19 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         os.unlink(prompts_file)
     pod.upload(eval_script, remote_eval_script, max_attempts=5)
     try:
-        existing = pod.exec("pgrep -c -f pod_eval 2>/dev/null || echo 0", timeout=10)
-        if isinstance(existing, dict):
-            existing = existing.get("stdout", "") or existing.get("output", "") or "0"
-        if isinstance(existing, dict):
-            existing = "0"
-        count = int(str(existing).strip().split("\n")[-1])
-        if count > 0:
-            logger.warning(f"Found {count} existing eval process(es) on pod — killing before new round")
-            pod.exec("pkill -9 -f pod_eval; sleep 2", timeout=15)
+        pod.exec(
+            "pkill -9 -f pod_eval 2>/dev/null; "
+            "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
+            "sleep 2; "
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | xargs -r kill -9 2>/dev/null; "
+            "rm -rf /dev/shm/vllm* 2>/dev/null; "
+            "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
+            "sleep 3",
+            timeout=30,
+        )
+        logger.info("Killed all existing eval/vllm processes and removed stale /home files")
     except Exception as exc:
-        logger.debug(f"Pre-check for existing eval: {exc}")
+        logger.debug(f"Pre-eval cleanup: {exc}")
     try:
         pod.exec(
             f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
@@ -93,6 +95,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     except Exception as exc:
         log_event(f"Pod disk cleanup failed: {str(exc)[:100]}", level="warn", state_dir=str(state.state_dir))
     pod.clear_gpu()
+    try:
+        verify = pod.exec("pgrep -af pod_eval 2>/dev/null; ls /home/pod_eval.py 2>/dev/null; echo VERIFY_DONE", timeout=15)
+        vout = verify.get("stdout", "")
+        if "/home/pod_eval.py" in vout or ("pod_eval" in vout and "VERIFY_DONE" in vout and vout.strip() != "VERIFY_DONE"):
+            logger.warning("Stale competing eval detected after cleanup, killing again")
+            pod.exec("pkill -9 -f pod_eval 2>/dev/null; rm -f /home/pod_eval.py 2>/dev/null; sleep 2", timeout=20)
+    except Exception:
+        pass
     student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
     revision_list = ",".join(models_to_eval[uid].get("revision", "main") for uid in ordered_uids)
     king_flag = ""
@@ -115,6 +125,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"--teacher-logits {shlex.quote(teacher_cache_remote)}"
         f"{king_flag}"
         f"{vllm_flag}"
+        f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"
     )
     inner_q = shlex.quote(inner_eval)
     start_cmd = (
@@ -173,6 +184,17 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     gpu_log_path.write_text(sanitize_gpu_log(log_text))
             except Exception:
                 pass
+            try:
+                our_pid_str = pod.exec(f"cat {shlex.quote(pid_remote)} 2>/dev/null", timeout=10).get("stdout", "").strip()
+                pod.exec(
+                    f"for p in $(pgrep -f 'pod_eval' 2>/dev/null); do "
+                    f"  if [ \"$p\" != \"{our_pid_str}\" ]; then kill -9 $p 2>/dev/null; fi; "
+                    f"done; "
+                    f"rm -f /home/pod_eval.py /home/prompts.json 2>/dev/null",
+                    timeout=15,
+                )
+            except Exception:
+                pass
             poll_stop.wait(15)
 
     poll_thread = threading.Thread(target=poll_pod_progress, daemon=True)
@@ -190,8 +212,6 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
-        starting_streak = 0
-        MAX_STARTING_POLLS = 15  # ~5 min (20s sleep × 15) — if PID file never appears, eval script crashed on startup
         deadline = time.time() + eval_timeout
         while time.time() < deadline:
             status = pod.exec(status_cmd, timeout=90)
@@ -201,21 +221,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 break
             if "DISTIL_STATUS:dead" in out:
                 dead_streak += 1
-                starting_streak = 0
                 if dead_streak >= 3:
                     logger.error("Eval worker on pod exited before writing eval_results.json")
                     result = {"stdout": "", "stderr": "worker_dead", "exit_code": -1, "success": False}
                     break
-            elif "DISTIL_STATUS:starting" in out:
-                starting_streak += 1
-                dead_streak = 0
-                if starting_streak >= MAX_STARTING_POLLS:
-                    logger.error("Eval script never wrote PID file after %d polls — likely crashed on startup", starting_streak)
-                    result = {"stdout": "", "stderr": "startup_timeout", "exit_code": -1, "success": False}
-                    break
             else:
                 dead_streak = 0
-                starting_streak = 0
             time.sleep(20)
         else:
             logger.error(f"Eval timed out after {eval_timeout}s — killing")

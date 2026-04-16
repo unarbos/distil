@@ -368,11 +368,15 @@ def main(network, netuid, wallet_name, hotkey_name, wallet_path,
             }
             state.save_round()
 
+            # Derive integer seed from block hash for deterministic teacher generation
+            _block_seed = int(current_block_hash[:16], 16) if current_block_hash else None
+
             # Run eval on pod
             results = run_eval_on_pod(
                 pod, models_to_eval, king_uid, n_prompts, prompt_texts,
                 state, max_params_b, is_full_eval, use_vllm,
                 eval_script, eval_script_remote,
+                block_seed=_block_seed,
             )
             if results is None:
                 logger.warning("Eval did not produce usable results — clearing round state")
