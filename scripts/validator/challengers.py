@@ -132,6 +132,42 @@ def cap_challengers(challengers, state: ValidatorState, king_uid):
         challengers[king_uid] = king_entry
 
 
+def assert_top_contenders_present(challengers, valid_models, state: ValidatorState, king_uid):
+    """Regression guard: loud WARNING if any H2H leaderboard contender is absent from the
+    eval round despite being a valid known model. Topaz's top-4 bug silently dropped
+    genuine contenders for several rounds before being noticed — never again.
+    """
+    lb_contenders = state.top4_leaderboard.get("contenders", []) or []
+    if not lb_contenders:
+        return
+    missing = []
+    for entry in lb_contenders:
+        uid = entry.get("uid")
+        if uid is None or uid == king_uid:
+            continue
+        if uid in challengers:
+            continue
+        in_valid = uid in valid_models
+        model = (valid_models.get(uid) or {}).get("model") if in_valid else entry.get("model")
+        missing.append({
+            "uid": uid,
+            "model": model,
+            "in_valid_models": in_valid,
+            "in_bad_list": model in state.permanently_bad_models if model else None,
+            "h2h_kl": entry.get("kl"),
+        })
+    if missing:
+        logger.warning(
+            f"⚠️  TOP-CONTENDER REGRESSION CHECK: {len(missing)} H2H leaderboard "
+            f"contender(s) NOT in this round: {missing}"
+        )
+    else:
+        logger.info(
+            f"✅ top-contender check: all {len(lb_contenders)} H2H leaderboard "
+            f"contender(s) present in round"
+        )
+
+
 def check_models_exist(models_to_eval, uid_to_hotkey, state: ValidatorState, commitments: dict):
     removed = []
     for uid in list(models_to_eval.keys()):

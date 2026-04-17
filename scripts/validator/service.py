@@ -19,6 +19,7 @@ from scripts.validator.announcements import announce_new_king
 from scripts.validator.chain import write_api_commitments_cache
 from scripts.validator.challengers import (
     add_top5_contenders,
+    assert_top_contenders_present,
     cap_challengers,
     check_models_exist,
     select_challengers,
@@ -243,6 +244,7 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
     )
     add_top5_contenders(challengers, valid_models, state, king_uid)
     cap_challengers(challengers, state, king_uid)
+    assert_top_contenders_present(challengers, valid_models, state, king_uid)
     has_new = len(challengers_before_top5) > 0
     top5_only = not has_new and len(challengers) > 0
     if top5_only:

@@ -1758,8 +1758,13 @@ def main():
         # ── Fine-tunability probe (anti-finetune defense) ──
         # Based on mantaLLM's Discord diagnostic: reject models that can't be
         # continued-pretrained over due to grad-norm explosion or scaled layer norms.
-        # King already passed when it was crowned, so skip to save ~10s/round.
-        if student is not None and not is_king and os.environ.get("FINETUNE_PROBE", "1") != "0":
+        # King is probed too — pete147 walk-through: king fails → kl=inf →
+        # results.py promotes best clean challenger (no new code needed).
+        # Skip the probe when king is reused from VRAM (already probed on first load).
+        probe_this = student is not None and os.environ.get("FINETUNE_PROBE", "1") != "0"
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            probe_this = False
+        if probe_this:
             try:
                 _fp_start = time.time()
                 probe = finetunability_probe(student, tokenizer, device)
@@ -1794,6 +1799,8 @@ def main():
                     live_progress["completed"].append({"student_name": student_name, "status": "anti_finetune"})
                     live_progress["current"] = None
                     _write_progress()
+                    if is_king:
+                        king_model = None
                     try:
                         del student
                     except Exception:
