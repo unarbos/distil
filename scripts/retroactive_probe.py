@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from transformers import AutoTokenizer
 
-from scripts.pod_eval_vllm import finetunability_probe
+from scripts.pod_eval_vllm import finetunability_probe, thinking_collapse_probe
 from eval.runtime import TEACHER_MODEL
 
 DISTIL_API = os.environ.get("DISTIL_API", "https://distil.arbos.life")
@@ -74,13 +74,26 @@ for uid in target_uids:
         )
         probe = finetunability_probe(model, tokenizer, DEVICE)
         mark = "✓" if probe["pass"] else f"✗ {probe['reason']}"
-        print(f"  UID {uid:>3}  norm_max={probe['worst_norm_weight']:.2f} grad={probe['global_grad_norm']:.1f} {mark}  ({time.time()-t0:.0f}s)")
+        m_tok = AutoTokenizer.from_pretrained(info["model"], revision=info["revision"])
+        tprobe = thinking_collapse_probe(model, m_tok, DEVICE)
+        tmark = "✓" if tprobe["pass"] else f"✗ {tprobe['reason']}"
+        print(f"  UID {uid:>3}  norm_max={probe['worst_norm_weight']:.2f} grad={probe['global_grad_norm']:.1f} {mark}"
+              f"  | think_loop={tprobe['prompts_looped']}/{tprobe['prompts_tested']} max_hits={tprobe['max_loop_repeats']} {tmark}"
+              f"  ({time.time()-t0:.0f}s)")
+        combined_pass = probe["pass"] and tprobe["pass"]
+        combined_reason = probe.get("reason", "") if not probe["pass"] else tprobe.get("reason", "")
         results[str(uid)] = {"model": info["model"], "revision": info["revision"],
-                             "pass": probe["pass"], "reason": probe.get("reason", ""),
+                             "pass": combined_pass, "reason": combined_reason,
                              "worst_norm_weight": probe["worst_norm_weight"],
                              "worst_norm_name": probe.get("worst_norm_name", ""),
                              "global_grad_norm": probe["global_grad_norm"],
                              "loss": probe["loss"],
+                             "think_pass": tprobe["pass"],
+                             "think_reason": tprobe.get("reason", ""),
+                             "think_prompts_tested": tprobe["prompts_tested"],
+                             "think_prompts_terminated": tprobe["prompts_terminated"],
+                             "think_prompts_looped": tprobe["prompts_looped"],
+                             "think_max_loop_repeats": tprobe["max_loop_repeats"],
                              "checked_at": time.time()}
     except Exception as e:
         print(f"  UID {uid:>3}  ERROR {e}")

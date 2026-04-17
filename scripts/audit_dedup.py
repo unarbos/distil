@@ -25,12 +25,15 @@ for r in rounds.get("results", []):
     if "hotkey" in r:
         hk_to_uid[r["hotkey"]] = r["uid"]
 
-try:
-    miners = requests.get(f"{DISTIL_API}/api/miners/batch?uids=" + ",".join(str(i) for i in range(256)), timeout=60).json().get("miners", [])
-    for m in miners:
-        hk_to_uid[m["hotkey"]] = m["uid"]
-except Exception as e:
-    print(f"[audit] miners/batch failed: {e}")
+for start in range(0, 512, 64):
+    uids_chunk = ",".join(str(i) for i in range(start, start + 64))
+    try:
+        miners = requests.get(f"{DISTIL_API}/api/miners/batch?uids={uids_chunk}", timeout=60).json().get("miners", [])
+        for m in miners:
+            if m.get("hotkey") and m.get("uid") is not None:
+                hk_to_uid[m["hotkey"]] = m["uid"]
+    except Exception as e:
+        print(f"[audit] miners/batch {start}: {e}")
 
 uid_to_model = {}
 for hk, commit in commitments.items():

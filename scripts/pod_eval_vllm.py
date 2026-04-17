@@ -409,6 +409,307 @@ def finetunability_probe(model, tokenizer, device="cuda"):
         return stats
 
 
+CHAT_PROBE_PROMPTS = [
+    "hi",
+    "What is 2+2?",
+    "Say hello in one word.",
+    "Reply with just the word: yes",
+]
+CHAT_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_PROBE_MAX_TOKENS", "768"))
+CHAT_PROBE_MIN_ANSWER_CHARS = int(os.environ.get("CHAT_PROBE_MIN_ANSWER_CHARS", "1"))
+CHAT_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("CHAT_PROBE_TERMINATE_THRESHOLD", "0.5"))
+
+THINK_PROBE_PROMPTS = [
+    "Hi",
+    "What is the largest planet? Answer in one word.",
+    "Say the word: done",
+]
+THINK_PROBE_MAX_TOKENS = int(os.environ.get("THINK_PROBE_MAX_TOKENS", "1024"))
+THINK_PROBE_LOOP_NGRAM_HITS = int(os.environ.get("THINK_PROBE_LOOP_NGRAM_HITS", "15"))
+THINK_PROBE_LOOP_THRESHOLD = float(os.environ.get("THINK_PROBE_LOOP_THRESHOLD", "0.50"))
+THINK_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("THINK_PROBE_TERMINATE_THRESHOLD", "0.66"))
+_CHAT_PROBE_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_CHAT_PROBE_THINK_TRAIL = re.compile(r"^.*?</think>\s*", re.DOTALL)
+_CHAT_PROBE_NARRATIVE = re.compile(r"^\s*Thinking Process:.*?(?=\n\n[A-Z0-9]|\Z)", re.DOTALL)
+
+
+def _strip_thinking_probe(text: str) -> str:
+    if "<think>" in text:
+        text = _CHAT_PROBE_THINK_RE.sub("", text, count=1)
+    elif "</think>" in text:
+        text = _CHAT_PROBE_THINK_TRAIL.sub("", text, count=1)
+    if text.lstrip().startswith("Thinking Process:"):
+        text = _CHAT_PROBE_NARRATIVE.sub("", text, count=1)
+    return text.strip()
+
+
+def chat_response_probe(model, tokenizer, device="cuda"):
+    """Chat-collapse probe: detect students that can't terminate simple chat prompts.
+
+    Off-policy distillation pathology flagged by Allan (SN97 Discord) + literature
+    (arxiv 2502.07266 on CoT complexity mismatch, thinkingmachines.ai/blog/on-policy-distillation).
+    Miners train students on long teacher reasoning rollouts; the 4B student learns
+    to always think, but has no reliable stop — leaving the chat endpoint in a
+    "Thinking Process:..." loop that never emits a user-facing answer.
+
+    For a short list of trivial prompts, run the student's chat template with
+    enable_thinking=False and require:
+      - at least CHAT_PROBE_TERMINATE_THRESHOLD of prompts emit EOS inside
+        CHAT_PROBE_MAX_TOKENS
+      - at least CHAT_PROBE_TERMINATE_THRESHOLD produce non-empty content after
+        stripping <think>...</think> and "Thinking Process:..." narration
+    """
+    stats = {
+        "pass": True, "reason": "",
+        "prompts_tested": 0, "prompts_terminated": 0,
+        "prompts_non_empty": 0,
+        "mean_gen_tokens": 0.0,
+        "mean_content_chars": 0.0,
+        "mean_reasoning_fraction": 0.0,
+        "samples": [],
+    }
+    try:
+        if tokenizer is None or model is None:
+            return stats
+        tpl_ok = getattr(tokenizer, "chat_template", None)
+        if not tpl_ok:
+            stats["reason"] = "probe_skip:no_chat_template"
+            return stats
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = eos_ids[0] if eos_ids else 0
+
+        was_training = model.training
+        model.eval()
+        terminated = 0
+        non_empty = 0
+        gen_tokens_acc = 0
+        content_chars_acc = 0
+        reasoning_frac_acc = 0.0
+
+        with torch.no_grad():
+            for prompt in CHAT_PROBE_PROMPTS:
+                msgs = [{"role": "user", "content": prompt}]
+                try:
+                    try:
+                        rendered = tokenizer.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=False,
+                        )
+                    except TypeError:
+                        rendered = tokenizer.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = model.generate(
+                        ids,
+                        max_new_tokens=CHAT_PROBE_MAX_TOKENS,
+                        do_sample=False,
+                        temperature=1.0,
+                        top_p=1.0,
+                        pad_token_id=pad_id,
+                        eos_token_id=eos_ids,
+                        use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    gen_len = int(new_ids.shape[0])
+                    did_terminate = (gen_len < CHAT_PROBE_MAX_TOKENS) or (
+                        eos_ids is not None and int(new_ids[-1].item()) in eos_ids
+                    )
+                    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    stripped = _strip_thinking_probe(raw_text)
+                    raw_len = max(1, len(raw_text))
+                    reasoning_frac = 1.0 - (len(stripped) / raw_len)
+                    if did_terminate:
+                        terminated += 1
+                    if len(stripped) >= CHAT_PROBE_MIN_ANSWER_CHARS:
+                        non_empty += 1
+                    gen_tokens_acc += gen_len
+                    content_chars_acc += len(stripped)
+                    reasoning_frac_acc += max(0.0, min(1.0, reasoning_frac))
+                    stats["samples"].append({
+                        "prompt": prompt, "gen_tokens": gen_len,
+                        "terminated": did_terminate,
+                        "content_chars": len(stripped),
+                        "reasoning_frac": round(reasoning_frac, 3),
+                        "content_preview": stripped[:80],
+                    })
+                except Exception as e:
+                    stats["samples"].append({"prompt": prompt, "error": str(e)[:120]})
+
+        n = max(1, len(CHAT_PROBE_PROMPTS))
+        stats["prompts_tested"] = n
+        stats["prompts_terminated"] = terminated
+        stats["prompts_non_empty"] = non_empty
+        stats["mean_gen_tokens"] = round(gen_tokens_acc / n, 1)
+        stats["mean_content_chars"] = round(content_chars_acc / n, 1)
+        stats["mean_reasoning_fraction"] = round(reasoning_frac_acc / n, 3)
+
+        min_ok = CHAT_PROBE_TERMINATE_THRESHOLD * n - 1e-9
+        if terminated < min_ok and non_empty < min_ok:
+            stats["pass"] = False
+            stats["reason"] = (
+                f"chat_collapse:terminated={terminated}/{n} "
+                f"non_empty={non_empty}/{n} "
+                f"mean_gen={stats['mean_gen_tokens']:.0f} "
+                f"mean_think_frac={stats['mean_reasoning_fraction']:.2f}"
+            )
+
+        if was_training:
+            model.train()
+        return stats
+    except Exception as e:
+        stats["reason"] = f"probe_error:{str(e)[:120]}"
+        return stats
+
+
+def _detect_phrase_loop(text: str, ngram: int = 6, min_repeat: int = 8) -> int:
+    """Return the raw repeat count of the most-repeated ``ngram``-word phrase.
+
+    Off-policy CoT collapse (allan_ww, #distil-97, 2026-04-17) produces
+    hundreds of repeats of the same short phrase; a legitimate long chain of
+    thought rarely repeats a 6-word span more than a handful of times. Using
+    the absolute count sidesteps the denominator problem when the response
+    hits ``max_new_tokens`` mid-loop.
+    """
+    if not text:
+        return 0
+    from collections import Counter
+    tokens = text.split()
+    if len(tokens) < ngram * min_repeat:
+        return 0
+    grams = Counter(
+        " ".join(tokens[i:i + ngram]) for i in range(len(tokens) - ngram + 1)
+    )
+    return max(grams.values()) if grams else 0
+
+
+def thinking_collapse_probe(model, tokenizer, device="cuda"):
+    """Reject models that loop inside the thinking block (off-policy CoT collapse).
+
+    Runs the chat template with ``enable_thinking=True`` on a handful of
+    trivial prompts. Fails a model if on >THINK_PROBE_LOOP_THRESHOLD of them
+    either (a) generation hits ``THINK_PROBE_MAX_TOKENS`` without EOS, or
+    (b) the raw generation contains a 40-char substring repeated ≥4 times.
+
+    The existing ``chat_response_probe`` already exercises
+    ``enable_thinking=False``; this probe adds the thinking-on failure mode
+    that Allan / Fish / Const demonstrated on chat.arbos.life (UID 107 loops
+    ``*Wait, I'll write:*`` 86+ times answering ``Hi``).
+
+    References: thinkingmachines.ai/blog/on-policy-distillation,
+    arxiv.org/abs/2502.07266 on CoT complexity mismatch.
+    """
+    stats = {
+        "pass": True, "reason": "",
+        "prompts_tested": 0, "prompts_terminated": 0, "prompts_looped": 0,
+        "mean_gen_tokens": 0.0, "max_loop_repeats": 0,
+        "samples": [],
+    }
+    try:
+        if tokenizer is None or model is None:
+            return stats
+        if not getattr(tokenizer, "chat_template", None):
+            stats["reason"] = "think_probe_skip:no_chat_template"
+            return stats
+
+        eos_ids = []
+        for tok in ["<|im_end|>", "<|endoftext|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid >= 0:
+                eos_ids.append(tid)
+        if getattr(tokenizer, "eos_token_id", None) is not None:
+            eos_ids.append(int(tokenizer.eos_token_id))
+        eos_ids = list(set(eos_ids)) or None
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = eos_ids[0] if eos_ids else 0
+
+        was_training = model.training
+        model.eval()
+        terminated = 0
+        looped = 0
+        gen_tokens_acc = 0
+        max_hits_overall = 0
+        samples = []
+
+        with torch.no_grad():
+            for prompt in THINK_PROBE_PROMPTS:
+                msgs = [{"role": "user", "content": prompt}]
+                try:
+                    try:
+                        rendered = tokenizer.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                            enable_thinking=True,
+                        )
+                    except TypeError:
+                        rendered = tokenizer.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True,
+                        )
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = model.generate(
+                        ids, max_new_tokens=THINK_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    gen_len = int(new_ids.shape[0])
+                    did_terminate = (gen_len < THINK_PROBE_MAX_TOKENS) or (
+                        eos_ids is not None and int(new_ids[-1].item()) in eos_ids
+                    )
+                    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    loop_hits = _detect_phrase_loop(raw_text)
+                    did_loop = loop_hits >= THINK_PROBE_LOOP_NGRAM_HITS
+                    if did_terminate and not did_loop:
+                        terminated += 1
+                    if did_loop:
+                        looped += 1
+                    gen_tokens_acc += gen_len
+                    max_hits_overall = max(max_hits_overall, loop_hits)
+                    samples.append({
+                        "prompt": prompt, "gen_tokens": gen_len,
+                        "terminated": did_terminate, "loop_hits": loop_hits,
+                        "tail": raw_text[-200:],
+                    })
+                    stats["prompts_tested"] += 1
+                except Exception as e:
+                    samples.append({"prompt": prompt, "error": str(e)[:120]})
+                    continue
+
+        stats["prompts_terminated"] = terminated
+        stats["prompts_looped"] = looped
+        n = max(1, stats["prompts_tested"])
+        stats["mean_gen_tokens"] = gen_tokens_acc / n
+        stats["max_loop_repeats"] = max_hits_overall
+        stats["samples"] = samples
+
+        term_ok = terminated >= THINK_PROBE_TERMINATE_THRESHOLD * n - 1e-9
+        loop_ok = (looped / n) <= THINK_PROBE_LOOP_THRESHOLD + 1e-9
+        if not term_ok or not loop_ok:
+            stats["pass"] = False
+            stats["reason"] = (
+                f"thinking_collapse:terminated={terminated}/{n} looped={looped}/{n} "
+                f"mean_gen={stats['mean_gen_tokens']:.0f} "
+                f"max_loop_hits={stats['max_loop_repeats']}"
+            )
+
+        if was_training:
+            model.train()
+        return stats
+    except Exception as e:
+        stats["reason"] = f"think_probe_error:{str(e)[:120]}"
+        return stats
+
+
 def compute_activation_fingerprint(model, device="cuda"):
     """
     Compute an activation-space fingerprint for functional copy detection.
@@ -1810,6 +2111,113 @@ def main():
                     continue
             except Exception as e:
                 print(f"[eval] Finetune probe error (non-fatal, allowing): {e}", flush=True)
+
+        # ── Chat-collapse probe (CoT-collapse defense) ──
+        # Allan's Discord observation + arxiv 2502.07266: off-policy CoT distillation
+        # teaches small students to always think but never stop. Validator scores
+        # token-level KL on raw web text so collapsed students slip through even
+        # as the chat endpoint hangs forever on "hi". Probe rejects models that
+        # can't terminate or produce content on trivial chat prompts.
+        chat_probe_this = student is not None and os.environ.get("CHAT_COLLAPSE_PROBE", "1") != "0"
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            chat_probe_this = False
+        if chat_probe_this:
+            try:
+                _cp_start = time.time()
+                cprobe = chat_response_probe(student, tokenizer, device)
+                _cp_dur = time.time() - _cp_start
+                mark = "✓" if cprobe["pass"] else f"✗ DQ: {cprobe['reason']}"
+                print(
+                    f"[eval] Chat probe: term={cprobe['prompts_terminated']}/{cprobe['prompts_tested']} "
+                    f"nonempty={cprobe['prompts_non_empty']}/{cprobe['prompts_tested']} "
+                    f"mean_gen={cprobe['mean_gen_tokens']:.0f} "
+                    f"think_frac={cprobe['mean_reasoning_fraction']:.2f} "
+                    f"({_cp_dur:.1f}s) {mark}",
+                    flush=True,
+                )
+                results["students"].setdefault(student_name, {})["chat_probe"] = {
+                    "pass": cprobe["pass"],
+                    "reason": cprobe.get("reason", ""),
+                    "prompts_tested": cprobe["prompts_tested"],
+                    "prompts_terminated": cprobe["prompts_terminated"],
+                    "prompts_non_empty": cprobe["prompts_non_empty"],
+                    "mean_gen_tokens": cprobe["mean_gen_tokens"],
+                    "mean_content_chars": cprobe["mean_content_chars"],
+                    "mean_reasoning_fraction": cprobe["mean_reasoning_fraction"],
+                    "samples": cprobe.get("samples", []),
+                }
+                if not cprobe["pass"]:
+                    results["students"][student_name].update({
+                        "status": "chat_collapse",
+                        "reason": f"chat_collapse:{cprobe['reason']}",
+                        "kl_global_avg": float("inf"),
+                    })
+                    with open(args.output, "w") as f:
+                        json.dump(results, f, indent=2)
+                    live_progress["completed"].append({"student_name": student_name, "status": "chat_collapse"})
+                    live_progress["current"] = None
+                    _write_progress()
+                    if is_king:
+                        king_model = None
+                    try:
+                        del student
+                    except Exception:
+                        pass
+                    free_gpu()
+                    clean_model_cache(student_name, args.teacher)
+                    continue
+            except Exception as e:
+                print(f"[eval] Chat probe error (non-fatal, allowing): {e}", flush=True)
+
+        think_probe_this = student is not None and os.environ.get("THINK_COLLAPSE_PROBE", "1") != "0"
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            think_probe_this = False
+        if think_probe_this:
+            try:
+                _tp_start = time.time()
+                tprobe = thinking_collapse_probe(student, tokenizer, device)
+                _tp_dur = time.time() - _tp_start
+                mark = "✓" if tprobe["pass"] else f"✗ DQ: {tprobe['reason']}"
+                print(
+                    f"[eval] Think probe: term={tprobe['prompts_terminated']}/{tprobe['prompts_tested']} "
+                    f"looped={tprobe['prompts_looped']}/{tprobe['prompts_tested']} "
+                    f"mean_gen={tprobe['mean_gen_tokens']:.0f} "
+                    f"max_loop_hits={tprobe['max_loop_repeats']} "
+                    f"({_tp_dur:.1f}s) {mark}",
+                    flush=True,
+                )
+                results["students"].setdefault(student_name, {})["think_probe"] = {
+                    "pass": tprobe["pass"],
+                    "reason": tprobe.get("reason", ""),
+                    "prompts_tested": tprobe["prompts_tested"],
+                    "prompts_terminated": tprobe["prompts_terminated"],
+                    "prompts_looped": tprobe["prompts_looped"],
+                    "mean_gen_tokens": tprobe["mean_gen_tokens"],
+                    "max_loop_repeats": tprobe["max_loop_repeats"],
+                    "samples": tprobe.get("samples", []),
+                }
+                if not tprobe["pass"]:
+                    results["students"][student_name].update({
+                        "status": "thinking_collapse",
+                        "reason": f"thinking_collapse:{tprobe['reason']}",
+                        "kl_global_avg": float("inf"),
+                    })
+                    with open(args.output, "w") as f:
+                        json.dump(results, f, indent=2)
+                    live_progress["completed"].append({"student_name": student_name, "status": "thinking_collapse"})
+                    live_progress["current"] = None
+                    _write_progress()
+                    if is_king:
+                        king_model = None
+                    try:
+                        del student
+                    except Exception:
+                        pass
+                    free_gpu()
+                    clean_model_cache(student_name, args.teacher)
+                    continue
+            except Exception as e:
+                print(f"[eval] Think probe error (non-fatal, allowing): {e}", flush=True)
 
         # ── Activation fingerprint (for functional copy detection) ──
         if student is not None:
