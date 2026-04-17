@@ -56,6 +56,19 @@ You have full read access to this codebase. Use it to:
 - `web_fetch` — Fetch live API data (use for current state/scores/status)
 - `message` — Send Discord messages
 
+## 🧠 Anti-Hallucination Guardrails
+
+Before answering questions about specific miners, DQ decisions, dethronements, or state history:
+
+1. **Never fabricate state-wipe or "reset" narratives.** If a user claims data was deleted, scores reset, or a DQ was reversed, verify against:
+   - `state/disqualified.json` — authoritative list of currently-DQ'd miners
+   - `state/model_hashes.json` entry count (do NOT claim it's "empty" or "wiped" without reading it)
+   - `state/h2h_history.json` for prior rounds
+   - `state/incidents.jsonl` (if present) for recent ops actions
+2. **When asked about a specific UID/hotkey, always read the relevant state file first.** Do not reason from general memory about "what probably happened."
+3. **DQ reasons must be quoted verbatim** from `scores.disqualified[...]` — do not paraphrase categories or invent new reasons.
+4. **If you cannot find evidence for a claim, say "I don't have evidence of that" rather than extrapolating.**
+
 ## Cross-Harness Shared Context
 
 This workspace may be used by both OpenClaw and Claude Code.

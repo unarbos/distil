@@ -5,7 +5,6 @@ import {
   fetchPrice,
   fetchAllModelInfo,
   fetchHistory,
-  fetchEvalProgress,
   fetchH2hLatest,
   buildMinerList,
 } from "@/lib/api";
@@ -16,13 +15,12 @@ import { SCORE_TO_BEAT_FACTOR } from "@/lib/subnet";
 export const dynamic = "force-dynamic";
 
 export default async function HomePage() {
-  const [metagraph, commitments, scores, price, history, evalProgress, h2hLatest] = await Promise.all([
+  const [metagraph, commitments, scores, price, history, h2hLatest] = await Promise.all([
     fetchMetagraph(),
     fetchCommitments(),
     fetchScores(),
     fetchPrice(),
     fetchHistory(),
-    fetchEvalProgress(),
     fetchH2hLatest(),
   ]);
 
@@ -39,9 +37,6 @@ export default async function HomePage() {
   const king = miners.find((m) => m.isWinner);
   const kingH2hKl = h2hLatest?.king_h2h_kl ?? king?.klScore ?? null;
   const scoreToBeat = kingH2hKl != null ? kingH2hKl * SCORE_TO_BEAT_FACTOR : null;
-  const lastEvalTime = scores?.last_eval_time ?? 0;
-  const tempoSeconds = scores?.tempo_seconds ?? 600;
-  const pendingMiners = miners.filter((m) => m.klScore == null && !m.isDisqualified);
 
   return (
     <div className="relative min-h-[calc(100vh-3rem)]">
@@ -100,10 +95,6 @@ export default async function HomePage() {
           currentBlock={currentBlock}
           taoUsd={taoUsd}
           minersTaoDay={minersTaoDay}
-          pendingMiners={pendingMiners}
-          evalProgress={evalProgress}
-          lastEvalTime={lastEvalTime}
-          tempoSeconds={tempoSeconds}
           history={history}
           kingUid={kingUid}
           kingH2hKl={kingH2hKl}

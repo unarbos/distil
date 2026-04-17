@@ -240,6 +240,8 @@ export interface H2hResult {
 
 export interface H2hLatestResponse {
   block: number;
+  block_hash?: string | null;
+  shard_idx?: number | null;
   timestamp: number;
   king_uid: number;
   king_h2h_kl: number;

@@ -116,8 +116,18 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 logger.info(f"Using global score {effective_king_kl:.6f} for new king UID {winner_uid} (not in h2h_results)")
 
     _king_h2h_kl = round(effective_king_kl, 6) if effective_king_kl else None
+
+    shard_idx: int | None = None
+    try:
+        from eval.dataset import CLIMBMIX_NUM_SHARDS, _compute_hash_hex
+        _hex = _compute_hash_hex(current_block, block_hash)
+        shard_idx = int(_hex[:8], 16) % CLIMBMIX_NUM_SHARDS
+    except Exception:
+        shard_idx = None
+
     h2h_round = {
         "block": current_block, "block_hash": block_hash, "timestamp": time.time(),
+        "shard_idx": shard_idx,
         "king_uid": effective_king_uid, "king_model": effective_king_model,
         "prev_king_uid": king_uid,
         "king_kl": _king_h2h_kl,  # canonical field for API consumers

@@ -554,99 +554,16 @@ def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
     return kl_per_pos
 
 
-def compute_kl_sparse_vs_sparse(teacher_indices, teacher_values, student_indices, student_values,
-                                teacher_values_are_logprobs=False):
-    """KL divergence between two sparse top-k representations.
-
-    Used when student logprobs come from vLLM prompt_logprobs (sparse top-k)
-    instead of full HF logits (dense).
-
-    For each position, renormalizes both teacher and student over the teacher's
-    top-k support. For teacher tokens not found in the student's top-k, uses a
-    floor logprob value.
-
-    Args:
-        teacher_indices: [1, seq_len, k_t] token IDs.
-        teacher_values:  [1, seq_len, k_t] logits or logprobs.
-        student_indices: [1, seq_len, k_s] token IDs.
-        student_values:  [1, seq_len, k_s] logprobs (from vLLM).
-        teacher_values_are_logprobs: if True, teacher_values are already log-probs.
-
-    Returns:
-        KL per position, shape [1, seq_len].
-    """
-    FLOOR_LOGPROB = -23.0  # ~log(1e-10)
-    KL_POS_CHUNK = 256  # chunk over positions to limit memory
-
-    device = teacher_indices.device
-    B, seq_len, k_t = teacher_indices.shape
-    _, _, k_s = student_indices.shape
-
-    t_idx = teacher_indices
-    t_vals = teacher_values.float()
-    s_idx = student_indices.to(device)
-    s_vals = student_values.to(device).float()
-
-    # Teacher: renormalize over top-k
-    if teacher_values_are_logprobs:
-        t_log_p = t_vals - t_vals.logsumexp(dim=-1, keepdim=True)
-    else:
-        t_log_p = F.log_softmax(t_vals, dim=-1)
-    t_p = t_log_p.exp()
-
-    kl_per_pos = torch.empty(B, seq_len, device=device)
-
-    for ci in range(0, seq_len, KL_POS_CHUNK):
-        cj = min(ci + KL_POS_CHUNK, seq_len)
-
-        t_chunk_idx = t_idx[:, ci:cj, :]     # [B, C, k_t]
-        s_chunk_idx = s_idx[:, ci:cj, :]     # [B, C, k_s]
-        s_chunk_vals = s_vals[:, ci:cj, :]   # [B, C, k_s]
-
-        # For each teacher token, find matching student token
-        # [B, C, k_t, 1] vs [B, C, 1, k_s] → [B, C, k_t, k_s]
-        match = (t_chunk_idx.unsqueeze(-1) == s_chunk_idx.unsqueeze(-2))
-        has_match = match.any(dim=-1)  # [B, C, k_t]
-
-        # Gather student logprobs at matching positions
-        s_expanded = s_chunk_vals.unsqueeze(-2).expand(-1, -1, k_t, -1)  # [B, C, k_t, k_s]
-        s_at_match = torch.where(match, s_expanded, torch.tensor(float('-inf'), device=device))
-        s_at_teacher, _ = s_at_match.max(dim=-1)  # [B, C, k_t]
-        s_at_teacher = torch.where(has_match, s_at_teacher,
-                                    torch.tensor(FLOOR_LOGPROB, device=device))
-
-        # Renormalize student over teacher's support
-        s_at_teacher_norm = s_at_teacher - s_at_teacher.logsumexp(dim=-1, keepdim=True)
-
-        # KL for this chunk
-        t_log_p_chunk = t_log_p[:, ci:cj, :]
-        t_p_chunk = t_p[:, ci:cj, :]
-        kl_per_pos[:, ci:cj] = (t_p_chunk * (t_log_p_chunk - s_at_teacher_norm)).sum(dim=-1)
-
-        del match, has_match, s_expanded, s_at_match, s_at_teacher, s_at_teacher_norm
-
-    return kl_per_pos
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # §6  vLLM Server Management
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def is_vllm_running():
-    """Check if vLLM server is running and healthy."""
-    import requests
-    try:
-        r = requests.get(f"{VLLM_URL}/health", timeout=3)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384, revision=None, _attempt=1):
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384, revision=None, tensor_parallel_size=1, _attempt=1):
     """Start vLLM server via subprocess. Returns True on success. Retries once on crash."""
     ensure_disk_space(model_name, threshold=80)
 
-    print(f"\n[vllm] Starting server for {model_name}..." + (f" (attempt {_attempt})" if _attempt > 1 else ""), flush=True)
+    tp_note = f" TP={tensor_parallel_size}" if tensor_parallel_size and tensor_parallel_size > 1 else ""
+    print(f"\n[vllm] Starting server for {model_name}{tp_note}..." + (f" (attempt {_attempt})" if _attempt > 1 else ""), flush=True)
     stop_vllm_server()
 
     cmd = [
@@ -663,6 +580,8 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
     ]
+    if tensor_parallel_size and tensor_parallel_size > 1:
+        cmd.extend(["--tensor-parallel-size", str(tensor_parallel_size)])
     if revision and revision != "main":
         cmd.extend(["--revision", revision])
 
@@ -695,7 +614,7 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
                 print("[vllm] Retrying after cleanup...", flush=True)
                 stop_vllm_server()
                 time.sleep(5)
-                return start_vllm_server(model_name, gpu_memory_utilization, max_model_len, revision, _attempt=2)
+                return start_vllm_server(model_name, gpu_memory_utilization, max_model_len, revision, tensor_parallel_size, _attempt=2)
             return False
         if elapsed % 60 == 0 and elapsed > 0:
             print(f"[vllm] Still starting... ({elapsed}s)", flush=True)
@@ -742,14 +661,23 @@ def stop_vllm_server():
                 ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
                 capture_output=True, text=True, timeout=10
             )
-            pids = [int(p.strip()) for p in result.stdout.strip().split("\n") if p.strip().isdigit() and int(p.strip()) != my_pid]
-            if not pids:
+            candidates = [int(p.strip()) for p in result.stdout.strip().split("\n") if p.strip().isdigit() and int(p.strip()) != my_pid]
+            if not candidates:
                 break
-            for pid in pids:
+            killed_any = False
+            for pid in candidates:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="ignore")
                 except Exception:
-                    pass
+                    cmdline = ""
+                if any(tag in cmdline for tag in ("vllm.entrypoints", "vllm/engine", "VllmWorker")):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        killed_any = True
+                    except Exception:
+                        pass
+            if not killed_any:
+                break
             time.sleep(2)
         except Exception:
             break
@@ -919,300 +847,7 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# §8  vLLM Student Scoring
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _parse_vllm_prompt_logprobs(prompt_logprobs_raw, token_to_id, tokenizer, k=128):
-    """Parse vLLM prompt_logprobs response into sparse format.
-
-    Handles multiple vLLM response formats:
-    1. List of dicts where keys are token strings, values are logprob floats
-    2. List of dicts where keys are token IDs (as strings), values are dicts
-       with 'logprob', 'rank', 'decoded_token'
-    3. List of lists in OpenAI top_logprobs format [{token, logprob, bytes}, ...]
-
-    Args:
-        prompt_logprobs_raw: list of (None | dict | list) from vLLM response.
-        token_to_id: pre-built mapping from token text to token ID.
-        tokenizer: tokenizer for fallback encoding.
-        k: number of top logprobs to keep per position.
-
-    Returns:
-        Sparse dict with 'indices' [1, seq_len, k] and 'values' [1, seq_len, k]
-        where values are logprobs.
-    """
-    seq_len = len(prompt_logprobs_raw)
-    indices = torch.zeros(1, seq_len, k, dtype=torch.long)
-    values = torch.full((1, seq_len, k), -100.0, dtype=torch.float32)
-
-    for pos, entry in enumerate(prompt_logprobs_raw):
-        if entry is None:
-            continue
-
-        # Parse entry into list of (token_id, logprob) tuples
-        items = []
-
-        if isinstance(entry, list):
-            # Format 3: OpenAI-style list of {token, logprob, bytes}
-            for item in entry:
-                if isinstance(item, dict):
-                    tok_str = item.get("token", "")
-                    lp = item.get("logprob", -100.0)
-                    token_id = token_to_id.get(tok_str)
-                    if token_id is None:
-                        try:
-                            encoded = tokenizer.encode(tok_str, add_special_tokens=False)
-                            token_id = encoded[0] if encoded else 0
-                        except Exception:
-                            token_id = 0
-                    items.append((token_id, lp))
-        elif isinstance(entry, dict):
-            for key, val in entry.items():
-                if isinstance(val, (int, float)):
-                    # Format 1: {token_str: logprob_float}
-                    token_id = token_to_id.get(key)
-                    if token_id is None:
-                        try:
-                            token_id = int(key)
-                        except (ValueError, TypeError):
-                            try:
-                                encoded = tokenizer.encode(key, add_special_tokens=False)
-                                token_id = encoded[0] if encoded else 0
-                            except Exception:
-                                token_id = 0
-                    items.append((token_id, float(val)))
-                elif isinstance(val, dict):
-                    # Format 2: {token_id_str: {logprob, rank, decoded_token}}
-                    lp = val.get("logprob", -100.0)
-                    try:
-                        token_id = int(key)
-                    except (ValueError, TypeError):
-                        token_id = token_to_id.get(key, 0)
-                    items.append((token_id, lp))
-
-        # Sort by logprob descending, take top-k
-        items.sort(key=lambda x: x[1], reverse=True)
-        for j, (tid, lp) in enumerate(items[:k]):
-            indices[0, pos, j] = tid
-            values[0, pos, j] = lp
-
-    return {"indices": indices, "values": values}
-
-
-def score_student_via_vllm(student_name, student_rev, full_sequences, prompt_lens,
-                            teacher_logits_list, tokenizer, token_to_id,
-                            gpu_memory_utilization=0.15, max_model_len=16384,
-                            batch_size=20, early_stop_fn=None, progress_cb=None,
-                            timeout=600):
-    """Score a student model using vLLM prompt_logprobs mode.
-
-    Starts a vLLM server for the student, sends full sequences as token IDs
-    with max_tokens=0 and prompt_logprobs=128 to get the student's log-probability
-    distribution at each position. Computes KL divergence against teacher's
-    sparse logprobs.
-
-    Args:
-        student_name: HF model name for the student.
-        student_rev: HF revision (commit hash).
-        full_sequences: list of [1, seq_len] tensors (full prompt+completion).
-        prompt_lens: list of int prompt lengths.
-        teacher_logits_list: list of sparse dicts with 'indices' and 'values'.
-        tokenizer: tokenizer (for fallback token mapping).
-        token_to_id: pre-built {token_str: token_id} mapping.
-        gpu_memory_utilization: vLLM GPU memory fraction (default 0.15 for small students).
-        max_model_len: max sequence length for vLLM.
-        batch_size: number of prompts per vLLM request.
-        early_stop_fn: callable(kl_means_so_far) -> bool.
-        progress_cb: callable(prompts_done, total, running_kl_mean).
-        timeout: per-model timeout in seconds.
-
-    Returns:
-        dict with:
-          'status': 'scored' | 'early_stopped' | 'error'
-          'kl_per_prompt': list of dicts with 'mean' key
-          'load_time': vLLM startup time in seconds
-          'scoring_time': inference + KL computation time in seconds
-          'error': error message (if status == 'error')
-    """
-    import requests as req_lib
-
-    result = {
-        "status": "error",
-        "kl_per_prompt": [],
-        "load_time": 0.0,
-        "scoring_time": 0.0,
-        "error": None,
-    }
-
-    # Step 1: Start vLLM for student
-    t0_load = time.time()
-    vllm_ok = start_vllm_server(student_name, gpu_memory_utilization, max_model_len,
-                                 revision=student_rev)
-    result["load_time"] = time.time() - t0_load
-
-    if not vllm_ok:
-        result["error"] = "vLLM failed to start for student"
-        stop_vllm_server()
-        return result
-
-    t0_score = time.time()
-    model_start = time.time()
-    kl_per_prompt = []
-    kl_means = []
-    early_stopped = False
-
-    try:
-        # Step 2: Score in batches
-        n_prompts = len(full_sequences)
-        for batch_start in range(0, n_prompts, batch_size):
-            if time.time() - model_start > timeout:
-                print(f"  [vllm-scoring] Timeout after {timeout}s", flush=True)
-                early_stopped = True
-                break
-
-            batch_end = min(batch_start + batch_size, n_prompts)
-            batch_token_ids = []
-            for idx in range(batch_start, batch_end):
-                seq = full_sequences[idx]
-                token_ids = seq.squeeze(0).tolist()
-                batch_token_ids.append(token_ids)
-
-            # Send batch request to vLLM
-            payload = {
-                "model": "teacher",  # served-model-name from start_vllm_server
-                "prompt": batch_token_ids,
-                "max_tokens": 0,
-                "prompt_logprobs": 128,
-                "temperature": 1.0,
-            }
-
-            resp = None
-            for attempt in range(3):
-                try:
-                    resp = req_lib.post(
-                        f"{VLLM_URL}/v1/completions",
-                        json=payload,
-                        timeout=VLLM_REQUEST_TIMEOUT,
-                    )
-                    resp.raise_for_status()
-                    break
-                except Exception as e:
-                    if attempt < 2:
-                        print(
-                            f"  [vllm-scoring] Batch {batch_start}-{batch_end} attempt {attempt + 1} failed: "
-                            f"{type(e).__name__}: {e}",
-                            flush=True,
-                        )
-                        time.sleep(2)
-                    else:
-                        raise RuntimeError(f"vLLM request failed after 3 attempts: {e}")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-
-            if len(choices) != batch_end - batch_start:
-                raise RuntimeError(
-                    f"Expected {batch_end - batch_start} choices, got {len(choices)}")
-
-            # Step 3: Extract logprobs and compute KL per prompt in this batch
-            for bi, choice in enumerate(choices):
-                prompt_idx = batch_start + bi
-                prompt_len = prompt_lens[prompt_idx]
-                tl_entry = teacher_logits_list[prompt_idx]
-
-                if not _is_sparse_logits(tl_entry):
-                    raise RuntimeError("vLLM student scoring requires sparse teacher logits")
-
-                # Extract prompt_logprobs — try multiple response locations
-                raw_prompt_lp = choice.get("prompt_logprobs")
-                if raw_prompt_lp is None:
-                    lp_obj = choice.get("logprobs")
-                    if isinstance(lp_obj, dict):
-                        raw_prompt_lp = lp_obj.get("prompt_logprobs") or lp_obj.get("top_logprobs")
-                    elif isinstance(lp_obj, list):
-                        raw_prompt_lp = lp_obj
-
-                if not raw_prompt_lp:
-                    raise RuntimeError(f"No prompt_logprobs in response for prompt {prompt_idx}")
-
-                # Parse into sparse format (full sequence)
-                student_sparse = _parse_vllm_prompt_logprobs(
-                    raw_prompt_lp, token_to_id, tokenizer, k=128)
-
-                # Align continuation positions:
-                # Teacher cont_logits[j] = logits at position prompt_len-1+j, predicting token prompt_len+j
-                # Student prompt_logprobs[prompt_len+j] predicts token prompt_len+j
-                # So student positions [prompt_len .. end) align with teacher positions [0 .. cont_len)
-                t_indices = tl_entry["indices"]  # [1, cont_len, k]
-                t_values = tl_entry["values"]    # [1, cont_len, k]
-                cont_len = t_indices.shape[1]
-
-                s_start = prompt_len
-                s_end = min(prompt_len + cont_len, student_sparse["indices"].shape[1])
-                actual_cont_len = s_end - s_start
-
-                if actual_cont_len == 0:
-                    kl_per_prompt.append({"mean": 0.0})
-                    kl_means.append(0.0)
-                    continue
-
-                s_cont_indices = student_sparse["indices"][:, s_start:s_end, :]
-                s_cont_values = student_sparse["values"][:, s_start:s_end, :]
-                t_cont_indices = t_indices[:, :actual_cont_len, :]
-                t_cont_values = t_values[:, :actual_cont_len, :]
-
-                # Detect if teacher values are logprobs (from vLLM) or raw logits (from HF top-k)
-                max_val = t_cont_values.max().item()
-                are_logprobs = (max_val <= 0.0)
-
-                kl_per_pos = compute_kl_sparse_vs_sparse(
-                    t_cont_indices, t_cont_values,
-                    s_cont_indices, s_cont_values,
-                    teacher_values_are_logprobs=are_logprobs,
-                ).squeeze(0)
-
-                kl_mean = kl_per_pos.mean().item()
-
-                if math.isnan(kl_mean) or math.isinf(kl_mean):
-                    raise RuntimeError(f"NaN/Inf KL at prompt {prompt_idx}")
-
-                kl_per_prompt.append({"mean": round(kl_mean, 6)})
-                kl_means.append(kl_mean)
-
-                del student_sparse, s_cont_indices, s_cont_values, kl_per_pos
-
-            # Progress reporting
-            n_done = len(kl_per_prompt)
-            running_mean = sum(kl_means) / len(kl_means) if kl_means else 0
-            if progress_cb:
-                progress_cb(n_done, n_prompts, running_mean)
-            print(f"  [vllm-scoring] [{n_done}/{n_prompts}] avg KL={running_mean:.6f}", flush=True)
-
-            # Early stopping check between batches
-            if early_stop_fn and early_stop_fn(kl_means):
-                print(f"  [vllm-scoring] Early stop at {n_done} prompts", flush=True)
-                early_stopped = True
-                break
-
-    except Exception as e:
-        result["error"] = str(e)[:500]
-        print(f"  [vllm-scoring] Error: {e}", flush=True)
-    finally:
-        stop_vllm_server()
-
-    result["scoring_time"] = time.time() - t0_score
-
-    if kl_per_prompt:
-        result["kl_per_prompt"] = kl_per_prompt
-        result["status"] = "early_stopped" if early_stopped else "scored"
-    elif not result["error"]:
-        result["error"] = "No prompts scored"
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# §9  HF Batched Forward Pass
+# §8  HF Batched Forward Pass
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def hf_batched_forward(teacher, sequences_data, device, batch_size=2, logprobs_k=128,
@@ -1405,9 +1040,7 @@ def main():
     parser.add_argument("--revisions", default=None, help="Comma-separated revisions matching --students order")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt texts")
     parser.add_argument("--output", default="/home/eval_results.json")
-    parser.add_argument("--max-prompt-len", type=int, default=1024)
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--max-params-b", type=float, default=36.0)
     parser.add_argument("--block-seed", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--teacher-logits", default="/home/teacher_cache.pt")
@@ -1420,19 +1053,35 @@ def main():
     parser.add_argument("--logprobs-k", type=int, default=128,
                         help="Top-k logprobs to store (128=sparse, 0=full vocab). Default 128.")
     parser.add_argument("--hf-batch-size", type=int, default=2,
-                        help="Batch size for HF forward pass (default 2). Helps on H200 with 140GB VRAM.")
-    parser.add_argument("--vllm-student-scoring", action="store_true", default=False,
-                        help="Use vLLM prompt_logprobs for student scoring instead of HF forward pass (experimental)")
+                        help="Batch size for HF forward pass (default 2).")
     parser.add_argument("--concurrency", type=int, default=4,
-                        help="Number of parallel requests to vLLM for teacher generation (default 4). "
-                             "vLLM batches internally — higher values speed up generation but use more KV cache VRAM.")
-    # Backward-compatible args (ignored)
-    parser.add_argument("--max-logit-len", type=int, default=None,
-                        help="DEPRECATED: ignored. Chunked forward pass replaces truncation.")
-    parser.add_argument("--gpu", type=int, default=None, help="Ignored — kept for backward compat")
-    parser.add_argument("--sequential", action="store_true", help="Ignored — kept for backward compat")
-    parser.add_argument("--persistent-vllm", action="store_true", help="Ignored — kept for backward compat")
+                        help="Parallel teacher-gen requests to vLLM. Auto-bumps to 16 when --tensor-parallel-size > 1 unless overridden.")
+    parser.add_argument("--tensor-parallel-size", type=int, default=0,
+                        help="vLLM tensor parallel size for teacher. 0 = auto (use all visible GPUs). 1 = single GPU.")
+    parser.add_argument("--early-stop-min", type=int, default=0,
+                        help="Enable same-point CI early stopping after N prompts (0 = disabled).")
+    # Accepted for backward compat with older in-memory validators. Ignored.
+    parser.add_argument("--max-prompt-len", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--max-params-b", type=float, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Auto-detect tensor-parallel size when unset (0 = all visible GPUs).
+    # Allow override via DISTIL_TP_SIZE env var even when caller forgot the flag.
+    env_tp = os.environ.get("DISTIL_TP_SIZE")
+    if args.tensor_parallel_size == 0 and env_tp:
+        try:
+            args.tensor_parallel_size = max(1, int(env_tp))
+        except ValueError:
+            args.tensor_parallel_size = 0
+    if args.tensor_parallel_size == 0:
+        try:
+            args.tensor_parallel_size = max(1, torch.cuda.device_count())
+        except Exception:
+            args.tensor_parallel_size = 1
+    # Higher concurrency pays off only when the teacher is sharded.
+    user_set_concurrency = any(a.startswith("--concurrency") for a in sys.argv[1:])
+    if args.tensor_parallel_size > 1 and not user_set_concurrency:
+        args.concurrency = 16
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     students = [s.strip() for s in args.students.split(",") if s.strip()]
@@ -1520,7 +1169,10 @@ def main():
 
         _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts))
         t0 = time.time()
-        vllm_ok = start_vllm_server(args.teacher, args.vllm_gpu_util, args.vllm_max_model_len)
+        vllm_ok = start_vllm_server(
+            args.teacher, args.vllm_gpu_util, args.vllm_max_model_len,
+            tensor_parallel_size=args.tensor_parallel_size,
+        )
         timings["vllm_startup"] = time.time() - t0
 
         # Build token-to-id mapping for vLLM logprobs decoding
@@ -1797,12 +1449,6 @@ def main():
     print(f"PHASE 2: Student scoring ({len(students)} models)", flush=True)
     print(f"{'='*60}", flush=True)
 
-    # Build token_to_id map for vLLM student scoring (if enabled)
-    vllm_token_to_id = None
-    if args.vllm_student_scoring:
-        vllm_token_to_id = _build_token_to_id_map(tokenizer)
-        print(f"[eval] vLLM student scoring: ENABLED (token map: {len(vllm_token_to_id)} entries)", flush=True)
-
     # Resume support
     prior_results = {}
     if args.resume and os.path.exists(args.output):
@@ -1820,8 +1466,8 @@ def main():
     results = {
         "teacher": args.teacher,
         "max_new_tokens": args.max_new_tokens,
-        "max_prompt_len": args.max_prompt_len,
         "block_seed": args.block_seed,
+        "tensor_parallel_size": args.tensor_parallel_size,
         "n_prompts": len(prompts),
         "n_prompts_filtered": n_filtered,
         "min_completion_tokens": MIN_COMPLETION_TOKENS,
@@ -1848,12 +1494,10 @@ def main():
             pass
     _write_progress()
 
-    # Early stopping state
+    # Early stopping state. args.early_stop_min <= 0 disables it outright.
     best_kl_so_far = None
     best_kl_per_prompt_cumulative = None
-    # Early stopping disabled — all models run full prompt set.
-    # Was MIN_PROMPTS_EARLY_STOP = 7; set above max prompts to disable.
-    MIN_PROMPTS_EARLY_STOP = 999999
+    MIN_PROMPTS_EARLY_STOP = args.early_stop_min if args.early_stop_min > 0 else len(prompts) + 1
     PER_MODEL_TIMEOUT = 600
 
     # King stays in VRAM
@@ -1906,116 +1550,7 @@ def main():
 
         is_king = (student_name == king_name)
 
-        # ── vLLM student scoring path (if enabled, skip for king) ──
-        if args.vllm_student_scoring and not is_king:
-            can_early_stop_v = (student_idx > 0) and (best_kl_so_far is not None)
-
-            def _vllm_early_stop_check(means_so_far):
-                """Early stopping check for vLLM batch scoring."""
-                n = len(means_so_far)
-                if not can_early_stop_v or n < MIN_PROMPTS_EARLY_STOP:
-                    return False
-                running_mean = sum(means_so_far) / n
-                running_var = sum((x - running_mean) ** 2 for x in means_so_far) / (n - 1)
-                running_se = math.sqrt(running_var / n)
-                student_lower = running_mean - 1.96 * running_se
-                if best_kl_per_prompt_cumulative and n <= len(best_kl_per_prompt_cumulative):
-                    best_at_n = best_kl_per_prompt_cumulative[n - 1]
-                else:
-                    best_at_n = best_kl_so_far
-                if best_at_n and best_at_n <= 0.001:
-                    best_at_n = best_kl_so_far if best_kl_so_far and best_kl_so_far > 0.001 else float('inf')
-                return student_lower > best_at_n
-
-            def _vllm_progress(done, total, running_mean):
-                live_progress["phase"] = "scoring"
-                live_progress["current"] = {
-                    "student_name": student_name, "student_idx": student_idx,
-                    "prompts_done": done, "prompts_total": total,
-                    "kl_running_mean": round(running_mean, 6) if running_mean else None,
-                    "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
-                    "method": "vllm",
-                }
-                _write_progress()
-
-            vllm_result = score_student_via_vllm(
-                student_name=student_name,
-                student_rev=student_rev,
-                full_sequences=full_sequences,
-                prompt_lens=prompt_lens,
-                teacher_logits_list=teacher_logits_list,
-                tokenizer=tokenizer,
-                token_to_id=vllm_token_to_id,
-                gpu_memory_utilization=0.15,
-                max_model_len=args.vllm_max_model_len,
-                batch_size=20,
-                early_stop_fn=_vllm_early_stop_check,
-                progress_cb=_vllm_progress,
-                timeout=PER_MODEL_TIMEOUT,
-            )
-
-            if vllm_result["status"] in ("scored", "early_stopped"):
-                # Success — record results and continue to next student
-                kl_per_prompt_v = vllm_result["kl_per_prompt"]
-                kl_means_v = [d["mean"] for d in kl_per_prompt_v]
-                kl_avg_v = sum(kl_means_v) / len(kl_means_v)
-                n_scored_v = len(kl_per_prompt_v)
-                status_v = vllm_result["status"]
-                early_stopped_v = (status_v == "early_stopped")
-
-                print(f"  \u2192 KL={kl_avg_v:.6f} ({n_scored_v}/{len(prompts)} prompts, {status_v}, vLLM)", flush=True)
-
-                student_result = {
-                    "status": status_v,
-                    "kl_global_avg": round(kl_avg_v, 6),
-                    "kl_per_prompt": [d["mean"] for d in kl_per_prompt_v],
-                    "prompts_scored": n_scored_v,
-                    "scoring_time": round(vllm_result.get("scoring_time", 0), 1),
-                    "load_time": round(vllm_result.get("load_time", 0), 1),
-                    "early_stopped": early_stopped_v,
-                    "scoring_method": "vllm",
-                }
-                results["students"][student_name] = student_result
-
-                # Update best KL tracking
-                if kl_avg_v > 0.001 and not early_stopped_v:
-                    if best_kl_so_far is None or kl_avg_v < best_kl_so_far:
-                        best_kl_so_far = kl_avg_v
-                        best_kl_per_prompt_cumulative = []
-                        s = 0.0
-                        for j, d in enumerate(kl_per_prompt_v):
-                            s += d["mean"]
-                            best_kl_per_prompt_cumulative.append(s / (j + 1))
-                        print(f"  \u2192 New best: KL={kl_avg_v:.6f}", flush=True)
-
-                # Save incremental results
-                results["timings"] = {k: round(v, 1) for k, v in timings.items()}
-                with open(args.output, "w") as f:
-                    json.dump(results, f, indent=2)
-
-                live_progress["completed"].append({
-                    "student_name": student_name,
-                    "status": status_v,
-                    "kl": round(kl_avg_v, 6),
-                    "prompts_scored": n_scored_v,
-                })
-                live_progress["current"] = None
-                _write_progress()
-
-                # Cleanup
-                clean_model_cache(student_name, args.teacher)
-                if prefetch_future:
-                    try:
-                        prefetch_future.result(timeout=1)
-                    except Exception:
-                        pass
-                    prefetch_future = None
-
-                continue  # Skip HF path for this student
-            else:
-                print(f"  [vllm-scoring] Failed: {vllm_result.get('error', '?')} \u2014 falling back to HF", flush=True)
-
-        # ── HF scoring path (original) ──
+        # ── HF scoring path ──
         student = None
         load_time = 0.0
 
@@ -2310,8 +1845,44 @@ def main():
         print(f"  {k}: {v:.1f}s", flush=True)
     print(f"{'='*60}", flush=True)
 
+    Path(args.output).with_name("eval_done.marker").write_text(
+        f"done {len(results['students'])} students\n")
+
     prefetch_executor.shutdown(wait=False)
 
 
+def _write_abort_marker(out_path, reason):
+    try:
+        Path(out_path).with_name("eval_done.marker").write_text(f"aborted {reason}\n")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    _out_guess = None
+    for i, a in enumerate(sys.argv):
+        if a == "--output" and i + 1 < len(sys.argv):
+            _out_guess = sys.argv[i + 1]
+            break
+
+    def _sig(signum, _frame):
+        reason = f"signal_{signum}"
+        if _out_guess:
+            _write_abort_marker(_out_guess, reason)
+        stop_vllm_server()
+        sys.exit(128 + (signum or 0))
+
+    for _s in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_s, _sig)
+        except Exception:
+            pass
+
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as _exc:
+        if _out_guess:
+            _write_abort_marker(_out_guess, f"exception:{type(_exc).__name__}")
+        raise

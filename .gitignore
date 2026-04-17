@@ -28,6 +28,10 @@ state/api_cache/
 state/prompt_cache/
 knowledge/
 results/
+
+# Next.js incremental build artifacts
+frontend/tsconfig.tsbuildinfo
+frontend/.next/
 state/
 frontend/.next/
 .openclaw/

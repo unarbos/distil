@@ -159,6 +159,35 @@ python miner.py --wallet-name mywallet --hotkey-name myhotkey \\
             </div>
           </div>
         </section>
+
+        <section className="space-y-2">
+          <h2 className="text-base font-semibold text-foreground">Roadmap</h2>
+          <p className="text-xs text-muted-foreground/70">
+            Next teacher candidates under discussion (subject to governance + community feedback).
+            No change is scheduled until announced.
+          </p>
+          <ul className="list-disc pl-5 space-y-1 text-xs">
+            <li>
+              <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline font-mono">
+                Qwen/Qwen3-Next-80B-A3B-Instruct
+              </a>{" "}
+              — current teacher.
+            </li>
+            <li>
+              Future MoE candidates with comparable active-param budgets.
+            </li>
+            <li>
+              Next-gen dense 7B-12B teachers if a strong open release appears.
+            </li>
+          </ul>
+          <p className="text-[11px] italic text-muted-foreground/50">
+            Want to propose a teacher? Open an issue on{" "}
+            <a href="https://github.com/unarbos/distil/issues" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">
+              GitHub
+            </a>
+            .
+          </p>
+        </section>
       </div>
     </div>
   );

@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import type { MinerEntry, ModelInfo, ScoresResponse } from "@/lib/api";
-import { formatParams } from "@/lib/utils";
+import { blocksAgo, formatParams } from "@/lib/utils";
 import { TEACHER } from "@/lib/subnet";
 import { Badge } from "@/components/ui/badge";
 import { CopyableHotkey } from "@/components/copyable-hotkey";
@@ -18,14 +18,6 @@ interface MinersTabProps {
 }
 
 type FilterMode = "all" | "scored" | "queued" | "dq";
-
-function timeAgo(block: number, currentBlock: number): string {
-  const blockDiff = currentBlock - block;
-  const hoursAgo = (blockDiff * 12) / 3600;
-  if (hoursAgo < 1) return `${Math.round(hoursAgo * 60)}m ago`;
-  if (hoursAgo < 24) return `${Math.round(hoursAgo)}h ago`;
-  return `${Math.round(hoursAgo / 24)}d ago`;
-}
 
 function formatDqReason(reason: string | null): string {
   if (!reason) return "DQ";
@@ -267,12 +259,26 @@ export function MinersTab({
                       {tokensPerSec != null && (
                         <span className="text-emerald-400/60">⚡{Math.round(tokensPerSec)}</span>
                       )}
-                      <span>{timeAgo(miner.commitBlock, currentBlock)}</span>
+                      <span>{blocksAgo(miner.commitBlock, currentBlock)}</span>
                       <span className="text-muted-foreground/30">#{miner.commitBlock.toLocaleString()}</span>
                     </div>
                     {miner.isDisqualified && miner.dqReason && (
                       <div className="text-[9px] text-red-400/50 mt-0.5 truncate max-w-md" title={miner.dqReason}>
                         {formatDqReason(miner.dqReason)}
+                        {miner.dqReason.startsWith("copy:") && (() => {
+                          const m = miner.dqReason.match(/UID\s+(\d+)/i);
+                          if (!m) return null;
+                          const parentUid = m[1];
+                          return (
+                            <span
+                              role="link"
+                              className="ml-1 underline text-red-400/80 hover:text-red-300 cursor-pointer"
+                              onClick={(e) => { e.preventDefault(); e.stopPropagation(); window.location.href = `/miner/${parentUid}`; }}
+                            >
+                              → UID {parentUid}
+                            </span>
+                          );
+                        })()}
                       </div>
                     )}
                   </div>

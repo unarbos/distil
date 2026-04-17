@@ -111,21 +111,20 @@ def get_validator_weight_target(subtensor, netuid: int, validator_uid: int) -> i
     return _retry_chain(_fetch, label="fetch_validator_weights")
 
 
+class SetWeightsError(RuntimeError):
+    """Raised when set_weights exhausts all retries."""
+
+
 def set_weights(subtensor, wallet, netuid: int, n_uids: int,
                 weights: list[float], winner_uid: int, max_attempts: int = 3):
     """Set weights on-chain with retry.
 
-    Args:
-        subtensor: Bittensor subtensor instance
-        wallet: Bittensor wallet for signing
-        netuid: subnet ID
-        n_uids: number of UIDs
-        weights: weight array (1.0 for winner, 0.0 for all others)
-        winner_uid: the UID receiving weight 1.0
-        max_attempts: number of retry attempts
+    Raises SetWeightsError if every attempt fails so callers can decide
+    whether to sleep + retry instead of silently leaving weights stale.
     """
     logger.info(f"Setting weights: UID {winner_uid} = 1.0")
     uids = list(range(n_uids))
+    last_err: str | None = None
 
     for attempt in range(max_attempts):
         try:
@@ -139,10 +138,14 @@ def set_weights(subtensor, wallet, netuid: int, n_uids: int,
             if ok:
                 logger.info("✓ Weights set on-chain!")
                 return
-            err_msg = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else str(result)
-            logger.warning(f"Attempt {attempt + 1}: rejected — {err_msg}")
+            last_err = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else str(result)
+            logger.warning(f"Attempt {attempt + 1}: rejected — {last_err}")
         except Exception as e:
+            last_err = str(e)
             logger.error(f"Attempt {attempt + 1}: {e}")
-        time.sleep(30)
+        if attempt < max_attempts - 1:
+            time.sleep(30)
 
-    logger.error(f"Failed to set weights after {max_attempts} attempts")
+    raise SetWeightsError(
+        f"Failed to set weights (UID {winner_uid}) after {max_attempts} attempts: {last_err or 'unknown'}"
+    )

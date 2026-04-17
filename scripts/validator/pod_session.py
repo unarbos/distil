@@ -7,12 +7,17 @@ import time
 
 from eval.pod import PodManager, sanitize_gpu_log
 from eval.state import ValidatorState, log_event
-from scripts.validator.config import MAX_NEW_TOKENS, MAX_PROMPT_TOKENS, TEACHER_MODEL, VLLM_CONCURRENCY
+from scripts.validator.config import MAX_NEW_TOKENS, TEACHER_MODEL, VLLM_CONCURRENCY
+
+# Opt-in teacher tensor-parallel size. 0 = let pod autodetect from torch.cuda.device_count().
+TP_SIZE = int(os.environ.get("DISTIL_TP_SIZE", "0") or "0")
+# Same-point early-stop floor; 0 disables (matches legacy behaviour).
+EARLY_STOP_MIN = int(os.environ.get("DISTIL_EARLY_STOP_MIN", "0") or "0")
 
 logger = logging.getLogger("distillation.remote_validator")
 
 
-def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, max_params_b: float, is_full_eval: bool, use_vllm: bool, eval_script: str, eval_script_remote: str, block_seed: int | None = None):
+def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None):
     import shutil
     import threading
 
@@ -71,14 +76,20 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         pod.exec(
             "pkill -9 -f pod_eval 2>/dev/null; "
             "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
+            "pkill -9 -f 'VllmWorker' 2>/dev/null; "
             "sleep 2; "
-            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | xargs -r kill -9 2>/dev/null; "
+            "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+            "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
+            "  case \"$cmd\" in "
+            "    *vllm.entrypoints*|*VllmWorker*|*pod_eval*) kill -9 $pid 2>/dev/null ;; "
+            "  esac; "
+            "done; "
             "rm -rf /dev/shm/vllm* 2>/dev/null; "
             "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
             "sleep 3",
             timeout=30,
         )
-        logger.info("Killed all existing eval/vllm processes and removed stale /home files")
+        logger.info("Killed existing eval/vllm processes and removed stale /home files")
     except Exception as exc:
         logger.debug(f"Pre-eval cleanup: {exc}")
     try:
@@ -113,6 +124,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         vllm_flag = " --vllm-gpu-util 0.90"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
+    tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""
+    early_stop_flag = f" --early-stop-min {EARLY_STOP_MIN}" if EARLY_STOP_MIN > 0 else ""
     inner_eval = (
         f"cd {shlex.quote(run_dir)} && python3 -u {shlex.quote(remote_eval_script)} "
         f"--teacher {TEACHER_MODEL} "
@@ -120,11 +133,11 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"--revisions {revision_list} "
         f"--prompts {shlex.quote(prompts_remote)} "
         f"--output {shlex.quote(results_remote)} "
-        f"--max-prompt-len {MAX_PROMPT_TOKENS} "
         f"--max-new-tokens {MAX_NEW_TOKENS} "
-        f"--max-params-b {max_params_b} "
         f"--concurrency {VLLM_CONCURRENCY} "
         f"--teacher-logits {shlex.quote(teacher_cache_remote)}"
+        f"{tp_flag}"
+        f"{early_stop_flag}"
         f"{king_flag}"
         f"{vllm_flag}"
         f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"

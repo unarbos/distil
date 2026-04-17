@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRefreshKey } from "@/components/auto-refresh";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import { formatFixed, formatPromptCount, timeAgo } from "@/lib/utils";
 
 interface KingChange {
   block: number;
@@ -21,18 +22,6 @@ interface KingChange {
   _exploit?: boolean;
 }
 
-function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
-}
-
-function formatPromptCount(scored: number | null | undefined, total: number | null | undefined): string | null {
-  if (typeof scored !== "number" || !Number.isFinite(scored)) return null;
-  if (typeof total === "number" && Number.isFinite(total) && total > 0) {
-    return `${scored}/${total}p`;
-  }
-  return `${scored}p`;
-}
-
 function formatTimestamp(ts: number): string {
   const d = new Date(ts * 1000);
   return d.toLocaleString("en-US", {
@@ -45,17 +34,10 @@ function formatTimestamp(ts: number): string {
   }) + " UTC";
 }
 
-function timeAgo(ts: number): string {
-  const diff = (Date.now() / 1000) - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-  return `${Math.round(diff / 86400)}d ago`;
-}
-
 export function KingHistory() {
   const [changes, setChanges] = useState<KingChange[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
   const refreshKey = useRefreshKey();
 
   useEffect(() => {
@@ -68,9 +50,9 @@ export function KingHistory() {
           const data = await res.json();
           if (!cancelled) {
             setChanges(Array.isArray(data) ? data : data.changes ?? []);
+            setError(false);
           }
         } else {
-          // Endpoint doesn't exist yet — try to extract from h2h-history
           if (!cancelled) await fallbackFromH2h();
         }
       } catch {
@@ -83,7 +65,10 @@ export function KingHistory() {
     async function fallbackFromH2h() {
       try {
         const res = await fetch(`${CLIENT_API_BASE}/api/h2h-history`, { cache: "no-store" });
-        if (!res.ok) return;
+        if (!res.ok) {
+          if (!cancelled) setError(true);
+          return;
+        }
         const raw = await res.json();
         const rounds = Array.isArray(raw) ? raw : Array.isArray(raw?.rounds) ? raw.rounds : [];
         // Extract king changes from h2h rounds
@@ -115,8 +100,9 @@ export function KingHistory() {
           }
         }
         setChanges(kingChanges);
+        setError(false);
       } catch {
-        // silently fail
+        if (!cancelled) setError(true);
       }
     }
 
@@ -136,6 +122,19 @@ export function KingHistory() {
             ))}
           </div>
         </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-xl border border-border/20 bg-card/10 p-6 text-center">
+        <p className="text-sm text-muted-foreground/60 font-mono">
+          Failed to load king history.
+        </p>
+        <p className="text-xs text-muted-foreground/40 font-mono mt-2">
+          Retrying on next refresh…
+        </p>
       </div>
     );
   }

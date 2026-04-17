@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
+import shutil
 import socket
 import subprocess
 import time
@@ -18,6 +21,17 @@ REPO_ROOT = Path(os.environ.get("DISTIL_REPO_ROOT", "/opt/distil/repo"))
 STATE_DIR = Path(os.environ.get("DISTIL_STATE_DIR", str(REPO_ROOT / "state")))
 OPEN_WEBUI_CONTAINER = os.environ.get("DISTIL_CHAT_CONTAINER", "open-webui")
 MAX_EVAL_STALENESS_SEC = int(os.environ.get("DISTIL_MAX_EVAL_STALENESS_SEC", str(3 * 60 * 60)))
+GPU_LOG_STALE_SEC = int(os.environ.get("DISTIL_GPU_LOG_STALE_SEC", str(15 * 60)))
+DISK_WARN_PCT = int(os.environ.get("DISTIL_DISK_WARN_PCT", "80"))
+DISK_FAIL_PCT = int(os.environ.get("DISTIL_DISK_FAIL_PCT", "90"))
+INCIDENT_LOG = Path(os.environ.get("DISTIL_INCIDENT_LOG", str(STATE_DIR / "incidents.jsonl")))
+RESTART_BUDGET_PATH = STATE_DIR / "restart_budget.json"
+RESTART_BUDGET_MAX = int(os.environ.get("DISTIL_RESTART_BUDGET_MAX", "2"))
+RESTART_BUDGET_WINDOW_SEC = int(os.environ.get("DISTIL_RESTART_BUDGET_WINDOW_SEC", "3600"))
+JOURNAL_FAIL_THRESHOLD = int(os.environ.get("DISTIL_JOURNAL_FAIL_THRESHOLD", "5"))
+CHAT_POD_HOST = os.environ.get("DISTIL_CHAT_POD_HOST", "")
+CHAT_POD_SSH_PORT = os.environ.get("DISTIL_CHAT_POD_SSH_PORT", "22")
+CHAT_POD_APP_PORT = os.environ.get("DISTIL_CHAT_POD_APP_PORT", "8000")
 
 SERVICE_UNITS = {
     "validator": "distil-validator",
@@ -144,6 +158,172 @@ def inspect_open_webui() -> dict[str, Any]:
     }
 
 
+def disk_usage(paths: list[Path]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for p in paths:
+        try:
+            st = shutil.disk_usage(p)
+            pct = int(round((st.used / st.total) * 100)) if st.total else 0
+            out[str(p)] = {"used_pct": pct, "total_gb": round(st.total / 1e9, 1), "free_gb": round(st.free / 1e9, 1)}
+        except Exception as exc:
+            out[str(p)] = {"error": str(exc)}
+    return out
+
+
+def inode_usage(paths: list[Path]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for p in paths:
+        result = run(["df", "-i", str(p)], timeout=10)
+        if result.returncode != 0:
+            out[str(p)] = {"error": result.stderr.strip() or result.stdout.strip()}
+            continue
+        lines = [l for l in result.stdout.splitlines() if l.strip()]
+        if len(lines) < 2:
+            out[str(p)] = {"error": "no_data"}
+            continue
+        parts = lines[-1].split()
+        pct = 0
+        for tok in parts:
+            if tok.endswith("%"):
+                try:
+                    pct = int(tok.rstrip("%"))
+                except ValueError:
+                    pass
+        out[str(p)] = {"used_pct": pct}
+    return out
+
+
+def gpu_log_probe() -> dict[str, Any]:
+    log = STATE_DIR / "gpu_eval.log"
+    if not log.exists():
+        return {"ok": True, "reason": "missing"}
+    try:
+        mtime = int(log.stat().st_mtime)
+        tail = subprocess.run(["tail", "-n", "200", str(log)], capture_output=True, text=True, timeout=5).stdout
+    except Exception as exc:
+        return {"ok": False, "reason": f"read_error:{exc}"}
+    hits = [m.group(0) for m in re.finditer(r"(?i)\b(OOM|Died|CUDA error|segmentation fault|out of memory)\b", tail)]
+    return {
+        "ok": not hits,
+        "mtime": mtime,
+        "age_sec": int(time.time()) - mtime,
+        "hits": hits[:5],
+    }
+
+
+def chat_pod_probe(expected_model: str | None) -> dict[str, Any]:
+    if not CHAT_POD_HOST:
+        return {"ok": True, "skipped": True, "reason": "no_host"}
+    ssh = [
+        "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+        "-o", "BatchMode=yes", "-p", CHAT_POD_SSH_PORT, f"root@{CHAT_POD_HOST}",
+    ]
+    nvsmi = run(ssh + ["nvidia-smi", "--query-gpu=name,utilization.gpu", "--format=csv,noheader"], timeout=15)
+    models = run(ssh + [f"curl -fsS http://localhost:{CHAT_POD_APP_PORT}/v1/models"], timeout=15)
+    served = None
+    if models.returncode == 0:
+        data = maybe_json(models.stdout) or {}
+        items = data.get("data") if isinstance(data, dict) else None
+        if isinstance(items, list) and items:
+            served = items[0].get("id") if isinstance(items[0], dict) else None
+    model_ok = expected_model is None or (served is not None and served == expected_model)
+    return {
+        "ok": nvsmi.returncode == 0 and models.returncode == 0 and model_ok,
+        "nvidia_smi": nvsmi.stdout.strip() if nvsmi.returncode == 0 else None,
+        "served_model": served,
+        "expected_model": expected_model,
+        "model_match": model_ok,
+    }
+
+
+def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
+    if expected_king_uid is None:
+        return {"ok": True, "skipped": True, "reason": "no_king"}
+    if not os.environ.get("VALIDATOR_UID"):
+        return {"ok": True, "skipped": True, "reason": "no_validator_uid"}
+    probe_script = (
+        "import os,sys,json;"
+        "sys.path.insert(0, '/opt/distil/repo');"
+        "import bittensor as bt;"
+        "from eval.chain import get_validator_weight_target;"
+        "net=os.environ.get('BT_NETWORK','finney');"
+        "netuid=int(os.environ.get('BT_NETUID','97'));"
+        "vuid=int(os.environ.get('VALIDATOR_UID','-1'));"
+        "st=bt.subtensor(network=net);"
+        "t=get_validator_weight_target(st, netuid, vuid) if vuid>=0 else None;"
+        "print(json.dumps({'target': t}))"
+    )
+    venv = "/opt/distil/venv/bin/python"
+    py = venv if Path(venv).exists() else "python3"
+    result = run([py, "-c", probe_script], timeout=40)
+    if result.returncode != 0:
+        return {"ok": False, "reason": (result.stderr.strip() or result.stdout.strip())[:400]}
+    data = maybe_json(result.stdout.strip().splitlines()[-1] if result.stdout else "")
+    target = (data or {}).get("target")
+    return {
+        "ok": target == expected_king_uid,
+        "chain_target_uid": target,
+        "expected_king_uid": expected_king_uid,
+    }
+
+
+def journal_failures(units: list[str], since: str = "1 hour ago") -> dict[str, int]:
+    out: dict[str, int] = {}
+    for unit in units:
+        result = run(
+            ["journalctl", "-u", unit, "--since", since, "--output=short", "--no-pager"],
+            timeout=15,
+        )
+        if result.returncode != 0:
+            out[unit] = -1
+            continue
+        out[unit] = sum(1 for line in result.stdout.splitlines() if "Failed" in line or "failed with result" in line)
+    return out
+
+
+def _load_json_safe(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def _save_json_safe(path: Path, data: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
+def restart_budget_check(unit: str) -> tuple[bool, int]:
+    now = int(time.time())
+    budget = _load_json_safe(RESTART_BUDGET_PATH, {}) or {}
+    hist = [t for t in budget.get(unit, []) if now - int(t) <= RESTART_BUDGET_WINDOW_SEC]
+    return (len(hist) < RESTART_BUDGET_MAX, len(hist))
+
+
+def restart_budget_record(unit: str) -> None:
+    now = int(time.time())
+    budget = _load_json_safe(RESTART_BUDGET_PATH, {}) or {}
+    hist = [t for t in budget.get(unit, []) if now - int(t) <= RESTART_BUDGET_WINDOW_SEC]
+    hist.append(now)
+    budget[unit] = hist
+    _save_json_safe(RESTART_BUDGET_PATH, budget)
+
+
+def append_incidents(events: list[dict[str, Any]]) -> None:
+    if not events:
+        return
+    try:
+        INCIDENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with INCIDENT_LOG.open("a") as f:
+            for event in events:
+                f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+
 def collect() -> dict[str, Any]:
     now = int(time.time())
     service_states = {name: systemd_state(unit) for name, unit in SERVICE_UNITS.items()}
@@ -221,6 +401,45 @@ def collect() -> dict[str, Any]:
         if age_sec > MAX_EVAL_STALENESS_SEC:
             issues.append(f"validator:stale_eval_progress:{age_sec}")
 
+    disk = disk_usage([REPO_ROOT, Path("/")])
+    for mount, info in disk.items():
+        pct = info.get("used_pct") if isinstance(info, dict) else None
+        if pct is None:
+            continue
+        if pct >= DISK_FAIL_PCT:
+            issues.append(f"disk:{mount}:{pct}")
+        elif pct >= DISK_WARN_PCT:
+            issues.append(f"disk_warn:{mount}:{pct}")
+    inodes = inode_usage([REPO_ROOT])
+    for mount, info in inodes.items():
+        pct = info.get("used_pct") if isinstance(info, dict) else None
+        if pct is not None and pct >= DISK_FAIL_PCT:
+            issues.append(f"inode:{mount}:{pct}")
+
+    gpu_probe = gpu_log_probe()
+    if not gpu_probe.get("ok") and gpu_probe.get("hits"):
+        issues.append(f"gpu:log_error:{len(gpu_probe['hits'])}")
+    if eval_progress.get("active") and isinstance(gpu_probe.get("age_sec"), int) and gpu_probe["age_sec"] > GPU_LOG_STALE_SEC:
+        issues.append(f"gpu:log_stale:{gpu_probe['age_sec']}")
+
+    king_model = (h2h_latest or {}).get("king_model") if isinstance(h2h_latest, dict) else None
+    king_uid = (h2h_latest or {}).get("king_uid") if isinstance(h2h_latest, dict) else None
+    chat_probe = chat_pod_probe(king_model)
+    if not chat_probe.get("ok") and not chat_probe.get("skipped"):
+        if chat_probe.get("model_match") is False:
+            issues.append(f"chat:model_mismatch:{chat_probe.get('served_model')}")
+        else:
+            issues.append("chat:pod_probe_failed")
+
+    weight_check = chain_weight_sanity(king_uid)
+    if not weight_check.get("ok") and not weight_check.get("skipped"):
+        issues.append(f"chain:weight_mismatch:{weight_check.get('chain_target_uid')}")
+
+    failures = journal_failures([u for u in SERVICE_UNITS.values() if not u.endswith(".timer")])
+    for unit, count in failures.items():
+        if count >= JOURNAL_FAIL_THRESHOLD:
+            issues.append(f"journal:{unit}:failures:{count}")
+
     payload = {
         "timestamp": now,
         "hostname": socket.gethostname(),
@@ -238,6 +457,12 @@ def collect() -> dict[str, Any]:
             "validator_log_mtime": validator_log_mtime,
         },
         "critical_files": critical_files,
+        "disk": disk,
+        "inodes": inodes,
+        "gpu_log": gpu_probe,
+        "chat_pod": chat_probe,
+        "chain_weight": weight_check,
+        "journal_failures": failures,
         "issues": issues,
     }
     payload["healthy"] = not issues
@@ -248,10 +473,19 @@ def repair(report: dict[str, Any]) -> list[str]:
     actions: list[str] = []
     services = report["services"]
     http_status = report["http"]
+    restarted: set[str] = set()
 
     def restart(unit: str, reason: str) -> None:
+        if unit in restarted:
+            return
+        allowed, used = restart_budget_check(unit)
+        if not allowed:
+            actions.append(f"budget_exceeded:{unit}:{reason}:{used}/{RESTART_BUDGET_MAX}")
+            return
         result = run(["systemctl", "restart", unit], timeout=30)
         if result.returncode == 0:
+            restart_budget_record(unit)
+            restarted.add(unit)
             actions.append(f"restarted:{unit}:{reason}")
         else:
             actions.append(f"failed_restart:{unit}:{reason}:{result.stderr.strip() or result.stdout.strip()}")
@@ -284,6 +518,22 @@ def repair(report: dict[str, Any]) -> list[str]:
 
     if any(issue.startswith("validator:stale_eval_progress:") for issue in report["issues"]):
         restart("distil-validator", "stale_eval_progress")
+
+    if any(issue.startswith("gpu:log_stale:") for issue in report["issues"]):
+        restart("distil-validator", "gpu_log_stale")
+
+    if any(issue.startswith("chat:model_mismatch:") for issue in report["issues"]):
+        actions.append("notify:chat:model_mismatch")
+
+    if any(issue.startswith("chain:weight_mismatch:") for issue in report["issues"]):
+        actions.append("notify:chain:weight_mismatch")
+
+    if any(issue.startswith("disk:") for issue in report["issues"]):
+        actions.append("notify:disk:full")
+
+    for issue in report["issues"]:
+        if issue.startswith("journal:"):
+            actions.append(f"notify:{issue}")
 
     return actions
 
@@ -336,6 +586,15 @@ def main() -> int:
     after["actions"] = actions
     after["issues_before_repair"] = before["issues"]
     after["healthy_after_repair"] = after["healthy"]
+
+    now = int(time.time())
+    events: list[dict[str, Any]] = []
+    for issue in before["issues"]:
+        resolved = issue not in after["issues"]
+        events.append({"ts": now, "type": "issue", "issue": issue, "resolved": resolved})
+    for action in actions:
+        events.append({"ts": now, "type": "action", "action": action})
+    append_incidents(events)
 
     if args.format == "markdown":
         print(render_markdown(after))

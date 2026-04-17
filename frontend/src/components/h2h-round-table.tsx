@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import type { H2hHistoryResponse, H2hLatestResponse } from "@/lib/api";
 import { useRefreshKey } from "@/components/auto-refresh";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import { formatFixed, formatPromptCount, timeAgo } from "@/lib/utils";
 
 function formatTimestamp(ts: number): string {
   const d = new Date(ts * 1000);
@@ -15,26 +16,6 @@ function formatTimestamp(ts: number): string {
     hour12: false,
     timeZone: "UTC",
   }) + " UTC";
-}
-
-function timeAgo(ts: number): string {
-  const diff = (Date.now() / 1000) - ts;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
-  return `${Math.round(diff / 86400)}d ago`;
-}
-
-function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
-}
-
-function formatPromptCount(scored: number | null | undefined, total: number | null | undefined): string | null {
-  if (typeof scored !== "number" || !Number.isFinite(scored)) return null;
-  if (typeof total === "number" && Number.isFinite(total) && total > 0) {
-    return `${scored}/${total}p`;
-  }
-  return `${scored}p`;
 }
 
 function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; defaultOpen: boolean; isLatest: boolean }) {
@@ -80,6 +61,14 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
           <span className="text-sm font-mono font-semibold text-foreground">
             Block #{round.block?.toLocaleString() ?? "—"}
           </span>
+          {typeof round.shard_idx === "number" && (
+            <span
+              className="text-[10px] font-mono text-muted-foreground/60 rounded border border-border/30 px-1.5 py-0.5"
+              title={`Climbmix shard ${round.shard_idx} of 6542 (picked from block hash)`}
+            >
+              shard {round.shard_idx}
+            </span>
+          )}
           <span className="text-[11px] font-mono text-muted-foreground/50">
             {formatTimestamp(round.timestamp)}
           </span>
@@ -167,9 +156,14 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
             const pctMatch = vsKing.match(/-(\d+\.\d+)%/);
             const pctText = pctMatch ? `-${pctMatch[1]}%` : null;
 
+            const tt = result.t_test;
+            const tooltip = tt
+              ? `n=${tt.n ?? "?"} paired prompts; KL Δ=${tt.mean_delta?.toFixed(6) ?? "?"}; t=${tt.t?.toFixed(3) ?? "?"}; p=${tt.p != null ? tt.p.toExponential(2) : "?"} (dethrone requires p<0.05 & ε>1%).`
+              : undefined;
             return (
               <div
                 key={result.model}
+                title={tooltip}
                 className={`grid grid-cols-1 sm:grid-cols-[2rem_1fr_7rem_10rem] gap-2 sm:gap-4 items-center px-5 py-2 ${
                   isKing
                     ? "bg-yellow-400/[0.04]"
@@ -321,7 +315,23 @@ export function H2hHistory() {
     );
   }
 
-  if (error || rounds.length === 0) return null;
+  if (error || rounds.length === 0) {
+    return (
+      <div className="space-y-3">
+        <h2 className="text-xl font-semibold tracking-tight bg-gradient-to-r from-blue-400 to-blue-600 bg-clip-text text-transparent">
+          ⚔️ Eval Rounds
+        </h2>
+        <div className="rounded-xl border border-border/20 bg-card/10 backdrop-blur-sm p-8 text-center">
+          <p className="text-sm text-muted-foreground/60 font-mono">
+            {error ? "Failed to load eval history." : "No eval rounds yet."}
+          </p>
+          <p className="text-xs text-muted-foreground/40 font-mono mt-2">
+            {error ? "Retrying every 30s…" : "Rounds will appear here after the next evaluation completes."}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">

@@ -22,6 +22,15 @@ from eval.runtime import (
 
 CHAT_POD_PORT = CHAT_POD_APP_PORT
 
+# ── Tunables (single source of truth, duplicated in several places before) ──
+STALE_EVAL_BLOCKS = 50
+EPOCH_BLOCKS = 360
+CHAT_RESTART_COOLDOWN = 120
+CHAT_SERVER_SCRIPT = "/root/chat_server.py"
+MAX_COMPARE_UIDS = 10
+MAX_BATCH_UIDS = 64
+ANNOUNCEMENT_CLAIMS_KEEP = 50
+
 API_DESCRIPTION = f"""
 # Distil - Subnet {NETUID} API
 

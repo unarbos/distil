@@ -1,22 +1,18 @@
-"""
-Lium pod connection, initialization, and lifecycle management.
-"""
+"""Lium pod connection, initialization, and lifecycle management."""
 import logging
-from pathlib import Path
 
 from eval.pod import PodManager
 
 logger = logging.getLogger("distillation.remote_validator")
 
 
-def init_pod(lium, pod_name: str, eval_script: str, eval_script_remote: str,
-             teacher_model: str) -> PodManager:
-    """Initialize and connect to the Lium GPU pod.
+def init_pod(lium, pod_name: str, teacher_model: str) -> PodManager:
+    """Connect to the Lium GPU pod, clear stale artifacts, ensure deps.
 
-    Connects, uploads eval script, and ensures dependencies are installed.
-    Returns the connected PodManager instance.
+    Each evaluation round uploads its own script into a unique run dir, so we
+    never persist an eval script on the pod here.
     """
-    print(f"[validator] Initializing Lium client...", flush=True)
+    print("[validator] Initializing Lium client...", flush=True)
     print(f"[validator] Connecting to pod '{pod_name}'...", flush=True)
     pod = PodManager(lium, pod_name=pod_name)
     pod.connect()
@@ -24,7 +20,10 @@ def init_pod(lium, pod_name: str, eval_script: str, eval_script_remote: str,
 
     print("[validator] Cleaning stale /home/pod_eval.py...", flush=True)
     try:
-        pod.exec("rm -f /home/pod_eval.py /home/eval_output.log /home/eval_progress.json /home/eval_results.json 2>/dev/null")
+        pod.exec(
+            "rm -f /home/pod_eval.py /home/pod_eval_vllm.py /home/eval_output.log "
+            "/home/eval_progress.json /home/eval_results.json 2>/dev/null"
+        )
     except Exception:
         pass
     print("[validator] Pod init complete (eval script uploaded per-round)", flush=True)

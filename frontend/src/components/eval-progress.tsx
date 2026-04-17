@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import { formatFixed } from "@/lib/utils";
 
 interface CompletedStudent {
   student_idx: number;
@@ -57,10 +58,6 @@ function formatEta(seconds: number): string {
   return `~${m}m ${s > 0 ? `${s}s` : ""}`;
 }
 
-function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
-}
-
 function statusColor(status: string): string {
   switch (status) {
     case "functional_copy": return "text-red-400";
@@ -103,9 +100,29 @@ export function EvalProgressBar() {
       } catch {}
     }
     poll();
-    const pollId = setInterval(poll, 5000);
+
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(`${CLIENT_API_BASE}/api/eval-stream`);
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          if (payload?.progress && !cancelled) setProgress(payload.progress);
+        } catch {}
+      };
+      es.onerror = () => { es?.close(); es = null; };
+    } catch {
+      es = null;
+    }
+
+    const pollId = setInterval(poll, es ? 30_000 : 5_000);
     const tickId = setInterval(() => setNow(Date.now() / 1000), 1000);
-    return () => { cancelled = true; clearInterval(pollId); clearInterval(tickId); };
+    return () => {
+      cancelled = true;
+      clearInterval(pollId);
+      clearInterval(tickId);
+      es?.close();
+    };
   }, []);
 
   // When idle — show idle state, not last round

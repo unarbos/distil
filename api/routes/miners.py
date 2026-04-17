@@ -1,16 +1,15 @@
 """Miner-related endpoints: scores, commitments, model info, miner details, compare."""
 
-import json
 import os
-import traceback
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from config import STATE_DIR
+from config import EPOCH_BLOCKS, MAX_BATCH_UIDS, MAX_COMPARE_UIDS, STALE_EVAL_BLOCKS, STATE_DIR
 from external import get_commitments as fetch_commitments_data, get_model_info as fetch_model_info_data
 from helpers.cache import _get_stale
-from helpers.sanitize import _sanitize_floats, _safe_json_load
+from helpers.h2h import compact_round, index_by_uid, load_history, rounds_for_uid, uid_stats
+from helpers.sanitize import _safe_json_load, _sanitize_floats
 from state_store import (
     disqualified,
     h2h_latest,
@@ -197,17 +196,16 @@ def get_miner(uid: int):
         eval_status["reason"] = "Waiting for first evaluation - new submissions get priority"
     elif tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
         last_block = tracker_entry["block"]
-        epochs_since = (current_block - last_block) // 360 if current_block > last_block else 0
-        stale_threshold = 50
-        if epochs_since < stale_threshold:
+        epochs_since = (current_block - last_block) // EPOCH_BLOCKS if current_block > last_block else 0
+        if epochs_since < STALE_EVAL_BLOCKS:
             eval_status["status"] = "tested"
-            eval_status["reason"] = f"Already tested against current king ({epochs_since} epochs ago, re-test after {stale_threshold})"
+            eval_status["reason"] = f"Already tested against current king ({epochs_since} epochs ago, re-test after {STALE_EVAL_BLOCKS})"
             eval_status["last_test_block"] = last_block
             eval_status["epochs_since"] = epochs_since
-            eval_status["stale_after"] = stale_threshold
+            eval_status["stale_after"] = STALE_EVAL_BLOCKS
         else:
             eval_status["status"] = "stale"
-            eval_status["reason"] = f"Due for re-test ({epochs_since} epochs since last H2H, threshold is {stale_threshold})"
+            eval_status["reason"] = f"Due for re-test ({epochs_since} epochs since last H2H, threshold is {STALE_EVAL_BLOCKS})"
             eval_status["last_test_block"] = last_block
             eval_status["epochs_since"] = epochs_since
     else:
@@ -215,23 +213,18 @@ def get_miner(uid: int):
         eval_status["reason"] = "Not yet tested against the current king - will be scheduled"
     result["eval_status"] = eval_status
 
-    # H2H history (last 10 rounds involving this UID)
-    h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
-    relevant = []
-    for rnd in reversed(h2h_history):
-        for r in rnd.get("results", []):
-            if r.get("uid") == uid:
-                relevant.append({
-                    "block": rnd.get("block"),
-                    "timestamp": rnd.get("timestamp"),
-                    "kl": r.get("kl"),
-                    "is_king": r.get("is_king", False),
-                    "king_changed": rnd.get("king_changed", False),
-                    "type": rnd.get("type"),
-                })
-                break
-        if len(relevant) >= 10:
-            break
+    h2h_index = index_by_uid(load_history())
+    relevant = [
+        {
+            "block": item["round"].get("block"),
+            "timestamp": item["round"].get("timestamp"),
+            "kl": item["row"].get("kl"),
+            "is_king": item["row"].get("is_king", False),
+            "king_changed": item["round"].get("king_changed", False),
+            "type": item["round"].get("type"),
+        }
+        for item in rounds_for_uid(h2h_index, uid, limit=10)
+    ]
     result["h2h_history"] = relevant
 
     return JSONResponse(
@@ -341,31 +334,8 @@ def get_miner_rounds(uid: int, limit: int = 50, page: int = 1):
     limit = max(1, min(limit, 200))
     page = max(1, page)
     try:
-        h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
-        if not isinstance(h2h_history, list):
-            h2h_history = []
-
-        # Filter rounds where this UID participated
-        relevant = []
-        for rnd in reversed(h2h_history):
-            for r in rnd.get("results", []):
-                if r.get("uid") == uid:
-                    relevant.append({
-                        "block": rnd.get("block"),
-                        "timestamp": rnd.get("timestamp"),
-                        "kl": r.get("kl"),
-                        "model": r.get("model"),
-                        "is_king": r.get("is_king", False),
-                        "vs_king": r.get("vs_king"),
-                        "king_changed": rnd.get("king_changed", False),
-                        "king_uid": rnd.get("king_uid"),
-                        "new_king_uid": rnd.get("new_king_uid"),
-                        "type": rnd.get("type"),
-                        "n_prompts": rnd.get("n_prompts"),
-                        "p_value": rnd.get("p_value"),
-                    })
-                    break
-
+        idx = index_by_uid(load_history())
+        relevant = [compact_round(it["round"], it["row"]) for it in idx.get(uid, [])]
         total = len(relevant)
         start = (page - 1) * limit
         end = start + limit
@@ -438,66 +408,111 @@ Returns for each UID:
 - Win/loss record vs king
 """)
 def compare_miners(uids: str):
-    uid_list = [int(u.strip()) for u in uids.split(",") if u.strip().isdigit()][:10]
+    uid_list = [int(u.strip()) for u in uids.split(",") if u.strip().isdigit()][:MAX_COMPARE_UIDS]
     if not uid_list:
         return JSONResponse(status_code=400, content={"error": "Provide ?uids=1,2,3"})
 
-    scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {})
-    uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
+    scores = load_scores()
+    uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
-    commitments = commitments_data.get("commitments", {})
-    h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
-    h2h_latest = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {})
-    dq = _safe_json_load(os.path.join(STATE_DIR, "disqualified.json"), {})
+    commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
+    latest = h2h_latest()
+    dq = disqualified()
+    idx = index_by_uid(load_history())
 
     result = []
     for uid in uid_list:
         entry = {"uid": uid, "kl_score": scores.get(str(uid))}
-
-        # Model name
         hotkey = uid_map.get(str(uid))
         if hotkey and hotkey in commitments:
             c = commitments[hotkey]
             entry["model"] = c.get("model") or c.get("repo")
         else:
             entry["model"] = None
-
-        # Is king?
-        entry["is_king"] = h2h_latest.get("king_uid") == uid
-
-        # DQ status
+        entry["is_king"] = latest.get("king_uid") == uid
         entry["disqualified"] = str(uid) in dq or (hotkey and hotkey in dq)
-
-        # H2H stats
-        rounds_participated = 0
-        best_kl = None
-        wins_vs_king = 0
-        losses_vs_king = 0
-        for rnd in h2h_history:
-            for r in rnd.get("results", []):
-                if r.get("uid") == uid:
-                    rounds_participated += 1
-                    kl = r.get("kl")
-                    if kl is not None and (best_kl is None or kl < best_kl):
-                        best_kl = kl
-                    if r.get("is_king"):
-                        if rnd.get("king_changed") and rnd.get("new_king_uid") != uid:
-                            losses_vs_king += 1
-                        else:
-                            wins_vs_king += 1
-                    else:
-                        if rnd.get("king_changed") and rnd.get("new_king_uid") == uid:
-                            wins_vs_king += 1
-                    break
-
-        entry["rounds_participated"] = rounds_participated
-        entry["best_kl"] = best_kl
-        entry["wins"] = wins_vs_king
-        entry["losses"] = losses_vs_king
+        entry.update(uid_stats(idx.get(uid, [])))
         result.append(entry)
 
     result.sort(key=lambda x: x.get("kl_score") or 999)
     return JSONResponse(
         content=_sanitize_floats({"miners": result}),
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+# ── New compact endpoints (Phase 3) ───────────────────────────────────────────
+
+@router.get("/api/miners/batch", tags=["Miners"], summary="Compact cards for a batch of UIDs",
+         description=f"""Returns compact cards (`uid`, `model`, `kl_score`, `is_king`, `disqualified`) for each requested UID.
+
+Example: `/api/miners/batch?uids=1,2,3`. Limit: {MAX_BATCH_UIDS} UIDs per call.
+""")
+def miners_batch(uids: str):
+    uid_list = [int(u.strip()) for u in uids.split(",") if u.strip().isdigit()][:MAX_BATCH_UIDS]
+    if not uid_list:
+        return JSONResponse(status_code=400, content={"error": "Provide ?uids=1,2,3"})
+
+    scores = load_scores()
+    uid_map = uid_hotkey_map()
+    commitments_data = _get_stale("commitments") or {}
+    commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
+    latest = h2h_latest()
+    dq = disqualified()
+
+    miners = []
+    for uid in uid_list:
+        hotkey = uid_map.get(str(uid))
+        model = None
+        if hotkey and hotkey in commitments:
+            c = commitments[hotkey]
+            model = c.get("model") or c.get("repo")
+        miners.append({
+            "uid": uid,
+            "hotkey": hotkey,
+            "model": model,
+            "kl_score": scores.get(str(uid)),
+            "is_king": latest.get("king_uid") == uid,
+            "disqualified": str(uid) in dq or (hotkey and hotkey in dq),
+        })
+    return JSONResponse(
+        content=_sanitize_floats({"miners": miners}),
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+@router.get("/api/cumulative-scores", tags=["Miners"], summary="Cumulative KL deltas per UID",
+         description="""Returns the running cumulative-KL-delta tracker used to rank long-running contenders.
+
+Response: `{miners: [{uid, cumulative_kl_diff, rounds, best_kl?}]}` sorted by largest delta first.
+""")
+def cumulative_scores():
+    raw = read_state("cumulative_scores.json", {})
+    uid_map = uid_hotkey_map()
+    commitments_data = _get_stale("commitments") or {}
+    commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
+    miners = []
+    for uid_str, info in (raw.items() if isinstance(raw, dict) else []):
+        if not isinstance(info, dict):
+            continue
+        try:
+            uid_int = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        hotkey = uid_map.get(uid_str)
+        model = None
+        if hotkey and hotkey in commitments:
+            c = commitments[hotkey]
+            model = c.get("model") or c.get("repo")
+        miners.append({
+            "uid": uid_int,
+            "model": model,
+            "cumulative_kl_diff": info.get("cumulative_kl_diff"),
+            "rounds": info.get("rounds"),
+            "best_kl": info.get("best_kl"),
+        })
+    miners.sort(key=lambda m: m.get("cumulative_kl_diff") or 0, reverse=True)
+    return JSONResponse(
+        content=_sanitize_floats({"miners": miners}),
+        headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"},
     )

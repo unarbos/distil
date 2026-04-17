@@ -1,33 +1,123 @@
 @import "tailwindcss";
 
 @theme inline {
-  --color-background: #09090b;
-  --color-foreground: #fafafa;
-  --color-card: #09090b;
-  --color-card-foreground: #fafafa;
-  --color-popover: #09090b;
-  --color-popover-foreground: #fafafa;
-  --color-primary: #fafafa;
-  --color-primary-foreground: #18181b;
-  --color-secondary: #27272a;
-  --color-secondary-foreground: #fafafa;
-  --color-muted: #27272a;
-  --color-muted-foreground: #a1a1aa;
-  --color-accent: #27272a;
-  --color-accent-foreground: #fafafa;
-  --color-destructive: #7f1d1d;
-  --color-destructive-foreground: #fafafa;
-  --color-border: #27272a;
-  --color-input: #27272a;
-  --color-ring: #d4d4d8;
+  --color-background: var(--surface);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface-elevated);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--surface-elevated);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--ink);
+  --color-primary-foreground: var(--ink-inverse);
+  --color-secondary: var(--surface-sunken);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface-sunken);
+  --color-muted-foreground: var(--ink-muted);
+  --color-accent: var(--surface-sunken);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: var(--ink-inverse);
+  --color-border: var(--border);
+  --color-input: var(--surface-sunken);
+  --color-ring: var(--ink-muted);
+  --color-king: var(--king);
+  --color-eval: var(--eval);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
   --radius-sm: 0.25rem;
   --radius-md: 0.375rem;
   --radius-lg: 0.5rem;
   --radius-xl: 0.75rem;
 }
 
+:root {
+  --surface: #09090b;
+  --surface-elevated: #09090b;
+  --surface-sunken: #27272a;
+  --ink: #fafafa;
+  --ink-inverse: #18181b;
+  --ink-muted: #a1a1aa;
+  --border: #27272a;
+  --king: #facc15;
+  --eval: #60a5fa;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --ok: #22c55e;
+}
+
+:root[data-theme="light"] {
+  --surface: #fafafa;
+  --surface-elevated: #ffffff;
+  --surface-sunken: #f4f4f5;
+  --ink: #18181b;
+  --ink-inverse: #fafafa;
+  --ink-muted: #52525b;
+  --border: #e4e4e7;
+  --king: #b45309;
+  --eval: #2563eb;
+  --warning: #b45309;
+  --danger: #b91c1c;
+  --ok: #15803d;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --surface: #fafafa;
+    --surface-elevated: #ffffff;
+    --surface-sunken: #f4f4f5;
+    --ink: #18181b;
+    --ink-inverse: #fafafa;
+    --ink-muted: #52525b;
+    --border: #e4e4e7;
+    --king: #b45309;
+    --eval: #2563eb;
+    --warning: #b45309;
+    --danger: #b91c1c;
+    --ok: #15803d;
+  }
+}
+
 body {
-  background: var(--color-background);
-  color: var(--color-foreground);
+  background: var(--surface);
+  color: var(--ink);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+@keyframes eval-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.25); }
+  50% { box-shadow: 0 0 0 6px rgba(96, 165, 250, 0); }
+}
+
+.eval-glow {
+  animation: eval-pulse 2s ease-in-out infinite;
+}
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-sunken) 25%, var(--border) 50%, var(--surface-sunken) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s linear infinite;
+  border-radius: var(--radius-md);
+}
+
+@keyframes skeleton-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .eval-glow { animation: none; box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.2); }
+  .skeleton { animation: none; background: var(--surface-sunken); }
+}
+
+.scroll-snap-x {
+  scroll-snap-type: x mandatory;
+}
+.scroll-snap-item {
+  scroll-snap-align: start;
 }

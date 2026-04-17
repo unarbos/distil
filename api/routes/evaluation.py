@@ -1,13 +1,15 @@
 """Evaluation endpoints: H2H, leaderboard, eval progress, history, benchmarks, announcements."""
 
+import asyncio
+import fcntl
 import json
 import os
 import time
 
-from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import STATE_DIR
+from config import ANNOUNCEMENT_CLAIMS_KEEP, EPOCH_BLOCKS, STALE_EVAL_BLOCKS, STATE_DIR
 from helpers.cache import _get_stale
 from helpers.sanitize import _sanitize_floats, _safe_json_load
 from state_store import (
@@ -113,31 +115,74 @@ def get_leaderboard():
 
 # ── Announcement helpers ──────────────────────────────────────────────────────
 
-def _is_announcement_claimed(ann: dict) -> bool:
-    """Check if an announcement has already been claimed, using the claims log."""
-    claims_path = os.path.join(STATE_DIR, "announcement_claims.json")
-    claims = _safe_json_load(claims_path, [])
+_ANN_LOCK_PATH = os.path.join(STATE_DIR, "announcement.lock")
+
+
+def _ann_claims_path() -> str:
+    return os.path.join(STATE_DIR, "announcement_claims.json")
+
+
+def _is_announcement_claimed_locked(ann: dict) -> bool:
+    claims = _safe_json_load(_ann_claims_path(), [])
     ann_ts = ann.get("timestamp", 0)
     ann_type = ann.get("type", "")
-    for claim in claims:
-        if claim.get("timestamp") == ann_ts and claim.get("type") == ann_type:
-            return True
-    return False
+    return any(
+        c.get("timestamp") == ann_ts and c.get("type") == ann_type
+        for c in claims
+    )
 
 
-def _record_announcement_claim(ann: dict):
-    """Record that an announcement was claimed, in a separate file rsync won't overwrite."""
-    claims_path = os.path.join(STATE_DIR, "announcement_claims.json")
-    claims = _safe_json_load(claims_path, [])
+def _record_announcement_claim_locked(ann: dict) -> None:
+    path = _ann_claims_path()
+    claims = _safe_json_load(path, [])
     claims.append({
         "timestamp": ann.get("timestamp", 0),
         "type": ann.get("type", ""),
         "claimed_at": time.time(),
     })
-    # Keep only last 50 claims
-    claims = claims[-50:]
-    with open(claims_path, "w") as f:
+    claims = claims[-ANNOUNCEMENT_CLAIMS_KEEP:]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(claims, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _is_announcement_claimed(ann: dict) -> bool:
+    """Lock-free read used by the non-claiming ``GET /api/announcement``."""
+    return _is_announcement_claimed_locked(ann)
+
+
+def _claim_with_lock():
+    """Atomically read announcement.json, check + record claim, mark posted.
+
+    Returns the claimed announcement dict, or ``None`` if nothing to claim.
+    """
+    ann_path = os.path.join(STATE_DIR, "announcement.json")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(_ANN_LOCK_PATH, "w") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            if not os.path.exists(ann_path):
+                return None
+            try:
+                with open(ann_path) as f:
+                    ann = json.load(f)
+            except Exception:
+                return None
+            if ann.get("posted", True) or _is_announcement_claimed_locked(ann):
+                return None
+            _record_announcement_claim_locked(ann)
+            ann["posted"] = True
+            tmp = ann_path + ".tmp"
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(ann, f, indent=2)
+                os.replace(tmp, ann_path)
+            except Exception:
+                pass
+            return ann
+        finally:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
 
 
 @router.get("/api/announcement", tags=["Evaluation"], summary="Pending announcements",
@@ -156,43 +201,22 @@ def get_announcement():
 
 
 @router.post("/api/announcement/claim", tags=["Evaluation"], summary="Claim pending announcement",
-          description="Atomically reads and marks an announcement as posted. Returns the announcement content, or `{type: null}` if none pending. "
+          description="Atomically reads and marks an announcement as posted (fcntl-locked). Returns the announcement content, or `{type: null}` if none pending. "
                       "Uses a claims log to prevent re-posting after rsync overwrites.")
 def claim_announcement():
-    ann_path = os.path.join(STATE_DIR, "announcement.json")
-    if os.path.exists(ann_path):
-        try:
-            with open(ann_path) as f:
-                ann = json.load(f)
-            if not ann.get("posted", True) and not _is_announcement_claimed(ann):
-                # Record the claim FIRST (idempotent protection)
-                _record_announcement_claim(ann)
-                # Also mark posted in the file (best effort - rsync may overwrite)
-                ann["posted"] = True
-                with open(ann_path, "w") as f:
-                    json.dump(ann, f, indent=2)
-                return ann
-        except Exception:
-            pass
-    return {"type": None}
+    ann = _claim_with_lock()
+    return ann or {"type": None}
 
 
-@router.post("/api/announcement/posted", tags=["Evaluation"], summary="Mark announcement as posted",
-          description="Marks the current announcement as posted. Legacy endpoint - prefer `/api/announcement/claim`.")
+@router.post("/api/announcement/posted", tags=["Evaluation"], summary="[LEGACY] Mark announcement as posted",
+          description="**DEPRECATED** — prefer `/api/announcement/claim`, which is atomic. "
+                      "Kept for backward compatibility with older dashboard clients.",
+          deprecated=True)
 def mark_announcement_posted():
-    ann_path = os.path.join(STATE_DIR, "announcement.json")
-    if os.path.exists(ann_path):
-        try:
-            with open(ann_path) as f:
-                ann = json.load(f)
-            _record_announcement_claim(ann)
-            ann["posted"] = True
-            with open(ann_path, "w") as f:
-                json.dump(ann, f, indent=2)
-            return {"ok": True}
-        except Exception as e:
-            return {"error": str(e)}
-    return {"ok": True, "note": "no announcement"}
+    ann = _claim_with_lock()
+    if ann is None:
+        return {"ok": True, "note": "no announcement"}
+    return {"ok": True}
 
 
 @router.get("/api/eval-progress", tags=["Evaluation"], summary="Live evaluation progress",
@@ -416,7 +440,6 @@ def get_eval_status():
     latest = h2h_latest()
     current_king_uid = latest.get("king_uid")
     current_block = latest.get("block", 0)
-    stale_threshold = 50
 
     result = {}
     for uid_str in scores_data:
@@ -429,8 +452,8 @@ def get_eval_status():
         tracker_entry = h2h_tracker.get(uid_str, {})
         if tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
             last_block = tracker_entry["block"]
-            epochs_since = (current_block - last_block) // 360 if current_block > last_block else 0
-            if epochs_since < stale_threshold:
+            epochs_since = (current_block - last_block) // EPOCH_BLOCKS if current_block > last_block else 0
+            if epochs_since < STALE_EVAL_BLOCKS:
                 result[uid_str] = {"status": "tested", "epochs_ago": epochs_since}
             else:
                 result[uid_str] = {"status": "stale", "epochs_ago": epochs_since}
@@ -497,3 +520,160 @@ def get_benchmarks():
         content=_sanitize_floats({"models": models, "baseline": baseline}),
         headers={"Cache-Control": "public, max-age=60, stale-while-revalidate=120"},
     )
+
+
+# ── Phase 3: aggregated dashboard + SSE ─────────────────────────────────────
+
+@router.get("/api/dashboard", tags=["Evaluation"], summary="Aggregated dashboard snapshot",
+         description="""One round-trip snapshot used by the landing page.
+
+Bundles the most commonly-fetched state (king, top-N contenders, eval progress,
+latest H2H, price, health) so clients don't have to fan out 7+ requests.
+""")
+def get_dashboard():
+    from state_store import disqualified as load_disqualified
+
+    from helpers.cache import _get_stale as _cache_get
+    try:
+        latest = h2h_latest() or {}
+        top4 = top4_leaderboard() or {}
+        prog = normalize_eval_progress(eval_progress())
+        scores_data = scores()
+        dq = load_disqualified()
+        price = _cache_get("price") or {}
+
+        king_uid = latest.get("king_uid")
+        king_kl = None
+        if king_uid is not None:
+            king_kl = scores_data.get(str(king_uid))
+        contenders = [c for c in (top4.get("contenders") or []) if c.get("uid") not in (-1, king_uid)][:5]
+
+        eval_age_min = None
+        if latest.get("timestamp"):
+            eval_age_min = round((time.time() - latest["timestamp"]) / 60, 1)
+
+        snapshot = {
+            "king": {
+                "uid": king_uid,
+                "kl": king_kl,
+                "h2h_kl": latest.get("king_h2h_kl"),
+                "block": latest.get("block"),
+            },
+            "top5": contenders,
+            "eval": {
+                "active": prog.get("active", False),
+                "phase": prog.get("phase"),
+                "students_done": prog.get("students_done"),
+                "students_total": prog.get("students_total"),
+                "prompts_total": prog.get("prompts_total"),
+                "current_student": prog.get("current_student") or (prog.get("current") or {}).get("student_name"),
+                "current_kl": prog.get("current_kl") or (prog.get("current") or {}).get("kl_running_mean"),
+                "eval_order": prog.get("eval_order"),
+                "teacher_prompts_done": prog.get("teacher_prompts_done"),
+            },
+            "h2h_latest": latest,
+            "price": {
+                "alpha_price_tao": price.get("alpha_price_tao"),
+                "alpha_price_usd": price.get("alpha_price_usd"),
+                "tao_usd": price.get("tao_usd"),
+                "price_change_24h": price.get("price_change_24h"),
+                "miners_tao_per_day": price.get("miners_tao_per_day"),
+                "symbol": price.get("symbol", "α"),
+            },
+            "health": {
+                "eval_age_min": eval_age_min,
+                "n_scored": len(scores_data),
+                "n_disqualified": len(dq),
+                "active_round": bool(prog.get("active")),
+            },
+        }
+        return JSONResponse(
+            content=_sanitize_floats(snapshot),
+            headers={"Cache-Control": "public, max-age=5, stale-while-revalidate=15"},
+        )
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": f"dashboard snapshot failed: {exc}"})
+
+
+@router.get("/api/eval-stream", tags=["Evaluation"], summary="Server-sent stream of live eval progress",
+         description="""SSE feed that re-emits `eval_progress.json` whenever it changes.
+
+Clients connect with `new EventSource('/api/eval-stream')` and receive the same
+payload as `GET /api/eval-progress` — but push-driven (poll-free) so dashboards
+stay ~1s behind the validator.
+""")
+async def eval_stream(request: Request):
+    progress_path = os.path.join(STATE_DIR, "eval_progress.json")
+    latest_path = os.path.join(STATE_DIR, "h2h_latest.json")
+
+    async def gen():
+        last_prog_mtime = 0.0
+        last_latest_mtime = 0.0
+        last_payload: str | None = None
+        yield "event: hello\ndata: {\"v\": 1}\n\n"
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                prog_mtime = os.path.getmtime(progress_path) if os.path.exists(progress_path) else 0.0
+                latest_mtime = os.path.getmtime(latest_path) if os.path.exists(latest_path) else 0.0
+                if prog_mtime != last_prog_mtime or latest_mtime != last_latest_mtime:
+                    progress = normalize_eval_progress(eval_progress())
+                    latest = h2h_latest()
+                    payload = json.dumps(_sanitize_floats({
+                        "progress": progress,
+                        "h2h_latest": latest,
+                        "t": time.time(),
+                    }))
+                    if payload != last_payload:
+                        yield f"data: {payload}\n\n"
+                        last_payload = payload
+                    last_prog_mtime = prog_mtime
+                    last_latest_mtime = latest_mtime
+            except Exception:
+                yield 'event: error\ndata: {"error": "stream glitch"}\n\n'
+            await asyncio.sleep(1.0)
+        yield "event: bye\ndata: {}\n\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get(
+    "/api/incidents",
+    tags=["Evaluation"],
+    summary="Recent ops incidents (healthcheck events)",
+    description="""Tail of `state/incidents.jsonl` emitted by the hourly healthcheck.
+Returns the last N entries sorted newest-first. Each entry is a `{ts, type, issue|action, resolved?}` record.
+Use this on the Live tab to surface what the self-repair agent has been doing.""",
+)
+def get_incidents(limit: int = 50):
+    path = os.path.join(STATE_DIR, "incidents.jsonl")
+    if not os.path.exists(path):
+        return {"incidents": [], "count": 0}
+    limit = max(1, min(int(limit), 500))
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            block = min(size, 64 * 1024)
+            f.seek(size - block, 0)
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception:
+        return {"incidents": [], "count": 0}
+    lines = [ln for ln in tail.splitlines() if ln.strip().startswith("{")]
+    events = []
+    for ln in lines[-limit:]:
+        try:
+            events.append(json.loads(ln))
+        except Exception:
+            continue
+    events.reverse()
+    return {"incidents": events, "count": len(events)}

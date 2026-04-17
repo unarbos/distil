@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import { formatFixed, shortRevision } from "@/lib/utils";
 
 interface HealthData {
   king_uid: number | null;
@@ -52,15 +53,6 @@ const TEACHER_PROGRESS_PHASES = new Set([
   "gpu_precompute",
 ]);
 
-function formatFixed(value: number | null | undefined, digits: number, fallback = "—"): string {
-  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : fallback;
-}
-
-function shortRevision(revision?: string): string | null {
-  if (!revision) return null;
-  return revision.length > 12 ? revision.slice(0, 8) : revision;
-}
-
 export function ValidatorStatus({
   kingUid,
   kingModel,
@@ -68,12 +60,20 @@ export function ValidatorStatus({
   onViewDetails,
 }: ValidatorStatusProps) {
   const [health, setHealth] = useState<HealthData | null>(null);
+  const [error, setError] = useState(false);
 
   const fetchHealth = useCallback(async () => {
     try {
       const res = await fetch(`${CLIENT_API_BASE}/api/health`, { cache: "no-store" });
-      if (res.ok) setHealth(await res.json());
-    } catch {}
+      if (res.ok) {
+        setHealth(await res.json());
+        setError(false);
+      } else {
+        setError(true);
+      }
+    } catch {
+      setError(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -92,8 +92,15 @@ export function ValidatorStatus({
 
   const codeRev = health?.code_revision;
 
-  // When idle, show a minimal revision badge only
   if (!isActive) {
+    if (error && !health) {
+      return (
+        <div className="flex items-center gap-2 text-[10px] font-mono text-amber-400/60 px-1">
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-400/60" />
+          <span>validator status unavailable — API unreachable, retrying…</span>
+        </div>
+      );
+    }
     if (!codeRev) return null;
     return (
       <div className="flex items-center gap-2 text-[10px] font-mono text-muted-foreground/40 px-1">
