@@ -160,26 +160,33 @@ def check_duplicate_hash(
     """
     Check if this model hash was already submitted by a different miner.
     Returns the UID of the original submitter, or None if unique.
+
+    Stored in weight_hashes.json — kept separate from model_hashes.json
+    (which holds git revision SHAs for integrity) so state.save_model_hashes()
+    can't overwrite the weight hash with an integrity hash and silently
+    break dedup (aizaysi root-caused this via wind77/third ↔ curli12/third).
     """
-    hash_file = state_dir / "model_hashes.json"
-    if not hash_file.exists():
-        return None
-    try:
-        hashes = json.loads(hash_file.read_text())
-        for uid_str, stored_hash in hashes.items():
-            if stored_hash == model_hash and int(uid_str) != miner_uid:
-                return int(uid_str)
-    except Exception:
-        pass
+    hash_file = state_dir / "weight_hashes.json"
+    legacy_file = state_dir / "model_hashes.json"
+    for f in (hash_file, legacy_file):
+        if not f.exists():
+            continue
+        try:
+            hashes = json.loads(f.read_text())
+            for uid_str, stored_hash in hashes.items():
+                if stored_hash == model_hash and int(uid_str) != miner_uid:
+                    return int(uid_str)
+        except Exception:
+            continue
     return None
 
 
 def register_model_hash(
     model_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
 ):
-    """Register a model hash for a miner UID."""
+    """Register a model (weight) hash for a miner UID."""
     state_dir.mkdir(parents=True, exist_ok=True)
-    hash_file = state_dir / "model_hashes.json"
+    hash_file = state_dir / "weight_hashes.json"
     hashes = {}
     if hash_file.exists():
         try:
