@@ -53,7 +53,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             continue
         if "error" in student_result:
             logger.warning(f"UID {uid} ({model_name}): eval error — {student_result['error']}")
-            record_failure(uid, state.failures)
+            record_failure(uid, state.failures, state.failure_models, model_name)
             continue
         if student_result.get("functional_copy"):
             copy_of = student_result.get("copy_of", "unknown")
@@ -129,7 +129,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             continue
         if kl == float("inf") or kl < 0:
             logger.warning(f"UID {uid}: invalid KL={kl}")
-            record_failure(uid, state.failures)
+            record_failure(uid, state.failures, state.failure_models, model_name)
             continue
         this_round_uids.add(uid)
         if uid == king_uid:

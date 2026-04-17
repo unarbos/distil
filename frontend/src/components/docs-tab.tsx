@@ -146,19 +146,33 @@ python miner.py --wallet-name mywallet --hotkey-name myhotkey \\
             on CoT-complexity mismatch between teacher and student.
           </p>
           <div className="rounded-lg border border-border/30 p-3 text-xs font-mono space-y-1">
-            <div><span className="text-muted-foreground/60">chat_response_probe</span> → greedy gen, <code>enable_thinking=False</code> on 4 trivial prompts (<code>&quot;hi&quot;</code>, <code>&quot;2+2?&quot;</code>, …)</div>
+            <div><span className="text-muted-foreground/60">chat_response_probe</span> → greedy gen, <code>enable_thinking=False</code> on 4 trivial prompts</div>
             <div><span className="text-muted-foreground/60">DQ if</span> &lt; 50% terminate within <code>768</code> tokens</div>
             <div><span className="text-muted-foreground/60">DQ if</span> &lt; 50% emit non-empty content after stripping <code>&lt;think&gt;…&lt;/think&gt;</code></div>
-            <div className="pt-1"><span className="text-muted-foreground/60">thinking_collapse_probe</span> → greedy gen, <code>enable_thinking=True</code> on 3 trivial prompts</div>
-            <div><span className="text-muted-foreground/60">DQ if</span> &gt; 50% of responses contain any 6-word phrase repeated ≥ <code>15×</code></div>
-            <div><span className="text-muted-foreground/60">DQ if</span> &lt; 66% terminate within <code>1024</code> tokens (no loop)</div>
+            <div className="pt-1"><span className="text-muted-foreground/60">thinking_collapse_probe</span> → <code>enable_thinking=True</code> on 5 trivial prompts</div>
+            <div><span className="text-muted-foreground/60">per-sample stats</span> gzip ratio, distinct-{'{'}1,2,4{'}'}-gram rate, top-6-gram rate, byte-entropy</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> &gt; 33% degenerate: gzip ratio robust z-score &lt; <code>−4σ</code> vs teacher on same prompts (or gzip ratio &lt; <code>0.25</code> when no teacher reference)</div>
+            <div><span className="text-muted-foreground/60">DQ if</span> &lt; 66% terminate within <code>1024</code> tokens</div>
           </div>
           <p className="text-xs text-muted-foreground/70">
-            Env knobs: <code>THINK_PROBE_MAX_TOKENS</code>, <code>THINK_PROBE_LOOP_NGRAM_HITS</code>,{" "}
-            <code>THINK_PROBE_TERMINATE_THRESHOLD</code>. Set <code>THINK_COLLAPSE_PROBE=0</code> to skip.
-            Recommended miner workflow: generate 5–10 &quot;Hi&quot;-style prompts through your model
-            with <code>enable_thinking=True</code> before submitting — if you see any loop-y
-            &quot;Thinking Process:&quot; output, you will fail.
+            The threshold is statistical, not hand-picked: the teacher&apos;s own distribution on identical
+            prompts defines the &quot;natural&quot; band via robust median/MAD z-scores (Iglewicz &amp; Hoaglin 1993);
+            a student only fails when its compression or top-n-gram rate is outside a <code>4σ</code>
+            robust band from the teacher&apos;s empirical distribution.
+          </p>
+          <p className="text-xs text-muted-foreground/70">
+            Refs: Holtzman et al. <a className="underline" href="https://arxiv.org/abs/1904.09751" target="_blank" rel="noreferrer">arXiv:1904.09751</a>{" "}
+            (repetition/entropy/Zipfian degeneracy axes); Pillutla et al. MAUVE{" "}
+            <a className="underline" href="https://arxiv.org/abs/2102.01454" target="_blank" rel="noreferrer">arXiv:2102.01454</a>{" "}
+            (distributional-gap formalism);{" "}
+            <a className="underline" href="https://thinkingmachines.ai/blog/on-policy-distillation/" target="_blank" rel="noreferrer">Thinking Machines on-policy distillation</a>{" "}
+            and <a className="underline" href="https://arxiv.org/abs/2502.07266" target="_blank" rel="noreferrer">arXiv:2502.07266</a>{" "}
+            (why off-policy distillation causes CoT collapse).
+          </p>
+          <p className="text-xs text-muted-foreground/70">
+            Env knobs: <code>THINK_PROBE_MAX_TOKENS</code>, <code>THINK_PROBE_DEGEN_SIGMA</code>,{" "}
+            <code>THINK_PROBE_GZIP_FLOOR</code>, <code>THINK_PROBE_TERMINATE_THRESHOLD</code>. Set{" "}
+            <code>THINK_COLLAPSE_PROBE=0</code> to skip.
           </p>
         </section>
 

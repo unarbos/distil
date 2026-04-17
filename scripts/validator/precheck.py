@@ -106,12 +106,17 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         if is_stale(uid, state.failures):
             last_failed_model = state.failure_models.get(str(uid))
-            if last_failed_model and last_failed_model != model_repo:
+            if not last_failed_model:
+                logger.info(f"UID {uid}: stale failure counter with no tracked model — resetting to retry {model_repo}")
+                reset_failures(uid, state.failures)
+                state.failure_models.pop(str(uid), None)
+            elif last_failed_model != model_repo:
                 logger.info(f"UID {uid}: model changed from {last_failed_model} to {model_repo}, resetting failure counter")
                 reset_failures(uid, state.failures)
                 state.failure_models.pop(str(uid), None)
             else:
-                logger.debug(f"UID {uid}: stale (too many failures), skipping")
+                logger.info(f"UID {uid} ({model_repo}): SKIPPED — stale ({state.failures.get(str(uid), 0)} failures on same model). "
+                            f"Submit a new revision to reset.")
                 disqualified.add(uid)
                 continue
         uid_str = str(uid)

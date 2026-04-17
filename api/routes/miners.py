@@ -185,12 +185,23 @@ def get_miner(uid: int):
     current_block = latest.get("block", 0)
     tracker_entry = h2h_tracker.get(uid_str, {})
     eval_status = {}
+    failures_map = _safe_json_load(os.path.join(STATE_DIR, "failures.json"), default={})
+    failure_models_map = _safe_json_load(os.path.join(STATE_DIR, "failure_models.json"), default={})
+    fail_count = int(failures_map.get(uid_str, 0) or 0)
+    fail_model = failure_models_map.get(uid_str)
     if result.get("disqualified"):
         eval_status["status"] = "disqualified"
         eval_status["reason"] = "Model is disqualified and won't be evaluated"
     elif result.get("is_king"):
         eval_status["status"] = "king"
         eval_status["reason"] = "Evaluated every round as the defending king"
+    elif fail_count >= 3 and fail_model and fail_model == (result.get("commitment") or {}).get("model"):
+        eval_status["status"] = "skipped_stale"
+        eval_status["reason"] = (
+            f"Skipped for {fail_count} consecutive rounds due to eval errors on the same model "
+            f"({fail_model}). Submit a new revision to reset."
+        )
+        eval_status["failure_count"] = fail_count
     elif not result.get("kl_score"):
         eval_status["status"] = "queued"
         eval_status["reason"] = "Waiting for first evaluation - new submissions get priority"

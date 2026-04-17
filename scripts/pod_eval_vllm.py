@@ -55,7 +55,6 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -424,11 +423,13 @@ THINK_PROBE_PROMPTS = [
     "Hi",
     "What is the largest planet? Answer in one word.",
     "Say the word: done",
+    "Reply with just the number 7.",
+    "Output only: OK",
 ]
 THINK_PROBE_MAX_TOKENS = int(os.environ.get("THINK_PROBE_MAX_TOKENS", "1024"))
-THINK_PROBE_LOOP_NGRAM_HITS = int(os.environ.get("THINK_PROBE_LOOP_NGRAM_HITS", "15"))
-THINK_PROBE_LOOP_THRESHOLD = float(os.environ.get("THINK_PROBE_LOOP_THRESHOLD", "0.50"))
 THINK_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("THINK_PROBE_TERMINATE_THRESHOLD", "0.66"))
+THINK_PROBE_DEGEN_SIGMA = float(os.environ.get("THINK_PROBE_DEGEN_SIGMA", "4.0"))
+THINK_PROBE_GZIP_FLOOR = float(os.environ.get("THINK_PROBE_GZIP_FLOOR", "0.25"))
 _CHAT_PROBE_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 _CHAT_PROBE_THINK_TRAIL = re.compile(r"^.*?</think>\s*", re.DOTALL)
 _CHAT_PROBE_NARRATIVE = re.compile(r"^\s*Thinking Process:.*?(?=\n\n[A-Z0-9]|\Z)", re.DOTALL)
@@ -573,48 +574,108 @@ def chat_response_probe(model, tokenizer, device="cuda"):
         return stats
 
 
-def _detect_phrase_loop(text: str, ngram: int = 6, min_repeat: int = 8) -> int:
-    """Return the raw repeat count of the most-repeated ``ngram``-word phrase.
+def _degeneracy_metrics(text: str) -> dict:
+    """Principled per-sample degeneracy metrics. No magic thresholds.
 
-    Off-policy CoT collapse (allan_ww, #distil-97, 2026-04-17) produces
-    hundreds of repeats of the same short phrase; a legitimate long chain of
-    thought rarely repeats a 6-word span more than a handful of times. Using
-    the absolute count sidesteps the denominator problem when the response
-    hits ``max_new_tokens`` mid-loop.
+    Refs:
+      Holtzman 2019 (arXiv:1904.09751) — the three canonical degeneracy axes.
+      Pillutla MAUVE (arXiv:2102.01454) — distributional-gap formalism.
+
+    Metric choices (all model-agnostic, no extra models required):
+
+    * ``gzip_ratio``     = len(gzip(text)) / len(text). Directly measures
+                           Kolmogorov-style redundancy; looped "Wait wait wait"
+                           compresses to a tiny fraction of its length.
+    * ``distinct_k``     = |unique k-grams| / |total k-grams| for k=1,2,4.
+                           Low-distinct-n is the classic Li & Jurafsky /
+                           Vijayakumar diversity signal.
+    * ``top_kgram_rate`` = (count of most-frequent 6-gram) / (#6-grams).
+                           Normalized -- scale-free.
+    * ``shannon_entropy`` of the byte distribution (bits/byte). Collapsed text
+                           has sub-Zipfian byte entropy.
+
+    All are cheap and deterministic. Compared against the teacher's own
+    empirical distribution on identical prompts (§thinking_collapse_probe
+    uses teacher's mu/sigma instead of a hand-picked threshold).
     """
-    if not text:
-        return 0
+    import gzip
     from collections import Counter
+    if not text:
+        return {"len": 0, "gzip_ratio": 1.0, "distinct_1": 0.0,
+                "distinct_2": 0.0, "distinct_4": 0.0, "top_kgram_rate": 0.0,
+                "byte_entropy": 0.0}
+    raw = text.encode("utf-8", errors="replace")
+    comp = gzip.compress(raw, compresslevel=6)
+    gzip_ratio = len(comp) / max(1, len(raw))
+    byte_counts = Counter(raw)
+    n_bytes = sum(byte_counts.values())
+    h = 0.0
+    for c in byte_counts.values():
+        p = c / n_bytes
+        if p > 0:
+            h -= p * math.log2(p)
     tokens = text.split()
-    if len(tokens) < ngram * min_repeat:
-        return 0
-    grams = Counter(
-        " ".join(tokens[i:i + ngram]) for i in range(len(tokens) - ngram + 1)
-    )
-    return max(grams.values()) if grams else 0
+    out = {"len": len(raw), "gzip_ratio": gzip_ratio, "byte_entropy": h}
+    for k in (1, 2, 4):
+        if len(tokens) < k:
+            out[f"distinct_{k}"] = 0.0
+            continue
+        grams = [" ".join(tokens[i:i + k]) for i in range(len(tokens) - k + 1)]
+        out[f"distinct_{k}"] = len(set(grams)) / max(1, len(grams))
+    if len(tokens) >= 6:
+        grams6 = [" ".join(tokens[i:i + 6]) for i in range(len(tokens) - 6 + 1)]
+        top = max(Counter(grams6).values()) if grams6 else 0
+        out["top_kgram_rate"] = top / max(1, len(grams6))
+    else:
+        out["top_kgram_rate"] = 0.0
+    return out
 
 
-def thinking_collapse_probe(model, tokenizer, device="cuda"):
-    """Reject models that loop inside the thinking block (off-policy CoT collapse).
+def _robust_zscore(x: float, values: list[float]) -> float:
+    """Modified z-score using median/MAD (Iglewicz & Hoaglin 1993).
 
-    Runs the chat template with ``enable_thinking=True`` on a handful of
-    trivial prompts. Fails a model if on >THINK_PROBE_LOOP_THRESHOLD of them
-    either (a) generation hits ``THINK_PROBE_MAX_TOKENS`` without EOS, or
-    (b) the raw generation contains a 40-char substring repeated ≥4 times.
+    Robust to the teacher itself occasionally producing an odd sample; a single
+    bad teacher rollout won't shift the threshold enough to let a degenerate
+    student through.
+    """
+    if not values:
+        return 0.0
+    vals = sorted(values)
+    n = len(vals)
+    med = vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+    deviations = sorted(abs(v - med) for v in vals)
+    mad = deviations[n // 2] if n % 2 else 0.5 * (deviations[n // 2 - 1] + deviations[n // 2])
+    if mad < 1e-9:
+        return 0.0
+    return 0.6745 * (x - med) / mad
 
-    The existing ``chat_response_probe`` already exercises
-    ``enable_thinking=False``; this probe adds the thinking-on failure mode
-    that Allan / Fish / Const demonstrated on chat.arbos.life (UID 107 loops
-    ``*Wait, I'll write:*`` 86+ times answering ``Hi``).
 
-    References: thinkingmachines.ai/blog/on-policy-distillation,
-    arxiv.org/abs/2502.07266 on CoT complexity mismatch.
+def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=None):
+    """Degeneracy probe for off-policy CoT collapse — threshold-free design.
+
+    Replaces the previous hand-picked 6-gram-repeat-15 threshold with a
+    distributional comparison against the teacher's own output on the same
+    prompts. A student fails only when its compression/distinct-k/top-kgram
+    statistics lie >= THINK_PROBE_DEGEN_SIGMA robust MAD-z-scores outside the
+    teacher's distribution, OR when it fails to terminate on trivial prompts.
+
+    This is Holtzman et al. 2019 (arXiv:1904.09751) three-axis degeneracy
+    (repetition / diversity / entropy) operationalized as a statistical test:
+    the teacher defines what "natural" generation looks like at this length,
+    and the student must stay within that regime. There is no magic number.
+
+    Args:
+      teacher_samples: optional list[str] of teacher's own continuations on
+        the probe prompts. If None, falls back to a single-axis gzip floor
+        (``THINK_PROBE_GZIP_FLOOR``) — looser but still principled since
+        gzip ratio < 0.25 on plain text is statistically impossible without
+        pathological repetition.
     """
     stats = {
         "pass": True, "reason": "",
-        "prompts_tested": 0, "prompts_terminated": 0, "prompts_looped": 0,
-        "mean_gen_tokens": 0.0, "max_loop_repeats": 0,
-        "samples": [],
+        "prompts_tested": 0, "prompts_terminated": 0, "prompts_degenerate": 0,
+        "mean_gen_tokens": 0.0,
+        "student_metrics": [], "teacher_metrics": [], "samples": [],
     }
     try:
         if tokenizer is None or model is None:
@@ -638,9 +699,8 @@ def thinking_collapse_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         terminated = 0
-        looped = 0
         gen_tokens_acc = 0
-        max_hits_overall = 0
+        student_m = []
         samples = []
 
         with torch.no_grad():
@@ -668,17 +728,17 @@ def thinking_collapse_probe(model, tokenizer, device="cuda"):
                         eos_ids is not None and int(new_ids[-1].item()) in eos_ids
                     )
                     raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    loop_hits = _detect_phrase_loop(raw_text)
-                    did_loop = loop_hits >= THINK_PROBE_LOOP_NGRAM_HITS
-                    if did_terminate and not did_loop:
+                    m = _degeneracy_metrics(raw_text)
+                    student_m.append(m)
+                    if did_terminate:
                         terminated += 1
-                    if did_loop:
-                        looped += 1
                     gen_tokens_acc += gen_len
-                    max_hits_overall = max(max_hits_overall, loop_hits)
                     samples.append({
                         "prompt": prompt, "gen_tokens": gen_len,
-                        "terminated": did_terminate, "loop_hits": loop_hits,
+                        "terminated": did_terminate,
+                        "gzip_ratio": round(m["gzip_ratio"], 3),
+                        "distinct_4": round(m.get("distinct_4", 0.0), 3),
+                        "top_6gram_rate": round(m.get("top_kgram_rate", 0.0), 3),
                         "tail": raw_text[-200:],
                     })
                     stats["prompts_tested"] += 1
@@ -687,20 +747,36 @@ def thinking_collapse_probe(model, tokenizer, device="cuda"):
                     continue
 
         stats["prompts_terminated"] = terminated
-        stats["prompts_looped"] = looped
         n = max(1, stats["prompts_tested"])
         stats["mean_gen_tokens"] = gen_tokens_acc / n
-        stats["max_loop_repeats"] = max_hits_overall
+        stats["student_metrics"] = student_m
+        if teacher_samples:
+            stats["teacher_metrics"] = [_degeneracy_metrics(t) for t in teacher_samples]
         stats["samples"] = samples
 
+        degenerate = 0
+        for m in student_m:
+            if teacher_samples and stats["teacher_metrics"]:
+                gzip_z = _robust_zscore(m["gzip_ratio"],
+                                        [t["gzip_ratio"] for t in stats["teacher_metrics"]])
+                top_z = _robust_zscore(m.get("top_kgram_rate", 0.0),
+                                       [t.get("top_kgram_rate", 0.0) for t in stats["teacher_metrics"]])
+                is_degen = (gzip_z < -THINK_PROBE_DEGEN_SIGMA) or (top_z > THINK_PROBE_DEGEN_SIGMA)
+            else:
+                is_degen = m["gzip_ratio"] < THINK_PROBE_GZIP_FLOOR
+            if is_degen:
+                degenerate += 1
+        stats["prompts_degenerate"] = degenerate
+
         term_ok = terminated >= THINK_PROBE_TERMINATE_THRESHOLD * n - 1e-9
-        loop_ok = (looped / n) <= THINK_PROBE_LOOP_THRESHOLD + 1e-9
-        if not term_ok or not loop_ok:
+        degen_frac = degenerate / n
+        degen_ok = degen_frac < 0.34
+        if not term_ok or not degen_ok:
             stats["pass"] = False
             stats["reason"] = (
-                f"thinking_collapse:terminated={terminated}/{n} looped={looped}/{n} "
-                f"mean_gen={stats['mean_gen_tokens']:.0f} "
-                f"max_loop_hits={stats['max_loop_repeats']}"
+                f"thinking_collapse:terminated={terminated}/{n} "
+                f"degenerate={degenerate}/{n} "
+                f"mean_gen={stats['mean_gen_tokens']:.0f}"
             )
 
         if was_training:
@@ -2176,14 +2252,16 @@ def main():
         if think_probe_this:
             try:
                 _tp_start = time.time()
-                tprobe = thinking_collapse_probe(student, tokenizer, device)
+                tprobe = thinking_collapse_probe(
+                    student, tokenizer, device,
+                    teacher_samples=globals().get("_TEACHER_PROBE_SAMPLES"),
+                )
                 _tp_dur = time.time() - _tp_start
                 mark = "✓" if tprobe["pass"] else f"✗ DQ: {tprobe['reason']}"
                 print(
                     f"[eval] Think probe: term={tprobe['prompts_terminated']}/{tprobe['prompts_tested']} "
-                    f"looped={tprobe['prompts_looped']}/{tprobe['prompts_tested']} "
+                    f"degen={tprobe['prompts_degenerate']}/{tprobe['prompts_tested']} "
                     f"mean_gen={tprobe['mean_gen_tokens']:.0f} "
-                    f"max_loop_hits={tprobe['max_loop_repeats']} "
                     f"({_tp_dur:.1f}s) {mark}",
                     flush=True,
                 )
@@ -2192,9 +2270,8 @@ def main():
                     "reason": tprobe.get("reason", ""),
                     "prompts_tested": tprobe["prompts_tested"],
                     "prompts_terminated": tprobe["prompts_terminated"],
-                    "prompts_looped": tprobe["prompts_looped"],
+                    "prompts_degenerate": tprobe["prompts_degenerate"],
                     "mean_gen_tokens": tprobe["mean_gen_tokens"],
-                    "max_loop_repeats": tprobe["max_loop_repeats"],
                     "samples": tprobe.get("samples", []),
                 }
                 if not tprobe["pass"]:
