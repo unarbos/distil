@@ -2323,10 +2323,12 @@ def main():
                 )
                 _tp_dur = time.time() - _tp_start
                 mark = "✓" if tprobe["pass"] else f"✗ DQ: {tprobe['reason']}"
+                sb = tprobe.get("self_bleu_across_prompts", 0.0)
                 print(
                     f"[eval] Think probe: term={tprobe['prompts_terminated']}/{tprobe['prompts_tested']} "
                     f"degen={tprobe['prompts_degenerate']}/{tprobe['prompts_tested']} "
                     f"mean_gen={tprobe['mean_gen_tokens']:.0f} "
+                    f"self_bleu={sb:.2f} "
                     f"({_tp_dur:.1f}s) {mark}",
                     flush=True,
                 )
@@ -2337,6 +2339,8 @@ def main():
                     "prompts_terminated": tprobe["prompts_terminated"],
                     "prompts_degenerate": tprobe["prompts_degenerate"],
                     "mean_gen_tokens": tprobe["mean_gen_tokens"],
+                    "self_bleu_across_prompts": sb,
+                    "teacher_self_bleu": tprobe.get("teacher_self_bleu", 0.0),
                     "samples": tprobe.get("samples", []),
                 }
                 if not tprobe["pass"]:

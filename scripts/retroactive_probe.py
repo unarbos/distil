@@ -77,8 +77,9 @@ for uid in target_uids:
         m_tok = AutoTokenizer.from_pretrained(info["model"], revision=info["revision"])
         tprobe = thinking_collapse_probe(model, m_tok, DEVICE)
         tmark = "✓" if tprobe["pass"] else f"✗ {tprobe['reason']}"
+        sb = tprobe.get("self_bleu_across_prompts", 0.0)
         print(f"  UID {uid:>3}  norm_max={probe['worst_norm_weight']:.2f} grad={probe['global_grad_norm']:.1f} {mark}"
-              f"  | think_term={tprobe['prompts_terminated']}/{tprobe['prompts_tested']} degen={tprobe['prompts_degenerate']}/{tprobe['prompts_tested']} {tmark}"
+              f"  | think_term={tprobe['prompts_terminated']}/{tprobe['prompts_tested']} degen={tprobe['prompts_degenerate']}/{tprobe['prompts_tested']} sb={sb:.2f} {tmark}"
               f"  ({time.time()-t0:.0f}s)")
         combined_pass = probe["pass"] and tprobe["pass"]
         combined_reason = probe.get("reason", "") if not probe["pass"] else tprobe.get("reason", "")
@@ -94,6 +95,7 @@ for uid in target_uids:
                              "think_prompts_terminated": tprobe["prompts_terminated"],
                              "think_prompts_degenerate": tprobe["prompts_degenerate"],
                              "think_mean_gen_tokens": tprobe.get("mean_gen_tokens", 0.0),
+                             "think_self_bleu": sb,
                              "checked_at": time.time()}
     except Exception as e:
         print(f"  UID {uid:>3}  ERROR {e}")

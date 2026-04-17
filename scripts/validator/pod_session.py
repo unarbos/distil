@@ -143,10 +143,18 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"
     )
     inner_q = shlex.quote(inner_eval)
+    wrapped = (
+        f"{{ echo $$ > {shlex.quote(pid_remote)}; "
+        f"exec bash -c {inner_q}; }}"
+    )
     start_cmd = (
         f"rm -f {shlex.quote(pid_remote)} && : > {shlex.quote(log_remote)} && "
-        f"nohup bash -c {inner_q} >> {shlex.quote(log_remote)} 2>&1 & "
-        f"echo $! > {shlex.quote(pid_remote)} && echo DISTIL_PID:$(cat {shlex.quote(pid_remote)})"
+        f"nohup bash -c {shlex.quote(wrapped)} >> {shlex.quote(log_remote)} 2>&1 & "
+        f"disown; "
+        f"for _ in 1 2 3 4 5 6 7 8 9 10; do "
+        f"  [ -s {shlex.quote(pid_remote)} ] && break; sleep 0.2; "
+        f"done; "
+        f"echo DISTIL_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
     )
     status_inner = (
         f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DISTIL_STATUS:done; "
@@ -227,7 +235,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
+        starting_streak = 0
         deadline = time.time() + eval_timeout
+        eval_started_at = time.time()
         while time.time() < deadline:
             status = pod.exec(status_cmd, timeout=90)
             out = status.get("stdout", "") or ""
@@ -236,12 +246,33 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 break
             if "DISTIL_STATUS:dead" in out:
                 dead_streak += 1
+                starting_streak = 0
                 if dead_streak >= 3:
                     logger.error("Eval worker on pod exited before writing eval_results.json")
                     result = {"stdout": "", "stderr": "worker_dead", "exit_code": -1, "success": False}
                     break
+            elif "DISTIL_STATUS:starting" in out:
+                dead_streak = 0
+                starting_streak += 1
+                if starting_streak >= 15 and (time.time() - eval_started_at) > 180:
+                    probe = pod.exec(
+                        f"tail -40 {shlex.quote(log_remote)} 2>/dev/null | grep -i -E 'traceback|error' | head -5",
+                        timeout=30,
+                    )
+                    probe_out = (probe.get("stdout", "") or "").strip()
+                    if probe_out:
+                        logger.error(
+                            "Eval stuck in 'starting' for >%ds; log shows: %s",
+                            int(time.time() - eval_started_at), probe_out[:300],
+                        )
+                        result = {
+                            "stdout": "", "stderr": f"worker_stuck_starting: {probe_out[:200]}",
+                            "exit_code": -1, "success": False,
+                        }
+                        break
             else:
                 dead_streak = 0
+                starting_streak = 0
             time.sleep(20)
         else:
             logger.error(f"Eval timed out after {eval_timeout}s — killing")
