@@ -1,0 +1,24 @@
+[Unit]
+Description=Distil SN97 Validator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=distil
+WorkingDirectory=/opt/distil/repo
+Environment=HOME=/home/distil
+Environment=PATH=/opt/distil/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DISTIL_PYTHON=/opt/distil/venv/bin/python
+Environment=DISTIL_STATE_DIR=/opt/distil/repo/state
+Environment=DISTIL_ENV_FILE=/home/distil/.secrets/distil.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /opt/distil/repo/scripts/run_validator.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=distil-validator
+
+[Install]
+WantedBy=multi-user.target
