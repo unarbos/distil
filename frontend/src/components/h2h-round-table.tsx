@@ -109,6 +109,11 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
               🎉 UID {round.new_king_uid} dethroned the previous king this round
             </div>
           )}
+          {!round.king_changed && round.king_retained_reason && (
+            <div className="mx-4 mt-3 rounded-lg border border-amber-400/30 bg-amber-400/[0.06] px-4 py-2.5 text-sm text-amber-400 font-mono">
+              King retained — {round.king_retained_reason}
+            </div>
+          )}
 
           {/* Info bar */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-5 py-2.5 text-[11px] font-mono text-muted-foreground/50">
@@ -142,12 +147,13 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
           {/* Rows */}
           {results.map((result, idx) => {
             const isKing = result.is_king;
+            const isDq = !isKing && Boolean(result.disqualified);
             const vsKing = result.vs_king ?? "";
             const promptCount = formatPromptCount(result.paired_prompts ?? result.prompts_scored, result.prompts_total ?? round.n_prompts);
-            const needsMorePrompts = !isKing && (result.dethrone_eligible === false || /need\s+100p/i.test(vsKing));
-            const isClose = !isKing && vsKing.includes("not enough");
-            const isWorse = !isKing && (vsKing === "worse" || (kingH2hKl != null && result.kl >= kingH2hKl));
-            const isDethroner = round.king_changed && !isKing && (
+            const needsMorePrompts = !isKing && !isDq && (result.dethrone_eligible === false || /need\s+100p/i.test(vsKing));
+            const isClose = !isKing && !isDq && vsKing.includes("not enough");
+            const isWorse = !isKing && !isDq && (vsKing === "worse" || (kingH2hKl != null && result.kl >= kingH2hKl));
+            const isDethroner = round.king_changed && !isKing && !isDq && (
               (result.uid != null && round.new_king_uid != null && result.uid === round.new_king_uid)
               || /dethroned/i.test(vsKing)
             );
@@ -211,6 +217,14 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                       more prompts needed
                     </span>
                   )}
+                  {isDq && (
+                    <span
+                      title={result.dq_reason ?? ""}
+                      className="inline-flex items-center rounded-full bg-rose-400/10 border border-rose-400/30 px-1.5 py-0.5 text-[9px] text-rose-400 font-mono shrink-0"
+                    >
+                      DQ
+                    </span>
+                  )}
                 </div>
 
                 {/* KL Score */}
@@ -231,6 +245,13 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                 <div className="text-right font-mono">
                   {isKing ? (
                     <span className="text-[11px] text-yellow-400/40">king</span>
+                  ) : isDq ? (
+                    <span
+                      title={result.dq_reason ?? ""}
+                      className="text-[11px] text-rose-400"
+                    >
+                      DQ — not crowned
+                    </span>
                   ) : isDethroner ? (
                     <span className="text-[11px] text-emerald-400 font-semibold">
                       {pctText} ✓ beat ε

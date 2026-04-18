@@ -125,6 +125,30 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     except Exception:
         shard_idx = None
 
+    dq_blocked = []
+    if not king_changed:
+        for r in h2h_results:
+            if r.get("is_king") or r.get("is_reference"):
+                continue
+            tt = r.get("t_test") or {}
+            beat_king = (tt.get("mean_delta", 0) > 0 and tt.get("p", 1.0) < PAIRED_TEST_ALPHA)
+            if beat_king and r.get("disqualified"):
+                dq_blocked.append({"uid": r.get("uid"), "model": r.get("model"),
+                                   "dq_reason": r.get("dq_reason"), "kl": r.get("kl"),
+                                   "p": tt.get("p"), "mean_delta": tt.get("mean_delta")})
+    king_retained_reason = None
+    if not king_changed and dq_blocked:
+        king_retained_reason = (
+            f"{len(dq_blocked)} lower-KL challenger(s) would have dethroned but were DQ'd "
+            f"(e.g. UID {dq_blocked[0]['uid']}: {(dq_blocked[0]['dq_reason'] or '')[:80]})"
+        )
+        for entry in dq_blocked:
+            logger.info(
+                f"King retained: UID {entry['uid']} had KL={entry['kl']:.6f} "
+                f"(p={entry['p']:.4f}, mean_delta={entry['mean_delta']:.6f}) "
+                f"but DQ'd — {entry['dq_reason']}"
+            )
+
     h2h_round = {
         "block": current_block, "block_hash": block_hash, "timestamp": time.time(),
         "shard_idx": shard_idx,
@@ -140,6 +164,8 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "n_prompts": n_prompts, "results": h2h_results,
         "king_changed": king_changed,
         "new_king_uid": winner_uid if king_changed else None,
+        "king_retained_reason": king_retained_reason,
+        "dq_blocked_dethrone": dq_blocked or None,
         "type": "full_eval" if is_full_eval else "h2h",
         "elapsed_seconds": round(time.time() - epoch_start_time, 1) if epoch_start_time else None,
         "n_students": len(h2h_results),

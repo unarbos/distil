@@ -230,6 +230,8 @@ export interface H2hResult {
   paired_prompts?: number;
   dethrone_eligible?: boolean;
   early_stopped?: boolean;
+  disqualified?: boolean;
+  dq_reason?: string;
   t_test?: {
     p?: number;
     t?: number;
@@ -252,6 +254,15 @@ export interface H2hLatestResponse {
   results: H2hResult[];
   king_changed: boolean;
   new_king_uid: number | null;
+  king_retained_reason?: string | null;
+  dq_blocked_dethrone?: Array<{
+    uid?: number;
+    model?: string;
+    dq_reason?: string;
+    kl?: number;
+    p?: number;
+    mean_delta?: number;
+  }> | null;
 }
 
 export interface H2hHistoryResponse {

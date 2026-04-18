@@ -269,7 +269,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 epsilon_dethroned_by = None
         else:
             winner_uid, winner_kl = best_uid, best_kl
-    h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model)
+    h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model, state.dq_reasons, uid_to_hotkey, commitments)
     try:
         annotate_h2h_with_composite(h2h_results, king_h2h_kl, results.get("students", {}))
         for entry in h2h_results:
@@ -303,9 +303,13 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     return winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, this_round_uids
 
 
-def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model):
+def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model,
+                       dq_reasons=None, uid_to_hotkey=None, commitments=None):
     h2h_results = []
     prompts_total = results.get("n_prompts")
+    dq_reasons = dq_reasons or {}
+    uid_to_hotkey = uid_to_hotkey or {}
+    commitments = commitments or {}
     for uid, info in models_to_eval.items():
         model_name = info["model"]
         student_data = results.get("students", {}).get(model_name, {})
@@ -313,6 +317,11 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
         if kl is None or "error" in student_data:
             continue
         is_king = uid == king_uid
+        hotkey = info.get("hotkey") or uid_to_hotkey.get(uid, "")
+        commit_block = info.get("commit_block") or (commitments.get(uid, {}) or {}).get("block")
+        dq_key = f"{hotkey}:{commit_block}" if hotkey and commit_block is not None else hotkey
+        dq_reason = dq_reasons.get(dq_key) or (dq_reasons.get(hotkey) if hotkey else None) or dq_reasons.get(str(uid))
+        is_dq = bool(dq_reason) and not is_king
         vs_king = ""
         t_test_info = None
         challenger_per_prompt = student_data.get("kl_per_prompt")
@@ -349,6 +358,10 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
                     vs_king = f"-{pct:.3f}% (not enough, need >{EPSILON * 100:.0f}%)"
                 else:
                     vs_king = "worse"
+        if is_dq:
+            short = (dq_reason or "").strip()[:140]
+            vs_king = f"DQ — not crowned ({short})"
+            dethrone_eligible = False
         entry = {
             "uid": uid,
             "model": model_name,
@@ -361,6 +374,9 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
             "dethrone_eligible": dethrone_eligible,
             "early_stopped": bool(student_data.get("early_stopped", False)),
         }
+        if is_dq:
+            entry["disqualified"] = True
+            entry["dq_reason"] = dq_reason
         if t_test_info:
             entry["t_test"] = t_test_info
         if info.get("is_reference"):

@@ -135,4 +135,8 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         model = entry.get("model")
         if not model or model not in students_data:
             continue
-        entry["composite"] = compute_composite(students_data[model], king_kl)
+        comp = compute_composite(students_data[model], king_kl)
+        if entry.get("disqualified") and not entry.get("is_king"):
+            comp = {**comp, "worst": 0.0, "weighted": 0.0,
+                    "disqualified": True, "dq_reason": entry.get("dq_reason")}
+        entry["composite"] = comp
