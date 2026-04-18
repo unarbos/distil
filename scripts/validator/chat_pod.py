@@ -14,7 +14,7 @@ def chat_ssh(cmd: str, timeout: int = 30) -> str:
     import subprocess
     ssh_cmd = [
         "ssh", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-        "-p", CHAT_POD_SSH_PORT, f"root@{CHAT_POD_HOST}", cmd,
+        "-p", str(CHAT_POD_SSH_PORT), f"root@{CHAT_POD_HOST}", cmd,
     ]
     try:
         result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=timeout)
@@ -43,7 +43,8 @@ def restart_chat_server(model_name: str):
             f"--port {CHAT_POD_APP_PORT} --max-model-len 8192 --dtype bfloat16 "
             f"--trust-remote-code --enforce-eager --reasoning-parser qwen3 "
             f"--enable-auto-tool-choice --tool-call-parser hermes "
-            f"--skip-mm-profiling > /root/chat_vllm.log 2>&1 &",
+            f'--skip-mm-profiling --limit-mm-per-prompt \'{{"image": 0}}\' '
+            f"> /root/chat_vllm.log 2>&1 &",
             timeout=10,
         )
         logger.info("Chat vLLM server restart initiated")

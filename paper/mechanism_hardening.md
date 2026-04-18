@@ -53,7 +53,7 @@ next quarter; **P3** = spec only, implementation-deferred.
 | A4 | Verifiable outcome rewards (math/format/factoid) | "Miracle-step" overfitting | P0 *(v2 shipped shadow: rotating per-block + procedural math)* | Tülu 3 2411.15124, Rubric Rewards 2510.07774 |
 | A5 | Teacher ensemble worst-case (Qwen + DeepSeek + Llama) | Teacher-specific Goodhart | P1 | Coste 2406.01013 |
 | A6 | Weight-fingerprint dedup at registration | Copy-miner / fork-king | P1 | AWM 2510.06738, REEF, DuFFin |
-| A7 | Rotating prompt pool + reusable-holdout DP noise | Prompt memorization / reverse-engineering | P2 | LiveBench 2406.19314, Dwork 2015 |
+| A7 | Rotating prompt pool + reusable-holdout DP noise | Prompt memorization / reverse-engineering | P0 *(v1 shipped shadow: 198-prompt private holdout, commit-reveal, DP noise scaffolding)* | LiveBench 2406.19314, Dwork 2015 |
 | A8 | Dethronement ε(Δblocks) margin | Copy-miner passing t-test by chance | P1 | SN37 + Blum&Hardt "Ladder" 1502.04585 |
 | A9 | TOPLOC attestations on miner inference | Model-swap after commitment | P2 | Ong 2501.16007 |
 | A10 | Commit-reveal weights v3 + Yuma 3 | Validator weight-copying | P1 | BT weight-copier whitepaper 05/2024 |
@@ -320,6 +320,45 @@ Static prompts are memorized. The theory:
    sensitivity of the score to one prompt.
 4. Track cumulative privacy budget per miner; reject further submissions
    once budget is exhausted until the pool is refreshed.
+
+### What shipped (April 2026, v1 — `eval/private_pool.py`)
+
+- **Private holdout** (`state/private_prompt_pool.json`): 198 hand-curated
+  prompts (instruction-style, recipe, translation, eulogy, format-compliance
+  — deliberately *off-distribution* from ClimbMix web text). Validator-only;
+  not in the public repo. Extend by appending JSON entries; rotation handles
+  the rest.
+- **Per-round mix**: `service.py` allocates 10% (`DEFAULT_PRIVATE_FRACTION`)
+  of `n_prompts` to a deterministic, block-seeded private subset; the
+  remaining 90% are public ClimbMix shards as before.
+- **Commit-reveal**:
+  - **Commit** (`state/private_pool_commit.json`): sha256 root over the
+    sorted per-prompt sha256 list, written *before* eval starts. Exposed via
+    `GET /api/private-pool-commit` so anyone can record the commit at the
+    block boundary.
+  - **Reveal** (`state/private_pool_reveal.json`): per-prompt sha256 list,
+    written *after* the round completes. Available via the same endpoint.
+    Auditors verify `sha256(sorted(prompt_hashes)) == root`.
+- **Public-API redaction**: `pod_session.py` redacts the private tail of
+  `eval_data_latest.json` and the per-round files in `state/eval_data/`
+  (which the public `/api/eval-data` serves) — the original raw copy is
+  retained under `state/eval_data_private/` for offline validator audit.
+- **DP-noise scaffolding** (`dp_noise_for`): per-prompt Laplace draw with
+  scale ∝ uses, seeded by `sha256(prompt ‖ uses)` so the same draw is
+  reproduced if asked again. Not yet wired into the score — composite
+  `_axis_kl` still uses raw KL — because we want one round of telemetry to
+  size the noise scale before perturbing rankings. Roll-out plan: shadow
+  noise for 7 days, compare ranking stability with/without, then enable.
+
+Still to do:
+- Multi-validator independence: each validator should sample its private
+  subset using `H(block_hash ‖ validator_hotkey)` so cross-validator
+  triangulation can't reduce-by-intersection. Currently all validators
+  share the same subset per block.
+- Cross-validator union pool growth (~5,000 prompts per memo §A7) so the
+  use rate doesn't outpace the holdout size; current 198 prompts is enough
+  for ~6-8 rounds at 10% before each prompt has been used twice.
+- Cumulative ε privacy budget tracking per *miner* (per memo §A7 step 4).
 
 ---
 

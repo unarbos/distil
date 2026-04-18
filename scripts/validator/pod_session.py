@@ -349,12 +349,45 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     try:
         eval_data_dir = state.state_dir / "eval_data"
         eval_data_dir.mkdir(exist_ok=True)
-        eval_data_dest = str(eval_data_dir / f"eval_data_{ts}.json")
-        pod.download(eval_data_remote, eval_data_dest)
-        shutil.copy2(eval_data_dest, str(state.state_dir / "eval_data_latest.json"))
+        # state/eval_data is API-served; state/eval_data_private is validator-only
+        # raw copy used for offline audit.
+        eval_data_private_dir = state.state_dir / "eval_data_private"
+        eval_data_private_dir.mkdir(exist_ok=True)
+        raw_dest = str(eval_data_private_dir / f"eval_data_{ts}.json")
+        pod.download(eval_data_remote, raw_dest)
+        public_dest = str(eval_data_dir / f"eval_data_{ts}.json")
+        try:
+            cur = state.current_round if isinstance(state.current_round, dict) else {}
+            pp = cur.get("private_pool") or {}
+            n_private = int(pp.get("n", 0) or 0)
+            with open(raw_dest) as fh:
+                raw = json.load(fh)
+            if n_private > 0 and isinstance(raw, dict) and isinstance(raw.get("data"), list):
+                rows = raw["data"]
+                cutoff = max(0, len(rows) - n_private)
+                redacted_rows = []
+                for i, r in enumerate(rows):
+                    if i >= cutoff and isinstance(r, dict):
+                        redacted_rows.append({**r, "prompt": "[PRIVATE]",
+                                              "continuation": "[PRIVATE]",
+                                              "is_private": True})
+                    else:
+                        redacted_rows.append(r)
+                raw_pub = {**raw, "data": redacted_rows, "private_redacted": n_private}
+            else:
+                raw_pub = raw
+            with open(public_dest, "w") as fh:
+                json.dump(raw_pub, fh)
+            shutil.copy2(public_dest, str(state.state_dir / "eval_data_latest.json"))
+        except Exception as exc:
+            logger.warning(f"Private-pool redaction failed, copying raw (non-fatal): {exc}")
+            shutil.copy2(raw_dest, public_dest)
+            shutil.copy2(public_dest, str(state.state_dir / "eval_data_latest.json"))
         for old in sorted(eval_data_dir.glob("eval_data_*.json"))[:-10]:
             old.unlink(missing_ok=True)
-        logger.info(f"Eval data saved: {eval_data_dest}")
+        for old in sorted(eval_data_private_dir.glob("eval_data_*.json"))[:-30]:
+            old.unlink(missing_ok=True)
+        logger.info(f"Eval data saved: public={public_dest} raw={raw_dest}")
     except Exception as exc:
         logger.warning(f"Eval data retrieval failed (non-fatal): {exc}")
     try:
