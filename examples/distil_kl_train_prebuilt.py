@@ -419,6 +419,98 @@ def _save_manifest(path: Path, data: dict):
     path.write_text(json.dumps(data, indent=2))
 
 
+def _read_json_file(path: Path) -> dict:
+    """Load a JSON object from disk; raise with a clear message if empty or corrupt."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise OSError(f"Cannot read {path}: {e}") from e
+    if raw.startswith("\ufeff"):
+        raw = raw[1:]
+    raw = raw.strip()
+    if not raw:
+        raise ValueError(
+            f"{path} is empty or whitespace-only. The checkpoint may be incomplete "
+            "(e.g. process killed while saving). Use an older step_* directory, or omit "
+            "--resume_from / --resume_latest."
+        )
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{path} is not valid JSON ({e}). The file may be corrupted or partially written."
+        ) from e
+    if not isinstance(out, dict):
+        raise ValueError(f"{path}: expected a JSON object, got {type(out).__name__}")
+    return out
+
+
+def _global_step_from_checkpoint_dir(checkpoint_dir: Path) -> int | None:
+    """Parse training step from a directory named ``step_<N>``."""
+    name = checkpoint_dir.name
+    if not name.startswith("step_"):
+        return None
+    tail = name.split("_", 1)[-1]
+    return int(tail) if tail.isdigit() else None
+
+
+def _read_train_state_or_repair(checkpoint_dir: Path) -> tuple[dict, bool]:
+    """
+    Load ``train_state.json`` from a checkpoint directory.
+
+    If the file is missing, empty, or invalid JSON, recover a minimal dict when the
+    directory name is ``step_<N>`` (so resume still works after a crash mid-save).
+
+    Returns ``(state, repaired)`` where ``repaired`` is True if recovery was used.
+    """
+    train_state_path = checkpoint_dir / "train_state.json"
+    err: Exception | None = None
+    if train_state_path.is_file():
+        try:
+            return _read_json_file(train_state_path), False
+        except (ValueError, OSError) as e:
+            err = e
+    else:
+        err = FileNotFoundError(str(train_state_path))
+
+    repaired = _global_step_from_checkpoint_dir(checkpoint_dir)
+    if repaired is None:
+        raise ValueError(
+            f"Cannot load train state from {checkpoint_dir}: {err}. "
+            f"Expected a readable {train_state_path.name} or a directory named step_<N>."
+        ) from err
+
+    log.warning(
+        "train_state.json in %s is missing or unreadable (%s). "
+        "Rebuilding minimal resume state from directory name (global_step=%s). "
+        "data_state was not restored; the data stream may replay samples. "
+        "beat_streak / best_beating_delta reset.",
+        checkpoint_dir,
+        err,
+        repaired,
+    )
+    minimal = {
+        "global_step": repaired,
+        "data_state": None,
+        "best_beating_delta": float("-inf"),
+        "beat_streak": 0,
+    }
+    try:
+        _atomic_write_json(train_state_path, minimal)
+    except OSError as werr:
+        log.warning("Could not write repaired train_state.json (%s).", werr)
+    return minimal, True
+
+
+def _atomic_write_json(path: Path, data: dict):
+    """Write JSON atomically (tmp + replace) so crashes never leave an empty train_state.json."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -864,6 +956,7 @@ class StreamingTokenStream:
 
         if min_chars < 0:
             raise ValueError(f"min_chars must be >= 0 (got {min_chars})")
+        self._teacher_model = teacher_model
         self.dataset = dataset
         self.max_seq_len = int(max_seq_len)
         self.min_chars = int(min_chars)
@@ -905,6 +998,66 @@ class StreamingTokenStream:
     @property
     def position(self):
         return self._consumed
+
+    def state_dict(self) -> dict:
+        return {
+            "variant": "streaming_token_stream",
+            "consumed": int(self._consumed),
+            "dataset": self.dataset,
+            "max_seq_len": int(self.max_seq_len),
+            "min_chars": int(self.min_chars),
+            "teacher_model": self._teacher_model,
+        }
+
+    def load_state_dict(self, state: dict):
+        from datasets import load_dataset
+
+        if state.get("variant") != "streaming_token_stream":
+            raise ValueError(
+                "Invalid streaming data_state: expected variant 'streaming_token_stream'"
+            )
+        if state.get("dataset") != self.dataset:
+            raise ValueError(
+                f"Streaming resume dataset mismatch: checkpoint={state.get('dataset')} "
+                f"current={self.dataset}"
+            )
+        if int(state.get("max_seq_len", self.max_seq_len)) != int(self.max_seq_len):
+            raise ValueError(
+                f"Streaming resume max_seq_len mismatch: checkpoint={state.get('max_seq_len')} "
+                f"current={self.max_seq_len}"
+            )
+        if int(state.get("min_chars", self.min_chars)) != int(self.min_chars):
+            raise ValueError(
+                f"Streaming resume min_chars mismatch: checkpoint={state.get('min_chars')} "
+                f"current={self.min_chars}"
+            )
+        if state.get("teacher_model") != self._teacher_model:
+            raise ValueError(
+                f"Streaming resume teacher_model mismatch: checkpoint={state.get('teacher_model')} "
+                f"current={self._teacher_model}"
+            )
+        target = int(state.get("consumed", 0))
+        if target < 0:
+            raise ValueError(f"Invalid consumed in checkpoint: {target}")
+        if target > 0:
+            log.info(
+                "Restoring streaming dataset position (%s raw rows scanned; may take a bit)...",
+                target,
+            )
+        self._ds = iter(load_dataset(self.dataset, split="train", streaming=True))
+        skipped = 0
+        while skipped < target:
+            try:
+                next(self._ds)
+            except StopIteration:
+                log.warning(
+                    "Streaming dataset exhausted after %s rows while restoring position (wanted %s).",
+                    skipped,
+                    target,
+                )
+                break
+            skipped += 1
+        self._consumed = skipped
 
 
 def build_teacher_cache(args):
@@ -1347,12 +1500,10 @@ def train_from_prebuilt(args):
         )
 
     resume_global_step = 0
+    resume_state: dict | None = None
     if resume_dir:
-        train_state_path = resume_dir / "train_state.json"
         optimizer_path = resume_dir / "optimizer.pt"
         scheduler_path = resume_dir / "scheduler.pt"
-        if not train_state_path.exists():
-            raise FileNotFoundError(f"Missing train_state.json in resume checkpoint: {resume_dir}")
         if not optimizer_path.exists():
             raise FileNotFoundError(f"Missing optimizer.pt in resume checkpoint: {resume_dir}")
         if not scheduler_path.exists():
@@ -1363,7 +1514,7 @@ def train_from_prebuilt(args):
         optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
         if scheduler_path.exists():
             scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
-        resume_state = json.loads(train_state_path.read_text())
+        resume_state, _train_state_repaired = _read_train_state_or_repair(resume_dir)
         resume_global_step = int(resume_state.get("global_step", 0))
 
     eval_prompts = []
@@ -1493,7 +1644,7 @@ def train_from_prebuilt(args):
 
     global_step = resume_global_step
     if resume_dir:
-        resume_state = json.loads((resume_dir / "train_state.json").read_text())
+        assert resume_state is not None
         data_state = resume_state.get("data_state")
         if data_state is not None:
             data.load_state_dict(data_state)
@@ -1633,20 +1784,18 @@ def train_from_prebuilt(args):
                     student.save_pretrained(best_dir)
                     tokenizer.save_pretrained(best_dir)
                     _copy_cached_origin_configs(origin_cfg_cache_dir, best_dir)
-                    with open(best_dir / "train_state.json", "w") as f:
-                        json.dump(
-                            {
-                                "global_step": global_step,
-                                "data_position": data.position,
-                                "best_beating_delta": best_beating_delta,
-                                "ttest": ttest,
-                                "eval_stats": eval_stats,
-                                "king_stats": king_stats,
-                                "saved_at": _utc_now_iso(),
-                            },
-                            f,
-                            indent=2,
-                        )
+                    _atomic_write_json(
+                        best_dir / "train_state.json",
+                        {
+                            "global_step": global_step,
+                            "data_position": data.position,
+                            "best_beating_delta": best_beating_delta,
+                            "ttest": ttest,
+                            "eval_stats": eval_stats,
+                            "king_stats": king_stats,
+                            "saved_at": _utc_now_iso(),
+                        },
+                    )
                     log.info(
                         "New best king-beating checkpoint saved at %s (delta=%.6f, p=%.6g)",
                         best_dir,
@@ -1694,18 +1843,16 @@ def train_from_prebuilt(args):
             _copy_cached_origin_configs(origin_cfg_cache_dir, d)
             torch.save(optimizer.state_dict(), d / "optimizer.pt")
             torch.save(scheduler.state_dict(), d / "scheduler.pt")
-            with open(d / "train_state.json", "w") as f:
-                json.dump(
-                    {
-                        "global_step": global_step,
-                        "data_position": data.position,
-                        "data_state": data.state_dict(),
-                        "best_beating_delta": best_beating_delta,
-                        "beat_streak": beat_streak,
-                    },
-                    f,
-                    indent=2,
-                )
+            _atomic_write_json(
+                d / "train_state.json",
+                {
+                    "global_step": global_step,
+                    "data_position": data.position,
+                    "data_state": data.state_dict(),
+                    "best_beating_delta": best_beating_delta,
+                    "beat_streak": beat_streak,
+                },
+            )
             log.info(f"  Saved: {d}")
 
         if global_step % 10 == 0:

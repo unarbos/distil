@@ -255,6 +255,20 @@ python3 examples/distil_kl_train_prebuilt.py train \
   --max_steps 2000
 ```
 
+#### GPU planning cheatsheet (8× GPU, disjoint spans)
+
+Each model uses a **contiguous** block: `--*_gpu` is the first index, `--*_gpu_count` is the length. The three blocks must not overlap (teacher + student + king = 8 in the examples below).
+
+| Scenario | `--teacher_gpu` + count | `--student_gpu` + count | `--king_gpu` + count | When to use |
+|----------|-------------------------|-------------------------|----------------------|---------------|
+| Default (balanced) | `0` + `3` | `3` + `3` | `6` + `2` | Online teacher + student + periodic king eval; good default. |
+| Heavy teacher | `0` + `4` | `4` + `3` | `7` + `1` | Teacher barely fits; king is smaller or eval is light (`--eval_prompts` low). |
+| Heavy student (online KL) | `0` + `2` | `2` + `4` | `6` + `2` | Student backward needs more VRAM than teacher forward; long `max_seq_len` or high `samples_per_step`. |
+| Smaller king / faster eval | `0` + `3` | `3` + `4` | `7` + `1` | Give student an extra GPU; king still fits on one card. |
+| No king eval | `0` + `4` | `4` + `4` | (omit) | Set `--eval_every_steps 0`: king model is not loaded; split all 8 between teacher and student only. |
+
+If eval OOMs but training is fine, reduce `--eval_prompts` / `--eval_max_new_tokens` first, or give king one more GPU and shrink student count by one.
+
 ### 4) Evaluate trained checkpoint with validator-like local logic
 
 Use `examples/eval_like_validator.py` to score your trained model with local logic aligned to
