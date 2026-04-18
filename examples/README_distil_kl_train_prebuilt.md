@@ -223,6 +223,9 @@ Notes:
 - In this mode, `--use_teacher_cache` is not allowed.
 - You must set `--max_steps > 0` (there is no finite prebuilt sample count).
 - You can control dataset filtering with `--dataset` and `--min_chars`.
+- **`--dataset_split`**: Hugging Face `datasets` split name (default `train`). Use e.g. `validation` if your dataset exposes it.
+- **`--dataset_skip_rows`**: skip the first *N* raw rows of that streaming split before training. Uses `IterableDataset.skip` when available (fast). **Ignored when you pass `--resume_from` or `--resume_latest`**; in that case the stream position comes from `train_state.json` (`data_state` / `consumed` for streaming).
+- Row count matches the training loop: every `next()` on the stream increments position, including rows dropped by `--min_chars`.
 
 ```bash
 python3 examples/distil_kl_train_prebuilt.py train \
@@ -231,8 +234,25 @@ python3 examples/distil_kl_train_prebuilt.py train \
   --teacher_gpu 0 --teacher_gpu_count 2 \
   --student_gpu 2 --student_gpu_count 2 \
   --dataset karpathy/climbmix-400b-shuffle \
+  --dataset_split train \
+  --dataset_skip_rows 0 \
   --min_chars 2560 \
   --max_seq_len 1024 \
+  --max_steps 2000 \
+  --output_dir ./distil-checkpoints
+```
+
+Example: start deep in the split (e.g. skip 500k raw rows) without resuming. Use a `--data_dir` that has **no** `manifest.json` so streaming fallback activates:
+
+```bash
+python3 examples/distil_kl_train_prebuilt.py train \
+  --teacher Qwen/Qwen3.5-35B-A3B \
+  --student Qwen/Qwen3.5-4B \
+  --teacher_gpu 0 --student_gpu 1 \
+  --data_dir ./streaming-data-no-manifest \
+  --dataset karpathy/climbmix-400b-shuffle \
+  --dataset_split train \
+  --dataset_skip_rows 500000 \
   --max_steps 2000 \
   --output_dir ./distil-checkpoints
 ```
@@ -302,6 +322,19 @@ The script validates:
 
 If any of these fail, training stops with an explicit error.
 
+## Checkpoints and origin `config.json`
+
+After each `save_pretrained`, the script copies cached **origin** metadata into `step_<N>/` (and `best_beat_king/` when applicable) so checkpoints stay aligned with the **published** model on Hugging Face, not only the slimmer config `transformers` may serialize from memory.
+
+- **Local `--student` path:** matching `*.json` and listed tokenizer/config files are copied from that directory into `<output_dir>/_origin_model_configs/` at run start, then merged into each checkpoint.
+- **Hub `--student` id (`org/model`):** the same filenames are **downloaded** from the Hub into `_origin_model_configs/` (requires network once per run). Use **`--student_revision`** (branch / tag / commit) to pin an exact revision.
+
+If Hub download fails for `config.json`, training still runs but checkpoints may miss Hub-only fields until the download succeeds.
+
+## LR schedule
+
+The cosine LR schedule’s **total step count** matches this run (`--max_steps` or one full pass over prebuilt data), not a fixed large constant. Warmup uses `--warmup_steps` as in Hugging Face `get_cosine_schedule_with_warmup`.
+
 ## Main arguments
 
 ### `build`
@@ -329,13 +362,14 @@ If any of these fail, training stops with an explicit error.
 
 - `--teacher`
 - `--student`
+- `--student_revision` (optional Hub revision for origin config download when `--student` is a repo id)
 - `--teacher_gpu`
 - `--teacher_gpu_count`
 - `--student_gpu`
 - `--student_gpu_count`
 - `--king_gpu`, `--king_gpu_count`
 - `--data_dir`
-- `--dataset`, `--min_chars` (used in streaming fallback mode)
+- `--dataset`, `--dataset_split`, `--dataset_skip_rows`, `--min_chars` (streaming fallback mode)
 - `--cache_dir`
 - `--use_teacher_cache`
 - `--shuffle_chunks`
@@ -348,7 +382,7 @@ If any of these fail, training stops with an explicit error.
 - `--king_repo`, `--king_revision`
 - `--beat_king_p_threshold`, `--beat_king_min_delta`, `--early_stop_on_beat_consecutive`
 - `--metrics_jsonl`
-- `--wandb_project`, `--wandb_run`, `--no_wandb`
+- `--wandb_project`, `--wandb_run`, `--wandb_init_timeout` (seconds for `wandb.init`; default 300), `--no_wandb`
 
 ## Artifacts
 
@@ -357,14 +391,15 @@ Saved checkpoints (every `save_every` steps):
 - `<output_dir>/step_<N>/` with:
   - model weights
   - tokenizer files
-  - copied origin model config artifacts (from local `--student` dir when available, including `preprocessor_config.json` and other json config files)
+  - origin config / tokenizer metadata merged after save (local `--student` dir or Hub download into `_origin_model_configs/`), including full **`config.json`** when available
   - `optimizer.pt`
   - `scheduler.pt`
-  - `train_state.json`
+  - `train_state.json` (written atomically; if missing or corrupt, resume can recover `global_step` from the `step_<N>` directory name)
 
 And one run config:
 
 - `<output_dir>/train_config.json`
+- `<output_dir>/_origin_model_configs/` (cached origin files for Hub or local `--student`; internal use, safe to delete between runs if you accept re-download)
 - `<output_dir>/king_eval_metrics.jsonl` (unless overridden by `--metrics_jsonl`)
 - `<output_dir>/best_beat_king/` (best checkpoint that satisfies beat-king thresholds)
 
@@ -375,7 +410,9 @@ And one run config:
 - **`Token chunk fingerprint mismatch`**: token chunks changed after cache build; rebuild teacher cache.
 - **Out of memory / process killed**: see [Memory and OOM](#memory-and-oom). Quick checks: `train --use_teacher_cache`, lower `--samples_per_step` / `--max_seq_len`, smaller `--chunk_size` during cache build, lighter `--teacher_cache_dtype`.
 - **`Missing manifest` / no prebuilt data**: this now triggers streaming fallback automatically. Set `--max_steps > 0`, and do not use `--use_teacher_cache` in that mode.
-- **Resume gives different sample order**: ensure checkpoint contains `train_state.json` with `data_state` (new checkpoints include this). Without it, resume can replay samples from the beginning.
+- **Resume gives different sample order**: ensure checkpoint contains `train_state.json` with `data_state` (new checkpoints include this). Without it, resume can replay samples from the beginning. For **streaming** fallback, `data_state` includes `consumed` and `dataset_split`; restore uses `IterableDataset.skip` when possible instead of replaying millions of `next()` calls.
+- **`train_state.json` empty / corrupt**: resume can rebuild minimal state from the `step_<N>` folder name; **`--dataset_skip_rows` is ignored** whenever `--resume_from` / `--resume_latest` is set.
+- **`wandb` init timeout**: increase `--wandb_init_timeout` or use `--no_wandb` if `api.wandb.ai` is slow from your network.
 - **No king eval output**: set `--eval_every_steps > 0` and provide `--king_repo`.
 - **King comparison looks noisy between runs**: fix `--eval_seed` and keep `--eval_prompts`/`--eval_dataset`/`--eval_block_number` unchanged to compare runs fairly.
 - **No early stop**: set `--early_stop_on_beat_consecutive > 0` and make sure thresholds (`--beat_king_p_threshold`, `--beat_king_min_delta`) are achievable.

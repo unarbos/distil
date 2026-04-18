@@ -355,35 +355,102 @@ def _evaluate_against_king(
     }
 
 
-def _collect_origin_config_files(origin_model_ref: str, cache_dir: Path) -> list[Path]:
-    """
-    Best-effort collection of origin model config/tokenizer artifacts from a local path.
+def _looks_like_hf_repo_id(ref: str) -> bool:
+    ref = ref.strip()
+    if "/" not in ref or ref.startswith(("/", ".", "~")):
+        return False
+    left, _, right = ref.partition("/")
+    return bool(left) and bool(right) and "\\" not in ref
 
-    For remote Hub model IDs, we skip silently (student.save_pretrained/tokenizer.save_pretrained
-    still write the canonical config files for checkpoints).
+
+# Files to preserve from the origin checkpoint (Hub or local). `save_pretrained` may rewrite a
+# slimmer config.json; we copy these into each step_* after save so validators see repo-identical JSON.
+_ORIGIN_ARTIFACT_NAMES: tuple[str, ...] = (
+    "config.json",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "video_preprocessor_config.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "chat_template.jinja",
+    "vocab.json",
+    "added_tokens.json",
+    "merges.txt",
+    "tokenizer.model",
+)
+
+
+def _ensure_origin_model_configs_cached(
+    origin_model_ref: str,
+    revision: str | None,
+    cache_dir: Path,
+) -> list[Path]:
+    """
+    Cache origin model config/tokenizer metadata for later copy into checkpoints.
+
+    - Local directory: copy matching files from disk (byte-identical).
+    - Hugging Face repo id (``org/name``): download the same filenames from the Hub so
+      ``config.json`` matches the published model, not only the in-memory config from
+      ``save_pretrained``.
     """
     src = Path(origin_model_ref)
-    if not src.exists() or not src.is_dir():
+    if src.is_dir():
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[Path] = []
+        names = set(_ORIGIN_ARTIFACT_NAMES)
+        for p in src.iterdir():
+            if not p.is_file():
+                continue
+            if p.name in names or p.name.endswith(".json"):
+                dst = cache_dir / p.name
+                shutil.copy2(p, dst)
+                copied.append(dst)
+        return copied
+
+    if not _looks_like_hf_repo_id(origin_model_ref):
         return []
 
-    config_like_names = {
-        "config.json",
-        "generation_config.json",
-        "preprocessor_config.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "tokenizer.json",
-        "chat_template.jinja",
-    }
+    from huggingface_hub import hf_hub_download
+
     cache_dir.mkdir(parents=True, exist_ok=True)
-    copied = []
-    for p in src.iterdir():
-        if not p.is_file():
+    copied: list[Path] = []
+    repo_id = origin_model_ref.strip()
+    rev_kw = {} if revision in (None, "") else {"revision": str(revision)}
+    for filename in _ORIGIN_ARTIFACT_NAMES:
+        try:
+            out = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=str(cache_dir),
+                local_dir_use_symlinks=False,
+                **rev_kw,
+            )
+            copied.append(Path(out))
+        except Exception as e:
+            if filename == "config.json":
+                log.warning(
+                    "Could not download origin config.json from Hub repo %s%s: %s",
+                    repo_id,
+                    f"@{revision}" if rev_kw else "",
+                    e,
+                )
             continue
-        if p.name in config_like_names or p.name.endswith(".json"):
-            dst = cache_dir / p.name
-            shutil.copy2(p, dst)
-            copied.append(dst)
+    if not (cache_dir / "config.json").is_file():
+        log.warning(
+            "Origin Hub cache for %s has no config.json; checkpoints will only contain "
+            "save_pretrained config (may omit Hub-only fields).",
+            repo_id,
+        )
+    else:
+        log.info(
+            "Cached %s origin Hub artifact(s) from %s%s into %s",
+            len(copied),
+            repo_id,
+            f" (revision={revision})" if rev_kw else "",
+            cache_dir,
+        )
     return copied
 
 
@@ -941,6 +1008,30 @@ class PrebuiltTeacherTargetStream:
             raise ValueError("Invalid teacher-target stream state: sample_ptr out of range")
 
 
+def _open_hf_streaming_iterator(dataset: str, split: str, skip_rows: int):
+    """
+    Open a streaming HF ``datasets`` iterator, optionally skipping the first ``skip_rows``
+    raw examples (fast path uses ``IterableDataset.skip`` when available).
+    """
+    from datasets import load_dataset
+
+    skip_rows = int(max(0, skip_rows))
+    ds = load_dataset(dataset, split=split, streaming=True)
+    if skip_rows > 0 and hasattr(ds, "skip"):
+        ds = ds.skip(skip_rows)
+        return iter(ds)
+    if skip_rows > 0:
+        log.warning(
+            "Streaming dataset has no .skip(); advancing %s rows with next() (slow for large skips).",
+            skip_rows,
+        )
+        it = iter(ds)
+        for _ in range(skip_rows):
+            next(it)
+        return it
+    return iter(ds)
+
+
 class StreamingTokenStream:
     """Streams raw dataset text and tokenizes on the fly (no prebuilt manifest needed)."""
 
@@ -950,18 +1041,21 @@ class StreamingTokenStream:
         dataset: str = DATASET,
         max_seq_len: int = MAX_SEQ_LEN,
         min_chars: int = MIN_CHARS,
+        dataset_split: str = "train",
+        dataset_skip_rows: int = 0,
     ):
-        from datasets import load_dataset
         from transformers import AutoTokenizer
 
         if min_chars < 0:
             raise ValueError(f"min_chars must be >= 0 (got {min_chars})")
         self._teacher_model = teacher_model
         self.dataset = dataset
+        self.dataset_split = str(dataset_split)
         self.max_seq_len = int(max_seq_len)
         self.min_chars = int(min_chars)
-        self._ds = iter(load_dataset(self.dataset, split="train", streaming=True))
-        self._consumed = 0
+        skip = int(max(0, dataset_skip_rows))
+        self._ds = _open_hf_streaming_iterator(self.dataset, self.dataset_split, skip)
+        self._consumed = skip
         self.manifest = {
             "dataset": self.dataset,
             "max_seq_len": self.max_seq_len,
@@ -1004,14 +1098,13 @@ class StreamingTokenStream:
             "variant": "streaming_token_stream",
             "consumed": int(self._consumed),
             "dataset": self.dataset,
+            "dataset_split": self.dataset_split,
             "max_seq_len": int(self.max_seq_len),
             "min_chars": int(self.min_chars),
             "teacher_model": self._teacher_model,
         }
 
     def load_state_dict(self, state: dict):
-        from datasets import load_dataset
-
         if state.get("variant") != "streaming_token_stream":
             raise ValueError(
                 "Invalid streaming data_state: expected variant 'streaming_token_stream'"
@@ -1020,6 +1113,12 @@ class StreamingTokenStream:
             raise ValueError(
                 f"Streaming resume dataset mismatch: checkpoint={state.get('dataset')} "
                 f"current={self.dataset}"
+            )
+        ckpt_split = state.get("dataset_split")
+        if ckpt_split is not None and ckpt_split != self.dataset_split:
+            raise ValueError(
+                f"Streaming resume dataset_split mismatch: checkpoint={ckpt_split!r} "
+                f"current={self.dataset_split!r}"
             )
         if int(state.get("max_seq_len", self.max_seq_len)) != int(self.max_seq_len):
             raise ValueError(
@@ -1041,23 +1140,12 @@ class StreamingTokenStream:
             raise ValueError(f"Invalid consumed in checkpoint: {target}")
         if target > 0:
             log.info(
-                "Restoring streaming dataset position (%s raw rows scanned; may take a bit)...",
+                "Restoring streaming dataset position (%s raw rows in split %r; using skip when available)...",
                 target,
+                self.dataset_split,
             )
-        self._ds = iter(load_dataset(self.dataset, split="train", streaming=True))
-        skipped = 0
-        while skipped < target:
-            try:
-                next(self._ds)
-            except StopIteration:
-                log.warning(
-                    "Streaming dataset exhausted after %s rows while restoring position (wanted %s).",
-                    skipped,
-                    target,
-                )
-                break
-            skipped += 1
-        self._consumed = skipped
+        self._ds = _open_hf_streaming_iterator(self.dataset, self.dataset_split, target)
+        self._consumed = target
 
 
 def build_teacher_cache(args):
@@ -1368,11 +1456,29 @@ def train_from_prebuilt(args):
             "Prebuilt manifest not found at %s. Falling back to streaming dataset mode.",
             data_manifest_path,
         )
+        ds_skip = int(getattr(args, "dataset_skip_rows", 0) or 0)
+        if ds_skip < 0:
+            raise ValueError("--dataset_skip_rows must be >= 0")
+        if resume_dir and ds_skip > 0:
+            log.warning(
+                "--dataset_skip_rows is ignored when resuming from a checkpoint; "
+                "streaming position comes from train_state.json data_state (or consumed)."
+            )
+        stream_skip_rows = 0 if resume_dir else ds_skip
+        if stream_skip_rows > 0:
+            log.info(
+                "Streaming: skipping first %s raw example(s) in split %r of %s.",
+                stream_skip_rows,
+                args.dataset_split,
+                args.dataset,
+            )
         data = StreamingTokenStream(
             teacher_model=args.teacher,
             dataset=args.dataset,
             max_seq_len=args.max_seq_len,
             min_chars=args.min_chars,
+            dataset_split=args.dataset_split,
+            dataset_skip_rows=stream_skip_rows,
         )
     elif args.use_teacher_cache:
         data = PrebuiltTeacherTargetStream(
@@ -1403,10 +1509,12 @@ def train_from_prebuilt(args):
     if not args.no_wandb:
         import wandb
 
+        _wb_timeout = max(30, int(args.wandb_init_timeout))
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run or "distil-kl-prebuilt",
             config=vars(args),
+            settings=wandb.Settings(init_timeout=_wb_timeout),
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
@@ -1489,18 +1597,10 @@ def train_from_prebuilt(args):
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, 100_000)
-    origin_cfg_cache_dir = output_dir / "_origin_model_configs"
-    copied_origin_cfgs = _collect_origin_config_files(args.student, origin_cfg_cache_dir)
-    if copied_origin_cfgs:
-        log.info(
-            "Cached %s origin model config files from %s",
-            len(copied_origin_cfgs),
-            args.student,
-        )
 
     resume_global_step = 0
     resume_state: dict | None = None
+    scheduler_path: Path | None = None
     if resume_dir:
         optimizer_path = resume_dir / "optimizer.pt"
         scheduler_path = resume_dir / "scheduler.pt"
@@ -1512,10 +1612,70 @@ def train_from_prebuilt(args):
                 resume_dir,
             )
         optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
-        if scheduler_path.exists():
-            scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
         resume_state, _train_state_repaired = _read_train_state_or_repair(resume_dir)
         resume_global_step = int(resume_state.get("global_step", 0))
+
+    dataset_samples = int(manifest.get("num_samples", 0) or 0)
+    if using_streaming_fallback and args.max_steps <= 0:
+        raise ValueError(
+            "Streaming fallback mode has no finite manifest sample count. "
+            "Set --max_steps to a positive value."
+        )
+    if args.max_steps > 0:
+        target_steps = args.max_steps
+        stop_reason = f"max_steps={args.max_steps}"
+    else:
+        if dataset_samples <= 0:
+            raise ValueError(
+                "Manifest is missing a valid num_samples. Set --max_steps explicitly to control run length."
+            )
+        target_steps = max(1, math.ceil(dataset_samples / max(args.samples_per_step, 1)))
+        stop_reason = (
+            f"one full pass over prebuilt data ({dataset_samples} samples, "
+            f"~{target_steps} steps at {args.samples_per_step} samples/step)"
+        )
+        log.info(
+            "--max_steps not set (or 0). Training will stop after %s.",
+            stop_reason,
+        )
+        if resume_dir and resume_global_step >= target_steps:
+            extra = max(1, math.ceil(dataset_samples / max(args.samples_per_step, 1)))
+            target_steps = resume_global_step + extra
+            stop_reason = (
+                f"resume extension by one more pass ({extra} steps) "
+                f"from resumed step {resume_global_step}"
+            )
+            log.info(
+                "Resumed step (%s) already reached auto target. Extending run: %s.",
+                resume_global_step,
+                stop_reason,
+            )
+
+    # Cosine schedule total must match this run length (hardcoding 100k flattens LR for short runs).
+    scheduler_total_steps = max(int(target_steps), int(args.warmup_steps) + 1)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, int(args.warmup_steps), scheduler_total_steps
+    )
+    log.info(
+        "LR scheduler: cosine over %s steps (warmup=%s).",
+        scheduler_total_steps,
+        args.warmup_steps,
+    )
+    if resume_dir and scheduler_path is not None and scheduler_path.exists():
+        scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
+
+    origin_cfg_cache_dir = output_dir / "_origin_model_configs"
+    copied_origin_cfgs = _ensure_origin_model_configs_cached(
+        args.student,
+        args.student_revision,
+        origin_cfg_cache_dir,
+    )
+    if copied_origin_cfgs:
+        log.info(
+            "Cached %s origin model config files from %s",
+            len(copied_origin_cfgs),
+            args.student,
+        )
 
     eval_prompts = []
     teacher_eval = None
@@ -1600,42 +1760,6 @@ def train_from_prebuilt(args):
             "Larger chunks = faster but more student-GPU memory for logits/activations.",
             getattr(args, "online_chunk_size", 1),
         )
-
-    dataset_samples = int(manifest.get("num_samples", 0) or 0)
-    if using_streaming_fallback and args.max_steps <= 0:
-        raise ValueError(
-            "Streaming fallback mode has no finite manifest sample count. "
-            "Set --max_steps to a positive value."
-        )
-    if args.max_steps > 0:
-        target_steps = args.max_steps
-        stop_reason = f"max_steps={args.max_steps}"
-    else:
-        if dataset_samples <= 0:
-            raise ValueError(
-                "Manifest is missing a valid num_samples. Set --max_steps explicitly to control run length."
-            )
-        target_steps = max(1, math.ceil(dataset_samples / max(args.samples_per_step, 1)))
-        stop_reason = (
-            f"one full pass over prebuilt data ({dataset_samples} samples, "
-            f"~{target_steps} steps at {args.samples_per_step} samples/step)"
-        )
-        log.info(
-            "--max_steps not set (or 0). Training will stop after %s.",
-            stop_reason,
-        )
-        if resume_dir and resume_global_step >= target_steps:
-            extra = max(1, math.ceil(dataset_samples / max(args.samples_per_step, 1)))
-            target_steps = resume_global_step + extra
-            stop_reason = (
-                f"resume extension by one more pass ({extra} steps) "
-                f"from resumed step {resume_global_step}"
-            )
-            log.info(
-                "Resumed step (%s) already reached auto target. Extending run: %s.",
-                resume_global_step,
-                stop_reason,
-            )
 
     best_beating_delta = float("-inf")
     beat_streak = 0
@@ -1783,6 +1907,7 @@ def train_from_prebuilt(args):
                     best_dir.mkdir(parents=True, exist_ok=True)
                     student.save_pretrained(best_dir)
                     tokenizer.save_pretrained(best_dir)
+                    # Restore full origin config/tokenizer files over save_pretrained output when cached.
                     _copy_cached_origin_configs(origin_cfg_cache_dir, best_dir)
                     _atomic_write_json(
                         best_dir / "train_state.json",
@@ -1840,6 +1965,7 @@ def train_from_prebuilt(args):
             d.mkdir(parents=True, exist_ok=True)
             student.save_pretrained(d)
             tokenizer.save_pretrained(d)
+            # Overwrite save_pretrained config.json with full origin Hub/local snapshot when cached.
             _copy_cached_origin_configs(origin_cfg_cache_dir, d)
             torch.save(optimizer.state_dict(), d / "optimizer.pt")
             torch.save(scheduler.state_dict(), d / "scheduler.pt")
@@ -1929,6 +2055,12 @@ def build_parser():
     )
     p_train.add_argument("--teacher", type=str, default=TEACHER_MODEL)
     p_train.add_argument("--student", type=str, default=STUDENT_MODEL)
+    p_train.add_argument(
+        "--student_revision",
+        type=str,
+        default=None,
+        help="Optional Hub revision/branch for --student when downloading origin config/tokenizer files.",
+    )
     p_train.add_argument("--teacher_gpu", type=int, default=0)
     p_train.add_argument("--student_gpu", type=int, default=1)
     p_train.add_argument(
@@ -1968,6 +2100,21 @@ def build_parser():
         type=int,
         default=MIN_CHARS,
         help="Minimum text length filter for streaming fallback mode.",
+    )
+    p_train.add_argument(
+        "--dataset_split",
+        type=str,
+        default="train",
+        help="Streaming fallback only: Hugging Face ``datasets`` split name (e.g. train, validation).",
+    )
+    p_train.add_argument(
+        "--dataset_skip_rows",
+        type=int,
+        default=0,
+        help=(
+            "Streaming fallback only: skip this many raw examples from the start of the split "
+            "before training (uses IterableDataset.skip when available). Ignored when resuming from a checkpoint."
+        ),
     )
     p_train.add_argument("--use_teacher_cache", action="store_true")
     p_train.add_argument("--data_seed", type=int, default=42)
@@ -2081,6 +2228,12 @@ def build_parser():
     )
     p_train.add_argument("--wandb_project", type=str, default="distil-subnet97")
     p_train.add_argument("--wandb_run", type=str, default=None)
+    p_train.add_argument(
+        "--wandb_init_timeout",
+        type=int,
+        default=300,
+        help="Seconds to wait for wandb.run init (slow networks / api.wandb.ai).",
+    )
     p_train.add_argument("--no_wandb", action="store_true")
 
     return parser
