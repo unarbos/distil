@@ -13,6 +13,14 @@ from eval.chain import (
     set_weights,
 )
 from eval.dataset import format_prompt, sample_prompts_from_dataset
+from eval.private_pool import (
+    DEFAULT_PRIVATE_FRACTION,
+    load_private_pool,
+    record_uses,
+    sample_private_subset,
+    write_commit,
+    write_reveal,
+)
 from eval.scoring import append_score_history
 from eval.state import ValidatorState, atomic_json_write, log_event
 from scripts.validator.announcements import announce_new_king
@@ -469,10 +477,38 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     time.sleep(60)
                     continue
 
+            # Mix climbmix-public prompts with a private holdout subset so
+            # miners can't fully precompute distillation against the eval set.
+            # Validator-only state/private_prompt_pool.json drives the
+            # private side; we commit its hash before running eval and reveal
+            # the per-prompt hashes after, so miners can audit non-retrofit.
+            try:
+                from eval.private_pool import PRIVATE_POOL_MIN_HEALTHY
+                pool_size = len(load_private_pool())
+                if pool_size and pool_size < PRIVATE_POOL_MIN_HEALTHY:
+                    logger.warning(
+                        f"private prompt pool small ({pool_size} prompts) "
+                        f"— extend state/private_prompt_pool.json to >= "
+                        f"{PRIVATE_POOL_MIN_HEALTHY} for healthy rotation"
+                    )
+            except Exception:
+                pass
+            private_subset = sample_private_subset(n_prompts, current_block)
+            n_public = max(1, n_prompts - len(private_subset))
             epoch_prompts = sample_prompts_from_dataset(
-                n_prompts, current_block, block_hash=current_block_hash,
+                n_public, current_block, block_hash=current_block_hash,
             )
-            prompt_texts = [format_prompt(p) for p in epoch_prompts]
+            public_texts = [format_prompt(p) for p in epoch_prompts]
+            private_texts = [format_prompt(p) for p in private_subset]
+            prompt_texts = public_texts + private_texts
+            commit_root = ""
+            try:
+                if private_texts:
+                    commit_root = write_commit(current_block, private_texts)
+                    logger.info(f"private-pool commit root: {commit_root[:16]}... "
+                                f"(n={len(private_texts)} of {n_prompts})")
+            except Exception as e:
+                logger.warning(f"private-pool commit failed (non-fatal): {e}")
             state.current_round = {
                 "started_at": time.time(),
                 "block": current_block,
@@ -480,6 +516,11 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 "king_uid": king_uid,
                 "model_names": [info["model"] for info in models_to_eval.values()],
                 "prompts": prompt_texts,
+                "private_pool": {
+                    "n": len(private_texts),
+                    "commit_root": commit_root,
+                    "fraction": DEFAULT_PRIVATE_FRACTION,
+                },
             }
             state.save_round()
 
@@ -488,6 +529,12 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 state, is_full_eval, use_vllm, eval_script,
                 block_seed=current_block,
             )
+            try:
+                if private_texts:
+                    record_uses(private_texts)
+                    write_reveal(current_block, private_texts)
+            except Exception as e:
+                logger.warning(f"private-pool reveal failed (non-fatal): {e}")
             if results is None:
                 logger.warning("Eval did not produce usable results — clearing round state")
                 log_event(

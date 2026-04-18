@@ -583,6 +583,33 @@ def get_eval_data(list: bool = False, file: str = None):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+@router.get("/api/private-pool-commit", tags=["Evaluation"],
+         summary="Private holdout commit (audit)",
+         description="""Returns the validator's commit-reveal record for the
+private prompt holdout (axis A7).
+
+Fields:
+- `current.block`, `current.root`, `current.n`: sha256 commit root over the
+  private subset chosen for the round at `block`. Published BEFORE eval runs.
+- `latest_reveal.prompt_hashes`: per-prompt sha256 list, published AFTER the
+  round completes. Auditors can verify `sha256(sorted(prompt_hashes)) == root`
+  to confirm the validator did not retro-fit the holdout to results.
+- `latest_reveal.block`: block number the reveal corresponds to.
+
+Per Dwork-Roth reusable-holdout (2015): a prompt's reuse increases the noise
+applied to its score, so even with reveal hashes a miner cannot infer
+high-resolution score deltas on a specific prompt.
+""")
+def get_private_pool_commit():
+    from api.state_store import read_state
+    commit = read_state("private_pool_commit.json", {}) or {}
+    reveal = read_state("private_pool_reveal.json", {}) or {}
+    return JSONResponse(
+        content={"current": commit, "latest_reveal": reveal},
+        headers={"Cache-Control": "public, max-age=15"},
+    )
+
+
 @router.get("/api/benchmarks", tags=["Evaluation"], summary="Benchmark results for king models",
          description="Returns benchmark scores for evaluated king models. Scores are from lm-eval-harness full eval sets.")
 def get_benchmarks():
