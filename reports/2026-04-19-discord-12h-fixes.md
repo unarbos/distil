@@ -133,3 +133,52 @@ Ship with the next safe restart window (between rounds). The threshold
 bump and FAQ updates are inert if not deployed. The tiebreaker activates
 only when 2+ challengers pass the king t-test in the same round, which
 happens roughly every 2-3 rounds at current activity levels.
+
+## Follow-ups after the initial deploy (22:28-22:45 UTC)
+
+Discovered three gaps during the deploy rollout — all fixed in `e2c534a`:
+
+1. **Stale activation-copy DQs don't auto-clear with the threshold bump**
+   (sebastian_020521's complaint about UID 191 and UID 193). Bumping
+   `activationCopyThreshold` in config alone does nothing for already-DQ'd
+   miners — precheck short-circuits on the cached `hotkey:commit_block`
+   entry in `disqualified.json` before any fresh comparison runs. Added
+   `scripts/maintenance/clear_activation_dqs_below_new_threshold.py`
+   which removes DQ entries whose recorded cosine sim falls in
+   `[0.9999, 0.99999)`. Ran against prod state: cleared 21 DQs, unbanned
+   5 models from `permanently_bad_models.json`.
+
+2. **Penalty history in `model_score_history.json` also needed reset.**
+   Even after un-DQing, `select_challengers` pruned these UIDs via the
+   `best_ever > king_kl*2` rule because their history was stamped with
+   `best_kl=3.0` (the sentinel assigned when the DQ was applied). Added
+   `scripts/maintenance/reset_penalty_history_for_cleared_uids.py`; ran
+   against prod and reset 16 penalty entries.
+
+3. **`cap_challengers` silently dropped top-4 contenders.** The cap
+   sorts by `state.scores.get(uid, 999)`; unscored challengers all tie
+   on the 999 default and top-4 contenders (added last in
+   `add_top5_contenders`) got truncated first by dict-insertion order.
+   UID 193 (`best26/sn97-best50622-2550`) hit this on the first round
+   after un-DQing — the existing `assert_top_contenders_present`
+   regression check caught it loudly but didn't fix it. Modified
+   `cap_challengers` to pin top-4 contenders before the sort; smoke-
+   tested with 3 scenarios (cap exceeded with top-4, cap exceeded
+   without top-4, under cap).
+
+Validator was restarted four times during rollout: (a) pick up the
+1c61941 commit, (b) reload in-memory `state.dq_reasons` after clearing
+21 entries, (c) reload `model_score_history` after resetting 16 penalty
+entries, (d) pick up the cap fix. After the last restart the H2H round
+correctly includes UID 193 via the newly-protected top-4 path, and the
+15 other cleared UIDs are visible in the precheck-valid pool for
+subsequent rounds.
+
+Files added:
+
+- `scripts/maintenance/clear_activation_dqs_below_new_threshold.py`
+- `scripts/maintenance/reset_penalty_history_for_cleared_uids.py`
+
+Files changed:
+
+- `scripts/validator/challengers.py` — `cap_challengers` protects top-4
