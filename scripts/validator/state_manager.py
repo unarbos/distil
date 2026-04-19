@@ -192,6 +192,39 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                           state.h2h_tested_against_king, indent=2)
 
 
+_COPY_LIKE_DQ_PATTERNS = (
+    "activation-space duplicate",
+    "identical weights",
+    "copy: activation",
+    "copy: identical",
+)
+
+
+def _is_copy_like_dq(reason: str) -> bool:
+    """Return True when a DQ reason indicates a "copy" of another model (same
+    weights or near-identical activation fingerprint), as opposed to a genuine
+    quality/integrity failure. Copy DQs should not auto-ban the model itself
+    from future consideration — only the specific late-committed duplicate is
+    penalised in the round.
+    """
+    if not isinstance(reason, str):
+        return False
+    lowered = reason.lower()
+    return any(p in lowered for p in _COPY_LIKE_DQ_PATTERNS)
+
+
+def _get_dq_reason_for_uid(uid, info: dict, dq_reasons: dict) -> str:
+    """Resolve the DQ reason (if any) for a UID + commit, tolerating missing
+    hotkey / commit_block.
+    """
+    hotkey = (info or {}).get("hotkey", "") or ""
+    cb = (info or {}).get("commit_block")
+    try:
+        return get_dq_reason(uid, hotkey, dq_reasons, commit_block=cb)
+    except Exception:
+        return ""
+
+
 def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
                           king_kl, disqualified):
     """Update persistent model score history and permanently bad models."""
@@ -218,7 +251,6 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
                 if "best_kl" not in state.model_score_history.get(model_name, {}):
                     state.model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
 
-    # Permanently bad models
     if king_kl > 0 and king_kl < float("inf"):
         perm_bad_threshold = king_kl * 10.0
         newly_banned = []
@@ -226,9 +258,23 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
             uid_str = str(uid)
             if uid_str in state.scores and state.scores[uid_str] > perm_bad_threshold:
                 model_name = info["model"]
-                if model_name not in state.permanently_bad_models:
-                    state.permanently_bad_models.add(model_name)
-                    newly_banned.append(f"{model_name} (UID {uid}, KL={state.scores[uid_str]:.4f})")
+                if model_name in state.permanently_bad_models:
+                    continue
+                dq_reason = _get_dq_reason_for_uid(uid, info, state.dq_reasons)
+                if dq_reason and _is_copy_like_dq(dq_reason):
+                    # Copy-like DQs (activation-space duplicate, identical weights) set
+                    # score=3.0 as a penalty, but the model itself may be perfectly valid
+                    # — it's just the same as a previously-submitted one. Banning the
+                    # model permanently here was the side-effect that wrongly-DQ'd
+                    # previous kings (UID 174/183/165 on 2026-04-18) from ever being
+                    # re-evaluated after the DQ was cleared. Skip it.
+                    logger.info(
+                        f"  skipping perm-ban of {model_name} (UID {uid}) — "
+                        f"DQ is copy-like: '{dq_reason[:80]}...'"
+                    )
+                    continue
+                state.permanently_bad_models.add(model_name)
+                newly_banned.append(f"{model_name} (UID {uid}, KL={state.scores[uid_str]:.4f})")
         if newly_banned:
             logger.info(f"🚫 Added {len(newly_banned)} models to permanently_bad_models")
 

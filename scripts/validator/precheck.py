@@ -37,7 +37,22 @@ def _cosine_sim(a: list, b: list) -> float:
     return dot / (norm_a * norm_b)
 
 
-def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, state_dir):
+def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, state_dir,
+                                 commit_block=None, uid_to_commit_block=None):
+    """Compare the incoming model's activation fingerprint against stored ones.
+
+    Returns: (is_copy, copy_uid, copy_model, original_uid, original_model, sim)
+        - is_copy: True iff a near-duplicate (sim >= ACTIVATION_COPY_THRESHOLD) was found.
+        - copy_uid / copy_model: the LATER-committed of the two (the one to DQ).
+        - original_uid / original_model: the EARLIER-committed (the one to keep).
+        - sim: the similarity score for the matched pair.
+
+    If commit_block / uid_to_commit_block aren't provided, falls back to the legacy
+    behaviour (DQ the incoming UID, treat any existing stored entry as the original).
+    The fingerprint is only persisted under `uid` if it is NOT determined to be a copy
+    of an earlier-committed model — avoids polluting the store with later copies and
+    makes future griefing attempts much harder (the king's fingerprint is the canonical one).
+    """
     from pathlib import Path
 
     fp_file = Path(state_dir) / "activation_fingerprints.json"
@@ -49,12 +64,16 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
             stored = {}
     layer_fps = fingerprint.get("layer_fingerprints", {})
     if not layer_fps:
-        return False, None, None, 0.0
+        return False, None, None, None, None, 0.0
     max_sim = 0.0
     max_sim_uid = None
     max_sim_model = None
+    max_sim_stored_block = None
     for other_uid_str, other_data in stored.items():
-        other_uid = int(other_uid_str)
+        try:
+            other_uid = int(other_uid_str)
+        except (TypeError, ValueError):
+            continue
         if other_uid == uid:
             continue
         other_fps = other_data.get("layer_fingerprints", {})
@@ -73,19 +92,82 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                 max_sim = avg_sim
                 max_sim_uid = other_uid
                 max_sim_model = other_data.get("model", "unknown")
-    stored[str(uid)] = {
-        "model": model_name,
-        "layer_fingerprints": layer_fps,
-        "n_layers": fingerprint.get("n_layers"),
-        "hidden_size": fingerprint.get("hidden_size"),
-        "updated": time.time(),
-    }
-    try:
-        fp_file.write_text(json.dumps(stored, indent=2))
-    except Exception as exc:
-        logger.warning(f"Failed to save fingerprints: {exc}")
+                max_sim_stored_block = other_data.get("commit_block")
+
     is_copy = max_sim >= ACTIVATION_COPY_THRESHOLD
-    return is_copy, max_sim_uid, max_sim_model, max_sim
+
+    copy_uid = uid
+    copy_model = model_name
+    original_uid = max_sim_uid
+    original_model = max_sim_model
+
+    if is_copy:
+        # Resolve commit_block for both sides with layered fallback:
+        #   self:  explicit arg > uid_to_commit_block > None
+        #   other: uid_to_commit_block > stored fingerprint's commit_block > None
+        # Using stored commit_block fixes the case where the matched UID is not in
+        # the current round (uid_to_commit_block would miss it) and avoids the
+        # flip-flop bug where the earlier committer kept getting flagged as the
+        # "later" one because its block resolved to None→inf.
+        my_block = commit_block
+        if my_block is None and uid_to_commit_block is not None:
+            my_block = uid_to_commit_block.get(uid)
+        other_block = None
+        if uid_to_commit_block is not None and max_sim_uid is not None:
+            other_block = uid_to_commit_block.get(max_sim_uid)
+        if other_block is None:
+            other_block = max_sim_stored_block
+        try:
+            my_b = float(my_block) if my_block is not None else None
+        except (TypeError, ValueError):
+            my_b = None
+        try:
+            other_b = float(other_block) if other_block is not None else None
+        except (TypeError, ValueError):
+            other_b = None
+        # Safety: if we can't determine commit order for sure, DO NOT DQ.
+        # Flipping a coin here is exactly the bug that took down UID 174.
+        # The copy will still be caught on the next round once we can resolve blocks.
+        if my_b is None or other_b is None:
+            logger.warning(
+                f"UID {uid} ({model_name}) activation-matched UID {max_sim_uid} "
+                f"({max_sim_model}) at sim={max_sim:.6f} but commit_block unresolved "
+                f"(my={my_block}, other={other_block}) — skipping DQ to avoid false positives. "
+                f"Will re-evaluate once on-chain blocks are known."
+            )
+            is_copy = False
+        else:
+            if other_b > my_b:
+                copy_uid = max_sim_uid
+                copy_model = max_sim_model
+                original_uid = uid
+                original_model = model_name
+            elif other_b == my_b and max_sim_uid is not None and max_sim_uid < uid:
+                copy_uid = max_sim_uid
+                copy_model = max_sim_model
+                original_uid = uid
+                original_model = model_name
+
+    if not is_copy or copy_uid != uid:
+        stored[str(uid)] = {
+            "model": model_name,
+            "layer_fingerprints": layer_fps,
+            "n_layers": fingerprint.get("n_layers"),
+            "hidden_size": fingerprint.get("hidden_size"),
+            "commit_block": commit_block,
+            "updated": time.time(),
+        }
+        try:
+            fp_file.write_text(json.dumps(stored, indent=2))
+        except Exception as exc:
+            logger.warning(f"Failed to save fingerprints: {exc}")
+    else:
+        logger.info(
+            f"UID {uid} ({model_name}) flagged as later-committed copy of UID {original_uid} "
+            f"({original_model}) — NOT persisting fingerprint to keep the original canonical"
+        )
+
+    return is_copy, copy_uid, copy_model, original_uid, original_model, max_sim
 
 
 def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: ValidatorState, max_params_b: float):
@@ -156,7 +238,13 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 disqualified.add(uid)
                 state.evaluated_uids.discard(uid_str)
                 continue
-            valid_models[uid] = {"model": model_repo, "revision": revision, "params_b": None, "hotkey": hotkey}
+            valid_models[uid] = {
+                "model": model_repo,
+                "revision": revision,
+                "params_b": None,
+                "hotkey": hotkey,
+                "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
+            }
             continue
         logger.info(f"Checking {model_repo}...")
         hf_user = model_repo.split("/")[0] if "/" in model_repo else None

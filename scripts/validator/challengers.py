@@ -7,7 +7,18 @@ from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 logger = logging.getLogger("distillation.remote_validator")
 
 
-def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl, epoch_count: int):
+def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
+                       epoch_count: int, trust_king_kl: bool = True):
+    """Pick challengers for the round.
+
+    ``trust_king_kl`` = False disables the ``best_ever > king_kl*2`` prune.
+    Set this when the king was picked from a stale cached score (the old H2H
+    leaderboard expired and `_resolve_king` fell back to `state.scores`) —
+    in that case ``king_kl`` can be artificially low (scores were measured
+    against a different king, prompt set, or even a different model later
+    re-uploaded under the same UID) and tightens the skip threshold so
+    aggressively that genuinely competitive UIDs never get re-evaluated.
+    """
     challengers = {}
     for uid, info in valid_models.items():
         uid_str = str(uid)
@@ -18,7 +29,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl, e
             state.evaluated_uids.add(uid_str)
             continue
         best_ever = state.model_score_history.get(model_name, {}).get("best_kl")
-        if best_ever is not None and king_kl < float("inf"):
+        if trust_king_kl and best_ever is not None and king_kl < float("inf"):
             skip_threshold = max(king_kl * 2.0, king_kl + 0.05)
             if best_ever > skip_threshold:
                 state.evaluated_uids.add(uid_str)

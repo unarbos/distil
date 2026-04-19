@@ -421,6 +421,8 @@ CHAT_PROBE_MIN_ANSWER_CHARS = int(os.environ.get("CHAT_PROBE_MIN_ANSWER_CHARS", 
 CHAT_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("CHAT_PROBE_TERMINATE_THRESHOLD", "0.5"))
 
 THINK_PROBE_PROMPTS = [
+    # ── Termination battery (16): trivial prompts where any sane model stops fast.
+    # A model that fails to stop here is broken, full stop.
     "Hi",
     "What is the largest planet? Answer in one word.",
     "Say the word: done",
@@ -431,12 +433,83 @@ THINK_PROBE_PROMPTS = [
     "Complete the word: appl_",
     "What color is the sky usually? One word.",
     "Name a primary color. One word.",
+    "Answer yes or no: is water wet?",
+    "What is 2+2? Reply with just the number.",
+    "What is the capital of France? One word.",
+    "Say the letter A.",
+    "Output the digit 5.",
+    "Respond with the single word: hello",
+    # ── Reasoning battery (16): prompts that legitimately warrant a chain of
+    # thought. A healthy distilled student should *use* CoT and still terminate
+    # within the budget. A model that loops, falls into a degenerate pattern,
+    # or empties the 2048-token budget without resolving is the failure we
+    # want to catch — this is the pathology we’ve observed in KL-saturated
+    # kings that “pass” on one-word probes but melt under actual thinking.
+    "A farmer has 17 sheep. All but 9 die. How many are left? Think step by step and give the final answer.",
+    "If it takes 5 machines 5 minutes to make 5 widgets, how long does it take 100 machines to make 100 widgets? Explain briefly then answer.",
+    "I have 3 apples today. Yesterday I ate 2. How many do I have now? Work it out.",
+    "What is 23 * 7? Show your steps then give the answer.",
+    "If today is Wednesday, what day of the week is it 10 days from now? Reason then answer.",
+    "A bat and a ball cost $1.10 total. The bat costs $1 more than the ball. How much does the ball cost? Reason then answer.",
+    "Sort these numbers ascending: 9, 3, 14, 1, 7. List the sorted order.",
+    "Is 51 prime? Give your reasoning then answer yes or no.",
+    "A rectangle is 5 by 8. What is its area and perimeter?",
+    "Explain why ice floats on water in one or two sentences.",
+    "List three differences between mitosis and meiosis.",
+    "In one short paragraph, explain what a neural network is.",
+    "Give three distinct English words that rhyme with 'orange' or say 'none' if impossible.",
+    "Translate to Spanish: 'The cat sat on the mat.'",
+    "What is the next number in the sequence 1, 1, 2, 3, 5, 8, __? Explain.",
+    "Write a single limerick about a programmer who forgets their password.",
 ]
-THINK_PROBE_MAX_TOKENS = int(os.environ.get("THINK_PROBE_MAX_TOKENS", "1024"))
+THINK_PROBE_MAX_TOKENS = int(os.environ.get("THINK_PROBE_MAX_TOKENS", "2048"))
 THINK_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("THINK_PROBE_TERMINATE_THRESHOLD", "0.66"))
 THINK_PROBE_DEGEN_SIGMA = float(os.environ.get("THINK_PROBE_DEGEN_SIGMA", "4.0"))
 THINK_PROBE_GZIP_FLOOR = float(os.environ.get("THINK_PROBE_GZIP_FLOOR", "0.25"))
 THINK_PROBE_SELFBLEU_MAX = float(os.environ.get("THINK_PROBE_SELFBLEU_MAX", "0.85"))
+# Wilson lower-bound confidence for pass/fail decisions (T0.2). Replaces the
+# old hand-picked 7/10 threshold with a statistical test anchored on the
+# teacher’s own termination rate on the same prompts. A student fails only
+# when its Wilson 95% lower bound on termination rate is strictly below the
+# teacher’s Wilson 95% lower bound minus ``THINK_PROBE_WILSON_MARGIN``.
+THINK_PROBE_WILSON_Z = float(os.environ.get("THINK_PROBE_WILSON_Z", "1.96"))
+THINK_PROBE_WILSON_MARGIN = float(os.environ.get("THINK_PROBE_WILSON_MARGIN", "0.10"))
+
+# ── On-policy reverse-KL probe (T1.1/T1.2) ────────────────────────────
+# Generates rollouts from the *student’s* own policy, scores them under
+# both student and teacher logits, and reports the reverse KL
+# D_KL(student || teacher) and a skew-KL D_KL(teacher || α·teacher + (1-α)·student).
+# Reverse KL is the mode-seeking objective that distillation literature
+# converges to (Gu et al. 2024 “MiniLLM”, Ko et al. 2024 “DistiLLM”), and
+# skew-KL (Ko et al. 2024) is the theoretically-preferred upper bound that
+# stays finite when student support drifts outside teacher support — which
+# is exactly the failure case off-policy KL silently misses.
+ON_POLICY_RKL_N_PROMPTS = int(os.environ.get("ON_POLICY_RKL_N_PROMPTS", "12"))
+ON_POLICY_RKL_MAX_NEW = int(os.environ.get("ON_POLICY_RKL_MAX_NEW", "128"))
+ON_POLICY_RKL_TEMPERATURE = float(os.environ.get("ON_POLICY_RKL_TEMPERATURE", "0.7"))
+ON_POLICY_RKL_TOP_P = float(os.environ.get("ON_POLICY_RKL_TOP_P", "0.9"))
+ON_POLICY_RKL_TOP_K_LOGITS = int(os.environ.get("ON_POLICY_RKL_TOP_K_LOGITS", "128"))
+ON_POLICY_RKL_SKEW_ALPHA = float(os.environ.get("ON_POLICY_RKL_SKEW_ALPHA", "0.1"))
+ON_POLICY_RKL_SEED = int(os.environ.get("ON_POLICY_RKL_SEED", "42"))
+ON_POLICY_RKL_ENABLED = os.environ.get("ON_POLICY_RKL", "1") != "0"
+ON_POLICY_RKL_PROMPTS = [
+    "Explain how a transformer attention layer works, in one paragraph.",
+    "What is 13 * 17? Show your reasoning.",
+    "Write a haiku about autumn.",
+    "List three causes of the French Revolution.",
+    "Translate to French: The cat sat on the mat.",
+    "What is the capital of Japan?",
+    "Summarize the plot of Romeo and Juliet in two sentences.",
+    "Is 97 prime? Answer with reasoning.",
+    "Define machine learning in one sentence.",
+    "Complete the sentence: The sky is blue because",
+    "What is the derivative of x^2?",
+    "In one sentence, explain why photosynthesis matters.",
+    "Name a famous work by Mozart.",
+    "What is the square root of 144?",
+    "Who wrote Hamlet?",
+    "Give a one-line summary of gradient descent.",
+]
 
 _CAPABILITY_STATIC_POOL = [
     {"q": "What is the capital of France? One word.", "a": "paris", "kind": "word"},
@@ -781,6 +854,26 @@ def _robust_zscore(x: float, values: list[float]) -> float:
     if mad < 1e-9:
         return 0.0
     return 0.6745 * (x - med) / mad
+
+
+def _wilson_bounds(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score-interval for a binomial proportion (Wilson 1927).
+
+    Returns (lower, upper) 95% CI (default z=1.96). More accurate than the
+    normal approximation at small n and near-boundary rates (0 or 1), which
+    is exactly the regime the think-probe operates in (n=32 prompts,
+    termination rates ≳ 0.9 for sane models). Used to replace the fragile
+    hand-picked 7/10 threshold with a teacher-anchored statistical test:
+    a student passes iff its Wilson LB is within ``margin`` of the teacher's
+    Wilson LB on the same prompt set.
+    """
+    if n <= 0:
+        return 0.0, 0.0
+    p = successes / n
+    denom = 1.0 + (z ** 2) / n
+    center = (p + (z ** 2) / (2 * n)) / denom
+    spread = (z * math.sqrt((p * (1 - p) + (z ** 2) / (4 * n)) / n)) / denom
+    return max(0.0, center - spread), min(1.0, center + spread)
 
 
 def _self_bleu_pairwise(texts: list[str], n: int = 4) -> float:
@@ -1219,18 +1312,72 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
                 degenerate += 1
         stats["prompts_degenerate"] = degenerate
 
-        term_ok = terminated >= THINK_PROBE_TERMINATE_THRESHOLD * n - 1e-9
-        degen_frac = degenerate / n
-        degen_ok = degen_frac < 0.34
+        # ── Teacher-anchored Wilson lower-bound test (T0.2) ──────────────
+        # Pass/fail is decided by comparing the student's Wilson LB against
+        # the teacher's Wilson LB on the *same* prompt set. This replaces
+        # the old hand-picked 7/10 threshold that tripped mrchen's model
+        # for a legitimate one-prompt difference.
+        z = THINK_PROBE_WILSON_Z
+        margin = THINK_PROBE_WILSON_MARGIN
+        n_teach = len(stats.get("teacher_metrics") or [])
+        teacher_term_rate = None
+        if teacher_samples and n_teach > 0:
+            # The teacher is assumed to terminate on all trivial probes. We
+            # approximate teacher termination as n_teach successes / n_teach
+            # trials (the teacher refs are pre-filtered for truncation
+            # upstream; if we ever let truncated teacher refs through, they
+            # would appear as extra tokens in teacher_samples which we do
+            # not have directly, so we use n_teach as the optimistic prior
+            # and subtract ``margin`` to stay conservative).
+            teacher_term_rate = 1.0
+            teach_term_lb, _ = _wilson_bounds(n_teach, n_teach, z=z)
+        else:
+            teach_term_lb = 1.0  # fall back to absolute threshold
+        stud_term_lb, stud_term_ub = _wilson_bounds(terminated, n, z=z)
+        # Floor ensures we still catch catastrophic non-termination even when
+        # the teacher anchor is unavailable; the Wilson margin is the primary
+        # gate when teacher stats are present.
+        term_floor = THINK_PROBE_TERMINATE_THRESHOLD
+        term_ok = stud_term_lb >= max(term_floor, teach_term_lb - margin)
+
+        # Degeneracy uses the symmetric test: student degenerate-rate Wilson
+        # UB must not exceed teacher's Wilson UB by more than ``margin``.
+        teacher_degen = 0
+        if teacher_samples and stats.get("teacher_metrics"):
+            for m_t in stats["teacher_metrics"]:
+                if m_t.get("gzip_ratio", 1.0) < THINK_PROBE_GZIP_FLOOR:
+                    teacher_degen += 1
+        teach_degen_lb, teach_degen_ub = _wilson_bounds(teacher_degen, max(1, n_teach), z=z)
+        stud_degen_lb, stud_degen_ub = _wilson_bounds(degenerate, n, z=z)
+        degen_ok = stud_degen_ub <= teach_degen_ub + margin if n_teach else (degenerate / n < 0.34)
+
         sb_threshold = max(THINK_PROBE_SELFBLEU_MAX, teacher_self_bleu + 0.10)
         self_bleu_ok = self_bleu < sb_threshold
+
+        stats["wilson"] = {
+            "z": z, "margin": margin, "n": n, "n_teacher": n_teach,
+            "student_term_lb": round(stud_term_lb, 3),
+            "student_term_ub": round(stud_term_ub, 3),
+            "teacher_term_lb": round(teach_term_lb, 3),
+            "student_degen_lb": round(stud_degen_lb, 3),
+            "student_degen_ub": round(stud_degen_ub, 3),
+            "teacher_degen_ub": round(teach_degen_ub, 3),
+            "term_ok": term_ok, "degen_ok": degen_ok,
+        }
+
         if not term_ok or not degen_ok or not self_bleu_ok:
             stats["pass"] = False
             reasons = []
             if not term_ok:
-                reasons.append(f"terminated={terminated}/{n}")
+                reasons.append(
+                    f"term_lb={stud_term_lb:.2f}<teach_lb-m={teach_term_lb - margin:.2f} "
+                    f"(terminated={terminated}/{n})"
+                )
             if not degen_ok:
-                reasons.append(f"degenerate={degenerate}/{n}")
+                reasons.append(
+                    f"degen_ub={stud_degen_ub:.2f}>teach_ub+m={teach_degen_ub + margin:.2f} "
+                    f"(degenerate={degenerate}/{n})"
+                )
             if not self_bleu_ok:
                 reasons.append(
                     f"self_bleu={self_bleu:.2f}>{sb_threshold:.2f}"
@@ -1246,6 +1393,257 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
     except Exception as e:
         stats["reason"] = f"think_probe_error:{str(e)[:120]}"
         return stats
+
+
+def on_policy_rollouts(student, tokenizer, device="cuda",
+                       prompts: list | None = None,
+                       n_prompts: int | None = None,
+                       max_new: int | None = None,
+                       top_k_logits: int | None = None,
+                       temperature: float | None = None,
+                       top_p: float | None = None,
+                       seed: int | None = None) -> list[dict]:
+    """Sample rollouts from student, capture its top-K logprobs per token.
+
+    This is **Phase A** of the on-policy RKL probe. We run it while the
+    student is still on-GPU (cheap — no second model load) and store:
+
+    - ``full_ids``: prompt + sampled continuation (CPU tensor)
+    - ``prompt_len``: length of the prompt portion
+    - ``gen_len``: number of student-sampled tokens
+    - ``sampled_logprobs``: log-prob the student assigned to the token it
+      actually sampled, per generated position (shape [gen_len])
+    - ``topk_idx``: student top-K vocab indices per generated position
+      (shape [gen_len, K]) — used to gather teacher logprobs in Phase B
+    - ``topk_logprobs``: student log-probs on ``topk_idx`` (shape [gen_len, K])
+    - ``gen_tail``: decoded tail (for debugging / Discord-facing transparency)
+
+    The teacher is re-loaded once after all students finish and each
+    saved-rollout is scored by ``on_policy_rkl_score`` below to compute the
+    actual RKL / SKL metrics. This two-phase design is how we avoid the
+    VRAM cliff of holding teacher + student concurrently.
+    """
+    if prompts is None:
+        prompts = ON_POLICY_RKL_PROMPTS[:n_prompts or ON_POLICY_RKL_N_PROMPTS]
+    max_new = max_new or ON_POLICY_RKL_MAX_NEW
+    top_k_logits = top_k_logits or ON_POLICY_RKL_TOP_K_LOGITS
+    temperature = temperature or ON_POLICY_RKL_TEMPERATURE
+    top_p = top_p or ON_POLICY_RKL_TOP_P
+    seed = seed or ON_POLICY_RKL_SEED
+
+    rollouts: list[dict] = []
+    if student is None or tokenizer is None:
+        return rollouts
+    if not getattr(tokenizer, "chat_template", None):
+        return rollouts
+
+    eos_ids = []
+    for t in ("<|im_end|>", "<|endoftext|>"):
+        i = tokenizer.convert_tokens_to_ids(t)
+        if isinstance(i, int) and i >= 0:
+            eos_ids.append(i)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_ids[0] if eos_ids else 0
+
+    was_training = student.training
+    student.eval()
+    try:
+        for p_idx, prompt in enumerate(prompts):
+            try:
+                msgs = [{"role": "user", "content": prompt}]
+                try:
+                    rendered = tokenizer.apply_chat_template(
+                        msgs, tokenize=False, add_generation_prompt=True,
+                    )
+                except Exception:
+                    rendered = prompt
+                ids = tokenizer(rendered, return_tensors="pt", truncation=True,
+                                max_length=1024).input_ids.to(device)
+                torch.manual_seed(seed + p_idx)
+                if device == "cuda":
+                    torch.cuda.manual_seed(seed + p_idx)
+                with torch.no_grad():
+                    out = student.generate(
+                        ids, max_new_tokens=max_new,
+                        do_sample=True, temperature=temperature, top_p=top_p,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                prompt_len = int(ids.shape[1])
+                full_ids = out  # [1, prompt_len + gen_len]
+                gen_len = int(full_ids.shape[1] - prompt_len)
+                if gen_len <= 0:
+                    continue
+                with torch.no_grad():
+                    s_logits = student(full_ids).logits.float()
+                # Positions prompt_len-1 .. end-1 predict the generated tokens
+                cont = s_logits[0, prompt_len - 1:-1, :]  # [gen_len, V]
+                if cont.shape[0] == 0:
+                    del s_logits
+                    continue
+                s_logp = F.log_softmax(cont, dim=-1)  # [gen_len, V]
+                k = min(top_k_logits, s_logp.shape[-1])
+                top_lp, top_idx = s_logp.topk(k, dim=-1)  # [gen_len, K]
+                sampled_tokens = full_ids[0, prompt_len:prompt_len + gen_len].unsqueeze(-1)
+                sampled_lp = s_logp.gather(-1, sampled_tokens).squeeze(-1)  # [gen_len]
+                gen_text = tokenizer.decode(full_ids[0, prompt_len:], skip_special_tokens=True)
+                rollouts.append({
+                    "prompt": prompt,
+                    "full_ids": full_ids.detach().cpu(),
+                    "prompt_len": prompt_len,
+                    "gen_len": gen_len,
+                    "sampled_logprobs": sampled_lp.detach().cpu(),
+                    "topk_idx": top_idx.detach().cpu(),
+                    "topk_logprobs": top_lp.detach().cpu(),
+                    "gen_tail": gen_text[-200:],
+                })
+                del s_logits, s_logp, cont, top_lp, top_idx, sampled_tokens, sampled_lp
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[on-policy-rkl] rollout {p_idx} error: {str(e)[:120]}", flush=True)
+                continue
+    finally:
+        if was_training:
+            student.train()
+    return rollouts
+
+
+def on_policy_rkl_score(teacher, rollouts: list[dict], device: str = "cuda",
+                        skew_alpha: float | None = None) -> dict:
+    """Phase B: score stored student rollouts under teacher logits.
+
+    For each rollout we compute per-position:
+      - ``rkl = E_s[log s - log t]`` — reverse KL (mode-seeking, the
+        objective on-policy distillation converges to).
+      - ``fkl = E_t[log t - log s]`` — forward KL (what we currently
+        ship as ``kl_global_avg``, kept for reference).
+      - ``skl = D_KL(t || α·t + (1-α)·s)`` — Ko et al. 2024 skew-KL,
+        the bounded proxy that fixes teacher-hacking pathologies.
+      - ``sampled_gap = log p_s(y|x) - log p_t(y|x)`` on the student's
+        sampled trajectory (a cheap single-sample RKL estimator).
+
+    Because we stored only the student's top-K logits to keep the
+    rollout cache compact, we compute RKL on the **top-K support** under
+    student, approximating the full-vocab RKL. This is a conservative
+    proxy: if the student puts mass outside its own top-K, that mass is
+    already ≤ 1/K of the total and teacher-hacking cases we care about
+    concentrate mass on a few tokens anyway.
+    """
+    if skew_alpha is None:
+        skew_alpha = ON_POLICY_RKL_SKEW_ALPHA
+    agg = {
+        "n_rollouts": 0, "tokens": 0,
+        "mean_rkl": float("nan"), "mean_fkl": float("nan"),
+        "mean_skl": float("nan"), "mean_sampled_gap": float("nan"),
+        "mean_gen_len": 0.0, "per_rollout": [],
+    }
+    if teacher is None or not rollouts:
+        return agg
+
+    was_training = teacher.training
+    teacher.eval()
+    try:
+        per_rollout = []
+        total_rkl = 0.0
+        total_fkl = 0.0
+        total_skl = 0.0
+        total_gap = 0.0
+        total_tokens = 0
+        total_gen = 0
+        for r_idx, r in enumerate(rollouts):
+            try:
+                full_ids = r["full_ids"].to(device)
+                prompt_len = int(r["prompt_len"])
+                topk_idx = r["topk_idx"].to(device)          # [gen_len, K]
+                s_topk_lp = r["topk_logprobs"].to(device)    # [gen_len, K]
+                sampled_lp_s = r["sampled_logprobs"].to(device)  # [gen_len]
+                with torch.no_grad():
+                    t_logits = teacher(full_ids).logits.float()
+                t_cont = t_logits[0, prompt_len - 1:-1, :]   # [gen_len, V]
+                if t_cont.shape[0] == 0:
+                    continue
+                gen_len = min(t_cont.shape[0], topk_idx.shape[0])
+                t_cont = t_cont[:gen_len]
+                topk_idx = topk_idx[:gen_len]
+                s_topk_lp = s_topk_lp[:gen_len]
+                sampled_lp_s = sampled_lp_s[:gen_len]
+
+                t_logp_full = F.log_softmax(t_cont, dim=-1)   # [gen_len, V]
+                t_topk_lp = t_logp_full.gather(-1, topk_idx)  # [gen_len, K]
+
+                # Renormalize both distributions on the student top-K
+                # support and compute the two KLs there. Bounded and
+                # avoids the full-vocab sum (which dominates runtime
+                # when V≈150k).
+                s_lp_norm = F.log_softmax(s_topk_lp, dim=-1)
+                t_lp_norm = F.log_softmax(t_topk_lp, dim=-1)
+                s_p_norm = s_lp_norm.exp()
+                t_p_norm = t_lp_norm.exp()
+
+                rkl_t = (s_p_norm * (s_lp_norm - t_lp_norm)).sum(-1)   # [gen_len]
+                fkl_t = (t_p_norm * (t_lp_norm - s_lp_norm)).sum(-1)   # [gen_len]
+                # Skew KL: D_KL(t || α t + (1-α) s)
+                mix = skew_alpha * t_p_norm + (1.0 - skew_alpha) * s_p_norm
+                mix_logp = torch.log(mix.clamp(min=1e-20))
+                skl_t = (t_p_norm * (t_lp_norm - mix_logp)).sum(-1)    # [gen_len]
+
+                # Sampled-trajectory gap (single-sample RKL). Needs the
+                # teacher's logprob at the token the student actually
+                # emitted — which lives in the full vocab, not just the
+                # student's top-K, so compute from t_logp_full.
+                sampled_tokens = full_ids[0, prompt_len:prompt_len + gen_len].unsqueeze(-1)
+                sampled_lp_t = t_logp_full.gather(-1, sampled_tokens).squeeze(-1)
+                gap = sampled_lp_s - sampled_lp_t  # [gen_len]
+
+                mean_rkl = float(rkl_t.mean().item())
+                mean_fkl = float(fkl_t.mean().item())
+                mean_skl = float(skl_t.mean().item())
+                mean_gap = float(gap.mean().item())
+                tokens = int(rkl_t.shape[0])
+
+                per_rollout.append({
+                    "prompt": r.get("prompt", "")[:160],
+                    "gen_len": r.get("gen_len", tokens),
+                    "tokens_scored": tokens,
+                    "rkl": round(mean_rkl, 6),
+                    "fkl": round(mean_fkl, 6),
+                    "skl": round(mean_skl, 6),
+                    "sampled_gap": round(mean_gap, 6),
+                    "tail": r.get("gen_tail", ""),
+                })
+                total_rkl += mean_rkl * tokens
+                total_fkl += mean_fkl * tokens
+                total_skl += mean_skl * tokens
+                total_gap += mean_gap * tokens
+                total_tokens += tokens
+                total_gen += int(r.get("gen_len", tokens))
+                del t_logits, t_cont, t_logp_full, t_topk_lp
+                del s_lp_norm, t_lp_norm, s_p_norm, t_p_norm, mix, mix_logp
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"[on-policy-rkl] score rollout {r_idx} error: {str(e)[:120]}", flush=True)
+                continue
+
+        if total_tokens > 0:
+            agg["n_rollouts"] = len(per_rollout)
+            agg["tokens"] = total_tokens
+            agg["mean_rkl"] = total_rkl / total_tokens
+            agg["mean_fkl"] = total_fkl / total_tokens
+            agg["mean_skl"] = total_skl / total_tokens
+            agg["mean_sampled_gap"] = total_gap / total_tokens
+            agg["mean_gen_len"] = total_gen / max(1, len(per_rollout))
+        agg["per_rollout"] = per_rollout
+        agg["skew_alpha"] = skew_alpha
+        agg["top_k"] = int(rollouts[0]["topk_idx"].shape[-1]) if rollouts else None
+    finally:
+        if was_training:
+            teacher.train()
+    return agg
 
 
 def compute_activation_fingerprint(model, device="cuda"):
@@ -2777,7 +3175,24 @@ def main():
             except Exception as e:
                 print(f"[eval] Chat probe error (non-fatal, allowing): {e}", flush=True)
 
-        think_probe_this = student is not None and os.environ.get("THINK_COLLAPSE_PROBE", "1") != "0"
+        # Thinking-collapse probe DISABLED as of 2026-04-19. See reports/
+        # 2026-04-19-think-probe-disabled.md — the teacher-anchored Wilson
+        # variant of the probe (commit 8eec9a2) DQ'd every student including
+        # the teacher itself and the reigning king for three consecutive
+        # rounds (blocks 7999728 / 8000338 / 8001xxx). Miners confirmed
+        # the breakage empirically; the probe's termination threshold is
+        # fundamentally miscalibrated for Qwen3.5 reasoning models that
+        # legitimately emit long chain-of-thought before EOS.
+        #
+        # The entire probe pipeline (generation, Wilson bounds, per-student
+        # storage) is retained but gated behind an opt-in env var so we can
+        # re-enable it offline once it is properly calibrated against a
+        # real teacher baseline. Default is OFF: the probe does NOT run,
+        # does NOT consume GPU time, and CANNOT DQ a model.
+        think_probe_this = (
+            student is not None
+            and os.environ.get("THINK_COLLAPSE_PROBE", "0") == "1"
+        )
         if is_king and king_model is not None and student is king_model and load_time == 0.0:
             think_probe_this = False
         if think_probe_this:
@@ -2807,28 +3222,19 @@ def main():
                     "mean_gen_tokens": tprobe["mean_gen_tokens"],
                     "self_bleu_across_prompts": sb,
                     "teacher_self_bleu": tprobe.get("teacher_self_bleu", 0.0),
+                    "wilson": tprobe.get("wilson"),
                     "samples": tprobe.get("samples", []),
                 }
                 if not tprobe["pass"]:
-                    results["students"][student_name].update({
-                        "status": "thinking_collapse",
-                        "reason": f"thinking_collapse:{tprobe['reason']}",
-                        "kl_global_avg": float("inf"),
-                    })
-                    with open(args.output, "w") as f:
-                        json.dump(results, f, indent=2)
-                    live_progress["completed"].append({"student_name": student_name, "status": "thinking_collapse"})
-                    live_progress["current"] = None
-                    _write_progress()
-                    if is_king:
-                        king_model = None
-                    try:
-                        del student
-                    except Exception:
-                        pass
-                    free_gpu()
-                    clean_model_cache(student_name, args.teacher)
-                    continue
+                    # Telemetry-only: record the failure on the student's
+                    # result entry but DO NOT DQ. See disable rationale in
+                    # the opt-in env var gate above.
+                    results["students"][student_name]["think_probe"]["would_have_dq"] = True
+                    print(
+                        f"[eval] Think probe FAILED (telemetry-only, not DQ'ing): "
+                        f"{tprobe['reason']}",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[eval] Think probe error (non-fatal, allowing): {e}", flush=True)
 
@@ -3105,11 +3511,46 @@ def main():
                       f"teacher={teach_mean_gen:.0f} ratio={ratio:.2f} "
                       f"penalty={length_penalty:.2f}", flush=True)
 
+            # ── On-policy RKL rollouts (Phase A) ─────────────────────────
+            # Sample rollouts from the student's own policy while it is
+            # still on-GPU. We save student top-K logprobs alongside each
+            # token so the later teacher pass (Phase B, runs once for all
+            # students after this loop) is a single forward per rollout.
+            if (
+                ON_POLICY_RKL_ENABLED
+                and student is not None
+                and student_result.get("status") in ("scored", "early_stopped", "partial")
+            ):
+                try:
+                    _op_start = time.time()
+                    rollouts = on_policy_rollouts(student, tokenizer, device)
+                    _op_dur = time.time() - _op_start
+                    if rollouts:
+                        # Stash raw rollouts on a module global; only the
+                        # aggregates get persisted to JSON. The rollouts
+                        # themselves live for the duration of this eval
+                        # and are consumed in Phase B.
+                        _store = globals().setdefault("_ON_POLICY_ROLLOUTS", {})
+                        _store[student_name] = rollouts
+                        gen_avg = sum(r["gen_len"] for r in rollouts) / len(rollouts)
+                        student_result["on_policy_rollouts_meta"] = {
+                            "n_rollouts": len(rollouts),
+                            "mean_gen_len": round(gen_avg, 1),
+                            "collected_at": round(_op_dur, 1),
+                        }
+                        print(
+                            f"  → On-policy rollouts: {len(rollouts)} "
+                            f"(avg_gen={gen_avg:.0f}, {_op_dur:.1f}s)",
+                            flush=True,
+                        )
+                except Exception as e:
+                    print(f"  → On-policy rollouts skipped: {str(e)[:140]}", flush=True)
+
             # Preserve probes and fingerprint already written into this
             # student's dict — overwriting it blanks them.
             preserved = {
                 k: v for k, v in results["students"].get(student_name, {}).items()
-                if k in ("think_probe", "capability", "activation_fingerprint")
+                if k in ("think_probe", "capability", "activation_fingerprint", "on_policy_rkl")
             }
             results["students"][student_name] = {**student_result, **preserved}
 
@@ -3152,6 +3593,73 @@ def main():
             except Exception:
                 pass
             prefetch_future = None
+
+    # ── On-policy RKL scoring (Phase B) ─────────────────────────────
+    # After the student loop, load the teacher once and score all
+    # collected rollouts. This amortizes the teacher load across
+    # students and keeps total wall time manageable (~30s load + ~0.5s
+    # per rollout). Results get merged back into each student's dict.
+    _store = globals().get("_ON_POLICY_ROLLOUTS") or {}
+    if ON_POLICY_RKL_ENABLED and _store:
+        try:
+            print(f"\n[eval] On-policy RKL Phase B: scoring {len(_store)} "
+                  f"students' rollouts against teacher", flush=True)
+            # Free the king if it's still resident — teacher forward pass
+            # wants all the VRAM it can get.
+            try:
+                if king_model is not None:
+                    del king_model
+                    king_model = None
+            except Exception:
+                pass
+            free_gpu()
+            _rkl_t0 = time.time()
+            teacher_b = load_model(args.teacher, device)
+            teacher_b.eval()
+            print(f"[eval] Teacher reloaded for RKL ({time.time() - _rkl_t0:.0f}s), "
+                  f"VRAM: {gpu_mem_str()}", flush=True)
+            n_scored = 0
+            for sn, rolls in _store.items():
+                try:
+                    _rkl_s_t0 = time.time()
+                    rkl = on_policy_rkl_score(teacher_b, rolls, device=device)
+                    dur = time.time() - _rkl_s_t0
+                    slim = {
+                        "n_rollouts": rkl["n_rollouts"],
+                        "tokens": rkl["tokens"],
+                        "mean_rkl": round(rkl["mean_rkl"], 6) if rkl["mean_rkl"] == rkl["mean_rkl"] else None,
+                        "mean_fkl": round(rkl["mean_fkl"], 6) if rkl["mean_fkl"] == rkl["mean_fkl"] else None,
+                        "mean_skl": round(rkl["mean_skl"], 6) if rkl["mean_skl"] == rkl["mean_skl"] else None,
+                        "mean_sampled_gap": round(rkl["mean_sampled_gap"], 6) if rkl["mean_sampled_gap"] == rkl["mean_sampled_gap"] else None,
+                        "mean_gen_len": round(rkl["mean_gen_len"], 1),
+                        "skew_alpha": rkl.get("skew_alpha"),
+                        "top_k": rkl.get("top_k"),
+                        "per_rollout": rkl.get("per_rollout", []),
+                        "scoring_time": round(dur, 1),
+                    }
+                    if sn in results["students"]:
+                        results["students"][sn]["on_policy_rkl"] = slim
+                    n_scored += 1
+                    print(
+                        f"  [{sn}] rkl={slim['mean_rkl']} fkl={slim['mean_fkl']} "
+                        f"skl={slim['mean_skl']} gap={slim['mean_sampled_gap']} "
+                        f"({dur:.1f}s, {rkl['n_rollouts']} rollouts)",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"  [{sn}] RKL scoring error: {str(e)[:160]}", flush=True)
+            try:
+                del teacher_b
+            except Exception:
+                pass
+            free_gpu()
+            timings["on_policy_rkl"] = time.time() - _rkl_t0
+            print(f"[eval] On-policy RKL: scored {n_scored}/{len(_store)} students "
+                  f"in {timings['on_policy_rkl']:.1f}s", flush=True)
+        except Exception as e:
+            print(f"[eval] On-policy RKL Phase B failed (non-fatal): {e}", flush=True)
+        finally:
+            globals()["_ON_POLICY_ROLLOUTS"] = {}
 
     # Final save
     results["timings"] = {k: round(v, 1) for k, v in timings.items()}

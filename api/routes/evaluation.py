@@ -44,8 +44,20 @@ def get_leaderboard():
     commitments = commitments_data.get("commitments", {})
     cumulative = read_state("cumulative_scores.json", {})
 
+    # Build UID → composite map from the most recent H2H round. The validator
+    # already attaches ``composite: {axes, worst, weighted}`` to every h2h
+    # result entry via ``annotate_h2h_with_composite`` — surfacing it here is
+    # the miner-facing half of the shadow migration (T0.3). Currently
+    # informational; flips to the ranking key once T2.1 lands.
+    uid_to_composite = {}
+    for r in (latest.get("results") or []):
+        uid = r.get("uid")
+        comp = r.get("composite")
+        if uid is not None and comp:
+            uid_to_composite[uid] = comp
+
     def _enrich(entry):
-        """Fill in model name and KL from live state if missing."""
+        """Fill in model name, KL, and composite breakdown from live state."""
         if not entry:
             return entry
         uid = entry.get("uid")
@@ -58,13 +70,23 @@ def get_leaderboard():
                 c = commitments[hotkey]
                 entry["model"] = c.get("model") or c.get("repo")
         # KL score
-        if not entry.get("h2h_kl") and str(uid) in scores:
-            entry["h2h_kl"] = scores[str(uid)]
+        if not entry.get("h2h_kl") and str(uid) in scores_data:
+            entry["h2h_kl"] = scores_data[str(uid)]
         # Cumulative score
         cum = cumulative.get(str(uid))
         if cum and isinstance(cum, dict):
             entry["cumulative_score"] = cum.get("cumulative_kl_diff")
             entry["cumulative_rounds"] = cum.get("rounds")
+        # Composite axes (shadow — will become canonical after T2.1).
+        comp = uid_to_composite.get(uid)
+        if comp:
+            entry["composite"] = {
+                "worst": comp.get("worst"),
+                "weighted": comp.get("weighted"),
+                "axes": comp.get("axes", {}),
+                "present_count": comp.get("present_count"),
+                "version": comp.get("version"),
+            }
         return entry
 
     king_data = dict(top4.get("king") or {}) if top4.get("king") else None

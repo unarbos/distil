@@ -75,12 +75,23 @@ def _log_git_revision():
 
 
 def _resolve_king(valid_models, state):
-    king_uid, king_kl = None, float("inf")
+    """Resolve the current king.
+
+    Returns (king_uid, king_kl, source) where source is one of:
+      - "h2h_latest":      king was confirmed by the most recent H2H round → trust king_kl
+      - "scores_fallback": king was picked from stale cached scores → DO NOT trust
+        king_kl for skip-threshold decisions (scores may be from a different teacher,
+        prompt set, or even a different model that was later re-uploaded under the
+        same UID — see cached-score exploit that previously caught UID 237/221)
+      - "none": no king (pure full-eval round)
+    """
+    king_uid, king_kl, source = None, float("inf"), "none"
     if state.h2h_latest:
         h2h_king = state.h2h_latest.get("king_uid")
         if h2h_king is not None and h2h_king in valid_models:
             king_uid = h2h_king
             king_kl = state.scores.get(str(h2h_king), float("inf"))
+            source = "h2h_latest"
             logger.info(f"King from h2h_latest: UID {king_uid} (KL={king_kl:.6f})")
     if king_uid is None:
         for uid in valid_models:
@@ -89,8 +100,12 @@ def _resolve_king(valid_models, state):
                 king_kl = state.scores[uid_str]
                 king_uid = uid
         if king_uid is not None:
-            logger.info(f"King from scores fallback: UID {king_uid} (KL={king_kl:.6f})")
-    return king_uid, king_kl
+            source = "scores_fallback"
+            logger.info(
+                f"King from scores fallback: UID {king_uid} (KL={king_kl:.6f}) "
+                f"— skip threshold disabled this round (score predates current teacher/prompts)"
+            )
+    return king_uid, king_kl, source
 
 
 def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, state_dir):
@@ -242,9 +257,21 @@ def run_precheck(commitments, uid_to_hotkey, uid_to_coldkey, state,
 
 
 def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
-               is_full_eval, state_dir):
-    """Select challengers, cap, and add top-5 contenders."""
-    challengers = select_challengers(valid_models, state, king_uid, king_kl, epoch_count)
+               is_full_eval, state_dir, king_source="h2h_latest"):
+    """Select challengers, cap, and add top-5 contenders.
+
+    ``king_source`` propagates from ``_resolve_king`` so we can skip the
+    king_kl-based challenger prune when king_kl came from a stale cached
+    score (scores_fallback / none). Without this, a fallback king with an
+    artificially-low cached KL tightens the skip threshold and silently
+    excludes every model with a historical best_kl above ``king_kl*2``,
+    preventing legitimate challengers from ever re-entering the round.
+    """
+    trust_king_kl = king_source == "h2h_latest"
+    challengers = select_challengers(
+        valid_models, state, king_uid, king_kl, epoch_count,
+        trust_king_kl=trust_king_kl,
+    )
     challengers_before_top5 = set(challengers.keys())
     log_event(
         f"select_challengers returned {len(challengers)} (P1/P3), king={king_uid}",
@@ -428,7 +455,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            king_uid, king_kl = _resolve_king(valid_models, state)
+            king_uid, king_kl, king_source = _resolve_king(valid_models, state)
             validator_uid = next(
                 (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
             )
@@ -436,7 +463,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
 
             models_to_eval, challengers = plan_round(
                 valid_models, state, king_uid, king_kl, epoch_count,
-                is_full_eval, state_dir,
+                is_full_eval, state_dir, king_source=king_source,
             )
             n_challengers_in_eval = sum(
                 1 for uid in models_to_eval if uid != king_uid and uid != REFERENCE_UID
