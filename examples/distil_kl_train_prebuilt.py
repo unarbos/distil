@@ -292,24 +292,38 @@ def _prepare_eval_cache(
     return cache
 
 
+def _mean_token_kl_forward_chunked(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    vocab_chunk: int = 4096,
+) -> float:
+    """
+    Forward KL(teacher || student) averaged over token positions.
+
+    Same math as ``kl_loss`` / ``(t_p * (t_log_p - s_log_p)).sum(-1).mean()`` but
+    sums over vocabulary in chunks so we never materialize full ``[B, T, V]`` tensors
+    (``F.kl_div`` on large V still peaks VRAM for huge vocabs).
+    """
+    b, t, v = student_log_probs.shape
+    if t <= 0 or v <= 0:
+        return 0.0
+    device = student_log_probs.device
+    # [B, T] running sum of per-token KL contributions
+    acc = torch.zeros((b, t), device=device, dtype=torch.float32)
+    for v0 in range(0, v, vocab_chunk):
+        v1 = min(v0 + vocab_chunk, v)
+        t_lp = teacher_log_probs[:, :, v0:v1].float()
+        s_lp = student_log_probs[:, :, v0:v1].float()
+        t_p = t_lp.exp()
+        acc += (t_p * (t_lp - s_lp)).sum(dim=-1)
+    return float(acc.mean().item())
+
+
 def _evaluate_against_king(
     student,
     king_eval,
     eval_cache: list[dict],
 ) -> tuple[list[float], list[float], dict]:
-    def _mean_token_kl(student_log_probs: torch.Tensor, teacher_log_probs: torch.Tensor) -> float:
-        """
-        Compute mean KL over tokens without allocating a [B, T, V] temporary.
-
-        Flattening to [B*T, V] lets us use batchmean reduction while preserving the
-        previous averaging semantics (mean over token positions).
-        """
-        b, t, v = student_log_probs.shape
-        if t <= 0:
-            return 0.0
-        s2 = student_log_probs.reshape(b * t, v)
-        t2 = teacher_log_probs.reshape(b * t, v)
-        return float(F.kl_div(s2, t2, log_target=True, reduction="batchmean").item())
 
     king_eval.eval()
     student.eval()
@@ -333,15 +347,20 @@ def _evaluate_against_king(
             min_len_k = min(k_cont.shape[1], t_log_p.shape[1])
             s_lp = F.log_softmax(s_cont[:, :min_len_s, :], dim=-1)
             k_lp = F.log_softmax(k_cont[:, :min_len_k, :], dim=-1)
-            t_lp_s = t_log_p[:, :min_len_s, :]
-            t_lp_k = t_log_p.to(king_device)[:, :min_len_k, :]
+            # Contiguous copies so we can drop the full teacher log-prob tensor and free VRAM.
+            t_lp_s = t_log_p[:, :min_len_s, :].contiguous()
+            t_lp_k = t_log_p[:, :min_len_k, :].to(device=king_device, dtype=torch.float32).contiguous()
+            del t_log_p
 
-            s_kl = _mean_token_kl(s_lp, t_lp_s)
-            k_kl = _mean_token_kl(k_lp, t_lp_k)
+            s_kl = _mean_token_kl_forward_chunked(s_lp, t_lp_s)
+            del s_logits, s_cont, s_lp, t_lp_s
+            if student_device.type == "cuda":
+                torch.cuda.empty_cache()
+            k_kl = _mean_token_kl_forward_chunked(k_lp, t_lp_k)
             eval_scores.append(float(s_kl))
             king_scores.append(float(k_kl))
 
-            del s_logits, s_cont, k_logits, k_cont, s_lp, k_lp, t_lp_s, t_lp_k
+            del k_logits, k_cont, k_lp, t_lp_k
 
     student.train()
     eval_stats = _summary_stats(eval_scores)
