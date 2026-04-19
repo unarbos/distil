@@ -4,7 +4,11 @@ import math
 from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
 from eval.state import ValidatorState, log_event
-from scripts.validator.composite import annotate_h2h_with_composite, compute_composite
+from scripts.validator.composite import (
+    _resolve_king_rkl,
+    annotate_h2h_with_composite,
+    compute_composite,
+)
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, EPSILON, MAX_KL_THRESHOLD, PAIRED_TEST_ALPHA
 from scripts.validator.precheck import check_activation_fingerprint
 
@@ -287,14 +291,53 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             continue
         if uid in this_round_uids and uid_str in state.scores and 0 < state.scores[uid_str] <= MAX_KL_THRESHOLD:
             h2h_candidates.append((uid, state.scores[uid_str]))
+
+    # ── T2.1: composite-worst as the ranking key ────────────────────────
+    # We compute composite up-front for every h2h candidate (plus the king
+    # if scored this round) so the canonical "best" is decided by the
+    # minimum-axis rule rather than raw KL. The paired t-test gate
+    # (``epsilon_dethroned_by``) is unchanged — it still enforces
+    # statistical significance before a crown changes hands — but which
+    # challenger is considered the canonical winner, and what we display
+    # as #1, is now driven by composite.worst.
+    students_data = results.get("students", {}) or {}
+    try:
+        _tmp_h2h = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []
+        king_rkl_ref = _resolve_king_rkl(king_h2h_kl, students_data, _tmp_h2h)
+    except Exception:
+        king_rkl_ref = None
+
+    def _composite_for(uid):
+        model = uid_to_model.get(uid)
+        data = students_data.get(model) or {}
+        try:
+            return compute_composite(data, king_h2h_kl, king_rkl_ref)
+        except Exception:
+            return {"worst": None, "weighted": None, "axes": {}, "present_count": 0}
+
     winner_uid, winner_kl = None, float("inf")
     if h2h_candidates:
-        h2h_candidates.sort(key=lambda item: item[1])
+        # Primary sort: composite.worst descending (higher-is-better).
+        # Ties broken by composite.weighted, then by KL ascending so
+        # behaviour degrades gracefully to KL-only when composite is
+        # missing (e.g. full-vocab KL still computed but probes errored).
+        def _rank_key(item):
+            uid_i, kl_i = item
+            comp = _composite_for(uid_i)
+            worst = comp.get("worst")
+            weighted = comp.get("weighted")
+            present = comp.get("present_count") or 0
+            # Sentinel: composite missing → fall back to KL-only rank.
+            if worst is None or present < 2:
+                return (0, float("-inf"), float("-inf"), kl_i)
+            return (1, worst, weighted if weighted is not None else 0.0, -kl_i)
+
+        h2h_candidates.sort(key=_rank_key, reverse=True)
         best_uid, best_kl = h2h_candidates[0]
         if king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
             winner_uid = king_uid
             winner_kl = state.scores.get(str(king_uid), king_kl)
-            logger.info(f"King UID {king_uid} retains crown (no challenger passed epsilon)")
+            logger.info(f"King UID {king_uid} retains crown (no challenger passed paired t-test)")
         elif epsilon_dethroned_by is not None:
             challenger_model = uid_to_model.get(epsilon_dethroned_by, "")
             try:
@@ -323,7 +366,19 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             winner_uid, winner_kl = best_uid, best_kl
     h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model, state.dq_reasons, uid_to_hotkey, commitments)
     try:
-        annotate_h2h_with_composite(h2h_results, king_h2h_kl, results.get("students", {}))
+        annotate_h2h_with_composite(h2h_results, king_h2h_kl, students_data)
+        # Re-sort h2h_results by composite.worst (desc) so the leaderboard
+        # endpoint and h2h_latest display rank order matches the ranking
+        # key used for crown decisions. KL stays as an informational field
+        # on each row.
+        def _h2h_sort_key(row):
+            comp = row.get("composite") or {}
+            worst = comp.get("worst")
+            if worst is None:
+                return (0, float("-inf"), -(row.get("kl") or float("inf")))
+            return (1, worst, -(row.get("kl") or float("inf")))
+        h2h_results.sort(key=_h2h_sort_key, reverse=True)
+
         for entry in h2h_results:
             comp = entry.get("composite") or {}
             worst = comp.get("worst")
@@ -332,7 +387,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 axes_str = " ".join(f"{k}={v:.2f}" if v is not None else f"{k}=–"
                                     for k, v in axes.items())
                 logger.info(
-                    f"  composite[shadow] UID {entry.get('uid')}: "
+                    f"  composite UID {entry.get('uid')}: "
                     f"worst={worst:.3f} weighted={comp.get('weighted')} [{axes_str}]"
                 )
     except Exception as exc:
