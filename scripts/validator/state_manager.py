@@ -331,9 +331,11 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                 "block": current_block,
             }
             contenders = []
-            for r in h2h_results:
+            for r in sorted(h2h_results, key=lambda r: r.get("kl", float("inf"))):
                 if r["uid"] == actual_king:
                     continue
+                if int(r["uid"]) < 0:
+                    continue  # skip reference model
                 if int(r["uid"]) in disqualified:
                     continue
                 contenders.append({
