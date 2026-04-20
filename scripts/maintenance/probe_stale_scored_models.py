@@ -56,7 +56,13 @@ def safetensors_input_layernorm_abs_max(model: str, revision: str | None) -> tup
 
     Prefers the sharded flow (single small shard) over the consolidated
     `model.safetensors` which can be 8-10 GB. Returns (abs_max, key_name)
-    or None when the weight can't be located."""
+    or None when the weight can't be located.
+
+    For consolidated (single-file) safetensors we fall back to an HTTP
+    range read of the tensor slice instead of a full 9 GB download —
+    safetensors files start with an 8-byte little-endian header length,
+    followed by a JSON header listing each tensor's byte offsets. We
+    fetch the header, find our tensor, then fetch exactly its bytes."""
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
 
@@ -81,23 +87,89 @@ def safetensors_input_layernorm_abs_max(model: str, revision: str | None) -> tup
 
         if target_shard is not None:
             st_path = hf_hub_download(model, target_shard, revision=revision)
+            downloaded_paths.append(Path(st_path))
+            with safe_open(st_path, framework="pt") as f:
+                for k in f.keys():
+                    if "layers.0.input_layernorm" in k and k.endswith(".weight"):
+                        t = f.get_tensor(k)
+                        return float(t.abs().max()), k
+            return None
         else:
-            st_path = hf_hub_download(model, "model.safetensors", revision=revision)
-        downloaded_paths.append(Path(st_path))
-
-        with safe_open(st_path, framework="pt") as f:
-            for k in f.keys():
-                if "layers.0.input_layernorm" in k and k.endswith(".weight"):
-                    t = f.get_tensor(k)
-                    return float(t.abs().max()), k
-        return None
+            # Consolidated file — byte-range read instead of 9GB download.
+            return _range_read_layernorm(model, revision or "main")
     except Exception as exc:
         print(f"  ! {model}@{(revision or 'main')[:8]}: fetch error: {type(exc).__name__}: {exc}", flush=True)
         return None
     finally:
-        # Scrub the model cache entirely — we're one-shot reading a single
-        # weight, nothing else in this dir is useful to keep around.
         _rmtree(model_cache_dir)
+
+
+def _range_read_layernorm(model: str, revision: str) -> tuple[float, str] | None:
+    """HTTP-range read just the header + target tensor bytes from a
+    consolidated model.safetensors on HuggingFace. Avoids downloading
+    the full 9-10 GB of a non-sharded model just to peek at one 2560-
+    element float32 vector. Returns (abs_max, key_name) or None if the
+    target tensor isn't in the file."""
+    import struct
+    import urllib.request
+    import os
+    import numpy as np
+
+    url = f"https://huggingface.co/{model}/resolve/{revision}/model.safetensors"
+    hf_token = os.environ.get("HF_TOKEN")
+
+    def _fetch(byte_range: str) -> bytes:
+        req = urllib.request.Request(url, headers={"Range": f"bytes={byte_range}"})
+        if hf_token:
+            req.add_header("Authorization", f"Bearer {hf_token}")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read()
+
+    header_len_raw = _fetch("0-7")
+    if len(header_len_raw) != 8:
+        return None
+    header_len = struct.unpack("<Q", header_len_raw)[0]
+    if header_len <= 0 or header_len > 100_000_000:
+        return None
+    header_bytes = _fetch(f"8-{7 + header_len}")
+    header = json.loads(header_bytes)
+
+    target = None
+    target_key = None
+    for k, v in header.items():
+        if k == "__metadata__":
+            continue
+        if "layers.0.input_layernorm" in k and k.endswith(".weight"):
+            target = v
+            target_key = k
+            break
+    if target is None:
+        return None
+
+    start, end = target["data_offsets"]
+    dtype = target["dtype"]
+    dtype_map = {
+        "F32": ("float32", 4),
+        "F16": ("float16", 2),
+        "BF16": ("bfloat16", 2),
+        "F64": ("float64", 8),
+    }
+    if dtype not in dtype_map:
+        return None
+    np_dtype, _elem_sz = dtype_map[dtype]
+    tensor_start = 8 + header_len + start
+    tensor_end = 8 + header_len + end - 1
+    tensor_bytes = _fetch(f"{tensor_start}-{tensor_end}")
+
+    if dtype == "BF16":
+        # numpy has no bfloat16 — reinterpret as uint16, shift up to float32.
+        raw = np.frombuffer(tensor_bytes, dtype=np.uint16)
+        as_f32 = (raw.astype(np.uint32) << 16).view(np.float32)
+        arr = as_f32
+    else:
+        arr = np.frombuffer(tensor_bytes, dtype=np_dtype).astype(np.float32)
+    abs_max = float(np.abs(arr).max())
+    return abs_max, target_key
 
 
 def main():
@@ -110,6 +182,30 @@ def main():
     evaluated_uids = set(json.load(open(STATE / "evaluated_uids.json")))
     disqualified = json.load(open(STATE / "disqualified.json"))
     h2h_tested = json.load(open(STATE / "h2h_tested_against_king.json"))
+
+    # Resume support: if we've already audited a UID in a previous run
+    # (the JSONL ledger was written to), skip the download and reuse the
+    # prior (uid, hotkey, norm, model, key_name) fingerprint. The HF hub
+    # occasionally hangs mid-download on consolidated 9-10 GB weight files
+    # which killed the long-running audit on 2026-04-20 at UID 197; this
+    # lets us restart without re-downloading the first 50+ models.
+    audit_path = STATE / "maintenance" / "retro_finetune_audit.jsonl"
+    prior_results: dict[int, dict] = {}
+    if audit_path.exists():
+        with audit_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "uid" in row:
+                    prior_results[int(row["uid"])] = row
+        if prior_results:
+            print(f"[retro-audit] resume: {len(prior_results)} UIDs already audited "
+                  f"(will be skipped)", flush=True)
 
     import urllib.request
 
@@ -167,7 +263,6 @@ def main():
     print(f"[retro-audit] {len(candidates)} candidate UIDs with cached scores "
           f"in (0, 0.5] KL and no prior DQ", flush=True)
 
-    audit_path = STATE / "maintenance" / "retro_finetune_audit.jsonl"
     audit_path.parent.mkdir(exist_ok=True)
 
     failures: list[dict] = []
@@ -176,6 +271,18 @@ def main():
         if args.limit and checked >= args.limit:
             break
         checked += 1
+        if uid in prior_results:
+            prior = prior_results[uid]
+            abs_max = prior["norm_weight_abs_max"]
+            key_name = prior["norm_weight_key"]
+            failed = bool(prior["watermarked"])
+            mark = "✗ WATERMARKED (cached)" if failed else "✓ clean (cached)"
+            print(f"  UID {uid} {mark} score={score_f:.6f} norm_w_max={abs_max:.1f} "
+                  f"{commit['model']}@{(commit.get('revision') or 'main')[:8]} ({key_name})",
+                  flush=True)
+            if failed:
+                failures.append((uid, commit["hotkey"], commit["block"], abs_max, commit["model"], key_name))
+            continue
         result = safetensors_input_layernorm_abs_max(commit["model"], commit.get("revision"))
         if result is None:
             print(f"  UID {uid} ({commit['model']}): could not fetch — skipping", flush=True)
