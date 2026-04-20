@@ -146,9 +146,14 @@ Window: 2026-04-19 22:14 UTC → 2026-04-20 12:05 UTC (91 messages in last 12h).
 - [x] Edits applied to `/opt/distil/repo`
 - [x] Syntax / imports clean
 - [x] Maintenance script ran cleanly
-- [ ] `systemctl restart distil-validator.service` to pick up
-  `vllmConcurrency=32`, same-coldkey carve-out, and revision-aware failure
-  tracking
-- [ ] `systemctl restart distil-api.service` (if separate) to pick up the
-  updated `skipped_stale` message
-- [ ] Commit + push
+- [x] `systemctl restart distil-api.service` — picked up the updated
+  `skipped_stale` reason string. Verified live via `mirror/state/miners.json`
+  for UIDs 23 and 247.
+- [ ] `systemctl restart distil-validator.service` — deferred. A round is
+  live as of 12:01 UTC (teacher_loading, 8 models, detached pod eval,
+  120-min timeout). `state/current_round.json` has no `pod_eval` meta block,
+  so a restart right now would *not* reattach via `_detect_resumable_round`
+  and would re-enter precheck from scratch, forcing the pod to redo teacher
+  generation for the same 8 models (~20-30 min). Restart is queued for the
+  inter-round window after this round finalizes.
+- [x] Commit `a9cc8a4` + push to `origin/main`.
