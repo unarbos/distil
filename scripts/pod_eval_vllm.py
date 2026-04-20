@@ -2044,8 +2044,19 @@ def stop_vllm_server():
         subprocess.run(["fuser", "-k", f"{VLLM_PORT}/tcp"], capture_output=True, timeout=5)
     except Exception:
         pass
+    # VLLM v1 spawns a child that renames its argv via prctl to just
+    # "VLLM::EngineCore" — cmdline-based pkill -f 'vllm.entrypoints' WILL NOT
+    # match it. If pod_eval exits without the engine being reaped, the engine
+    # survives holding the entire GPU, OOM-ing every future round on this pod.
+    for pattern in ("vllm.entrypoints", "VllmWorker", "VLLM::EngineCore"):
+        try:
+            subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, timeout=5)
+        except Exception:
+            pass
+    # comm is capped at 15 chars so "VLLM::EngineCore" shows up as
+    # "VLLM::EngineCor" — match that too.
     try:
-        subprocess.run(["pkill", "-9", "-f", "vllm.entrypoints"], capture_output=True, timeout=5)
+        subprocess.run(["pkill", "-9", "-x", "VLLM::EngineCor"], capture_output=True, timeout=5)
     except Exception:
         pass
     my_pid = os.getpid()
@@ -2064,7 +2075,14 @@ def stop_vllm_server():
                     cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="ignore")
                 except Exception:
                     cmdline = ""
-                if any(tag in cmdline for tag in ("vllm.entrypoints", "vllm/engine", "VllmWorker")):
+                try:
+                    comm = Path(f"/proc/{pid}/comm").read_text().strip()
+                except Exception:
+                    comm = ""
+                # Include VLLM::EngineCore(r) — argv-renamed engine holds the
+                # GPU but has no python module path in its cmdline.
+                if any(tag in cmdline for tag in ("vllm.entrypoints", "vllm/engine", "VllmWorker", "VLLM::EngineCore")) \
+                        or comm.startswith("VLLM::EngineCor"):
                     try:
                         os.kill(pid, signal.SIGKILL)
                         killed_any = True

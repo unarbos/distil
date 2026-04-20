@@ -73,21 +73,49 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         os.unlink(prompts_file)
     pod.upload(eval_script, remote_eval_script, max_attempts=5)
     try:
+        # VLLM v1 spawns a child process that renames itself to "VLLM::EngineCore"
+        # via prctl(PR_SET_NAME). That process holds the GPU allocation but will
+        # NOT match `pkill -f 'vllm.entrypoints'` because its argv is literally
+        # just "VLLM::EngineCore" — same story for "VllmWorker". If the parent
+        # pod_eval dies without reaping the engine (as happens when the validator
+        # is stopped hard), the EngineCore lives on forever holding ~130 GB of
+        # GPU memory until the next reboot, causing OOMs in future rounds.
+        #
+        # To prevent that, we:
+        #   1. pkill by comm (matches "VLLM::EngineCor", 15-char kernel limit)
+        #   2. pkill by cmdline (belt and braces for any future vllm rename)
+        #   3. fall back on nvidia-smi: if anything is still holding the GPU
+        #      and it looks like a vllm/python worker, nuke it.
         pod.exec(
             "pkill -9 -f pod_eval 2>/dev/null; "
             "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
             "pkill -9 -f 'VllmWorker' 2>/dev/null; "
+            "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
+            "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "  # match comm (15-char trunc)
             "sleep 2; "
             "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+            "  comm=$(cat /proc/$pid/comm 2>/dev/null); "
             "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
-            "  case \"$cmd\" in "
-            "    *vllm.entrypoints*|*VllmWorker*|*pod_eval*) kill -9 $pid 2>/dev/null ;; "
+            "  case \"$cmd$comm\" in "
+            "    *vllm.entrypoints*|*VllmWorker*|*pod_eval*|*VLLM::EngineCor*) "
+            "      kill -9 $pid 2>/dev/null ;; "
             "  esac; "
             "done; "
+            "sleep 2; "
+            # Last-resort sweep: if GPU is still non-empty, something slipped
+            # through. Log the survivors so we can improve the patterns above.
+            "survivors=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
+            "if [ -n \"$survivors\" ]; then "
+            "  for pid in $survivors; do "
+            "    echo \"[cleanup] gpu still held by pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 200)\" >&2; "
+            "    kill -9 $pid 2>/dev/null; "
+            "  done; "
+            "  sleep 2; "
+            "fi; "
             "rm -rf /dev/shm/vllm* 2>/dev/null; "
             "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
-            "sleep 3",
-            timeout=30,
+            "sleep 1",
+            timeout=40,
         )
         logger.info("Killed existing eval/vllm processes and removed stale /home files")
     except Exception as exc:

@@ -28,7 +28,16 @@ def restart_chat_server(model_name: str):
     """Kill old vLLM chat server and start with new king model."""
     logger.info(f"Restarting chat server with new king: {model_name}")
     try:
-        chat_ssh("pkill -9 -f 'vllm.entrypoints.openai.api_server' || true", timeout=10)
+        # VLLM v1 spawns a child that renames itself to "VLLM::EngineCore" —
+        # killing only the entrypoints wrapper leaves the engine holding the
+        # GPU. Kill both so the next server start can allocate cleanly.
+        chat_ssh(
+            "pkill -9 -f 'vllm.entrypoints.openai.api_server' 2>/dev/null; "
+            "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
+            "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "
+            "true",
+            timeout=10,
+        )
         time.sleep(3)
         # Download model first so vLLM doesn't timeout during startup
         chat_ssh(
