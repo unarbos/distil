@@ -78,7 +78,7 @@ def _resolve_king(valid_models, state):
     """Resolve the current king.
 
     Returns (king_uid, king_kl, source) where source is one of:
-      - "h2h_latest":      king was confirmed by the most recent H2H round → trust king_kl
+      - "h2h_latest":  king was confirmed by the most recent H2H round → trust king_kl
       - "scores_fallback": king was picked from stale cached scores → DO NOT trust
         king_kl for skip-threshold decisions (scores may be from a different teacher,
         prompt set, or even a different model that was later re-uploaded under the
@@ -103,7 +103,7 @@ def _resolve_king(valid_models, state):
             source = "scores_fallback"
             logger.info(
                 f"King from scores fallback: UID {king_uid} (KL={king_kl:.6f}) "
-                f"— skip threshold disabled this round (score predates current teacher/prompts)"
+                f"— skip threshold will be disabled this round (stale cache)"
             )
     return king_uid, king_kl, source
 
@@ -200,6 +200,260 @@ def _append_round_score_history(state, current_block, winner_uid, uid_to_hotkey)
 
 # ── pipeline steps ──────────────────────────────────────────────────────
 
+def _detect_resumable_round(state, pod):
+    """If a prior validator instance left an in-flight pod eval, return the
+    persisted current_round dict. Otherwise return None.
+
+    Attachment is only attempted when (a) current_round has a pod_eval meta
+    block, (b) the pod-side process is still alive or a done marker is
+    present, AND (c) this round's block has not already been applied to state
+    (otherwise we'd re-process the same results every epoch).
+    """
+    try:
+        cur = state.current_round
+        if not isinstance(cur, dict):
+            return None
+        pe = cur.get("pod_eval")
+        if not isinstance(pe, dict) or not pe.get("run_dir"):
+            return None
+        started = cur.get("started_at")
+        if started is not None:
+            age_min = (time.time() - float(started)) / 60
+            if age_min > 180:
+                return None
+        round_block = cur.get("block")
+        if round_block is not None:
+            last_applied = None
+            try:
+                last_applied = (state.h2h_latest or {}).get("block")
+            except Exception:
+                last_applied = None
+            if last_applied is not None and int(last_applied) >= int(round_block):
+                logger.info(
+                    "Resume skipped: round block %s already applied (h2h_latest.block=%s) — clearing stale marker",
+                    round_block, last_applied,
+                )
+                import shlex as _shlex
+                run_dir = pe.get("run_dir")
+                if run_dir:
+                    try:
+                        pod.exec(
+                            f"pkill -9 -f pod_eval 2>/dev/null; rm -rf {_shlex.quote(run_dir)}",
+                            timeout=30,
+                        )
+                    except Exception:
+                        pass
+                state.clear_round()
+                state.current_round = {}
+                return None
+        import shlex as _shlex
+        run_dir = pe["run_dir"]
+        pid_remote = pe.get("pid_remote") or f"{run_dir}/pod_eval.pid"
+        done_remote = pe.get("done_marker_remote") or f"{run_dir}/eval_done.marker"
+        cmd = (
+            f"if [ -f {_shlex.quote(done_remote)} ]; then echo done; "
+            f"elif [ ! -f {_shlex.quote(pid_remote)} ]; then echo missing; "
+            f"elif kill -0 \"$(cat {_shlex.quote(pid_remote)} 2>/dev/null)\" 2>/dev/null; then echo running; "
+            "else echo dead; fi"
+        )
+        res = pod.exec(f"bash -lc {_shlex.quote(cmd)}", timeout=30)
+        status = ((res.get("stdout") or "").strip() or "missing").splitlines()[-1].strip()
+        if status in ("running", "done"):
+            cur = dict(cur)
+            cur["_resume_status"] = status
+            return cur
+    except Exception as exc:
+        logger.debug(f"Resume detection failed (non-fatal): {exc}")
+    return None
+
+
+def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
+                       epoch_count, epoch_start, eval_script, use_vllm, state_dir,
+                       max_params_b):
+    """Attach to an in-flight pod eval, wait for completion via the normal
+    poll-and-write-progress path, then apply results through the regular
+    scoring/weights/H2H pipeline.
+
+    Unlike the old implementation, this DOES update eval_progress.json and
+    DOES update scores, king, top-4, and set weights when the eval completes.
+    """
+    import shlex as _shlex
+    cr = dict(resume_round)
+    models_raw = cr.get("models_to_eval") or {}
+    models_to_eval = {}
+    for uid_s, info in models_raw.items():
+        try:
+            uid_int = int(uid_s)
+        except (TypeError, ValueError):
+            continue
+        cb = info.get("commit_block")
+        models_to_eval[uid_int] = {
+            "model": info.get("model"),
+            "revision": info.get("revision", "main"),
+            "commit_block": cb if cb is not None else float("inf"),
+            "is_reference": bool(info.get("is_reference")),
+            "hotkey": info.get("hotkey", ""),
+        }
+    king_uid = cr.get("king_uid")
+    prompt_texts = cr.get("prompts") or []
+    is_full_eval = bool(cr.get("is_full_eval"))
+    current_block = cr.get("block")
+    current_block_hash = cr.get("block_hash")
+    n_prompts = len(prompt_texts) or (EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H)
+
+    if not models_to_eval or king_uid is None or not prompt_texts or current_block is None:
+        logger.warning(
+            "Resume: persisted current_round missing required fields "
+            "(models=%d, king=%s, prompts=%d) — clearing and letting epoch plan fresh.",
+            len(models_to_eval), king_uid, len(prompt_texts),
+        )
+        pe = cr.get("pod_eval") or {}
+        run_dir = pe.get("run_dir")
+        if run_dir:
+            try:
+                pod.exec(
+                    f"pkill -9 -f pod_eval 2>/dev/null; rm -rf {_shlex.quote(run_dir)}",
+                    timeout=30,
+                )
+            except Exception:
+                pass
+        state.clear_round()
+        state.save_progress({"active": False, "stage": "resume_missing_fields"})
+        return
+
+    state.current_round = cr
+    state.save_round()
+    state.save_progress({
+        "active": True,
+        "phase": "resumed_attaching",
+        "models": {str(u): info["model"] for u, info in models_to_eval.items()},
+        "king_uid": king_uid,
+        "challenger_uids": [u for u in models_to_eval if u != king_uid],
+        "students_total": len(models_to_eval),
+        "prompts_total": n_prompts,
+        "started_at": cr.get("started_at") or time.time(),
+        "resumed": True,
+    })
+
+    logger.info(
+        "Resume: attaching to in-flight eval (%d models, %d prompts, king=UID %s)",
+        len(models_to_eval), n_prompts, king_uid,
+    )
+    log_event(
+        f"Resume: attaching to in-flight eval ({len(models_to_eval)} models, king=UID {king_uid})",
+        state_dir=state_dir,
+    )
+
+    results = run_eval_on_pod(
+        pod, models_to_eval, king_uid, n_prompts, prompt_texts,
+        state, is_full_eval, use_vllm, eval_script,
+        block_seed=current_block,
+    )
+    if results is None:
+        logger.warning("Resumed eval did not produce usable results — clearing round state")
+        log_event(
+            "Resumed eval failed to produce usable results; cleared round state",
+            level="warning", state_dir=state_dir,
+        )
+        state.clear_round()
+        state.save_progress({"active": False, "failed": True, "failed_at": time.time(),
+                             "stage": "resume_no_results"})
+        try:
+            pod.post_eval_cleanup(TEACHER_MODEL)
+            pod.resume_background_tasks()
+        except Exception as exc:
+            logger.warning(f"Pod cleanup after failed resume: {exc}")
+        return
+
+    try:
+        metagraph, fresh_block, fresh_block_hash, n_uids, revealed = fetch_chain(subtensor, netuid)
+    except Exception as exc:
+        logger.error(f"Chain unreachable during resume-apply: {exc} — saving results only")
+        try:
+            results_local = str(state.state_dir / "last_eval.json")
+            with open(results_local, "w") as fh:
+                import json as _json
+                _json.dump(results, fh)
+        except Exception:
+            pass
+        state.clear_round()
+        state.save_progress({"active": False, "failed": True, "failed_at": time.time(),
+                             "stage": "resume_chain_unreachable"})
+        return
+
+    commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments(metagraph, revealed, n_uids)
+    write_api_commitments_cache(commitments, state_dir)
+    state.uid_hotkey_map = {str(uid): hotkey for uid, hotkey in uid_to_hotkey.items()}
+
+    try:
+        valid_models, disqualified = run_precheck(
+            commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b, state_dir,
+        )
+    except Exception as exc:
+        logger.warning(f"Resume: precheck during apply failed (non-fatal): {exc}")
+        valid_models, disqualified = {}, []
+
+    for uid, info in models_to_eval.items():
+        if uid not in valid_models and uid != REFERENCE_UID:
+            valid_models[uid] = {
+                "model": info["model"],
+                "revision": info.get("revision", "main"),
+                "commit_block": info.get("commit_block"),
+                "hotkey": uid_to_hotkey.get(uid, info.get("hotkey", "")),
+            }
+
+    king_kl = state.scores.get(str(king_uid), MAX_KL_THRESHOLD)
+    challengers = {
+        uid: info for uid, info in models_to_eval.items()
+        if uid != king_uid and uid != REFERENCE_UID
+    }
+
+    try:
+        winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model = (
+            apply_results_and_weights(
+                subtensor, wallet, netuid, n_uids,
+                results, models_to_eval, king_uid, king_kl,
+                state, uid_to_hotkey, commitments,
+                n_prompts, current_block, current_block_hash or fresh_block_hash,
+                epoch_count, is_full_eval, epoch_start, state_dir,
+            )
+        )
+        post_round(
+            state, pod, winner_uid, winner_kl, king_uid, king_kl, king_h2h_kl,
+            king_per_prompt, models_to_eval, uid_to_model, valid_models, h2h_results,
+            current_block, current_block_hash or fresh_block_hash, n_prompts, is_full_eval,
+            challengers, epoch_count, disqualified, epoch_start,
+            uid_to_hotkey, state_dir,
+        )
+        log_event(
+            f"Resume complete: winner=UID {winner_uid} KL={winner_kl}",
+            state_dir=state_dir,
+        )
+        pe_done = (resume_round.get("pod_eval") or {})
+        run_dir_done = pe_done.get("run_dir")
+        if run_dir_done:
+            try:
+                pod.exec(
+                    f"pkill -9 -f pod_eval 2>/dev/null; rm -rf {_shlex.quote(run_dir_done)}",
+                    timeout=30,
+                )
+                logger.info(f"Resume: cleaned up pod run_dir {run_dir_done}")
+            except Exception as exc:
+                logger.warning(f"Resume: pod run_dir cleanup failed (non-fatal): {exc}")
+        state.clear_round()
+        state.current_round = {}
+        state.save_progress({"active": False, "stage": "resume_complete",
+                             "completed_block": current_block,
+                             "completed_at": time.time()})
+    except Exception as exc:
+        logger.error(f"Resume apply-results failed: {exc}")
+        log_event(f"Resume apply-results failed: {str(exc)[:200]}",
+                  level="error", state_dir=state_dir)
+        state.clear_round()
+        state.save_progress({"active": False, "failed": True, "failed_at": time.time(),
+                             "stage": "resume_apply_error"})
+
+
 def ensure_clean_state(state, state_dir):
     """Drop orphaned UIDs and clear stale/half-finished rounds."""
     orphans = [uid for uid in list(state.evaluated_uids) if uid not in state.scores]
@@ -209,16 +463,25 @@ def ensure_clean_state(state, state_dir):
         state.save_model_tracking()
         logger.info(f"Cleaned {len(orphans)} orphaned UIDs from evaluated_uids")
 
+    has_pod_eval = (
+        isinstance(state.current_round, dict)
+        and isinstance(state.current_round.get("pod_eval"), dict)
+        and state.current_round["pod_eval"].get("run_dir")
+    )
     if state.eval_progress.get("active"):
         age_min = (time.time() - state.eval_progress.get("started_at", 0)) / 60
-        if age_min > 30:
-            logger.warning(f"STALE ROUND: active for {age_min:.0f}m — clearing")
+        stale_limit = 180 if has_pod_eval else 30
+        if age_min > stale_limit:
+            logger.warning(
+                f"STALE ROUND: active for {age_min:.0f}m (limit={stale_limit}m, "
+                f"pod_eval={'yes' if has_pod_eval else 'no'}) — clearing"
+            )
             state.save_progress({"active": False, "stale_cleared": True,
                                  "stale_age_min": round(age_min, 1)})
             state.clear_round()
             state.current_round = {}
 
-    if state.current_round and not state.eval_progress.get("active"):
+    if state.current_round and not state.eval_progress.get("active") and not has_pod_eval:
         round_age_min = None
         if state.current_round.get("started_at"):
             round_age_min = (time.time() - state.current_round["started_at"]) / 60
@@ -308,6 +571,7 @@ def apply_results_and_weights(
     state, uid_to_hotkey, commitments,
     n_prompts, current_block, current_block_hash,
     epoch_count, is_full_eval, epoch_start, state_dir,
+    uid_to_coldkey=None,
 ):
     """Run process_results -> set weights -> persist H2H state."""
     uid_to_model = _persist_preliminary_results(
@@ -319,6 +583,7 @@ def apply_results_and_weights(
             results, models_to_eval, king_uid, state, uid_to_hotkey, commitments,
             n_prompts, current_block, king_kl, epoch_count, is_full_eval,
             epoch_start_time=epoch_start,
+            uid_to_coldkey=uid_to_coldkey,
         )
     )
     if winner_uid is not None:
@@ -415,6 +680,38 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             log_event(f"Starting epoch {epoch_count}", state_dir=state_dir)
 
             ensure_clean_state(state, state_dir)
+
+            resume_round = _detect_resumable_round(state, pod)
+            if resume_round is not None:
+                logger.warning(
+                    "RESUME: in-flight pod eval detected (run_dir=%s). Skipping precheck/planning "
+                    "this epoch and attaching to the live eval instead.",
+                    resume_round.get("pod_eval", {}).get("run_dir"),
+                )
+                log_event(
+                    f"Resuming live pod eval (round block={resume_round.get('block')}); skipping replan",
+                    level="warn", state_dir=state_dir,
+                )
+                try:
+                    _run_resumed_round(
+                        subtensor, wallet, netuid, state, pod, resume_round,
+                        epoch_count, epoch_start, eval_script, use_vllm, state_dir,
+                        max_params_b,
+                    )
+                except Exception as exc:
+                    import traceback as _tb
+                    tb = _tb.format_exc()
+                    logger.error(f"Resumed round failed: {exc}\n{tb}")
+                    log_event(f"Resumed round failed: {str(exc)[:200]}",
+                              level="error", state_dir=state_dir)
+                    state.clear_round()
+                    state.save_progress({"active": False, "failed": True,
+                                         "failed_at": time.time(),
+                                         "stage": "resume_error"})
+                if once:
+                    break
+                time.sleep(tempo)
+                continue
 
             print("[validator] Fetching chain state...", flush=True)
             try:
@@ -541,8 +838,18 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 "block": current_block,
                 "block_hash": current_block_hash,
                 "king_uid": king_uid,
+                "models_to_eval": {
+                    str(uid): {
+                        "model": info["model"],
+                        "revision": info.get("revision", "main"),
+                        "commit_block": info.get("commit_block"),
+                        "is_reference": info.get("is_reference", False),
+                    }
+                    for uid, info in models_to_eval.items()
+                },
                 "model_names": [info["model"] for info in models_to_eval.values()],
                 "prompts": prompt_texts,
+                "is_full_eval": is_full_eval,
                 "private_pool": {
                     "n": len(private_texts),
                     "commit_root": commit_root,
@@ -587,6 +894,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     state, uid_to_hotkey, commitments,
                     n_prompts, current_block, current_block_hash,
                     epoch_count, is_full_eval, epoch_start, state_dir,
+                    uid_to_coldkey=uid_to_coldkey,
                 )
             )
 

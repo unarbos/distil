@@ -24,6 +24,24 @@ from state_store import (
 router = APIRouter()
 
 
+def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
+    """Tolerant match for failure_models entries vs the current commitment.
+
+    failure_models historically stored just the repo name. As of 2026-04-20 we
+    store ``"{repo}@{revision}"`` so that revision pushes reset the counter.
+    Both shapes must be understood when rendering eval_status so we don't show
+    ``skipped_stale`` for a miner who's already pushed a new revision/repo.
+    """
+    repo = (commitment or {}).get("model")
+    rev = (commitment or {}).get("revision")
+    if not repo or not fail_entry:
+        return False
+    if "@" in fail_entry:
+        f_repo, f_rev = fail_entry.split("@", 1)
+        return f_repo == repo and (f_rev == rev or not rev)
+    return fail_entry == repo
+
+
 @router.get("/api/commitments", tags=["Miners"], summary="Miner model commitments",
          description="""Returns all miner HuggingFace model commitments (on-chain).
 
@@ -195,11 +213,11 @@ def get_miner(uid: int):
     elif result.get("is_king"):
         eval_status["status"] = "king"
         eval_status["reason"] = "Evaluated every round as the defending king"
-    elif fail_count >= 3 and fail_model and fail_model == (result.get("commitment") or {}).get("model"):
+    elif fail_count >= 3 and fail_model and _failure_matches_commitment(fail_model, result.get("commitment") or {}):
         eval_status["status"] = "skipped_stale"
         eval_status["reason"] = (
-            f"Skipped for {fail_count} consecutive rounds due to eval errors on the same model "
-            f"({fail_model}). Submit a new revision to reset."
+            f"Skipped for {fail_count} consecutive rounds due to eval errors on the same model+revision "
+            f"({fail_model}). Push a new HuggingFace revision, or commit a new model_repo on-chain, to reset."
         )
         eval_status["failure_count"] = fail_count
     elif not result.get("kl_score"):

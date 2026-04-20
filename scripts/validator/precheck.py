@@ -38,7 +38,8 @@ def _cosine_sim(a: list, b: list) -> float:
 
 
 def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, state_dir,
-                                 commit_block=None, uid_to_commit_block=None):
+                                 commit_block=None, uid_to_commit_block=None,
+                                 uid_to_coldkey=None):
     """Compare the incoming model's activation fingerprint against stored ones.
 
     Returns: (is_copy, copy_uid, copy_model, original_uid, original_model, sim)
@@ -52,6 +53,13 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     The fingerprint is only persisted under `uid` if it is NOT determined to be a copy
     of an earlier-committed model — avoids polluting the store with later copies and
     makes future griefing attempts much harder (the king's fingerprint is the canonical one).
+
+    Same-coldkey carve-out (2026-04-20, sebastian_020521 request): if the matched
+    UID shares a coldkey with `uid`, this is a miner iterating on their own model
+    across hotkeys (e.g. best26/* family). We still report the match in logs so
+    scoring can use it as a tiebreaker, but we do NOT DQ either side — a miner
+    griefing themselves is not the attack we're protecting against, and losing a
+    legitimate hotkey slot is worse than letting a self-copy sit un-crowned.
     """
     from pathlib import Path
 
@@ -100,6 +108,17 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     copy_model = model_name
     original_uid = max_sim_uid
     original_model = max_sim_model
+
+    if is_copy and uid_to_coldkey is not None and max_sim_uid is not None:
+        my_ck = uid_to_coldkey.get(uid)
+        other_ck = uid_to_coldkey.get(max_sim_uid)
+        if my_ck and other_ck and my_ck == other_ck:
+            logger.info(
+                f"UID {uid} ({model_name}) activation-matches UID {max_sim_uid} "
+                f"({max_sim_model}) at sim={max_sim:.6f} BUT they share coldkey "
+                f"{my_ck[:12]}… — self-copy carve-out, skipping DQ for both sides."
+            )
+            is_copy = False
 
     if is_copy:
         # Resolve commit_block for both sides with layered fallback:
@@ -188,17 +207,22 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         if is_stale(uid, state.failures):
             last_failed_model = state.failure_models.get(str(uid))
+            current_model_key = f"{model_repo}@{revision}"
             if not last_failed_model:
-                logger.info(f"UID {uid}: stale failure counter with no tracked model — resetting to retry {model_repo}")
+                logger.info(f"UID {uid}: stale failure counter with no tracked model — resetting to retry {current_model_key}")
                 reset_failures(uid, state.failures)
                 state.failure_models.pop(str(uid), None)
-            elif last_failed_model != model_repo:
-                logger.info(f"UID {uid}: model changed from {last_failed_model} to {model_repo}, resetting failure counter")
+            elif last_failed_model != current_model_key and last_failed_model != model_repo:
+                logger.info(f"UID {uid}: model changed from {last_failed_model} to {current_model_key}, resetting failure counter")
+                reset_failures(uid, state.failures)
+                state.failure_models.pop(str(uid), None)
+            elif last_failed_model == model_repo and last_failed_model != current_model_key:
+                logger.info(f"UID {uid}: revision changed on {model_repo} (legacy pre-@-tracking entry), resetting failure counter")
                 reset_failures(uid, state.failures)
                 state.failure_models.pop(str(uid), None)
             else:
-                logger.info(f"UID {uid} ({model_repo}): SKIPPED — stale ({state.failures.get(str(uid), 0)} failures on same model). "
-                            f"Submit a new revision to reset.")
+                logger.info(f"UID {uid} ({current_model_key}): SKIPPED — stale ({state.failures.get(str(uid), 0)} failures on same model@revision). "
+                            f"Push a new HuggingFace revision or commit a new model_repo on-chain to reset.")
                 disqualified.add(uid)
                 continue
         uid_str = str(uid)
@@ -214,7 +238,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 mtype = cfg.get("model_type", "")
                 if mtype != "qwen3_5" or "Qwen3_5ForConditionalGeneration" not in archs:
                     logger.info(f"UID {uid} ({model_repo}): FAIL — wrong architecture ({mtype}/{','.join(archs)})")
-                    record_failure(uid, state.failures, state.failure_models, model_repo)
+                    record_failure(uid, state.failures, state.failure_models, f"{model_repo}@{revision}")
                     disqualify(
                         hotkey,
                         f"arch: Must use Qwen3_5ForConditionalGeneration (found {','.join(archs)}, model_type={mtype}). Fix: edit config.json on HuggingFace.",
@@ -258,7 +282,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         if not check["pass"]:
             logger.info(f"UID {uid} ({model_repo}): FAIL — {check['reason']}")
-            record_failure(uid, state.failures, state.failure_models, model_repo)
+            record_failure(uid, state.failures, state.failure_models, f"{model_repo}@{revision}")
             disqualify(hotkey, f"arch: {check['reason']}", state.dq_reasons, coldkey=coldkey, hf_username=hf_user, commit_block=this_commit_block)
             disqualified.add(uid)
             continue

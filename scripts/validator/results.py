@@ -1,5 +1,8 @@
+import json
 import logging
 import math
+import time
+from pathlib import Path
 
 from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
@@ -15,6 +18,49 @@ from scripts.validator.precheck import check_activation_fingerprint
 logger = logging.getLogger("distillation.remote_validator")
 
 MIN_PROMPTS_DETHRONE = 100
+
+
+def _log_finetune_probe_telemetry(
+    state_dir, uid, model_name, student_result, current_block, is_king,
+):
+    """Append one row per evaluated model to state/finetune_probe_telemetry.jsonl.
+
+    Requested by manta.llm on Discord (2026-04-20): "monitor the anti-finetune
+    threshold values… my values are pure heuristic. Some miners will try to
+    modify their anti-finetune method to pass it (as outlier)." Persisting ALL
+    probe values (pass AND fail, king AND challengers) lets us build an
+    empirical distribution and later replace static thresholds with calibrated
+    ones — same playbook as the activation-threshold bump from 0.9999 to
+    0.99999.
+
+    Writes to JSONL so it's cheap to append, easy to tail, and trivial to load
+    with pandas when we're ready to calibrate.
+    """
+    probe = student_result.get("finetune_probe") or {}
+    if not probe:
+        return
+    row = {
+        "ts": time.time(),
+        "block": current_block,
+        "uid": uid,
+        "model": model_name,
+        "is_king": bool(is_king),
+        "status": student_result.get("status"),
+        "pass": bool(probe.get("pass")),
+        "loss": probe.get("loss"),
+        "global_grad_norm": probe.get("global_grad_norm"),
+        "worst_param_type": probe.get("worst_param_type"),
+        "worst_param_norm": probe.get("worst_param_norm"),
+        "worst_norm_weight": probe.get("worst_norm_weight"),
+        "worst_norm_name": probe.get("worst_norm_name"),
+        "reason": probe.get("reason"),
+    }
+    try:
+        path = Path(state_dir) / "finetune_probe_telemetry.jsonl"
+        with path.open("a") as handle:
+            handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        logger.warning(f"finetune_probe telemetry write failed (non-fatal): {exc}")
 
 
 def _apply_dp_noise_to_per_prompt(per_prompt, prompt_texts, private_start_idx):
@@ -195,7 +241,7 @@ def _paired_t_stats(deltas: list[float]):
     return t_stat, p_one_sided, p_two_sided
 
 
-def process_results(results, models_to_eval, king_uid, state: ValidatorState, uid_to_hotkey, commitments, n_prompts, current_block, king_kl, epoch_count, is_full_eval, epoch_start_time=None):
+def process_results(results, models_to_eval, king_uid, state: ValidatorState, uid_to_hotkey, commitments, n_prompts, current_block, king_kl, epoch_count, is_full_eval, epoch_start_time=None, uid_to_coldkey=None):
     uid_to_model = {uid: model["model"] for uid, model in models_to_eval.items()}
     model_to_uid = {model: uid for uid, model in uid_to_model.items()}
     king_h2h_kl = None
@@ -208,9 +254,18 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             ref_kl = student_result.get("kl_global_avg", "error")
             logger.info(f"REFERENCE ({model_name}): KL={ref_kl} (baseline — not scored)")
             continue
+        _log_finetune_probe_telemetry(
+            state_dir=state.state_dir,
+            uid=uid,
+            model_name=model_name,
+            student_result=student_result,
+            current_block=current_block,
+            is_king=(uid == king_uid),
+        )
         if "error" in student_result:
             logger.warning(f"UID {uid} ({model_name}): eval error — {student_result['error']}")
-            record_failure(uid, state.failures, state.failure_models, model_name)
+            rev = models_to_eval.get(uid, {}).get("revision", "main")
+            record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
             continue
         if student_result.get("functional_copy"):
             copy_of = student_result.get("copy_of", "unknown")
@@ -235,6 +290,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 model_name, uid, fingerprint, state.state_dir,
                 commit_block=this_commit_block,
                 uid_to_commit_block=uid_to_commit_block,
+                uid_to_coldkey=uid_to_coldkey,
             )
             if is_copy:
                 if copy_uid == uid:
@@ -305,7 +361,8 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             continue
         if kl == float("inf") or kl < 0:
             logger.warning(f"UID {uid}: invalid KL={kl}")
-            record_failure(uid, state.failures, state.failure_models, model_name)
+            rev = models_to_eval.get(uid, {}).get("revision", "main")
+            record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
             continue
         this_round_uids.add(uid)
         if uid == king_uid:
