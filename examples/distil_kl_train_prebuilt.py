@@ -224,6 +224,21 @@ def _paired_t_stats(deltas: list[float]) -> tuple[float, float]:
     return float(t_stat), float(p_one_sided)
 
 
+def _update_ema(prev: float | None, value: float, beta: float) -> float:
+    if prev is None:
+        return float(value)
+    return float(beta * prev + (1.0 - beta) * value)
+
+
+def _gate_score(delta_ema: float, p_value: float) -> float:
+    """
+    Composite ranking score for stable-vs-king checkpoints.
+
+    Higher is better: reward stronger positive margin, penalize weaker significance.
+    """
+    return float(delta_ema - 0.5 * p_value)
+
+
 def _json_lists_to_tuples(value):
     if isinstance(value, list):
         return tuple(_json_lists_to_tuples(v) for v in value)
@@ -1784,6 +1799,10 @@ def train_from_prebuilt(args):
     beat_streak = 0
     metrics_jsonl = Path(args.metrics_jsonl) if args.metrics_jsonl else (output_dir / "king_eval_metrics.jsonl")
     metrics_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    gate_delta_ema: float | None = None
+    gate_streak = 0
+    best_gate_score = float("-inf")
+    best_gate_step = 0
 
     global_step = resume_global_step
     if resume_dir:
@@ -1899,6 +1918,16 @@ def train_from_prebuilt(args):
             eval_stats = _summary_stats(eval_scores)
             king_stats = _summary_stats(king_scores)
             lr_scale = lr / max(args.lr, 1e-12)
+            gate_delta_ema = _update_ema(
+                gate_delta_ema, float(ttest["delta"]), float(args.gate_ema_beta)
+            )
+            gate_promotable = (
+                gate_delta_ema >= float(args.gate_min_delta)
+                and float(ttest["p"]) <= float(args.gate_max_p)
+            )
+            gate_streak = gate_streak + 1 if gate_promotable else 0
+            gate_is_stable = gate_streak >= int(args.gate_patience_evals)
+            gate_score = _gate_score(gate_delta_ema, float(ttest["p"]))
             entry = {
                 "step": int(global_step),
                 "lr_scale": float(lr_scale),
@@ -1906,6 +1935,13 @@ def train_from_prebuilt(args):
                 "eval_stats": eval_stats,
                 "king_stats": king_stats,
                 "ttest": ttest,
+                "gate": {
+                    "delta_ema": float(gate_delta_ema),
+                    "promotable": bool(gate_promotable),
+                    "streak": int(gate_streak),
+                    "is_stable": bool(gate_is_stable),
+                    "score": float(gate_score),
+                },
                 "time_s": float(time.time() - eval_t0),
                 "ts": _utc_now_iso(),
             }
@@ -1949,6 +1985,43 @@ def train_from_prebuilt(args):
             else:
                 beat_streak = 0
 
+            if gate_is_stable and gate_score > best_gate_score:
+                best_gate_score = gate_score
+                best_gate_step = int(global_step)
+                stable_dir = output_dir / "best_stable_vs_king"
+                stable_dir.mkdir(parents=True, exist_ok=True)
+                student.save_pretrained(stable_dir)
+                tokenizer.save_pretrained(stable_dir)
+                _copy_cached_origin_configs(origin_cfg_cache_dir, stable_dir)
+                _atomic_write_json(
+                    stable_dir / "train_state.json",
+                    {
+                        "global_step": global_step,
+                        "data_position": data.position,
+                        "gate": {
+                            "delta": float(ttest["delta"]),
+                            "p": float(ttest["p"]),
+                            "delta_ema": float(gate_delta_ema),
+                            "streak": int(gate_streak),
+                            "min_delta": float(args.gate_min_delta),
+                            "max_p": float(args.gate_max_p),
+                            "patience_evals": int(args.gate_patience_evals),
+                            "ema_beta": float(args.gate_ema_beta),
+                            "score": float(gate_score),
+                        },
+                        "eval_stats": eval_stats,
+                        "king_stats": king_stats,
+                        "saved_at": _utc_now_iso(),
+                    },
+                )
+                log.info(
+                    "New best stable-vs-king checkpoint saved at %s (score=%.6f, delta_ema=%.6f, p=%.6g)",
+                    stable_dir,
+                    gate_score,
+                    gate_delta_ema,
+                    ttest["p"],
+                )
+
             if not args.no_wandb:
                 import wandb
 
@@ -1964,6 +2037,11 @@ def train_from_prebuilt(args):
                         "ttest/delta": ttest["delta"],
                         "ttest/beats_king": int(beats_king),
                         "train/beat_streak": beat_streak,
+                        "gate/delta_ema": gate_delta_ema,
+                        "gate/promotable": int(gate_promotable),
+                        "gate/streak": gate_streak,
+                        "gate/is_stable": int(gate_is_stable),
+                        "gate/score": gate_score,
                     },
                     step=global_step,
                 )
@@ -2005,6 +2083,12 @@ def train_from_prebuilt(args):
             torch.cuda.empty_cache()
 
     log.info(f"Done. Step {global_step} (stopped by {stop_reason})")
+    if best_gate_step > 0:
+        log.info(
+            "Best stable-vs-king checkpoint selected at step %s (score=%.6f).",
+            best_gate_step,
+            best_gate_score,
+        )
     if not args.no_wandb:
         import wandb
 
@@ -2244,6 +2328,30 @@ def build_parser():
         type=str,
         default=None,
         help="Path to append eval-vs-king JSON lines (default: output_dir/king_eval_metrics.jsonl).",
+    )
+    p_train.add_argument(
+        "--gate_min_delta",
+        type=float,
+        default=0.0025,
+        help="Stable-gate minimum EMA delta (king - student) required for promotion.",
+    )
+    p_train.add_argument(
+        "--gate_max_p",
+        type=float,
+        default=0.03,
+        help="Stable-gate maximum one-sided p-value required for promotion.",
+    )
+    p_train.add_argument(
+        "--gate_patience_evals",
+        type=int,
+        default=3,
+        help="Stable-gate required consecutive promotable evals before checkpoint promotion.",
+    )
+    p_train.add_argument(
+        "--gate_ema_beta",
+        type=float,
+        default=0.6,
+        help="EMA smoothing factor for stable-gate delta.",
     )
     p_train.add_argument("--wandb_project", type=str, default="distil-subnet97")
     p_train.add_argument("--wandb_run", type=str, default=None)
