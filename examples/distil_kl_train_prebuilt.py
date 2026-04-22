@@ -39,6 +39,7 @@ import random
 import time
 import math
 import statistics
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,7 @@ KL_START_POS = 128
 SAMPLES_PER_STEP = 100
 SAVE_EVERY = 500
 MIN_CHARS = 2560
+DEFAULT_EVAL_DATA_URL = "https://distil.arbos.life/api/eval-data"
 
 
 def _require_positive(name: str, value: int):
@@ -305,6 +307,70 @@ def _prepare_eval_cache(
             )
             del prompt_ids, full_seq, t_logits, t_cont, t_log_p
     return cache
+
+
+def _fetch_eval_data_bundle(eval_data_url: str) -> dict:
+    req = urllib.request.Request(
+        eval_data_url,
+        headers={"User-Agent": "distil_kl_train_prebuilt/1.0"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=120.0) as resp:
+        raw = resp.read().decode("utf-8")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object from {eval_data_url}")
+    return payload
+
+
+def _extract_eval_prompts_from_bundle(bundle: dict, max_prompts: int) -> list[str]:
+    from eval.dataset import format_prompt
+
+    rows = bundle.get("data") or []
+    out: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw = row.get("prompt", "")
+        if not raw:
+            continue
+        formatted = format_prompt(raw)
+        if not formatted:
+            continue
+        out.append(formatted)
+        if max_prompts > 0 and len(out) >= max_prompts:
+            break
+    return out
+
+
+def _save_eval_cache_payload(
+    path: Path,
+    cache: list[dict],
+    prompts: list[str],
+    meta: dict,
+):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "version": 1,
+            "meta": meta,
+            "prompts": prompts,
+            "cache": cache,
+        },
+        path,
+    )
+
+
+def _load_eval_cache_payload(path: Path) -> tuple[list[dict], list[str], dict]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a dict payload")
+    cache = payload.get("cache")
+    prompts = payload.get("prompts") or []
+    meta = payload.get("meta") or {}
+    if not isinstance(cache, list) or len(cache) < 2:
+        raise ValueError(f"{path} has invalid or too-small eval cache")
+    return cache, prompts, meta
 
 
 def _mean_token_kl_forward_chunked(
@@ -1435,6 +1501,64 @@ def build_teacher_cache(args):
     log.info(f"Teacher cache complete: {total_samples} samples in {cache_dir}")
 
 
+def build_eval_cache_api(args):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    teacher_gpus = _gpu_span(args.teacher_gpu, args.teacher_gpu_count, "teacher")
+    teacher_device_map, teacher_max_memory = _device_map_and_memory(teacher_gpus)
+    out_path = Path(args.eval_cache_path)
+    if out_path.exists() and not args.rebuild_eval_cache:
+        raise FileExistsError(
+            f"Eval cache already exists: {out_path}. Use --rebuild_eval_cache to overwrite."
+        )
+
+    bundle = _fetch_eval_data_bundle(args.eval_data_url)
+    prompts = _extract_eval_prompts_from_bundle(bundle, args.eval_prompts)
+    if len(prompts) < 2:
+        raise RuntimeError(f"Need at least 2 formatted prompts from eval_data; got {len(prompts)}")
+    max_new_tokens = int(bundle.get("max_new_tokens") or args.eval_max_new_tokens)
+    eval_seed = int(bundle.get("block_seed") or args.eval_seed)
+
+    log.info(
+        "Building eval cache from API: prompts=%s max_new_tokens=%s seed=%s",
+        len(prompts),
+        max_new_tokens,
+        eval_seed,
+    )
+    teacher_load_kwargs = {
+        "dtype": torch.bfloat16,
+        "device_map": teacher_device_map,
+        "trust_remote_code": True,
+    }
+    if teacher_max_memory is not None:
+        teacher_load_kwargs["max_memory"] = teacher_max_memory
+    teacher_eval = AutoModelForCausalLM.from_pretrained(args.teacher, **teacher_load_kwargs)
+    teacher_eval.eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    cache = _prepare_eval_cache(
+        teacher_eval=teacher_eval,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        max_new_tokens=max_new_tokens,
+        seed=eval_seed,
+    )
+    meta = {
+        "teacher": args.teacher,
+        "eval_data_url": args.eval_data_url,
+        "eval_prompts": len(prompts),
+        "max_new_tokens": max_new_tokens,
+        "eval_seed": eval_seed,
+        "block_seed": bundle.get("block_seed"),
+        "source_n_prompts": bundle.get("n_prompts"),
+        "saved_at": _utc_now_iso(),
+    }
+    _save_eval_cache_payload(out_path, cache, prompts, meta)
+    log.info("Saved eval cache to %s", out_path)
+
+
 def train_from_prebuilt(args):
     from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
     from eval.dataset import sample_prompts_from_dataset, format_prompt
@@ -1721,34 +1845,59 @@ def train_from_prebuilt(args):
         king_device_map, king_max_memory = _device_map_and_memory(king_gpus)
         if not args.king_repo:
             raise ValueError("--king_repo is required when --eval_every_steps > 0")
-        raw_prompts = sample_prompts_from_dataset(
-            n=args.eval_prompts,
-            block_number=args.eval_block_number,
-            block_hash=None,
-            dataset_name=args.eval_dataset,
-        )
-        for text in raw_prompts:
-            formatted = format_prompt(text)
-            if formatted:
-                eval_prompts.append(formatted)
-            if len(eval_prompts) >= args.eval_prompts:
-                break
-        if len(eval_prompts) < 2:
-            raise RuntimeError(
-                f"Need at least 2 eval prompts after filtering; got {len(eval_prompts)}"
+        cache_path = Path(args.eval_cache_path) if args.eval_cache_path else None
+        if cache_path and cache_path.exists() and not args.rebuild_eval_cache:
+            log.info("Loading eval cache from %s", cache_path)
+            eval_cache, eval_prompts, cache_meta = _load_eval_cache_payload(cache_path)
+            log.info(
+                "Loaded eval cache: prompts=%s max_new_tokens=%s seed=%s",
+                len(eval_prompts),
+                cache_meta.get("max_new_tokens"),
+                cache_meta.get("eval_seed"),
             )
-        if teacher is None:
-            log.info("Eval enabled: loading teacher model for periodic king-comparison metrics...")
-            teacher_eval_kwargs = {
-                "dtype": torch.bfloat16,
-                "device_map": teacher_device_map,
-                "trust_remote_code": True,
-            }
-            if teacher_max_memory is not None:
-                teacher_eval_kwargs["max_memory"] = teacher_max_memory
-            teacher_eval = AutoModelForCausalLM.from_pretrained(args.teacher, **teacher_eval_kwargs)
         else:
-            teacher_eval = teacher
+            if args.eval_use_api_prompts:
+                bundle = _fetch_eval_data_bundle(args.eval_data_url)
+                eval_prompts = _extract_eval_prompts_from_bundle(bundle, args.eval_prompts)
+                eval_tokens = int(bundle.get("max_new_tokens") or args.eval_max_new_tokens)
+                eval_seed = int(bundle.get("block_seed") or args.eval_seed)
+                log.info(
+                    "Eval prompts from API: prompts=%s max_new_tokens=%s seed=%s",
+                    len(eval_prompts),
+                    eval_tokens,
+                    eval_seed,
+                )
+            else:
+                raw_prompts = sample_prompts_from_dataset(
+                    n=args.eval_prompts,
+                    block_number=args.eval_block_number,
+                    block_hash=None,
+                    dataset_name=args.eval_dataset,
+                )
+                for text in raw_prompts:
+                    formatted = format_prompt(text)
+                    if formatted:
+                        eval_prompts.append(formatted)
+                    if len(eval_prompts) >= args.eval_prompts:
+                        break
+                eval_tokens = args.eval_max_new_tokens
+                eval_seed = args.eval_seed
+            if len(eval_prompts) < 2:
+                raise RuntimeError(
+                    f"Need at least 2 eval prompts after filtering; got {len(eval_prompts)}"
+                )
+            if teacher is None:
+                log.info("Eval enabled: loading teacher model for periodic king-comparison metrics...")
+                teacher_eval_kwargs = {
+                    "dtype": torch.bfloat16,
+                    "device_map": teacher_device_map,
+                    "trust_remote_code": True,
+                }
+                if teacher_max_memory is not None:
+                    teacher_eval_kwargs["max_memory"] = teacher_max_memory
+                teacher_eval = AutoModelForCausalLM.from_pretrained(args.teacher, **teacher_eval_kwargs)
+            else:
+                teacher_eval = teacher
         log.info("Eval enabled: loading king model (%s) on GPUs %s...", args.king_repo, king_gpus)
         king_load_kwargs = {
             "revision": args.king_revision,
@@ -1760,16 +1909,28 @@ def train_from_prebuilt(args):
             king_load_kwargs["max_memory"] = king_max_memory
         king_eval = AutoModelForCausalLM.from_pretrained(args.king_repo, **king_load_kwargs)
         king_eval.eval()
-        if teacher_eval is not None:
-            teacher_eval.eval()
-        log.info("Preparing deterministic eval cache from teacher continuations...")
-        eval_cache = _prepare_eval_cache(
-            teacher_eval=teacher_eval,
-            tokenizer=tokenizer,
-            prompts=eval_prompts,
-            max_new_tokens=args.eval_max_new_tokens,
-            seed=args.eval_seed,
-        )
+        if not eval_cache:
+            if teacher_eval is not None:
+                teacher_eval.eval()
+            log.info("Preparing deterministic eval cache from teacher continuations...")
+            eval_cache = _prepare_eval_cache(
+                teacher_eval=teacher_eval,
+                tokenizer=tokenizer,
+                prompts=eval_prompts,
+                max_new_tokens=eval_tokens,
+                seed=eval_seed,
+            )
+            if cache_path:
+                meta = {
+                    "teacher": args.teacher,
+                    "eval_data_url": args.eval_data_url if args.eval_use_api_prompts else None,
+                    "eval_prompts": len(eval_prompts),
+                    "max_new_tokens": eval_tokens,
+                    "eval_seed": eval_seed,
+                    "saved_at": _utc_now_iso(),
+                }
+                _save_eval_cache_payload(cache_path, eval_cache, eval_prompts, meta)
+                log.info("Saved eval cache to %s", cache_path)
         log.info("Prepared eval cache for %s prompts", len(eval_cache))
         log.info(
             "Periodic king eval configured: %s prompts every %s steps",
@@ -2153,6 +2314,54 @@ def build_parser():
         ),
     )
 
+    p_eval_cache = subparsers.add_parser(
+        "build_eval_cache_api",
+        help="Build teacher eval cache once from live eval_data API prompts.",
+    )
+    p_eval_cache.add_argument("--teacher", type=str, default=TEACHER_MODEL)
+    p_eval_cache.add_argument("--teacher_gpu", type=int, default=0)
+    p_eval_cache.add_argument(
+        "--teacher_gpu_count",
+        type=int,
+        default=1,
+        help="Number of GPUs allocated to teacher model (starting at --teacher_gpu).",
+    )
+    p_eval_cache.add_argument(
+        "--eval_data_url",
+        type=str,
+        default=DEFAULT_EVAL_DATA_URL,
+        help="URL for validator eval_data JSON bundle.",
+    )
+    p_eval_cache.add_argument(
+        "--eval_prompts",
+        type=int,
+        default=0,
+        help="Max prompts to cache (0 = all prompts from eval_data API).",
+    )
+    p_eval_cache.add_argument(
+        "--eval_max_new_tokens",
+        type=int,
+        default=8192,
+        help="Fallback if eval_data has no max_new_tokens.",
+    )
+    p_eval_cache.add_argument(
+        "--eval_seed",
+        type=int,
+        default=12345,
+        help="Fallback if eval_data has no block_seed.",
+    )
+    p_eval_cache.add_argument(
+        "--eval_cache_path",
+        type=str,
+        default="./eval_cache_api.pt",
+        help="Output path for serialized eval cache payload.",
+    )
+    p_eval_cache.add_argument(
+        "--rebuild_eval_cache",
+        action="store_true",
+        help="Overwrite eval cache if --eval_cache_path already exists.",
+    )
+
     p_train = subparsers.add_parser(
         "train", help="Train from prebuilt tokenized samples."
     )
@@ -2294,6 +2503,28 @@ def build_parser():
         help="Seed for deterministic teacher continuations used in periodic eval.",
     )
     p_train.add_argument(
+        "--eval_use_api_prompts",
+        action="store_true",
+        help="Use prompts from live eval_data API (instead of local dataset sampling).",
+    )
+    p_train.add_argument(
+        "--eval_data_url",
+        type=str,
+        default=DEFAULT_EVAL_DATA_URL,
+        help="URL for validator eval_data JSON bundle (used when --eval_use_api_prompts).",
+    )
+    p_train.add_argument(
+        "--eval_cache_path",
+        type=str,
+        default=None,
+        help="Path to prebuilt eval cache payload (.pt). If present, reuse without teacher generation.",
+    )
+    p_train.add_argument(
+        "--rebuild_eval_cache",
+        action="store_true",
+        help="Force rebuild eval cache even when --eval_cache_path exists.",
+    )
+    p_train.add_argument(
         "--king_repo",
         type=str,
         default=None,
@@ -2372,6 +2603,8 @@ def main():
         build_dataset(args)
     elif args.command == "build_teacher_cache":
         build_teacher_cache(args)
+    elif args.command == "build_eval_cache_api":
+        build_eval_cache_api(args)
     elif args.command == "train":
         train_from_prebuilt(args)
     else:
