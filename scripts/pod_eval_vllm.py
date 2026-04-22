@@ -463,9 +463,25 @@ CHAT_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_PROBE_MAX_TOKENS", "768"))
 CHAT_PROBE_MIN_ANSWER_CHARS = int(os.environ.get("CHAT_PROBE_MIN_ANSWER_CHARS", "1"))
 CHAT_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("CHAT_PROBE_TERMINATE_THRESHOLD", "0.5"))
 
-THINK_PROBE_PROMPTS = [
-    # ── Termination battery (16): trivial prompts where any sane model stops fast.
-    # A model that fails to stop here is broken, full stop.
+# ── Think-probe prompt pools ────────────────────────────────────────────────
+# Each round, _pick_think_probe_prompts(block_seed) deterministically samples
+# 16 termination + 16 reasoning prompts from these pools. The fixed 32-prompt
+# list that lived here previously was trivially memorizable — a miner could
+# train to terminate cleanly on the exact strings "Hi" / "Say the word: done"
+# / … while still degenerating on everything else. That's the same class of
+# gaming the finetunability probe (now seeded from FINETUNE_PROBE_TEXTS)
+# already defends against. Combinatorially, C(48,16)^2 ≈ 4·10^26 distinct
+# round-level prompt sets, so memorizing every possible battery is out of
+# reach for any realistic training budget.
+#
+# Pool design:
+#   * Termination pool: trivial, one-shot prompts where any sane model stops
+#     in <10 tokens. A model that fails to stop on these is broken.
+#   * Reasoning pool: prompts that legitimately warrant CoT. A healthy
+#     distilled student should *use* CoT and still terminate within the
+#     budget. The pathology we're catching — KL-saturated kings that pass
+#     one-word probes but melt under actual thinking — shows up here.
+THINK_PROBE_TERMINATION_POOL = (
     "Hi",
     "What is the largest planet? Answer in one word.",
     "Say the word: done",
@@ -482,12 +498,40 @@ THINK_PROBE_PROMPTS = [
     "Say the letter A.",
     "Output the digit 5.",
     "Respond with the single word: hello",
-    # ── Reasoning battery (16): prompts that legitimately warrant a chain of
-    # thought. A healthy distilled student should *use* CoT and still terminate
-    # within the budget. A model that loops, falls into a degenerate pattern,
-    # or empties the 2048-token budget without resolving is the failure we
-    # want to catch — this is the pathology we’ve observed in KL-saturated
-    # kings that “pass” on one-word probes but melt under actual thinking.
+    "Hello.",
+    "Say: ready",
+    "Reply with the number 42.",
+    "Which is smaller: 8 or 15? Answer with just the digit.",
+    "What is 10-3? Reply with just the number.",
+    "What is the capital of Japan? One word.",
+    "Name the opposite of hot. One word.",
+    "What day follows Monday? One word.",
+    "Output only: GO",
+    "Respond with the single word: world",
+    "Say the letter Z.",
+    "Output the digit 0.",
+    "What sound does a cow make? One word.",
+    "Answer yes or no: is the sun a star?",
+    "Name a fruit. One word.",
+    "Complete the word: ban_na",
+    "What is 5+0? Just the number.",
+    "Name a vegetable. One word.",
+    "What color is grass typically? One word.",
+    "Reply with just: fine",
+    "Answer yes or no: does water boil at 100°C at sea level?",
+    "Greet me in one word.",
+    "Say the word: proceed",
+    "Output only: yes",
+    "Output only: no",
+    "Name a day of the week. One word.",
+    "Complete the word: pen_il",
+    "Which is larger: 100 or 99? Just the digit sequence.",
+    "What is 1+1? Reply with just the number.",
+    "Name a metal. One word.",
+    "What is the opposite of up? One word.",
+    "Output the word: stop",
+)
+THINK_PROBE_REASONING_POOL = (
     "A farmer has 17 sheep. All but 9 die. How many are left? Think step by step and give the final answer.",
     "If it takes 5 machines 5 minutes to make 5 widgets, how long does it take 100 machines to make 100 widgets? Explain briefly then answer.",
     "I have 3 apples today. Yesterday I ate 2. How many do I have now? Work it out.",
@@ -504,7 +548,99 @@ THINK_PROBE_PROMPTS = [
     "Translate to Spanish: 'The cat sat on the mat.'",
     "What is the next number in the sequence 1, 1, 2, 3, 5, 8, __? Explain.",
     "Write a single limerick about a programmer who forgets their password.",
-]
+    "A train travels 60 miles in 45 minutes. What is its average speed in mph? Show your work.",
+    "How many distinct ways can you arrange the letters of ABCD? Reason then answer.",
+    "If a coin is flipped 3 times, what is the probability of exactly 2 heads? Show your reasoning.",
+    "Translate to French: 'The book is on the table.'",
+    "Is 997 prime? Explain your reasoning then answer yes or no.",
+    "A cube has side length 4. What is its volume and total surface area?",
+    "What is 144 / 12? Show one step then the answer.",
+    "Sort these words alphabetically: banana, apple, grape, cherry.",
+    "Explain in one sentence why the sky appears blue.",
+    "List three major differences between arteries and veins.",
+    "Convert 98.6°F to Celsius. Show the calculation.",
+    "What is the greatest common divisor of 48 and 36? Reason briefly.",
+    "If a triangle has angles 40° and 65°, what is the third angle? Explain.",
+    "Translate to German: 'I like to read books.'",
+    "Write one haiku about autumn leaves.",
+    "A store marks up a $20 item by 25%. What is the new price? Show the work.",
+    "If 2x + 3 = 11, what is x? Show your steps.",
+    "Name two causes of World War I in one short sentence each.",
+    "Explain in two sentences what photosynthesis is.",
+    "What is 7! (seven factorial)? Show your calculation.",
+    "A car uses 4 gallons to travel 120 miles. How many miles per gallon? Show the division.",
+    "List three planets in order from the sun outward.",
+    "What is the square root of 144? One sentence of reasoning then the answer.",
+    "If a recipe calls for 3 cups of flour for 12 cookies, how much flour for 30 cookies? Show your work.",
+    "Explain the difference between a simile and a metaphor in one sentence, with one example of each.",
+    "Is the number 2^10 greater or less than 1000? Reason briefly.",
+    "Translate to Italian: 'Good morning, how are you?'",
+    "A clock shows 3:45. What is the angle between the hour and minute hands? Explain.",
+    "Write a two-line rhyming couplet about the ocean.",
+    "How many minutes are in a full day? Show the calculation.",
+    "Explain in two sentences why leaves change color in autumn.",
+    "If a set has 5 elements, how many distinct subsets does it have? Reason then answer.",
+)
+# Number of prompts sampled per battery per round. Keep equal to the original
+# 16/16 split so ``THINK_PROBE_TERMINATE_THRESHOLD`` and Wilson-bound
+# statistics remain calibrated.
+THINK_PROBE_TERMINATION_PER_ROUND = 16
+THINK_PROBE_REASONING_PER_ROUND = 16
+
+
+def _pick_think_probe_prompts(block_seed):
+    """Deterministically sample 16 termination + 16 reasoning prompts.
+
+    Hardens the think-probe the same way ``_pick_finetune_probe_text`` hardens
+    the finetunability probe: a miner who memorizes the exact prompt text
+    to look compliant this round gets a different set next round. Uses
+    ``random.Random(int(seed))`` so teacher refs generated here are
+    reproducible on the same (teacher, block_seed) pair.
+
+    Returns a plain list[str] preserving the "termination first, reasoning
+    second" order so downstream indexing by ``THINK_PROBE_TERMINATION_PER_ROUND``
+    still partitions the two batteries when needed.
+
+    When ``block_seed`` is None or unparseable, falls back to the first
+    16 + 16 entries of each pool (the exact set that used to live here),
+    so unit tests that never pass a seed behave identically.
+    """
+    import random
+    seed_val = None
+    if block_seed is not None:
+        try:
+            seed_val = int(block_seed)
+        except (TypeError, ValueError):
+            try:
+                seed_val = int(str(block_seed), 16)
+            except (TypeError, ValueError):
+                seed_val = None
+    if seed_val is None:
+        return (
+            list(THINK_PROBE_TERMINATION_POOL[:THINK_PROBE_TERMINATION_PER_ROUND])
+            + list(THINK_PROBE_REASONING_POOL[:THINK_PROBE_REASONING_PER_ROUND])
+        )
+    # Two independent RNG draws so the reasoning sample is decorrelated from
+    # the termination sample even when pools have overlapping stylistic
+    # shapes.
+    rng_term = random.Random(seed_val)
+    rng_reason = random.Random(seed_val ^ 0x9E3779B97F4A7C15)
+    term = rng_term.sample(
+        list(THINK_PROBE_TERMINATION_POOL),
+        k=min(THINK_PROBE_TERMINATION_PER_ROUND, len(THINK_PROBE_TERMINATION_POOL)),
+    )
+    reason = rng_reason.sample(
+        list(THINK_PROBE_REASONING_POOL),
+        k=min(THINK_PROBE_REASONING_PER_ROUND, len(THINK_PROBE_REASONING_POOL)),
+    )
+    return term + reason
+
+
+# Back-compat default: some callers (unit tests, dev scripts) import
+# THINK_PROBE_PROMPTS directly without a seed. Keep the name pointing at the
+# seed=None default so nothing breaks; the production path always goes
+# through _pick_think_probe_prompts(args.block_seed).
+THINK_PROBE_PROMPTS = _pick_think_probe_prompts(None)
 THINK_PROBE_MAX_TOKENS = int(os.environ.get("THINK_PROBE_MAX_TOKENS", "2048"))
 THINK_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("THINK_PROBE_TERMINATE_THRESHOLD", "0.66"))
 THINK_PROBE_DEGEN_SIGMA = float(os.environ.get("THINK_PROBE_DEGEN_SIGMA", "4.0"))
@@ -1103,19 +1239,24 @@ def _render_chat_prompt(tokenizer, user_text: str, enable_thinking: bool = False
         )
 
 
-def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda"):
+def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=None):
     """Run teacher on think-probe + capability-probe prompts while HF-loaded.
 
     Populates the two globals the student-side probes read. Doing this once
     per round amortizes teacher cost across all students and lets us run
     statistical comparisons (teacher_self_bleu, per-prompt correctness
     delta) that the single-student probe cannot do on its own.
+
+    ``block_seed`` rotates the think-probe prompts so the teacher references
+    match the student-side probe set for this round (see
+    ``_pick_think_probe_prompts`` for the rationale).
     """
     think_samples = []
     cap_answers = []
     cap_gen_lens = []
     if tokenizer is None or teacher is None:
         return think_samples, cap_answers, cap_gen_lens
+    think_prompts = _pick_think_probe_prompts(block_seed)
     try:
         eos_ids = []
         for tok in ["<|im_end|>", "<|endoftext|>"]:
@@ -1130,7 +1271,7 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda"):
         was_training = teacher.training
         teacher.eval()
         with torch.no_grad():
-            for prompt in THINK_PROBE_PROMPTS:
+            for prompt in think_prompts:
                 try:
                     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
@@ -1168,7 +1309,7 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda"):
     return think_samples, cap_answers, cap_gen_lens
 
 
-def prepare_teacher_probe_refs_vllm(tokenizer):
+def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None):
     """Same as the HF variant but using the live vLLM server. Greedy only."""
     import requests
     think_samples = []
@@ -1176,8 +1317,9 @@ def prepare_teacher_probe_refs_vllm(tokenizer):
     cap_gen_lens = []
     if tokenizer is None:
         return think_samples, cap_answers, cap_gen_lens
+    think_prompts = _pick_think_probe_prompts(block_seed)
     try:
-        for prompt in THINK_PROBE_PROMPTS:
+        for prompt in think_prompts:
             try:
                 rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
                 resp = requests.post(
@@ -1225,7 +1367,8 @@ def prepare_teacher_probe_refs_vllm(tokenizer):
     return think_samples, cap_answers, cap_gen_lens
 
 
-def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=None):
+def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=None,
+                             block_seed=None):
     """Degeneracy probe for off-policy CoT collapse — threshold-free design.
 
     Replaces the previous hand-picked 6-gram-repeat-15 threshold with a
@@ -1278,8 +1421,9 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
         student_m = []
         samples = []
 
+        think_prompts = _pick_think_probe_prompts(block_seed)
         with torch.no_grad():
-            for prompt in THINK_PROBE_PROMPTS:
+            for prompt in think_prompts:
                 msgs = [{"role": "user", "content": prompt}]
                 try:
                     try:
@@ -2774,7 +2918,9 @@ def main():
             # axis has a reference.
             try:
                 _tpr_t0 = time.time()
-                think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_vllm(tokenizer)
+                think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_vllm(
+                    tokenizer, block_seed=args.block_seed,
+                )
                 globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
                 globals()["_TEACHER_CAPABILITY_REFS"] = {
                     "answers": cap_answers, "gen_lens": cap_gen_lens,
@@ -2852,7 +2998,7 @@ def main():
                 try:
                     _tpr_t0 = time.time()
                     think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_hf(
-                        teacher, tokenizer, device,
+                        teacher, tokenizer, device, block_seed=args.block_seed,
                     )
                     globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
                     globals()["_TEACHER_CAPABILITY_REFS"] = {
@@ -2973,7 +3119,7 @@ def main():
         try:
             _tpr_t0 = time.time()
             think_refs, cap_answers, cap_gen_lens = prepare_teacher_probe_refs_hf(
-                teacher, tokenizer, device,
+                teacher, tokenizer, device, block_seed=args.block_seed,
             )
             globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
             globals()["_TEACHER_CAPABILITY_REFS"] = {
@@ -3373,6 +3519,7 @@ def main():
                 tprobe = thinking_collapse_probe(
                     student, tokenizer, device,
                     teacher_samples=globals().get("_TEACHER_PROBE_SAMPLES"),
+                    block_seed=args.block_seed,
                 )
                 _tp_dur = time.time() - _tp_start
                 mark = "✓" if tprobe["pass"] else f"✗ DQ: {tprobe['reason']}"
