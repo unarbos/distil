@@ -246,6 +246,27 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     model_to_uid = {model: uid for uid, model in uid_to_model.items()}
     king_h2h_kl = None
     this_round_uids = set()
+
+    # Safety: a king can become DQ'd between rounds — e.g. the retro re-save
+    # audit DQ'd them while this round was already in flight on the pod, or a
+    # runtime DQ was applied (anti-finetune, integrity) after king selection.
+    # Without this guard the "retain crown / no dethroner" fallback below would
+    # happily keep a disqualified king seated. Treat it as a king-less round
+    # instead so the best non-DQ challenger is promoted.
+    if king_uid is not None:
+        king_hotkey_now = uid_to_hotkey.get(king_uid, "")
+        king_commit_block_now = (commitments.get(king_uid, {}) or {}).get("block")
+        if is_disqualified(king_uid, king_hotkey_now, state.dq_reasons, commit_block=king_commit_block_now):
+            logger.warning(
+                f"King UID {king_uid} ({uid_to_model.get(king_uid)}) is DQ'd at round-processing "
+                f"time — treating as king-less; best non-DQ challenger will be crowned"
+            )
+            log_event(
+                f"King UID {king_uid} DQ'd mid-round → crown passes to best non-DQ challenger",
+                level="warning", state_dir=str(state.state_dir),
+            )
+            king_uid = None
+            king_kl = float("inf")
     for model_name, student_result in results.get("students", {}).items():
         uid = model_to_uid.get(model_name)
         if uid is None:
@@ -504,6 +525,91 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             f"Legacy epsilon path: {len(legacy_dethroners)} dethroner(s) without "
             f"per-prompt vectors — picking lowest KL UID {epsilon_dethroned_by}"
         )
+
+    # ── Re-save copy gate ────────────────────────────────────────────────
+    # Before promoting the challenger, do a tensor-by-tensor weight-diff
+    # vs the current king. The paired t-test + 3% epsilon margin can be
+    # defeated by a save_pretrained() round-trip through bf16 (2026-04-22
+    # `abacada/ea` vs `tom9491/distil-32`, also 2026-04-21 `olive5/train-1`
+    # vs `best26/sn97-best900`): the bf16 rounding is deterministic, not
+    # random, so it creates a systematic ~1% KL shift that passes the
+    # t-test and squeaks under 3% epsilon. A direct weight comparison is
+    # the only reliable signal at this point because neither the raw
+    # activation cosine check nor the KL statistics distinguish a
+    # round-trip copy from a lightly-tuned fine-tune.
+    #
+    # Cascade logic: if the top dethroner is a copy, DQ it and fall back
+    # to the next-best dethroner. Repeat until either (a) we find a
+    # non-copy dethroner or (b) the list is exhausted and the king holds.
+    if king_uid is not None:
+        king_model_for_check = uid_to_model.get(king_uid)
+        king_commit = (commitments.get(king_uid, {}) or {}).get("block")
+        king_revision = (commitments.get(king_uid, {}) or {}).get("revision")
+        remaining = list(dethroners)
+        while epsilon_dethroned_by is not None and remaining:
+            current_entry = next(
+                (d for d in remaining if d["uid"] == epsilon_dethroned_by), None
+            )
+            if current_entry is None:
+                break
+            ch_uid = current_entry["uid"]
+            ch_model = uid_to_model.get(ch_uid)
+            ch_commit = (commitments.get(ch_uid, {}) or {}).get("block")
+            ch_revision = (commitments.get(ch_uid, {}) or {}).get("revision")
+            if not (ch_model and king_model_for_check):
+                break
+            # The copy must be the LATER commit — otherwise the king is
+            # the copy, which gets handled by the separate retro-audit
+            # path on startup, not here.
+            if king_commit is not None and ch_commit is not None and ch_commit <= king_commit:
+                break
+            try:
+                from eval.resave_check import detect_resave_copy
+
+                verdict = detect_resave_copy(
+                    ch_model, ch_revision,
+                    king_model_for_check, king_revision,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[resave-check] UID {ch_uid} vs king UID {king_uid}: "
+                    f"check failed ({exc}); allowing dethrone through"
+                )
+                break
+            logger.info(
+                f"[resave-check] UID {ch_uid} ({ch_model}) vs king UID {king_uid} "
+                f"({king_model_for_check}): {verdict['reason']} "
+                f"[elapsed={verdict['elapsed_s']:.1f}s]"
+            )
+            if not verdict.get("is_copy"):
+                break
+            reason = (
+                f"copy: re-save of king UID {king_uid} ({king_model_for_check}) — "
+                f"{verdict['identical_count']}/{verdict['total_tensors']} "
+                f"bit-identical, {verdict['bf16_noise_count']}/{verdict['total_tensors']} "
+                f"within bf16 floor, max|Δ|={verdict['max_abs_diff']:.2e} "
+                f"(signature of save_pretrained() round-trip, NOT training)"
+            )
+            logger.info(f"UID {ch_uid} ({ch_model}): BLOCKED DETHRONE — {reason}")
+            log_event(
+                f"Re-save copy blocked dethrone: UID {ch_uid} is copy of king UID {king_uid}",
+                level="warning", state_dir=str(state.state_dir),
+            )
+            ch_hotkey = uid_to_hotkey.get(ch_uid, str(ch_uid))
+            disqualify(
+                ch_hotkey, reason, state.dq_reasons, commit_block=ch_commit,
+            )
+            state.scores[str(ch_uid)] = MAX_KL_THRESHOLD + 1
+            state.evaluated_uids.add(str(ch_uid))
+            remaining = [d for d in remaining if d["uid"] != ch_uid]
+            if remaining:
+                epsilon_dethroned_by = _resolve_dethrone_winner(remaining)
+            else:
+                epsilon_dethroned_by = None
+                logger.info(
+                    f"All {len(dethroners)} dethroner(s) were re-save copies; "
+                    f"king UID {king_uid} retains crown"
+                )
     h2h_candidates = []
     all_round_uids = set([king_uid] + list(challengers.keys())) if king_uid is not None else set(challengers.keys())
     for uid in all_round_uids:
