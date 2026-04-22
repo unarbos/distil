@@ -253,9 +253,46 @@ def clean_model_cache(name, teacher_name=None):
         pass
 
 
-FINETUNE_PROBE_TEXT = "The capital of France is Paris. The capital of Germany is Berlin."
+# Pool of trivial-fact probe sentences. The finetunability probe samples one
+# per round using block_seed so miners can't hard-code a tiny regularizer that
+# masks only the probe loss. Static set is fine; rotation is the whole point.
+# Requested by manta.llm / const on Discord (2026-04-22): "some miners will try
+# to modify their anti-finetune method to pass it (as outlier)" — rotating the
+# probe text forces the watermark to generalize, so if the miner preserved
+# fine-tunability for *this* sentence they had to preserve it for all of them.
+FINETUNE_PROBE_TEXTS = (
+    "The capital of France is Paris. The capital of Germany is Berlin.",
+    "Water boils at 100 degrees Celsius at sea level pressure.",
+    "The Pacific Ocean is the largest ocean on planet Earth.",
+    "Photosynthesis converts sunlight into chemical energy in plants.",
+    "The speed of light is approximately 300000 kilometers per second.",
+    "Shakespeare wrote Hamlet around the year sixteen hundred.",
+    "The human heart has four chambers: two atria and two ventricles.",
+    "DNA stands for deoxyribonucleic acid and stores genetic information.",
+    "Mount Everest is the tallest mountain above sea level on Earth.",
+    "Gold, silver, and copper are classified as transition metals.",
+    "The Great Wall of China was built over several centuries.",
+    "Electrons have a negative charge and orbit an atomic nucleus.",
+    "The mitochondrion is often called the powerhouse of the cell.",
+    "Shakespeare's plays are often grouped as comedies and tragedies.",
+    "The Amazon rainforest produces roughly twenty percent of Earth's oxygen.",
+    "Pythagoras proved that a squared plus b squared equals c squared.",
+)
 FINETUNE_GRAD_NORM_MAX = float(os.environ.get("FINETUNE_GRAD_NORM_MAX", "500"))
 FINETUNE_NORM_WEIGHT_MAX = float(os.environ.get("FINETUNE_NORM_WEIGHT_MAX", "30"))
+
+
+def _pick_finetune_probe_text(block_seed):
+    """Deterministically rotate the probe sentence per block.
+
+    Same seed that rotates capability prompts — every validator computes the
+    same text for a given round, so the probe is reproducible across pods, but
+    the text changes every round so a gaming miner has to defeat the whole
+    pool rather than a single fixed sentence.
+    """
+    if block_seed is None:
+        return FINETUNE_PROBE_TEXTS[0]
+    return FINETUNE_PROBE_TEXTS[int(block_seed) % len(FINETUNE_PROBE_TEXTS)]
 
 
 def _classify_probe_param(name: str) -> str:
@@ -275,7 +312,7 @@ def _classify_probe_param(name: str) -> str:
     return "other"
 
 
-def finetunability_probe(model, tokenizer, device="cuda"):
+def finetunability_probe(model, tokenizer, device="cuda", block_seed=None):
     """Fine-tunability diagnostic inspired by mantaLLM / const / caseus (SN97 Discord).
 
     Rejects models that can't be continued-pretrained over:
@@ -284,8 +321,13 @@ def finetunability_probe(model, tokenizer, device="cuda"):
       - NaN/Inf in loss or gradients
       - Per-param-type norm imbalance (one group >> the rest)
 
+    Probe text rotates per block_seed (see FINETUNE_PROBE_TEXTS) so a miner
+    that special-cased one sentence's fine-tunability still fails on the next
+    round's sentence.
+
     Returns dict with pass, reason, stats. Never raises — errors return pass=True with note.
     """
+    probe_text = _pick_finetune_probe_text(block_seed)
     stats = {
         "pass": True, "reason": "",
         "global_grad_norm": 0.0,
@@ -294,6 +336,7 @@ def finetunability_probe(model, tokenizer, device="cuda"):
         "worst_norm_weight": 0.0,
         "worst_norm_name": "",
         "loss": 0.0,
+        "probe_text_hash": hash(probe_text) & 0xFFFF,
     }
     try:
         worst_name = ""
@@ -322,7 +365,7 @@ def finetunability_probe(model, tokenizer, device="cuda"):
             p.requires_grad_(True)
             p.grad = None
 
-        ids = tokenizer(FINETUNE_PROBE_TEXT, return_tensors="pt").input_ids.to(device)
+        ids = tokenizer(probe_text, return_tensors="pt").input_ids.to(device)
         try:
             with torch.enable_grad():
                 out = model(input_ids=ids, labels=ids)
@@ -2106,6 +2149,61 @@ def stop_vllm_server():
 # §7  vLLM Generation (teacher continuations + logprobs)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _align_prompt_boundary(full_text, prompt_text, full_ids, tokenizer):
+    """Return the token index in ``full_ids`` that separates prompt from
+    continuation, accounting for BPE's non-concatenative tokenization.
+
+    The naive ``len(tokenizer(prompt_text))`` can drift from the true boundary
+    in ``tokenizer(prompt_text + cont_text)`` because BPE may merge characters
+    across the join (e.g. "Hello " + "world" re-tokenizes to ["Hello", " world"]
+    rather than ["Hello", " ", "world"]). A wrong boundary poisons KL because
+    we score only the continuation slice — a few prompt tokens leaking in or
+    out inflates the KL of whichever side tokenized differently.
+
+    We find the boundary from the authoritative full-string tokenization using
+    char offsets when the tokenizer is fast, and a slow decode-prefix walk as
+    fallback. When the prompt ends mid-token, we exclude the boundary-spanning
+    token from the prompt side so the continuation starts at a clean token.
+    """
+    prompt_char_len = len(prompt_text)
+    if prompt_char_len == 0:
+        return 0
+    n_full = full_ids.shape[1]
+    if prompt_char_len >= len(full_text):
+        return n_full
+    try:
+        enc = tokenizer(
+            full_text, return_tensors="pt", truncation=False,
+            return_offsets_mapping=True,
+        )
+        offsets = enc["offset_mapping"][0].tolist()
+        last_prompt_tok = None
+        for k, (start, end) in enumerate(offsets):
+            if end <= prompt_char_len:
+                last_prompt_tok = k
+            elif start >= prompt_char_len:
+                break
+            else:
+                # Token straddles the prompt/continuation boundary. Keep it
+                # out of the prompt so the continuation gets a clean start.
+                break
+        if last_prompt_tok is None:
+            return 0
+        return last_prompt_tok + 1
+    except Exception:
+        ids_list = full_ids[0].tolist()
+        for k in range(1, len(ids_list) + 1):
+            try:
+                decoded = tokenizer.decode(ids_list[:k], skip_special_tokens=False)
+            except Exception:
+                continue
+            if decoded == prompt_text:
+                return k
+            if len(decoded) > prompt_char_len:
+                return max(k - 1, 0)
+        return len(ids_list)
+
+
 def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
                             logprobs_k, tokenizer, token_to_id):
     """Generate a single prompt via vLLM. Used by both sequential and concurrent paths."""
@@ -2138,11 +2236,13 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
             cont_text = choice["text"]
             full_text = prompt_text + cont_text
             full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
-            prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=False).input_ids
+            prompt_len = _align_prompt_boundary(
+                full_text, prompt_text, full_ids, tokenizer,
+            )
             result = {
                 "full_ids": full_ids,
-                "prompt_len": prompt_ids.shape[1],
-                "gen_len": full_ids.shape[1] - prompt_ids.shape[1],
+                "prompt_len": prompt_len,
+                "gen_len": full_ids.shape[1] - prompt_len,
             }
             if logprobs_k > 0 and "logprobs" in choice and choice["logprobs"]:
                 lp_data = choice["logprobs"]
@@ -3144,7 +3244,9 @@ def main():
         if probe_this:
             try:
                 _fp_start = time.time()
-                probe = finetunability_probe(student, tokenizer, device)
+                probe = finetunability_probe(
+                    student, tokenizer, device, block_seed=args.block_seed,
+                )
                 _fp_dur = time.time() - _fp_start
                 mark = "✓" if probe["pass"] else f"✗ DQ: {probe['reason']}"
                 print(
