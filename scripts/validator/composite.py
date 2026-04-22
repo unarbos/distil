@@ -1,4 +1,4 @@
-"""Multi-axis composite score computation — shadow mode.
+"""Multi-axis composite score computation — production ranking key.
 
 Core idea: a single scalar like KL can be over-optimized until the model is
 useless under autoregressive sampling (the Tiapkin 2025 "Teacher Hacking"
@@ -10,10 +10,14 @@ This module is intentionally pure-Python, no ML deps, safe to import from
 the validator service. It consumes the JSON that ``pod_eval_vllm.py``
 writes per student and emits a ``composite`` score and per-axis breakdown.
 
-Status: SHADOW. The validator logs this alongside KL and surfaces it to
-miners via h2h_results; it does NOT yet decide the king. A 14-day grace
-period starts when we ship this so miners can train against the new axes.
-After the grace period the composite replaces ``kl`` as the ranking key.
+Status: PRODUCTION (promoted from shadow 2026-04-19, commit 8eec9a2).
+``composite.worst`` is the primary ranking key used by
+``scripts/validator/results.py`` to order the leaderboard and select the
+canonical challenger. Crown transitions still additionally require the
+paired t-test on KL + 3% epsilon (``epsilon_dethroned_by``) so a single
+bad round cannot dethrone the king on axis noise. Axes that are missing
+for a given round (e.g. ``degeneracy`` while ``THINK_COLLAPSE_PROBE=0``)
+drop out and the weighted mean renormalizes over the surviving axes.
 """
 from __future__ import annotations
 
