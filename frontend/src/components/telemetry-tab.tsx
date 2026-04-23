@@ -25,6 +25,8 @@ interface CompositeAxes {
   length?: number;
   degeneracy?: number;
   adversarial?: number;
+  on_policy_rkl?: number;
+  judge_probe?: number;
 }
 
 interface Composite {
@@ -33,6 +35,8 @@ interface Composite {
   worst?: number;
   weighted?: number;
   present_count?: number;
+  broken_axes?: string[];
+  judge_in_composite?: boolean;
 }
 
 interface RoundResult {
@@ -57,6 +61,10 @@ interface RoundResult {
   think_reason?: string;
   adversarial_pass_frac?: number;
   adversarial_mean_tokens?: number;
+  judge_mean_score?: number;
+  judge_normalized?: number;
+  judge_n_valid?: number;
+  judge_n?: number;
 }
 
 interface RoundDetail {
@@ -445,10 +453,11 @@ export function TelemetryTab() {
                   <th className="py-1.5 pr-2">UID</th>
                   <th className="pr-2">Model</th>
                   <th className="pr-2">KL</th>
+                  <th className="pr-2">RKL</th>
                   <th className="pr-2">Cap</th>
                   <th className="pr-2">Len</th>
                   <th className="pr-2">Deg</th>
-                  <th className="pr-2">Adv</th>
+                  <th className="pr-2" title="Teacher-as-judge score (shadow). Normalized from 1-5 rubric on 16 rotated prompts per round.">Judge*</th>
                   <th className="pr-2">Worst</th>
                   <th className="pr-2">vs King</th>
                 </tr>
@@ -475,10 +484,16 @@ export function TelemetryTab() {
                           {isDq && <span className="ml-1 text-[9px] rounded bg-red-400/15 text-red-400 px-1 py-0.5">DQ</span>}
                         </td>
                         <td className="pr-2 tabular-nums">{formatFixed(r.kl, 4)}</td>
+                        <td className={`pr-2 tabular-nums ${axisColor(ax.on_policy_rkl)}`}>{ax.on_policy_rkl == null ? "—" : ax.on_policy_rkl.toFixed(2)}</td>
                         <td className={`pr-2 tabular-nums ${axisColor(ax.capability)}`}>{ax.capability == null ? "—" : ax.capability.toFixed(2)}</td>
                         <td className={`pr-2 tabular-nums ${axisColor(ax.length)}`}>{ax.length == null ? "—" : ax.length.toFixed(2)}</td>
                         <td className={`pr-2 tabular-nums ${axisColor(ax.degeneracy)}`}>{ax.degeneracy == null ? "—" : ax.degeneracy.toFixed(2)}</td>
-                        <td className={`pr-2 tabular-nums ${axisColor(ax.adversarial)}`}>{ax.adversarial == null ? "—" : ax.adversarial.toFixed(2)}</td>
+                        <td
+                          className={`pr-2 tabular-nums ${axisColor(ax.judge_probe)} ${r.composite?.judge_in_composite ? "" : "opacity-70"}`}
+                          title={r.composite?.judge_in_composite ? "Judge axis in composite" : "Judge axis in SHADOW — displayed only, not in ranking"}
+                        >
+                          {ax.judge_probe == null ? "—" : ax.judge_probe.toFixed(2)}
+                        </td>
                         <td className={`pr-2 tabular-nums font-semibold ${axisColor(worst)}`}>
                           {worst == null ? "—" : worst.toFixed(2)}
                         </td>
@@ -488,7 +503,7 @@ export function TelemetryTab() {
                       </tr>
                       {isExpanded && (
                         <tr>
-                          <td colSpan={9} className="pb-2 pl-4 text-muted-foreground/60 bg-card/5">
+                          <td colSpan={10} className="pb-2 pl-4 text-muted-foreground/60 bg-card/5">
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[10px] py-2">
                               <div>prompts: {r.prompts_scored}/{r.prompts_total}</div>
                               <div>paired: {r.paired_prompts}</div>
@@ -510,6 +525,15 @@ export function TelemetryTab() {
                                   )}
                                 </div>
                               )}
+                              {r.judge_mean_score != null && (
+                                <div>
+                                  judge: {r.judge_mean_score.toFixed(2)}/5
+                                  {r.judge_n_valid != null && r.judge_n != null && (
+                                    <span className="text-muted-foreground/40"> · {r.judge_n_valid}/{r.judge_n} parsed</span>
+                                  )}
+                                  <span className="text-amber-400/70"> (shadow)</span>
+                                </div>
+                              )}
                               {r.early_stopped && <div className="text-amber-400">early-stopped</div>}
                               {r.dq_reason && (
                                 <div className="col-span-2 md:col-span-4 text-red-300">
@@ -527,7 +551,8 @@ export function TelemetryTab() {
             </table>
           </div>
           <div className="text-[10px] text-muted-foreground/40 font-mono">
-            Composite axes (0–1): worst-of-axis drives reward. Axes = KL (fidelity), capability (math/regex/rhyme probes), length (≈ teacher length), degeneracy (coherence).
+            Composite axes (0–1): worst-of-axis drives reward. Axes = KL (fidelity), RKL (on-policy KL), capability (absolute correctness + teacher-relative), length (≈ teacher length), degeneracy (coherence).
+            <span className="ml-1">Judge* = teacher-as-judge rubric score (1–5 normalized). <span className="text-amber-400">SHADOW</span> — visible here but not yet in ranking (48h telemetry before promotion).</span>
           </div>
         </div>
       )}

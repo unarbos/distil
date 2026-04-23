@@ -824,7 +824,17 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             winner_uid, winner_kl = best_uid, best_kl
     h2h_results = _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_prompt, uid_to_model, state.dq_reasons, uid_to_hotkey, commitments)
     try:
-        annotate_h2h_with_composite(h2h_results, king_h2h_kl, students_data)
+        # Teacher sanity gate (2026-04-23): if pod_eval_vllm recorded a
+        # row for the teacher as a pseudo-student (via the
+        # ``TEACHER_SANITY_PROBE`` path), pass it to the composite
+        # annotator so axes where the teacher itself scored below the
+        # sanity floor drop out this round. Falls back to None when the
+        # teacher wasn't probed (older pod_eval builds) and the gate
+        # fails open — same behaviour as before this commit.
+        teacher_name = results.get("teacher")
+        teacher_row = students_data.get(teacher_name) if teacher_name else None
+        annotate_h2h_with_composite(h2h_results, king_h2h_kl, students_data,
+                                    teacher_student_row=teacher_row)
         # Backfill the vs_king string for entries that would have passed
         # the KL gate (``... dethroned``) but were blocked by the
         # composite-floor veto. Without this the dashboard would say

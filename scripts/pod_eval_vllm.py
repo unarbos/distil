@@ -671,24 +671,467 @@ ON_POLICY_RKL_TOP_K_LOGITS = int(os.environ.get("ON_POLICY_RKL_TOP_K_LOGITS", "1
 ON_POLICY_RKL_SKEW_ALPHA = float(os.environ.get("ON_POLICY_RKL_SKEW_ALPHA", "0.1"))
 ON_POLICY_RKL_SEED = int(os.environ.get("ON_POLICY_RKL_SEED", "42"))
 ON_POLICY_RKL_ENABLED = os.environ.get("ON_POLICY_RKL", "1") != "0"
-ON_POLICY_RKL_PROMPTS = [
+
+# ── On-policy RKL prompt pool (hardened 2026-04-23) ─────────────────────
+# Before this commit this list was 16 hard-coded prompts, sampled in
+# order. That is trivially memorizable: any student trained to emit
+# teacher-mimicking rollouts on exactly these 16 strings scores 1.0 on
+# the on_policy_rkl composite axis while failing the distributional goal
+# the axis is meant to measure (``student-initiated rollouts look like
+# teacher ones in aggregate''). We expand the pool to 80 prompts across
+# six coverage categories — chat / reasoning / instruction-following /
+# creative / translation / arithmetic — and sample 16 per round via the
+# block_seed, mirroring the 2026-04-19 think-probe pool hardening.
+#
+# Combinatorics: C(80, 16) ≈ 4.88·10^14 distinct sets per round; with
+# the per-block seed also shuffling rollout order and the distillation
+# objective requiring teacher-like *distributions* (not memorized
+# token sequences), the only way to score highly on the axis across
+# arbitrary round seeds is to actually produce teacher-like rollouts on
+# broad open-ended prompts.
+ON_POLICY_RKL_POOL = (
+    # Chat-style — open-ended helpful answers
     "Explain how a transformer attention layer works, in one paragraph.",
-    "What is 13 * 17? Show your reasoning.",
-    "Write a haiku about autumn.",
-    "List three causes of the French Revolution.",
-    "Translate to French: The cat sat on the mat.",
-    "What is the capital of Japan?",
     "Summarize the plot of Romeo and Juliet in two sentences.",
-    "Is 97 prime? Answer with reasoning.",
-    "Define machine learning in one sentence.",
-    "Complete the sentence: The sky is blue because",
-    "What is the derivative of x^2?",
     "In one sentence, explain why photosynthesis matters.",
-    "Name a famous work by Mozart.",
-    "What is the square root of 144?",
-    "Who wrote Hamlet?",
+    "Define machine learning in one sentence.",
     "Give a one-line summary of gradient descent.",
-]
+    "In plain language, what is an operating system?",
+    "Explain the concept of compound interest in one short paragraph.",
+    "What is the greenhouse effect? Answer in two sentences.",
+    "Explain what a database index does, briefly.",
+    "What is HTTP and why is it used? Two sentences.",
+    "In two sentences, explain what DNA is.",
+    "Describe the role of mitochondria in a cell, briefly.",
+    "Explain what a compiler does, in one paragraph.",
+    "What is a linked list in computer science? Two sentences.",
+    "Summarize the theory of evolution by natural selection in two sentences.",
+    # Reasoning — require multi-step thought
+    "What is 13 * 17? Show your reasoning.",
+    "Is 97 prime? Answer with reasoning.",
+    "A farmer has 17 sheep. All but 9 die. How many are left? Reason then answer.",
+    "If today is Tuesday, what day is it 100 days from now? Reason then answer.",
+    "A bat and a ball cost $1.10; the bat costs $1 more than the ball. How much is the ball? Reason then answer.",
+    "How many trailing zeros does 25! have? Reason briefly then answer.",
+    "If the population doubles every 10 years and is 1 million today, what is it in 30 years? Reason briefly.",
+    "Alice has twice as many apples as Bob, and together they have 18. How many does Alice have? Show the steps.",
+    "A cylinder has radius 3 and height 10. What is its volume? Show the calculation.",
+    "If 3 painters paint 3 rooms in 3 hours, how many rooms do 9 painters paint in 9 hours? Reason then answer.",
+    "Is the number 2**13 - 1 prime? Give the name of this class of number and answer briefly.",
+    "What is 2^8 and why is that number notable in computing? One paragraph.",
+    "If a square's side length doubles, what happens to its area? Reason briefly.",
+    "How many handshakes occur if everyone in a group of 10 shakes hands with everyone else exactly once? Show the formula.",
+    "If you flip a fair coin 4 times, what's the probability of at least one head? Reason briefly then answer.",
+    # Instruction-following — specific format / constraint
+    "List three causes of the French Revolution.",
+    "Complete the sentence: The sky is blue because",
+    "Write a haiku about autumn.",
+    "Write a single limerick about a cat learning to code.",
+    "List five elements of the periodic table with atomic number ≤ 10.",
+    "Write exactly two sentences about clouds.",
+    "Give three ways to reduce household electricity consumption.",
+    "Name four primary emotions in a comma-separated list.",
+    "List three fruits and three vegetables, clearly labeled.",
+    "Write a two-line rhyming couplet about the ocean.",
+    "In exactly one sentence, describe what courage is.",
+    "Provide three synonyms of 'happy', one per line.",
+    "Output a JSON object with keys 'name' and 'age' describing a fictional person. Just the JSON.",
+    "Write a function signature in Python for a function that sorts a list of ints. No body, just the signature.",
+    "Give a one-line bash command to list files by size descending.",
+    # Creative — require coherent generation
+    "Name a famous work by Mozart.",
+    "Write the opening sentence of a mystery novel set in a library.",
+    "Describe a sunset using exactly three adjectives.",
+    "Write a single tweet-length (<=280 chars) review of a made-up book titled 'The Stone Garden'.",
+    "Describe the taste of a lemon to someone who has never had one. Two sentences.",
+    "Invent a name for a coffee shop that specializes in rare teas. Explain the name in one sentence.",
+    "Write a one-paragraph product description for a fictional smart water bottle.",
+    "Describe a dream forest in two sentences.",
+    "Write a four-line poem about loneliness.",
+    "Give a two-sentence horror story.",
+    # Translation — bilingual correctness
+    "Translate to French: The cat sat on the mat.",
+    "Translate to Spanish: I would like a cup of coffee, please.",
+    "Translate to German: Good morning, how are you today?",
+    "Translate to Italian: Where is the nearest train station?",
+    "Translate to Portuguese: The book is on the table.",
+    "Translate to Japanese (romaji is fine): I am learning to cook.",
+    "Translate to Russian (transliteration ok): Thank you very much.",
+    "Translate to Mandarin (pinyin ok): My name is Alex.",
+    "Translate to Dutch: The red house is on the left.",
+    "Translate to Arabic (transliteration ok): I love reading books.",
+    # Arithmetic / factual — short anchored answers
+    "What is the capital of Japan?",
+    "What is the square root of 144?",
+    "What is the derivative of x^2?",
+    "Who wrote Hamlet?",
+    "What is the chemical formula for water?",
+    "How many continents are there?",
+    "What is the largest ocean on Earth?",
+    "What is 2**10?",
+    "How many planets are in the solar system?",
+    "What is the boiling point of water in Celsius at sea level?",
+    "Who painted the Mona Lisa?",
+    "In what year did humans first land on the Moon?",
+    "What is 7 factorial?",
+    "Who is the author of '1984'?",
+    "What is the atomic number of oxygen?",
+)
+ON_POLICY_RKL_PER_ROUND = int(os.environ.get("ON_POLICY_RKL_PER_ROUND", "16"))
+
+
+def _pick_on_policy_rkl_prompts(block_seed):
+    """Deterministically sample ON_POLICY_RKL_PER_ROUND prompts per round.
+
+    Mirrors ``_pick_think_probe_prompts``: uses ``random.Random(int(seed))``
+    so every validator computes the same set for a given round, yet the
+    set rotates unpredictably between rounds. Falls back to the first
+    16 entries when ``block_seed`` is None (local dev).
+    """
+    import random
+    if block_seed is None:
+        return list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
+    try:
+        rng = random.Random(int(block_seed))
+    except (TypeError, ValueError):
+        return list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
+    pool = list(ON_POLICY_RKL_POOL)
+    rng.shuffle(pool)
+    k = min(ON_POLICY_RKL_PER_ROUND, len(pool))
+    return pool[:k]
+
+
+# Backward-compatibility alias so the rest of the file (and any caller
+# that imports ``ON_POLICY_RKL_PROMPTS`` directly) keeps working. Rewritten
+# per-round by ``set_on_policy_rkl_block_seed`` below.
+ON_POLICY_RKL_PROMPTS = list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
+
+_ON_POLICY_RKL_BLOCK_SEED = None
+
+
+def set_on_policy_rkl_block_seed(block_seed):
+    """Regenerate ON_POLICY_RKL_PROMPTS deterministically for this round.
+
+    Call from main() right after ``set_capability_block_seed`` so both
+    axes rotate together on the same on-chain seed.
+    """
+    global _ON_POLICY_RKL_BLOCK_SEED, ON_POLICY_RKL_PROMPTS
+    if block_seed is None or block_seed == _ON_POLICY_RKL_BLOCK_SEED:
+        return
+    _ON_POLICY_RKL_BLOCK_SEED = block_seed
+    ON_POLICY_RKL_PROMPTS = _pick_on_policy_rkl_prompts(block_seed)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# § Judge probe (teacher-as-judge) — 2026-04-23, shadow mode
+# ═══════════════════════════════════════════════════════════════════════
+# Goal: every other axis measures a *proxy* for model quality (logit
+# similarity, termination rate, diversity, length ratio). The judge probe
+# measures whether the teacher — Qwen3.5-35B, the strongest model we
+# have on-GPU during the eval — considers the student's response to be
+# a good answer. A student that optimizes for "teacher says this is a 5"
+# has essentially aligned with the teacher's quality judgement on
+# realistic queries, which is the actual definition of successful
+# distillation in a way that KL-on-pretraining-text is not.
+#
+# Shadow-mode contract: this probe is computed + logged + shown on the
+# dashboard but is NOT included in the composite ranking until the flip
+# announced in ``reports/2026-04-23-goodhart-immune-eval.md``. The 48h
+# delay lets us (a) collect baseline distribution data, (b) verify the
+# teacher scores itself at >= 0.85 on average, and (c) give miners
+# notice.
+#
+# Pool design: 64 realistic prompts across chat / reasoning /
+# instruction-following / coding / creative. Sample 16/round via
+# ``_pick_judge_probe_prompts(block_seed)`` — same rotation pattern as
+# the other hardened pools. Combinatorics: C(64, 16) ≈ 4.89·10^14.
+JUDGE_PROBE_POOL = (
+    # Chat / factual-helpful
+    "What is the best way to learn a new programming language? Answer in 2-3 sentences.",
+    "Explain briefly the difference between TCP and UDP.",
+    "Why does water expand when it freezes? Give a concise explanation.",
+    "In one paragraph, explain why the seasons exist.",
+    "Give three practical tips for writing cleaner code.",
+    "Describe what version control is to a complete beginner, in 2-3 sentences.",
+    "What is the point of unit tests? Explain briefly.",
+    "In 3 sentences, describe how the internet routes a web request.",
+    "What is a binary search and when would you use it? One short paragraph.",
+    "Briefly: what does a cache do in a CPU?",
+    # Reasoning
+    "A shop buys a product for $40 and sells it at a 25% profit. What is the selling price? Show one line of reasoning then give the answer.",
+    "A train leaves City A at 9am traveling 60 mph toward City B. At 10am another train leaves City B at 90 mph toward A. If the cities are 300 miles apart, at what time do they meet? Show the reasoning.",
+    "A bag contains 3 red marbles and 2 blue marbles. If you draw two without replacement, what is the probability both are red? Show the calculation.",
+    "If all Bloops are Razzies and all Razzies are Lazzies, must all Bloops be Lazzies? Answer yes or no with a one-sentence justification.",
+    "You have a 3-liter jug and a 5-liter jug and a water source. Describe briefly how to measure exactly 4 liters.",
+    "What is the next number in this sequence: 2, 6, 12, 20, 30, ? — and why?",
+    "If it is 2:30 PM now, what time will it be 250 minutes from now? Show your work.",
+    "A cyclist bikes 15 km at 20 km/h, then 10 km at 25 km/h. What is the average speed over the full trip? Show the calculation.",
+    "Sort [3, 1, 4, 1, 5, 9, 2, 6, 5] ascending and return the sorted list.",
+    "If the interior angle of a regular polygon is 150°, how many sides does it have? Show one step of reasoning.",
+    # Instruction-following
+    "Write exactly three numbered bullet points explaining why backups matter.",
+    "Give me a response that is exactly one sentence ending in 'fin.'",
+    "Reply in the format: 'PROS: <a, b>; CONS: <c, d>'. Topic: working from home.",
+    "List five countries of Europe separated by commas, no other text.",
+    "Write a JSON object with keys 'title' and 'summary' describing the book '1984' (title by Orwell). Respond with only the JSON.",
+    "Produce a haiku about winter. The only output should be three lines of the haiku — no intro, no explanation.",
+    "Give me a command-line one-liner that counts the number of .py files under the current directory (do not explain, just the command).",
+    "In fewer than 30 words, describe what a transformer is in machine learning.",
+    "Provide three synonyms of 'angry' in a single comma-separated line.",
+    "Output the word 'OK' in English, French, and German, separated by slashes. Just the output line.",
+    # Coding / code output
+    "Write a Python function `is_palindrome(s: str) -> bool` that returns True if `s` is a palindrome ignoring case and spaces. Include only the function.",
+    "Write a one-line Python list comprehension that returns the squares of the even numbers from 0 to 20 inclusive.",
+    "Write a SQL query that returns the top 5 customers by total `amount` from a table `orders(customer_id, amount)`. Just the query.",
+    "Show a simple Bash loop that prints numbers 1 through 5, one per line.",
+    "Write a Python function `fibonacci(n)` that returns the nth Fibonacci number iteratively. Just the function.",
+    "Given a JSON object `{\"name\": \"Ada\", \"langs\": [\"py\", \"go\"]}`, what is the value at langs[0]? Answer with the value only.",
+    "Translate this Python expression to JavaScript: `[x for x in range(5) if x % 2 == 0]`. Just the expression.",
+    "Write a Python one-liner that reverses the string 'hello world' without using `[::-1]`. Just the one-liner.",
+    "Write a regex that matches a US 5-digit zip code. Just the regex.",
+    "What is the output of `print(list(range(3, 10, 2)))` in Python? Just the output.",
+    # Creative / writing
+    "Write the opening two sentences of a short story set on a lighthouse during a storm.",
+    "Write a single sentence that describes the color 'deep ocean blue' without using the words 'blue' or 'ocean'.",
+    "Produce a one-line encouraging message for someone about to take their first job interview.",
+    "Write one tweet (<280 chars) introducing a fictional coffee-subscription service called 'BeanBox'.",
+    "Give one creative metaphor comparing a commit history to something from everyday life.",
+    # Misc — world model / common sense / ambiguity handling
+    "Which weighs more: a pound of feathers or a pound of lead? Answer in one sentence.",
+    "Is it OK to defrost frozen chicken on the kitchen counter at room temperature? Answer with one-sentence reasoning.",
+    "Name two advantages and two disadvantages of remote work. Use bullet points.",
+    "In one short paragraph, explain why you would or wouldn't recommend ice baths for sore muscles after exercise.",
+    "If someone says 'that's sick!', what are the two most likely meanings depending on context? Two sentences.",
+    "When is it appropriate to ask for clarification when given an ambiguous task? One sentence.",
+    "What does 'rubber-ducking' mean in a programming context? One short sentence.",
+    "Explain why you should not reuse the same password across multiple websites, in one paragraph.",
+    "What's the difference between correlation and causation? Give one example in 2 sentences.",
+    "Name one thing you should check before submitting a pull request. Single-line answer.",
+    "Write one guideline for giving constructive code review feedback.",
+    "What's a sensible response when you notice a bug in a colleague's code? One sentence.",
+    "Why do we typically indent code? One sentence.",
+    "What is the benefit of writing a docstring on a function? One sentence.",
+    "Explain in one sentence why running database migrations in transactions is usually a good idea.",
+)
+JUDGE_PROBE_PER_ROUND = int(os.environ.get("JUDGE_PROBE_PER_ROUND", "16"))
+JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
+# Env gate: off by default would hide the shadow data, which defeats the
+# purpose. On by default; set to "0" to skip if pod cost needs to be
+# temporarily cut.
+JUDGE_PROBE_ENABLED = os.environ.get("JUDGE_PROBE", "1") != "0"
+# Composite inclusion gate. Kept distinct from JUDGE_PROBE_ENABLED so we
+# can flip "promote from shadow to production" without also toggling the
+# probe itself. See Session 2 in the design doc.
+JUDGE_PROBE_IN_COMPOSITE = os.environ.get("JUDGE_PROBE_IN_COMPOSITE", "0") != "0"
+
+
+def _pick_judge_probe_prompts(block_seed):
+    """Deterministically sample JUDGE_PROBE_PER_ROUND prompts per round."""
+    import random
+    if block_seed is None:
+        return list(JUDGE_PROBE_POOL[:JUDGE_PROBE_PER_ROUND])
+    try:
+        seed_val = int(block_seed)
+    except (TypeError, ValueError):
+        return list(JUDGE_PROBE_POOL[:JUDGE_PROBE_PER_ROUND])
+    rng = random.Random(seed_val ^ 0x6A09E667F3BCC908)  # distinct sub-stream vs think/rkl
+    pool = list(JUDGE_PROBE_POOL)
+    rng.shuffle(pool)
+    return pool[:min(JUDGE_PROBE_PER_ROUND, len(pool))]
+
+
+JUDGE_PROBE_PROMPTS = _pick_judge_probe_prompts(None)
+_JUDGE_PROBE_BLOCK_SEED = None
+
+
+def set_judge_probe_block_seed(block_seed):
+    global _JUDGE_PROBE_BLOCK_SEED, JUDGE_PROBE_PROMPTS
+    if block_seed is None or block_seed == _JUDGE_PROBE_BLOCK_SEED:
+        return
+    _JUDGE_PROBE_BLOCK_SEED = block_seed
+    JUDGE_PROBE_PROMPTS = _pick_judge_probe_prompts(block_seed)
+
+
+# Rubric sent to the teacher as the judge. Kept short so output parsing
+# is robust: the teacher is asked to emit a single digit 1-5. Any output
+# where we can't find a digit in that range is recorded as score=None and
+# drops out of the mean. If many prompts drop out in a round that's a
+# strong signal the rubric or teacher behavior drifted and we should
+# investigate — logged explicitly.
+JUDGE_RUBRIC_TEMPLATE = (
+    "You are a strict grader. Score the candidate response to the user "
+    "question on a 1-5 scale.\n"
+    "5 = excellent (correct, clear, addresses the question, appropriate "
+    "length).\n"
+    "4 = good (mostly correct, minor issues).\n"
+    "3 = mediocre (partial answer, noticeable issues, some correct).\n"
+    "2 = poor (mostly wrong, off-topic, or unhelpful).\n"
+    "1 = bad (wrong, harmful, or nonsensical).\n"
+    "Output ONLY the single digit, nothing else.\n\n"
+    "USER QUESTION:\n{prompt}\n\n"
+    "CANDIDATE RESPONSE:\n{response}\n\n"
+    "SCORE (just the digit):"
+)
+
+
+def judge_response_probe(model, tokenizer, device="cuda"):
+    """Collect greedy student responses to the current round's judge prompts.
+
+    Stores ``{'prompts': [...], 'responses': [...], 'gen_tokens': [...]}``
+    in a dict; caller stashes it in the module-level _JUDGE_ROLLOUTS so
+    Phase B (teacher scoring) can consume it after the student is
+    unloaded. The student-side generation is deliberately the same shape
+    as the chat-probe: greedy, ``enable_thinking=False``, bounded max
+    tokens. This matches the "user types a question and gets a response"
+    deployment usage the judge axis is approximating.
+    """
+    out = {
+        "prompts": list(JUDGE_PROBE_PROMPTS),
+        "responses": [],
+        "gen_tokens": [],
+    }
+    if tokenizer is None or model is None or not JUDGE_PROBE_PROMPTS:
+        return out
+    if not getattr(tokenizer, "chat_template", None):
+        return out
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_ids[0] if eos_ids else 0
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for prompt in JUDGE_PROBE_PROMPTS:
+                try:
+                    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                    gen = model.generate(
+                        ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    out["responses"].append(_strip_thinking_probe(text))
+                    out["gen_tokens"].append(int(new_ids.shape[0]))
+                except Exception as e:
+                    out["responses"].append("")
+                    out["gen_tokens"].append(0)
+                    print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
+    finally:
+        if was_training:
+            model.train()
+    return out
+
+
+def _parse_judge_score(text: str) -> int | None:
+    """Extract an integer 1-5 score from the teacher's judge output.
+
+    The rubric instructs the teacher to emit a single digit. In practice
+    the teacher sometimes emits "5." or "Score: 4" or leading
+    whitespace. We search for the first standalone digit in 1-5 and
+    return it. Returns None if no valid digit is found — the caller
+    drops such samples from the mean.
+    """
+    if not text:
+        return None
+    m = re.search(r"\b([1-5])\b", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda") -> dict:
+    """Score a student's collected responses with the teacher as judge.
+
+    ``collected`` is the dict returned by ``judge_response_probe`` for
+    one student. The teacher is prompted with the rubric for each
+    (prompt, response) pair and emits a single digit 1-5. Per-prompt
+    scores are averaged, mapped to [0, 1] via ``(s - 1) / 4``, and
+    returned alongside the raw list so the dashboard can show the
+    distribution.
+    """
+    agg = {
+        "n": 0, "n_valid": 0, "mean_score": None,
+        "normalized": None, "per_prompt": [],
+    }
+    if teacher is None or tokenizer is None or not collected:
+        return agg
+    prompts = collected.get("prompts") or []
+    responses = collected.get("responses") or []
+    if not prompts or not responses:
+        return agg
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_ids[0] if eos_ids else 0
+    was_training = teacher.training
+    teacher.eval()
+    scores: list[int | None] = []
+    try:
+        with torch.no_grad():
+            for prompt, response in zip(prompts, responses):
+                agg["n"] += 1
+                try:
+                    rubric = JUDGE_RUBRIC_TEMPLATE.format(
+                        prompt=prompt.strip(),
+                        response=(response or "").strip()[:2048],
+                    )
+                    rendered = _render_chat_prompt(tokenizer, rubric, enable_thinking=False)
+                    ids = tokenizer(rendered, return_tensors="pt",
+                                    truncation=True, max_length=4096).input_ids.to(device)
+                    gen = teacher.generate(
+                        ids, max_new_tokens=8,
+                        do_sample=False, temperature=1.0, top_p=1.0,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                    )
+                    new_ids = gen[0, ids.shape[1]:]
+                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    score = _parse_judge_score(text)
+                    scores.append(score)
+                    agg["per_prompt"].append({
+                        "prompt": prompt[:160],
+                        "response_preview": (response or "")[:120],
+                        "raw": text[:24],
+                        "score": score,
+                    })
+                    if score is not None:
+                        agg["n_valid"] += 1
+                except Exception as e:
+                    scores.append(None)
+                    agg["per_prompt"].append({
+                        "prompt": prompt[:160],
+                        "error": str(e)[:120],
+                        "score": None,
+                    })
+    finally:
+        if was_training:
+            teacher.train()
+    valid = [s for s in scores if s is not None]
+    if valid:
+        mean = sum(valid) / len(valid)
+        agg["mean_score"] = round(mean, 3)
+        agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    return agg
+
 
 _CAPABILITY_STATIC_POOL = [
     {"q": "What is the capital of France? One word.", "a": "paris", "kind": "word"},
@@ -753,6 +1196,140 @@ _CAPABILITY_STATIC_POOL = [
      "a": "d", "kind": "mc"},
     {"q": "Which one was a Roman emperor? A) Napoleon B) Einstein C) Augustus D) Shakespeare. Respond with only the letter.",
      "a": "c", "kind": "mc"},
+    # ── 2026-04-23 pool expansion ──────────────────────────────────────
+    # Goal: broaden coverage so that ``overfitting to capability'' means
+    # actually being correct across a wide range of verifiable tasks,
+    # not memorizing a 52-item list. Kinds stay within the existing
+    # scoring grammar (word / word_alt / int / yesno / phrase /
+    # format_re / word_count / rhyme / mc) so we don't also need to
+    # teach ``_capability_score_one`` new tricks in the same commit.
+    # Additional trivia — capitals
+    {"q": "What is the capital of Germany? One word.", "a": "berlin", "kind": "word"},
+    {"q": "What is the capital of Spain? One word.", "a": "madrid", "kind": "word"},
+    {"q": "What is the capital of Portugal? One word.", "a": "lisbon", "kind": "word"},
+    {"q": "What is the capital of Russia? One word.", "a": "moscow", "kind": "word"},
+    {"q": "What is the capital of Mexico? Two words.", "a": "mexico city", "kind": "phrase", "accept_re": r"\bmexico\s+city\b|\bciudad\s+de\s+m[eé]xico\b"},
+    {"q": "What is the capital of Argentina? Two words.", "a": "buenos aires", "kind": "phrase", "accept_re": r"\bbuenos\s+aires\b"},
+    {"q": "What is the capital of South Korea? One word.", "a": "seoul", "kind": "word"},
+    {"q": "What is the capital of Turkey? One word.", "a": "ankara", "kind": "word"},
+    {"q": "What is the capital of Sweden? One word.", "a": "stockholm", "kind": "word"},
+    {"q": "What is the capital of Norway? One word.", "a": "oslo", "kind": "word"},
+    {"q": "What is the capital of India? One word.", "a": "delhi", "kind": "word_alt", "alts": ["new delhi", "newdelhi"]},
+    {"q": "What is the capital of China? One word.", "a": "beijing", "kind": "word_alt", "alts": ["peking"]},
+    {"q": "What is the capital of Thailand? One word.", "a": "bangkok", "kind": "word"},
+    {"q": "What is the capital of Vietnam? One word.", "a": "hanoi", "kind": "word"},
+    # Geography / earth science
+    {"q": "What is the largest continent by area? One word.", "a": "asia", "kind": "word"},
+    {"q": "What is the longest river in the world? One word.", "a": "nile", "kind": "word_alt", "alts": ["amazon"]},
+    {"q": "What is the tallest mountain above sea level? One word.", "a": "everest", "kind": "word"},
+    {"q": "What is the largest desert on Earth? One word.", "a": "antarctica", "kind": "word_alt", "alts": ["sahara"]},
+    {"q": "How many oceans are commonly recognized on Earth? Answer with only the number.", "a": "5", "kind": "int"},
+    {"q": "What is the smallest country in the world? Two words or one hyphenated.",
+     "a": "vatican city", "kind": "phrase", "accept_re": r"\bvatican(\s+city)?\b"},
+    {"q": "Is Greenland larger than Australia in area? Answer yes or no.", "a": "no", "kind": "yesno"},
+    # Science — physics, chemistry, biology
+    {"q": "What is the chemical symbol for iron? One word.", "a": "fe", "kind": "word"},
+    {"q": "What is the chemical symbol for sodium? One word.", "a": "na", "kind": "word"},
+    {"q": "What is the chemical symbol for potassium? One word.", "a": "k", "kind": "word"},
+    {"q": "What gas makes up about 78% of Earth's atmosphere? One word.", "a": "nitrogen", "kind": "word"},
+    {"q": "What is the most abundant gas in Earth's atmosphere? One word.", "a": "nitrogen", "kind": "word"},
+    {"q": "What force keeps planets in orbit around the sun? One word.", "a": "gravity", "kind": "word"},
+    {"q": "Which blood cells carry oxygen? Two words or 'rbc'.",
+     "a": "red blood cells", "kind": "phrase", "accept_re": r"\brbcs?\b|\bred\s+blood\s+cells?\b"},
+    {"q": "What is the powerhouse of the cell? One word.", "a": "mitochondria", "kind": "word_alt", "alts": ["mitochondrion"]},
+    {"q": "What is the hardest naturally occurring substance? One word.", "a": "diamond", "kind": "word"},
+    {"q": "Speed of light in vacuum in m/s to the nearest hundred million. Answer with only the number.",
+     "a": "300000000", "kind": "int"},
+    {"q": "What is the SI unit of force? One word.", "a": "newton", "kind": "word"},
+    {"q": "What is the SI unit of electric current? One word.", "a": "ampere", "kind": "word_alt", "alts": ["amp", "amps"]},
+    {"q": "What is the freezing point of water in Fahrenheit? Answer with only the number.", "a": "32", "kind": "int"},
+    {"q": "Is the sun considered a star? Answer yes or no.", "a": "yes", "kind": "yesno"},
+    {"q": "Are viruses made of cells? Answer yes or no.", "a": "no", "kind": "yesno"},
+    {"q": "Is sound faster in water than in air? Answer yes or no.", "a": "yes", "kind": "yesno"},
+    # Math / counting / arithmetic
+    {"q": "How many degrees are in a circle? Answer with only the number.", "a": "360", "kind": "int"},
+    {"q": "How many degrees in a right angle? Answer with only the number.", "a": "90", "kind": "int"},
+    {"q": "How many sides does a dodecagon have? Answer with only the number.", "a": "12", "kind": "int"},
+    {"q": "How many edges does a cube have? Answer with only the number.", "a": "12", "kind": "int"},
+    {"q": "How many vertices does a cube have? Answer with only the number.", "a": "8", "kind": "int"},
+    {"q": "How many minutes are in a full day? Answer with only the number.", "a": "1440", "kind": "int"},
+    {"q": "How many seconds in one hour? Answer with only the number.", "a": "3600", "kind": "int"},
+    {"q": "How many millimeters in a kilometer? Answer with only the number.", "a": "1000000", "kind": "int"},
+    {"q": "How many weeks in a common year? Answer with only the number.", "a": "52", "kind": "int"},
+    {"q": "What is 9 squared? Answer with only the number.", "a": "81", "kind": "int"},
+    {"q": "What is 12 squared? Answer with only the number.", "a": "144", "kind": "int"},
+    {"q": "What is 15 squared? Answer with only the number.", "a": "225", "kind": "int"},
+    {"q": "What is 2 to the 5th power? Answer with only the number.", "a": "32", "kind": "int"},
+    {"q": "What is 2 to the 7th power? Answer with only the number.", "a": "128", "kind": "int"},
+    {"q": "Is 1 a prime number? Answer yes or no.", "a": "no", "kind": "yesno"},
+    {"q": "Is 2 a prime number? Answer yes or no.", "a": "yes", "kind": "yesno"},
+    {"q": "Is 0 an even number? Answer yes or no.", "a": "yes", "kind": "yesno"},
+    {"q": "Is 49 divisible by 7? Answer yes or no.", "a": "yes", "kind": "yesno"},
+    {"q": "Is 60 divisible by 9? Answer yes or no.", "a": "no", "kind": "yesno"},
+    # Language / word knowledge
+    {"q": "How many letters are in the word 'encyclopedia'? Answer with only the number.", "a": "12", "kind": "int"},
+    {"q": "How many vowels are in the word 'beautiful'? Answer with only the number.", "a": "5", "kind": "int"},
+    {"q": "What is the plural of 'child'? One word.", "a": "children", "kind": "word"},
+    {"q": "What is the plural of 'mouse' (the animal)? One word.", "a": "mice", "kind": "word"},
+    {"q": "What is the past tense of 'run'? One word.", "a": "ran", "kind": "word"},
+    {"q": "What is the past tense of 'eat'? One word.", "a": "ate", "kind": "word"},
+    {"q": "What is the opposite of 'begin'? One word.", "a": "end", "kind": "word_alt", "alts": ["finish", "stop"]},
+    {"q": "What is the opposite of 'cold'? One word.", "a": "hot", "kind": "word_alt", "alts": ["warm"]},
+    {"q": "How many syllables are in the word 'banana'? Answer with only the number.", "a": "3", "kind": "int"},
+    # More IFEval-style format compliance
+    {"q": "Reply with exactly the single word 'DONE' in uppercase.",
+     "kind": "format_re", "accept_re": r"^\s*DONE\s*\.?\s*$"},
+    {"q": "Answer with exactly two words describing a dog.",
+     "kind": "word_count", "count": 2},
+    {"q": "Answer with exactly four words describing a storm.",
+     "kind": "word_count", "count": 4},
+    {"q": "Respond with a single lowercase word that rhymes with 'night'.",
+     "kind": "rhyme", "rhyme": "ight", "lowercase": True},
+    {"q": "Respond with a single lowercase word that rhymes with 'bee'.",
+     "kind": "rhyme", "rhyme": "ee", "lowercase": True},
+    {"q": "List four seasons of the year separated by commas, nothing else.",
+     "kind": "format_re",
+     "accept_re": r"^\s*(spring|summer|fall|autumn|winter)\s*,\s*(spring|summer|fall|autumn|winter)\s*,\s*(spring|summer|fall|autumn|winter)\s*,\s*(spring|summer|fall|autumn|winter)\s*\.?\s*$"},
+    {"q": "Answer with the single token 'true' in all lowercase.",
+     "kind": "format_re", "accept_re": r"^\s*true\s*\.?\s*$"},
+    {"q": "Answer with exactly the digit 7 and nothing else.",
+     "kind": "format_re", "accept_re": r"^\s*7\s*$"},
+    {"q": "Write the word 'world' reversed (letter-by-letter). One word only.",
+     "a": "dlrow", "kind": "word"},
+    {"q": "Write the word 'python' reversed (letter-by-letter). One word only.",
+     "a": "nohtyp", "kind": "word"},
+    # Simple code-output (one line, no explanation)
+    {"q": "What does 'len([1, 2, 3, 4])' evaluate to in Python? Answer with only the number.",
+     "a": "4", "kind": "int"},
+    {"q": "What does 'max(3, 7, 2)' evaluate to in Python? Answer with only the number.",
+     "a": "7", "kind": "int"},
+    {"q": "What does 'sum([1, 2, 3])' evaluate to in Python? Answer with only the number.",
+     "a": "6", "kind": "int"},
+    {"q": "What does 'bool([])' evaluate to in Python? Answer with only 'True' or 'False'.",
+     "kind": "format_re", "accept_re": r"^\s*False\s*\.?\s*$"},
+    {"q": "What does '\"abc\".upper()' evaluate to in Python? One word, uppercase letters only.",
+     "kind": "format_re", "accept_re": r"^\s*['\"]?\s*ABC\s*['\"]?\s*\.?\s*$"},
+    {"q": "In Python, what is 7 // 2? Answer with only the number.", "a": "3", "kind": "int"},
+    {"q": "In Python, what is 7 % 3? Answer with only the number.", "a": "1", "kind": "int"},
+    # More MC
+    {"q": "Which is a reptile? A) salmon B) frog C) iguana D) rabbit. Respond with only the letter.",
+     "a": "c", "kind": "mc"},
+    {"q": "Which is a transition metal? A) sodium B) iron C) chlorine D) helium. Respond with only the letter.",
+     "a": "b", "kind": "mc"},
+    {"q": "Which is the smallest country by population? A) India B) China C) Vatican City D) Russia. Respond with only the letter.",
+     "a": "c", "kind": "mc"},
+    {"q": "Which is NOT a programming language? A) Rust B) Cobalt C) Kotlin D) Go. Respond with only the letter.",
+     "a": "b", "kind": "mc"},
+    {"q": "Which planet has the shortest year? A) Venus B) Earth C) Mars D) Mercury. Respond with only the letter.",
+     "a": "d", "kind": "mc"},
+    {"q": "Which layer of Earth is solid metal? A) crust B) mantle C) outer core D) inner core. Respond with only the letter.",
+     "a": "d", "kind": "mc"},
+    # Historical / cultural
+    {"q": "In what year did World War II end? Answer with only the number.", "a": "1945", "kind": "int"},
+    {"q": "In what year did the Berlin Wall fall? Answer with only the number.", "a": "1989", "kind": "int"},
+    {"q": "Who wrote 'Hamlet'? Two words.", "a": "william shakespeare", "kind": "phrase", "accept_re": r"\b(william\s+)?shakespeare\b"},
+    {"q": "Who painted the 'Mona Lisa'? Two words.", "a": "leonardo da vinci", "kind": "phrase", "accept_re": r"\b(leonardo\s+)?da\s+vinci\b|\bleonardo\s+da\s+vinci\b"},
+    {"q": "Who discovered penicillin? Two words.", "a": "alexander fleming", "kind": "phrase", "accept_re": r"\b(alexander\s+)?fleming\b"},
 ]
 
 CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", "48"))
@@ -2832,6 +3409,8 @@ def main():
     args = parser.parse_args()
 
     set_capability_block_seed(args.block_seed)
+    set_on_policy_rkl_block_seed(args.block_seed)
+    set_judge_probe_block_seed(args.block_seed)
 
     # Auto-detect tensor-parallel size when unset (0 = all visible GPUs).
     # Allow override via DISTIL_TP_SIZE env var even when caller forgot the flag.
@@ -3680,6 +4259,42 @@ def main():
             except Exception as e:
                 print(f"[eval] Capability probe error (non-fatal): {e}", flush=True)
 
+        # ── Judge probe — student-side response collection (SHADOW) ──
+        # Generate greedy responses to the round's 16 judge prompts while
+        # the student is still loaded. Teacher scoring happens in Phase
+        # B (where the teacher is reloaded for RKL scoring anyway).
+        # 2026-04-23 — shadow axis, not in composite ranking yet. See
+        # ``reports/2026-04-23-goodhart-immune-eval.md``.
+        judge_collect_this = (
+            student is not None
+            and JUDGE_PROBE_ENABLED
+        )
+        if is_king and king_model is not None and student is king_model and load_time == 0.0:
+            judge_collect_this = False
+        if judge_collect_this:
+            try:
+                _jp_start = time.time()
+                judge_raw = judge_response_probe(student, tokenizer, device)
+                _jp_dur = time.time() - _jp_start
+                if judge_raw and judge_raw.get("responses"):
+                    _judge_store = globals().setdefault("_JUDGE_ROLLOUTS", {})
+                    _judge_store[student_name] = judge_raw
+                    resp_lens = judge_raw.get("gen_tokens") or []
+                    avg_len = (sum(resp_lens) / len(resp_lens)) if resp_lens else 0.0
+                    results["students"].setdefault(student_name, {})["judge_probe_meta"] = {
+                        "n_prompts": len(judge_raw.get("prompts") or []),
+                        "mean_gen_tokens": round(avg_len, 1),
+                        "collected_at": round(_jp_dur, 1),
+                    }
+                    print(
+                        f"[eval] Judge probe (collect): "
+                        f"{len(judge_raw['responses'])} responses, "
+                        f"avg_gen={avg_len:.0f} tokens ({_jp_dur:.1f}s)",
+                        flush=True,
+                    )
+            except Exception as e:
+                print(f"[eval] Judge probe collection error (non-fatal): {e}", flush=True)
+
         # ── Activation fingerprint (for functional copy detection) ──
         if student is not None:
             try:
@@ -4032,16 +4647,20 @@ def main():
                 pass
             prefetch_future = None
 
-    # ── On-policy RKL scoring (Phase B) ─────────────────────────────
-    # After the student loop, load the teacher once and score all
-    # collected rollouts. This amortizes the teacher load across
-    # students and keeps total wall time manageable (~30s load + ~0.5s
-    # per rollout). Results get merged back into each student's dict.
-    _store = globals().get("_ON_POLICY_ROLLOUTS") or {}
-    if ON_POLICY_RKL_ENABLED and _store:
+    # ── Phase B: teacher-side scoring (RKL + judge) ─────────────────
+    # After the student loop, load the teacher once and run every
+    # teacher-side scoring pass we need. Amortizes the teacher load
+    # (~30s) across both on-policy RKL and the shadow judge probe.
+    # Results are merged back into each student's dict.
+    _rkl_store = globals().get("_ON_POLICY_ROLLOUTS") or {}
+    _judge_store = globals().get("_JUDGE_ROLLOUTS") or {}
+    _need_teacher = (ON_POLICY_RKL_ENABLED and _rkl_store) or (JUDGE_PROBE_ENABLED and _judge_store)
+    if _need_teacher:
         try:
-            print(f"\n[eval] On-policy RKL Phase B: scoring {len(_store)} "
-                  f"students' rollouts against teacher", flush=True)
+            print(f"\n[eval] Phase B: teacher-side scoring "
+                  f"(RKL={'on' if (ON_POLICY_RKL_ENABLED and _rkl_store) else 'off'}, "
+                  f"judge={'on' if (JUDGE_PROBE_ENABLED and _judge_store) else 'off'})",
+                  flush=True)
             # Free the king if it's still resident — teacher forward pass
             # wants all the VRAM it can get.
             try:
@@ -4051,53 +4670,145 @@ def main():
             except Exception:
                 pass
             free_gpu()
-            _rkl_t0 = time.time()
+            _phb_t0 = time.time()
             teacher_b = load_model(args.teacher, device)
             teacher_b.eval()
-            print(f"[eval] Teacher reloaded for RKL ({time.time() - _rkl_t0:.0f}s), "
+            print(f"[eval] Teacher reloaded for Phase B ({time.time() - _phb_t0:.0f}s), "
                   f"VRAM: {gpu_mem_str()}", flush=True)
-            n_scored = 0
-            for sn, rolls in _store.items():
-                try:
-                    _rkl_s_t0 = time.time()
-                    rkl = on_policy_rkl_score(teacher_b, rolls, device=device)
-                    dur = time.time() - _rkl_s_t0
-                    slim = {
-                        "n_rollouts": rkl["n_rollouts"],
-                        "tokens": rkl["tokens"],
-                        "mean_rkl": round(rkl["mean_rkl"], 6) if rkl["mean_rkl"] == rkl["mean_rkl"] else None,
-                        "mean_fkl": round(rkl["mean_fkl"], 6) if rkl["mean_fkl"] == rkl["mean_fkl"] else None,
-                        "mean_skl": round(rkl["mean_skl"], 6) if rkl["mean_skl"] == rkl["mean_skl"] else None,
-                        "mean_sampled_gap": round(rkl["mean_sampled_gap"], 6) if rkl["mean_sampled_gap"] == rkl["mean_sampled_gap"] else None,
-                        "mean_gen_len": round(rkl["mean_gen_len"], 1),
-                        "skew_alpha": rkl.get("skew_alpha"),
-                        "top_k": rkl.get("top_k"),
-                        "per_rollout": rkl.get("per_rollout", []),
-                        "scoring_time": round(dur, 1),
-                    }
-                    if sn in results["students"]:
-                        results["students"][sn]["on_policy_rkl"] = slim
-                    n_scored += 1
-                    print(
-                        f"  [{sn}] rkl={slim['mean_rkl']} fkl={slim['mean_fkl']} "
-                        f"skl={slim['mean_skl']} gap={slim['mean_sampled_gap']} "
-                        f"({dur:.1f}s, {rkl['n_rollouts']} rollouts)",
-                        flush=True,
-                    )
-                except Exception as e:
-                    print(f"  [{sn}] RKL scoring error: {str(e)[:160]}", flush=True)
+
+            # ── Phase B.1: on-policy RKL scoring ────────────────────
+            if ON_POLICY_RKL_ENABLED and _rkl_store:
+                _rkl_t0 = time.time()
+                n_scored = 0
+                for sn, rolls in _rkl_store.items():
+                    try:
+                        _rkl_s_t0 = time.time()
+                        rkl = on_policy_rkl_score(teacher_b, rolls, device=device)
+                        dur = time.time() - _rkl_s_t0
+                        slim = {
+                            "n_rollouts": rkl["n_rollouts"],
+                            "tokens": rkl["tokens"],
+                            "mean_rkl": round(rkl["mean_rkl"], 6) if rkl["mean_rkl"] == rkl["mean_rkl"] else None,
+                            "mean_fkl": round(rkl["mean_fkl"], 6) if rkl["mean_fkl"] == rkl["mean_fkl"] else None,
+                            "mean_skl": round(rkl["mean_skl"], 6) if rkl["mean_skl"] == rkl["mean_skl"] else None,
+                            "mean_sampled_gap": round(rkl["mean_sampled_gap"], 6) if rkl["mean_sampled_gap"] == rkl["mean_sampled_gap"] else None,
+                            "mean_gen_len": round(rkl["mean_gen_len"], 1),
+                            "skew_alpha": rkl.get("skew_alpha"),
+                            "top_k": rkl.get("top_k"),
+                            "per_rollout": rkl.get("per_rollout", []),
+                            "scoring_time": round(dur, 1),
+                        }
+                        if sn in results["students"]:
+                            results["students"][sn]["on_policy_rkl"] = slim
+                        n_scored += 1
+                        print(
+                            f"  [{sn}] rkl={slim['mean_rkl']} fkl={slim['mean_fkl']} "
+                            f"skl={slim['mean_skl']} gap={slim['mean_sampled_gap']} "
+                            f"({dur:.1f}s, {rkl['n_rollouts']} rollouts)",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"  [{sn}] RKL scoring error: {str(e)[:160]}", flush=True)
+                timings["on_policy_rkl"] = time.time() - _rkl_t0
+                print(f"[eval] On-policy RKL: scored {n_scored}/{len(_rkl_store)} students "
+                      f"in {timings['on_policy_rkl']:.1f}s", flush=True)
+
+            # ── Phase B.2: judge probe scoring (SHADOW) ─────────────
+            # Teacher scores each student response 1-5 per rubric. Each
+            # scoring is a single-token greedy completion so the cost
+            # is tiny (~0.1s / pair). Shadow-only: emitted to JSON +
+            # dashboard but composite.py does NOT include it in the
+            # ranking yet (gated on ``JUDGE_PROBE_IN_COMPOSITE``).
+            if JUDGE_PROBE_ENABLED and _judge_store:
+                _jb_t0 = time.time()
+                judge_scored = 0
+                for sn, collected in _judge_store.items():
+                    try:
+                        _jb_s_t0 = time.time()
+                        judged = judge_teacher_score(teacher_b, tokenizer, collected, device=device)
+                        dur = time.time() - _jb_s_t0
+                        payload = {
+                            "n": judged["n"],
+                            "n_valid": judged["n_valid"],
+                            "mean_score": judged["mean_score"],
+                            "normalized": judged["normalized"],
+                            "per_prompt": judged.get("per_prompt", []),
+                            "scoring_time": round(dur, 1),
+                            "in_composite": JUDGE_PROBE_IN_COMPOSITE,
+                            "version": 1,
+                        }
+                        if sn in results["students"]:
+                            results["students"][sn]["judge_probe"] = payload
+                        judge_scored += 1
+                        print(
+                            f"  [{sn}] judge mean={payload['mean_score']} "
+                            f"norm={payload['normalized']} "
+                            f"valid={payload['n_valid']}/{payload['n']} ({dur:.1f}s)",
+                            flush=True,
+                        )
+                    except Exception as e:
+                        print(f"  [{sn}] judge scoring error: {str(e)[:160]}", flush=True)
+                timings["judge_probe"] = time.time() - _jb_t0
+                print(f"[eval] Judge probe: scored {judge_scored}/{len(_judge_store)} students "
+                      f"in {timings['judge_probe']:.1f}s (SHADOW — not in composite)",
+                      flush=True)
+
             try:
                 del teacher_b
             except Exception:
                 pass
             free_gpu()
-            timings["on_policy_rkl"] = time.time() - _rkl_t0
-            print(f"[eval] On-policy RKL: scored {n_scored}/{len(_store)} students "
-                  f"in {timings['on_policy_rkl']:.1f}s", flush=True)
+            timings["phase_b_total"] = time.time() - _phb_t0
         except Exception as e:
-            print(f"[eval] On-policy RKL Phase B failed (non-fatal): {e}", flush=True)
+            print(f"[eval] Phase B teacher scoring failed (non-fatal): {e}", flush=True)
         finally:
             globals()["_ON_POLICY_ROLLOUTS"] = {}
+            globals()["_JUDGE_ROLLOUTS"] = {}
+
+    # ── Teacher sanity row (2026-04-23) ─────────────────────────────
+    # Emit a synthetic row under ``results['students'][<teacher>]`` that
+    # records the teacher's own performance on every axis where we have
+    # a natural comparison to make this round. The validator
+    # (``scripts/validator/composite.resolve_teacher_broken_axes``)
+    # consumes this and drops any axis where the teacher scored < 0.70,
+    # preventing miscalibrated probes from corrupting rankings (the
+    # 2026-04-19 Wilson-anchor outage class).
+    #
+    # Scope: only axes that are non-trivial to evaluate for the teacher.
+    # KL, length, on_policy_rkl, degeneracy all score the teacher at ~1.0
+    # by construction (self-comparison) and would never trip the gate.
+    # Capability is the only axis that can genuinely be miscalibrated —
+    # new prompt pool, buggy scorer, dataset corruption — and we have
+    # the teacher's pass_frac from the probe refs collection phase.
+    try:
+        _teacher_refs = globals().get("_TEACHER_CAPABILITY_REFS") or {}
+        _teacher_answers = _teacher_refs.get("answers") or []
+        if _teacher_answers:
+            _teach_correct = 0
+            _teach_paired = 0
+            for _item_idx, _item in enumerate(CAPABILITY_PROBE_PROMPTS):
+                if _item_idx < len(_teacher_answers):
+                    _teach_paired += 1
+                    if _capability_score_one(_teacher_answers[_item_idx], _item):
+                        _teach_correct += 1
+            if _teach_paired:
+                _teach_frac = _teach_correct / _teach_paired
+                _teacher_row = results["students"].setdefault(args.teacher, {})
+                _teacher_row["status"] = _teacher_row.get("status", "teacher_sanity")
+                _teacher_row["capability"] = {
+                    "n": _teach_paired, "correct": _teach_correct,
+                    "pass_frac": round(_teach_frac, 3),
+                    "teacher_pass_frac": round(_teach_frac, 3),
+                    "items": [],
+                    "source": "teacher_sanity_probe",
+                }
+                print(
+                    f"[eval] Teacher sanity row: capability "
+                    f"{_teach_correct}/{_teach_paired} ({_teach_frac*100:.0f}%)",
+                    flush=True,
+                )
+    except Exception as _e:
+        print(f"[eval] Teacher sanity row build failed (non-fatal): {_e}", flush=True)
 
     # Final save
     results["timings"] = {k: round(v, 1) for k, v in timings.items()}

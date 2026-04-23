@@ -204,6 +204,7 @@ def _compact_round(h2h, last_eval):
         length = s.get("length_axis") or {}
         tp = s.get("think_probe") or {}
         adv = s.get("adversarial") or {}
+        jp = s.get("judge_probe") or {}
         rows.append({
             "uid": r.get("uid"),
             "model": model,
@@ -226,6 +227,13 @@ def _compact_round(h2h, last_eval):
             "think_reason": tp.get("reason"),
             "adversarial_pass_frac": adv.get("pass_frac"),
             "adversarial_mean_tokens": adv.get("mean_gen_tokens"),
+            # Judge probe (shadow) — teacher-as-judge 1-5 rubric.
+            # 2026-04-23 — in composite only when JUDGE_AXIS_IN_COMPOSITE=1
+            # on the validator side. Dashboard shows it regardless.
+            "judge_mean_score": jp.get("mean_score"),
+            "judge_normalized": jp.get("normalized"),
+            "judge_n_valid": jp.get("n_valid"),
+            "judge_n": jp.get("n"),
         })
     return {
         "block": h2h.get("block"),
