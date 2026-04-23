@@ -2098,20 +2098,47 @@ def _bench_load_pools(verbose: bool = True):
     # 378 Python programming problems with bundled unit tests. Same
     # subprocess-sandbox path as HumanEval but a different pool so
     # miners can't overfit just by memorizing 164 HumanEval signatures.
+    #
+    # 2026-04-25: evalplus/mbppplus's ``test`` field is a verbose
+    # assertion *helper* (defines an ``assertion()`` function that runs
+    # many cases). The simple ``assert fn_name(...)`` pattern lives in
+    # ``test_list``. We prefer ``test_list`` for both entry-point
+    # extraction and sandbox execution; fall back to ``test`` only if
+    # ``test_list`` is missing, then extract entry_point from it.
     try:
         mbpp = load_dataset("evalplus/mbppplus", split="test")
         for item in mbpp:
             prompt = item.get("prompt") or ""
-            tests = item.get("test") or item.get("test_list")
-            if isinstance(tests, list):
-                tests = "\n".join(tests)
+            test_list = item.get("test_list")
+            test_verbose = item.get("test")
+            if isinstance(test_list, list) and test_list:
+                tests = "\n".join(test_list)
+            elif isinstance(test_verbose, str) and test_verbose:
+                tests = test_verbose
+            else:
+                continue
             entry_point = item.get("entry_point") or ""
             if not entry_point:
-                # MBPP canonical tests call the function directly, extract from assertion.
-                if isinstance(tests, str):
-                    m = re.search(r"assert\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", tests)
-                    if m:
-                        entry_point = m.group(1)
+                # Extract from the first assertion call. Skip common
+                # helper wrappers (``math.isclose``, ``set``, ``round``,
+                # ``abs``, ``len``, ``isinstance``) — the actual user
+                # function is typically the first arg of the wrapper.
+                _helpers = {"set", "round", "abs", "len", "isinstance",
+                            "sorted", "tuple", "list", "dict", "str", "int",
+                            "float", "frozenset", "all", "any"}
+                for cand_m in re.finditer(
+                    r"([a-zA-Z_][a-zA-Z0-9_.]*)\s*\(", tests,
+                ):
+                    cand = cand_m.group(1)
+                    base = cand.split(".")[-1] if "." in cand else cand
+                    top = cand.split(".")[0]
+                    if top in {"math", "numpy", "np", "os", "sys",
+                               "collections", "itertools", "functools"}:
+                        continue
+                    if base in _helpers:
+                        continue
+                    entry_point = base
+                    break
             if not (prompt and tests and entry_point):
                 continue
             _BENCH_POOLS["mbpp"].append({
@@ -2921,13 +2948,30 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
             model.train()
         # MBPP solutions often don't stub the function signature at the
         # top of the prompt the way HumanEval does (which uses signature
-        # + docstring). To reuse the sandbox runner, wrap the generated
-        # body inside a trivial pass-through prompt — this keeps the
-        # runner's concatenation (prompt+completion+test) semantically
-        # the same (tests call the function by name and that name is
-        # defined in the completion).
+        # + docstring). To reuse the sandbox runner, we:
+        #   1. Pass an empty prompt (generation defines the function).
+        #   2. Wrap the standalone assert lines in a ``check(candidate)``
+        #      function the sandbox expects. MBPP ``test`` fields are
+        #      either raw assertions (preferred, from ``test_list``) or
+        #      a helper module that still calls the target by name —
+        #      either way, wrapping in ``def check(candidate):`` and
+        #      binding ``candidate`` to the entry_point makes it work.
+        def _wrap_for_sandbox(test: str, entry_point: str) -> str:
+            # The sandbox calls ``check({entry_point})`` after running
+            # the generation. The generation defines the target function
+            # in module scope. Inside ``check``, the test body references
+            # the function by name and Python looks it up in the
+            # enclosing module scope, so no rebinding is needed — we
+            # only need to indent the asserts into the ``check`` body.
+            indented = "\n".join(
+                (f"    {line}" if line.strip() else "")
+                for line in test.splitlines()
+            )
+            return f"def check(candidate):\n{indented}\n    return True\n"
         sandbox_input = [
-            ("", _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            ("", _strip_thinking_probe(gen or ""),
+             _wrap_for_sandbox(it["test"], it["entry_point"]),
+             it["entry_point"])
             for gen, it in generations if "gen_error" not in it
         ]
         sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
@@ -5846,7 +5890,7 @@ def main():
                     else:
                         summary_bits.append(f"{short}=skip")
                 print(
-                    f"[eval] Bench battery (SHADOW): "
+                    f"[eval] Bench battery (Arena v3 — S2 live, S3 shadow): "
                     f"{' | '.join(summary_bits)} "
                     f"[total {total_w:.1f}s]",
                     flush=True,
