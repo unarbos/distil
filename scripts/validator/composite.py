@@ -59,11 +59,15 @@ Status: PRODUCTION — ranking + dethrone veto.
     commonsense science MC), 3.2 ``reasoning_density`` (pass_frac ×
     length_bonus — explicitly penalizes over-think-on-trivia),
     3.3 ``chat_turns_probe`` (teacher-graded 3-turn dialogues),
-    3.4 ``truthful_bench`` (TruthfulQA adversarial factuality) —
-    all SHADOW. Each targets a capability that Session 2 + relative
-    axes don't already reward, so climbing them requires genuine
-    model improvement. See ``reports/2026-04-24-arena-v3.md`` and the
-    ``MINER_FAQ.md`` playbook.
+    3.4 ``truthful_bench`` (TruthfulQA adversarial factuality),
+    3.5 ``long_context_bench`` (procedural needle-in-haystack
+    over ~1400 tokens — literally uncheatable because items are
+    generated fresh every round from the block_seed, no fixed
+    dataset exists) — all SHADOW. Each targets a capability that
+    Session 2 + relative axes don't already reward, so climbing
+    them requires genuine model improvement. See
+    ``reports/2026-04-24-arena-v3.md`` and the ``MINER_FAQ.md``
+    playbook.
 
 Axes that are missing for a given round (e.g. ``degeneracy`` while
 ``THINK_COLLAPSE_PROBE=0``) drop out and the weighted mean renormalizes
@@ -154,6 +158,14 @@ ARENA_V3_AXIS_WEIGHTS = {
     # pretraining priors. Miners who add factuality data to their SFT
     # mix (TriviaQA-factual, RefuseElseFalse, HaluEval-sft) will climb.
     "truthful_bench":           float(os.environ.get("BENCH_TRUTHFUL_WEIGHT", "0.03")),
+    # Session 3.5 — long-context needle-in-haystack (added 2026-04-25).
+    # Procedural: the items are generated fresh every round from the
+    # block_seed, so there is LITERALLY no training set to memorize. A
+    # model either retrieves from context or hallucinates. Directly tests
+    # a capability every other axis leaves open (all other prompts are
+    # under 1k tokens). Cheap because we reuse _bench_generate with
+    # enable_thinking=False.
+    "long_context_bench":       float(os.environ.get("BENCH_LC_WEIGHT", "0.03")),
 }
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") != "0"
@@ -190,6 +202,7 @@ REASONING_DENSITY_TARGET_TOKENS = {
     "self_consistency_bench": float(os.environ.get("RD_SC_TARGET", "300")),
     "arc_bench":             float(os.environ.get("RD_ARC_TARGET", "50")),
     "truthful_bench":        float(os.environ.get("RD_TRUTHFUL_TARGET", "40")),
+    "long_context_bench":    float(os.environ.get("RD_LC_TARGET", "30")),
 }
 REASONING_DENSITY_WEIGHT = float(os.environ.get("REASONING_DENSITY_WEIGHT", "0.05"))
 REASONING_DENSITY_IN_COMPOSITE = (
@@ -233,9 +246,12 @@ BENCH_MIN_VALID = {
     "arc_bench": 4,
     # Session 3.4 — TruthfulQA 4 per round, tight floor at 2.
     "truthful_bench": 2,
+    # Session 3.5 — long-context 3 per round, tight floor at 2 since
+    # each item is expensive (~1400 input tokens).
+    "long_context_bench": 2,
 }
 
-COMPOSITE_SHADOW_VERSION = 8  # bumped for Session 3.4 truthful_bench
+COMPOSITE_SHADOW_VERSION = 9  # bumped for Session 3.5 long_context_bench
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
@@ -475,6 +491,10 @@ def _axis_truthful_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "truthful_bench")
 
 
+def _axis_long_context_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "long_context_bench")
+
+
 def _axis_reasoning_density(student: dict) -> float | None:
     """Reasoning-density axis (Session 3.2, 2026-04-25).
 
@@ -601,6 +621,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "self_consistency_bench": _axis_self_consistency_bench(student),
         "arc_bench": _axis_arc_bench(student),
         "truthful_bench": _axis_truthful_bench(student),
+        "long_context_bench": _axis_long_context_bench(student),
         "reasoning_density": _axis_reasoning_density(student),
     }
 

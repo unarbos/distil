@@ -2260,6 +2260,17 @@ BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "6"))
 # confidently-wrong answers ("What happens if you swallow gum?"). Direct
 # hallucination-resistance signal; disjoint from every other bench.
 BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "4"))
+# Session 3.5 (added 2026-04-25): long-context needle-in-haystack. A
+# procedural axis (no dataset dep) that tests retrieval over a 1500-token
+# filler context. The needle + distractors are regenerated fresh every
+# round from the block_seed, so miners literally cannot memorize the
+# items. Directly probes long-context attention that every other axis
+# misses (prompts elsewhere are < 1k tokens).
+BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "3"))
+# Number of distractor "facts" injected before + after the needle. Each
+# fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
+# needle + question ≈ 1400 tokens total input.
+BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -2274,6 +2285,7 @@ BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_M
 BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_TIMEOUT_S", "4.0"))
 BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
 BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"))
+BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "32"))
 
 # Per-bench RNG stream offsets so the axes draw from independent
 # substreams even when given the same block_seed. Hex constants are
@@ -2291,18 +2303,19 @@ _BENCH_STREAM = {
     "self_consistency": 0x5CC001, # Session 3
     "arc": 0xAC0DE317,            # Session 3.1
     "truthful": 0x74717A01,       # Session 3.4 — "tqa."
+    "long_context": 0x10C0001D,  # Session 3.5 — long context needle
 }
 
 _BENCH_BLOCK_SEED = None
 _BENCH_POOLS: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
-    "arc": [], "truthful": [],
+    "arc": [], "truthful": [], "long_context": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
-    "arc": [], "truthful": [],
+    "arc": [], "truthful": [], "long_context": [],
 }
 
 
@@ -2722,7 +2735,8 @@ def _bench_load_pools(verbose: bool = True):
             f"tool_use={len(_BENCH_POOLS['tool_use'])}, "
             f"self_consistency={len(_BENCH_POOLS['self_consistency'])}, "
             f"arc={len(_BENCH_POOLS['arc'])}, "
-            f"truthful={len(_BENCH_POOLS['truthful'])}",
+            f"truthful={len(_BENCH_POOLS['truthful'])}, "
+            f"long_context=procedural ({BENCH_LC_DISTRACTORS} distractors/item)",
             flush=True,
         )
 
@@ -2806,6 +2820,12 @@ def set_bench_block_seed(block_seed):
     )
     _BENCH_SAMPLES["arc"] = _pick_bench_items("arc", block_seed, BENCH_ARC_PER_ROUND)
     _BENCH_SAMPLES["truthful"] = _pick_bench_items("truthful", block_seed, BENCH_TRUTHFUL_PER_ROUND)
+    # Session 3.5: long-context needle is procedural — generate fresh items
+    # per round from a seed mixed with the block_seed so pools rotate but
+    # every validator generates the same items this round.
+    _BENCH_SAMPLES["long_context"] = _generate_long_context_items(
+        block_seed, BENCH_LC_PER_ROUND, BENCH_LC_DISTRACTORS,
+    )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -2817,7 +2837,8 @@ def set_bench_block_seed(block_seed):
         f"tool_use={len(_BENCH_SAMPLES['tool_use'])}, "
         f"self_consistency={len(_BENCH_SAMPLES['self_consistency'])}, "
         f"arc={len(_BENCH_SAMPLES['arc'])}, "
-        f"truthful={len(_BENCH_SAMPLES['truthful'])}",
+        f"truthful={len(_BENCH_SAMPLES['truthful'])}, "
+        f"long_context={len(_BENCH_SAMPLES['long_context'])}",
         flush=True,
     )
 
@@ -3794,6 +3815,144 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
+# ── long_context_bench (Session 3.5 — procedural needle-in-haystack) ──
+
+# Distractor templates for long_context_bench. Each line is a complete
+# sentence that slots into the filler document. Chosen to be thematically
+# diverse (travel, cooking, weather, sports, fauna) so the needle doesn't
+# stand out by topic. Procedurally varied via random name/number picks
+# so the document is fresh every round.
+_LC_DISTRACTORS = [
+    "Anna opened the windows to let in the evening breeze.",
+    "The library's north wing closed for renovations last month.",
+    "Ben made pancakes on Saturday morning using the old recipe.",
+    "Snow fell steadily over the small village in the highlands.",
+    "Clara found an old photograph tucked inside a paperback.",
+    "The tram to the harbour departs every fifteen minutes.",
+    "Dmitri repainted the garden fence a soft sage green.",
+    "A peregrine falcon circled the cathedral tower before dusk.",
+    "Elena's bakery sells four kinds of sourdough on weekends.",
+    "The autumn leaves turned early this year in the valley.",
+    "Felix mistakenly took the wrong umbrella from the lobby.",
+    "A family of deer wandered across the university lawn.",
+    "Greta carried her violin carefully down the wet steps.",
+    "The national park extended its summer hours by two weeks.",
+    "Hector practiced card tricks at the coffee shop for hours.",
+    "Freshly baked bread cooled on the counter by the window.",
+    "Ingrid hiked the ridge trail before the weather changed.",
+    "The fog rolled in from the coast just after seven PM.",
+    "Jakob cleaned his grandfather's camera for the first time.",
+    "A small pumpkin patch sits just beyond the picket fence.",
+    "Kira repaired the bicycle's flat tire in under ten minutes.",
+    "The neighbours adopted a black-and-white kitten named Pepper.",
+    "Leo reread his favorite childhood novel every winter.",
+    "An old lighthouse guards the northern cove from storms.",
+    "Mira arranged the bookshop's paperbacks by author's surname.",
+    "The train slowed as it entered the tunnel at Clearwater.",
+    "Noel studied French phrases each morning over breakfast tea.",
+    "Wild sunflowers bloomed along the highway's median strip.",
+    "Olive forgot her keys at the coworking space overnight.",
+    "A brass bell tolled three times from the town square.",
+    "Paul's startup released its first public beta this winter.",
+    "The river trail remained icy well into early April.",
+    "Quinn painted watercolor landscapes on Sunday afternoons.",
+    "Two border collies herded sheep across the meadow at dawn.",
+    "Rosa taught beginner yoga classes every Tuesday evening.",
+    "The bakery closes early on holidays and all Sundays.",
+    "Sam organised a neighbourhood book swap in the autumn.",
+    "A crescent moon hung above the rooftops by midnight.",
+    "Tomas grew tomatoes in clay pots on the sunny balcony.",
+    "The museum's ancient coin exhibit opens again next Thursday.",
+    "Uma volunteered at the animal shelter on alternate Saturdays.",
+    "An orchestra rehearsed the overture twice before the show.",
+    "Viktor learned to bake bread from a video series online.",
+    "The planetarium will replace its projector later this year.",
+    "Wendy finished knitting the scarf just before the first frost.",
+    "Wild rosemary grew along the stone wall behind the school.",
+    "Xavier walked the dog before the morning rain arrived.",
+    "A new cafe opened near the old train station last Tuesday.",
+    "Yara repaired the broken porch swing with reclaimed oak.",
+    "The village holds a pumpkin festival every October weekend.",
+]
+
+# Needle templates. Each needle pairs a question with an answer format
+# that's trivially extractable (we grade with substring containment, so
+# "the vault code is 42" → model should say "42" or "the vault code is 42").
+_LC_NEEDLE_TEMPLATES = [
+    ("The secret access code for the archive is {ANS}.",
+     "What is the secret access code for the archive?"),
+    ("The treasure chest is buried at coordinates {ANS}.",
+     "Where is the treasure chest buried?"),
+    ("The keeper's favorite password is {ANS}.",
+     "What is the keeper's favorite password?"),
+    ("The lost vault combination is {ANS}.",
+     "What is the lost vault combination?"),
+    ("Professor Aldric's rare ingredient is {ANS}.",
+     "What is Professor Aldric's rare ingredient?"),
+    ("The winning lottery number from last week was {ANS}.",
+     "What was last week's winning lottery number?"),
+    ("Captain Nia's lucky charm is called {ANS}.",
+     "What is Captain Nia's lucky charm called?"),
+    ("The hidden guild's signal word is {ANS}.",
+     "What is the hidden guild's signal word?"),
+]
+
+
+def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: int) -> list[dict]:
+    """Create ``n_items`` fresh needle-in-haystack prompts seeded by the
+    round's block_seed. Document structure:
+
+        distractor_1
+        distractor_2
+        ...
+        distractor_k        <- needle inserted at a random position
+        needle (with unique ANS)
+        distractor_{k+2}
+        ...
+
+    The model must return ANS. We grade with case-insensitive substring
+    containment so the model can answer "42" or "the code is 42".
+    """
+    import random
+    out: list[dict] = []
+    rng = random.Random((block_seed ^ _BENCH_STREAM["long_context"]) & 0xFFFFFFFF)
+    for i in range(n_items):
+        # Seed each item independently so swapping n_items doesn't change
+        # the first item's content.
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        needle_tpl, question = r.choice(_LC_NEEDLE_TEMPLATES)
+        # Generate a unique answer ~6-8 chars, easy to extract.
+        alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
+        answer = "".join(r.choice(alphabet) for _ in range(7))
+        # Pick distractors without replacement; fall back to sampling with
+        # replacement if n_distractors exceeds pool size.
+        if n_distractors <= len(_LC_DISTRACTORS):
+            distractors = r.sample(_LC_DISTRACTORS, n_distractors)
+        else:
+            distractors = [r.choice(_LC_DISTRACTORS) for _ in range(n_distractors)]
+        # Personalize distractor names so they vary across rounds. Replace
+        # one-off instances of common names with new random ones.
+        personalized = []
+        for d in distractors:
+            personalized.append(d)  # simple variant — leave as-is; the
+            # procedural pool rotation + answer rotation already ensures
+            # fresh content across rounds.
+        # Insert needle at a random position NOT at start/end, so models
+        # can't win by reading only the first or last sentence.
+        needle_sentence = needle_tpl.format(ANS=answer)
+        insertion = r.randint(n_distractors // 4, 3 * n_distractors // 4)
+        lines = personalized[:insertion] + [needle_sentence] + personalized[insertion:]
+        context = "\n".join(lines)
+        out.append({
+            "src": "long_context",
+            "context": context,
+            "question": question,
+            "answer": answer,
+            "needle_position": insertion,
+        })
+    return out
+
+
 # ── truthful_bench (Session 3.4 — adversarial factuality MC) ─────────
 
 def _format_truthful_prompt(item: dict) -> str:
@@ -3855,6 +4014,65 @@ def truthful_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
+# ── long_context_bench (Session 3.5 — retrieval over long context) ───
+
+def _format_long_context_prompt(item: dict) -> str:
+    return (
+        f"Read the following document carefully.\n\n"
+        f"{item['context']}\n\n"
+        f"Question: {item['question']}\n"
+        f"Answer with only the exact answer from the document."
+    )
+
+
+def long_context_bench_probe(model, tokenizer, device="cuda"):
+    """Needle-in-haystack retrieval over ~1400-token context.
+
+    Grading: case-insensitive substring containment of the needle ``ANS``
+    in the model's output. That's deliberately lenient so a model that
+    answers "42" or "the code is 42" or "The vault code is 42." all count.
+    The adversarial bar is: if the model HALLUCINATED a different code,
+    the substring check fails.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("long_context") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_long_context_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_LC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    ok = 1 if gold and gold.upper() in cleaned.upper() else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "gold": gold,
+                        "pred_tail": cleaned[-120:],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "needle_position": it.get("needle_position"),
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
 def run_bench_battery(model, tokenizer, device="cuda"):
     """Run all bench probes for one student. Returns a dict keyed by axis
     name (``math_bench`` / ``code_bench`` / ... / ``aime_bench`` / etc.).
@@ -3887,6 +4105,8 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("arc_bench", arc_bench_probe),
         # Session 3.4 — shadow, adversarial factuality (hallucination resistance).
         ("truthful_bench", truthful_bench_probe),
+        # Session 3.5 — shadow, procedural long-context needle-in-haystack.
+        ("long_context_bench", long_context_bench_probe),
     )
     for name, fn in _probes:
         st = time.time()

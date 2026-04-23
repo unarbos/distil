@@ -320,6 +320,8 @@ def _compact_round(h2h, last_eval):
             "arc_bench": _compact_bench(s.get("arc_bench")),
             # Session 3.4 (2026-04-25, SHADOW) — TruthfulQA factuality MC.
             "truthful_bench": _compact_bench(s.get("truthful_bench")),
+            # Session 3.5 (2026-04-25, SHADOW) — procedural needle-in-haystack.
+            "long_context_bench": _compact_bench(s.get("long_context_bench")),
         })
     return {
         "block": h2h.get("block"),

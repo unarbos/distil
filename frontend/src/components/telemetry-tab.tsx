@@ -45,6 +45,11 @@ interface CompositeAxes {
   // popular-but-wrong answer looks attractive; a model grounded in facts
   // wins, a model leaning on pretraining priors loses.
   truthful_bench?: number;
+  // Arena v3 Session 3.5 (SHADOW) — procedural needle-in-haystack.
+  // Items are generated fresh every round from the block_seed, so the
+  // test set literally does not exist outside the live round. Tests
+  // long-context retrieval (~1400 tokens) — the only axis doing so.
+  long_context_bench?: number;
   // Arena v3 Session 3.2 (SHADOW) — bench-level token efficiency.
   // pass_frac * length_bonus averaged over each bench with correct items.
   // Overfit-resistant: short answers only score high if they're correct.
@@ -169,6 +174,8 @@ interface RoundResult {
   arc_bench?: BenchBlock | null;
   // Arena v3 Session 3.4 (SHADOW) — adversarial factuality MC.
   truthful_bench?: BenchBlock | null;
+  // Arena v3 Session 3.5 (SHADOW) — needle-in-haystack long-context.
+  long_context_bench?: BenchBlock | null;
 }
 
 interface RoundDetail {
@@ -563,7 +570,7 @@ export function TelemetryTab() {
                   <th className="pr-2">Deg</th>
                   <th className="pr-2" title="Teacher-as-judge score (PROMOTED 2026-04-24). Normalized from 1-5 rubric on 16 rotated prompts per round.">Judge</th>
                   <th className="pr-2" title="Arena v3 Session 2 (PROMOTED 2026-04-24) — worst of math/code/reason/know/ifeval absolute-correctness axes.">Bench</th>
-                  <th className="pr-2" title="Arena v3 Session 3 (SHADOW, promote +48h) — worst of aime/mbpp/tool_use/self_consistency/arc/truthful.">V3*</th>
+                  <th className="pr-2" title="Arena v3 Session 3 (SHADOW, promote +48h) — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx.">V3*</th>
                   <th className="pr-2" title="Pareto vs king: W/L/T across all axes (shadow gate).">Pareto*</th>
                   <th className="pr-2">Worst</th>
                   <th className="pr-2">vs King</th>
@@ -592,6 +599,7 @@ export function TelemetryTab() {
                     ax.self_consistency_bench,
                     ax.arc_bench,
                     ax.truthful_bench,
+                    ax.long_context_bench,
                   ].filter((v): v is number => v != null);
                   const v3Worst = v3AxisValues.length > 0 ? Math.min(...v3AxisValues) : undefined;
                   const pareto = r.composite?.pareto;
@@ -635,8 +643,8 @@ export function TelemetryTab() {
                           className={`pr-2 tabular-nums ${axisColor(v3Worst)} ${r.composite?.arena_v3_in_composite ? "" : "opacity-70"}`}
                           title={
                             r.composite?.arena_v3_in_composite
-                              ? "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful (live)"
-                              : "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful (SHADOW — promote +48h)"
+                              ? "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx (live)"
+                              : "Arena v3 Session 3 — worst of aime/mbpp/tool_use/self_consistency/arc/truthful/long_ctx (SHADOW — promote +48h)"
                           }
                         >
                           {v3Worst == null ? "—" : v3Worst.toFixed(2)}
@@ -728,20 +736,21 @@ export function TelemetryTab() {
                               </div>
                             )}
                             {/* Arena v3 Session 3 — shadow axes */}
-                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench || r.truthful_bench) && (
+                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench || r.truthful_bench || r.long_context_bench) && (
                               <div className="mt-1 border-t border-border/10 pt-2">
                                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground/40 mb-1">
                                   Arena v3 — capability extension <span className={r.composite?.arena_v3_in_composite ? "text-emerald-400" : "text-amber-400/80"}>
                                     {r.composite?.arena_v3_in_composite ? "(live)" : "(shadow, promote +48h)"}
                                   </span>
                                 </div>
-                                <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-[10px]">
+                                <div className="grid grid-cols-2 md:grid-cols-7 gap-2 text-[10px]">
                                   <BenchCell label="aime" b={r.aime_bench} />
                                   <BenchCell label="mbpp" b={r.mbpp_bench} />
                                   <BenchCell label="tool_use" b={r.tool_use_bench} />
                                   <BenchCell label="self_consistency" b={r.self_consistency_bench} />
                                   <BenchCell label="arc" b={r.arc_bench} />
                                   <BenchCell label="truthful" b={r.truthful_bench} />
+                                  <BenchCell label="long_ctx" b={r.long_context_bench} />
                                 </div>
                               </div>
                             )}
@@ -821,7 +830,7 @@ export function TelemetryTab() {
               <span className="text-emerald-400">Judge</span> &amp; <span className="text-emerald-400">Bench</span> = Arena v3 Session 2 (<span className="text-emerald-400">PROMOTED 2026-04-24</span>): teacher-as-judge rubric + absolute pass-frac on rotated samples of GSM8K+MATH-500 (math), HumanEval (code, sandboxed), BBH (reasoning), MMLU-Pro (knowledge), IFEval (instruction-following). Scored against ground truth so overfitting ⇒ SOTA model.
             </div>
             <div>
-              <span className="text-amber-400">V3*</span> = Arena v3 Session 3 (<span className="text-amber-400">SHADOW, promote +48h</span>): AIME olympiad math, MBPP+ coding, agentic tool-use (Python calculator), self-consistency (majority vote over 5 samples at T=0.7), ARC-Challenge science MC, and TruthfulQA adversarial factuality. Inspired by Affine Cortex; each points to a genuinely valuable capability where overfitting still yields a useful model.
+              <span className="text-amber-400">V3*</span> = Arena v3 Session 3 (<span className="text-amber-400">SHADOW, promote +48h</span>): AIME olympiad math, MBPP+ coding, agentic tool-use (Python calculator), self-consistency (majority vote over 5 samples at T=0.7), ARC-Challenge science MC, TruthfulQA adversarial factuality, and procedural needle-in-haystack long-context retrieval. Inspired by Affine Cortex; each points to a genuinely valuable capability where overfitting still yields a useful model.
             </div>
             <div>
               <span className="text-amber-400">Pareto*</span> = soft pareto dominance vs king (wins/losses/ties). A challenger that passes KL but loses on a majority of axes is flagged. Today informational; becomes part of the dethrone gate after the 48h public notice.

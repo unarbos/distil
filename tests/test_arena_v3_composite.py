@@ -252,6 +252,50 @@ class TestSession3Shadow(unittest.TestCase):
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
 
+    def test_long_context_bench_is_v3_shadow(self):
+        """long_context_bench (Session 3.5) follows ARC's shadow semantics."""
+        import scripts.validator.composite as _c
+        self.assertIn("long_context_bench", _c.ARENA_V3_AXIS_WEIGHTS)
+        self.assertIn("long_context_bench", _c.BENCH_MIN_VALID)
+        self.assertIn("long_context_bench", _c.REASONING_DENSITY_TARGET_TOKENS)
+        self.assertFalse(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        student = _make_student(bench={
+            "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
+            "knowledge_bench": 0.8, "ifeval_bench": 0.8,
+            "long_context_bench": 0.05,  # a hallucinator — shadow, so ignored
+        })
+        comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
+        self.assertGreater(
+            comp["worst"], 0.10,
+            "long_context_bench=0.05 must NOT pull worst down in shadow mode",
+        )
+        self.assertEqual(comp["axes"]["long_context_bench"], 0.05)
+
+    def test_long_context_bench_gates_worst_when_promoted(self):
+        """long_context_bench joins worst-axis rule when Arena v3 is promoted."""
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = True
+            _c.BENCH_AXES_IN_COMPOSITE = True
+            student = _make_student(bench={
+                "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
+                "knowledge_bench": 0.8, "ifeval_bench": 0.8,
+                "aime_bench": 0.6, "mbpp_bench": 0.6,
+                "tool_use_bench": 0.6, "self_consistency_bench": 0.6,
+                "arc_bench": 0.6, "truthful_bench": 0.6,
+                "long_context_bench": 0.1,
+            })
+            comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
+            self.assertLessEqual(
+                comp["worst"], 0.11,
+                "long_context_bench=0.1 must now pull worst down",
+            )
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+
 
 class TestParetoDominance(unittest.TestCase):
     """Soft Pareto dominance semantics."""

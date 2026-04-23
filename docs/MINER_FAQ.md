@@ -106,6 +106,12 @@ All axes are in `[0, 1]`, higher-is-better. Missing axes (e.g. probe outage) are
 |------------------------------|---------------------------------------------------------------------------------------------------------|
 | `truthful_bench`             | TruthfulQA mc1 (~817 items), 4/round. Adversarial factual questions where the popularly-believed-but-wrong answer is included as a tempting distractor. Tests hallucination resistance. Correct letter is deterministically shuffled per item so a model can't win by always answering "A". |
 
+**Arena v3 Session 3.5 — SHADOW, added 2026-04-25 (long-context retrieval):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `long_context_bench`         | Procedural needle-in-haystack over ~600 tokens (tunable), 3/round. Items are *generated fresh every round from `block_seed`* — there is no dataset to memorize. Each item inserts a single needle sentence (e.g. "The lost vault combination is 4ESGKG3.") into a document of 40 distractor sentences and asks the student to recall the needle. Tests whether the model actually reads its input window instead of leaning on priors. Probably the most Goodhart-immune axis we have. |
+
 All bench pools rotate per-round via `block_seed`, so every validator picks the same items but items differ between rounds (anti-memorization).
 
 ### Dethrone gates (all must pass)
@@ -138,6 +144,7 @@ The fastest way to climb Arena v3 is to broaden your distillation data mix so th
 | `reasoning_density`          | Train your model to emit short correct answers on trivia and medium-length on reasoning. Use the teacher's own output length as the target (the `RD_*_TARGET` values). Long-CoT on `knowledge_bench` or `arc_bench` is strictly worse than short-CoT. |
 | `chat_turns_probe`           | Multi-turn SFT (OpenAssistant Conversations, ShareGPT, UltraChat, LMSYS-chat-1M). Teach the model to reference its own earlier turns when asked ("based on your last answer…"). A model that resets context every turn will score ~2/5. |
 | `truthful_bench`             | Hallucination-resistance data: TriviaQA-factual (short, gold-referenced answers), RefuseElseFalse, HaluEval-sft, the TruthfulQA train split (CC-BY). Teach the model to prefer precise short factual answers over confident-sounding prose. Avoid training data with speculative "facts" that aren't in the teacher's cutoff. |
+| `long_context_bench`         | General-purpose long-context retrieval data: RULER, NeedleBench, long-context SFT derived from books/Wikipedia (e.g. QuALITY, NarrativeQA), or anything in the 2k–16k-token range that forces the model to answer from document content rather than priors. Aggressive 4-bit quantization and LoRA-only training break long-context attention — if you're shipping either, verify this axis before dethrone attempts. |
 
 **Two anti-patterns to avoid:**
 
@@ -217,9 +224,9 @@ All endpoints are on `api.arbos.life`.
 | Max new tokens | 8,192 |
 | Max prompt tokens | 1,024 |
 | Dethronement threshold | paired t-test, p < 0.03 AND worst-axis ≥ 0.20 |
-| Composite version | Arena v3 (shadow v7) |
+| Composite version | Arena v3 (shadow v9) |
 | Live axes | kl, on_policy_rkl, capability, length, degeneracy, judge_probe, math_bench, code_bench, reasoning_bench, knowledge_bench, ifeval_bench |
-| Shadow axes (live 2026-04-26) | aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, arc_bench, truthful_bench, reasoning_density, chat_turns_probe, pareto_dominance |
+| Shadow axes (live 2026-04-26) | aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, arc_bench, truthful_bench, long_context_bench, reasoning_density, chat_turns_probe, pareto_dominance |
 | Top-N always included | 5 |
 | Dataset (distillation) | `karpathy/climbmix-400b-shuffle` |
 | Reference baseline | `Qwen/Qwen3.5-4B` (UID -1) |
