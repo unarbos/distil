@@ -166,6 +166,14 @@ def get_miner(uid: int):
     else:
         result["commitment"] = None
 
+    # Shortcut: surface the committed model repo at the top level too.
+    # Previously callers had to dig into `commitment.model`, and the dashboard
+    # kept showing "model: null" for perfectly-registered UIDs. 2026-04-24.
+    if isinstance(result.get("commitment"), dict):
+        result["model"] = result["commitment"].get("model") or result["commitment"].get("repo")
+    else:
+        result["model"] = None
+
     # KL score
     scores = load_scores()
     uid_str = str(uid)
