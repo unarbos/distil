@@ -342,6 +342,26 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             logger.error("Failed to start detached eval: %s", start_res)
             return None
         logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
+        # 2026-04-24 (distil-97): persist pod paths so `_detect_resumable_round`
+        # can reattach after a validator restart mid-eval. Previously the
+        # `current_round.json.pod_eval` block was never populated, so a
+        # restart during eval tossed the in-flight round and forced
+        # re-planning (discarding partial results, corrupting state).
+        try:
+            if isinstance(state.current_round, dict):
+                state.current_round["pod_eval"] = {
+                    "run_dir": run_dir,
+                    "pid_remote": pid_remote,
+                    "done_marker_remote": done_marker_remote,
+                    "log_remote": log_remote,
+                    "progress_remote": progress_remote,
+                    "results_remote": results_remote,
+                    "eval_data_remote": eval_data_remote,
+                    "started_at": now,
+                }
+                state.save_round()
+        except Exception as _save_exc:
+            logger.warning("Failed to persist pod_eval meta (non-fatal): %s", _save_exc)
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
         starting_streak = 0
