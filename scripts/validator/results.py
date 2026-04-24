@@ -19,6 +19,16 @@ logger = logging.getLogger("distillation.remote_validator")
 
 MIN_PROMPTS_DETHRONE = 100
 
+# Mirror of MIN_PROMPTS_FOR_LEADERBOARD in state_manager — when the king's
+# completed prompts are below this, we treat the entire round's scores as
+# untrustworthy for persistent state (global `state.scores`, best_kl
+# history, etc.). The h2h_latest + leaderboard gate lives in state_manager.
+# This constant is the challenger-side score gate so a partial round can't
+# lower a challenger's "best score ever" from a legitimate 0.2 down to the
+# corrupted H2H-scale 0.06, which broke `select_challengers` filtering and
+# forced a full rollback on 2026-04-24.
+MIN_PROMPTS_FOR_SCORE_UPDATE = 150
+
 # ── Composite-axis dethronement floor (2026-04-22) ──────────────────────
 # A challenger that passes the KL paired t-test (p<0.05) AND the 3% epsilon
 # margin is still blocked from taking the crown if its worst composite axis
@@ -555,16 +565,49 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         this_round_uids.add(uid)
         if uid == king_uid:
             king_h2h_kl = kl
-            state.scores[str(uid)] = kl
+            king_scored_prompts = student_result.get("prompts_scored", n_prompts) or 0
+            king_early_stopped = bool(student_result.get("early_stopped", False))
+            # Gate king's score write too. When the king died early (e.g. 129/300
+            # prompts on 2026-04-24) its `kl` is computed on a much smaller
+            # sample and drifts dramatically from its canonical global KL,
+            # producing the 0.068731 vs 0.198586 discrepancy that overwrote
+            # the real score and propagated everywhere.
+            can_persist_king_score = (
+                not king_early_stopped
+                or king_scored_prompts >= MIN_PROMPTS_FOR_SCORE_UPDATE
+            )
+            if can_persist_king_score:
+                state.scores[str(uid)] = kl
+                logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
+            else:
+                logger.warning(
+                    f"UID {uid} ({model_name}): king early-stopped at "
+                    f"{king_scored_prompts}/{n_prompts} prompts — NOT persisting "
+                    f"KL={kl:.6f}, preserving prior global score "
+                    f"{state.scores.get(str(uid))}"
+                )
             state.evaluated_uids.add(str(uid))
-            logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
             log_event(f"UID {uid}: KL={kl:.6f} (king)", state_dir=str(state.state_dir))
         else:
-            per_prompt = student_result.get("per_prompt_kl", [])
-            scored_prompts = len(per_prompt) if isinstance(per_prompt, list) and per_prompt else student_result.get("prompts_scored", n_prompts)
+            scored_prompts = student_result.get("prompts_scored", n_prompts) or 0
             early_stopped = bool(student_result.get("early_stopped", False))
-            state.scores[str(uid)] = kl
-            if early_stopped and (scored_prompts or 0) < MIN_PROMPTS_DETHRONE:
+            # Gate: do not persist a potentially-corrupt KL into state.scores
+            # if the challenger stopped before reaching the leaderboard floor.
+            # 2026-04-24: previously a challenger that died at 129/300 prompts
+            # wrote kl=0.06 into state.scores over a pre-existing kl=0.20,
+            # which then flowed into the contender leaderboard and silently
+            # replaced real top contenders. See MIN_PROMPTS_FOR_SCORE_UPDATE
+            # docstring above for the full incident.
+            can_persist_score = not early_stopped or scored_prompts >= MIN_PROMPTS_FOR_SCORE_UPDATE
+            if can_persist_score:
+                state.scores[str(uid)] = kl
+            else:
+                logger.info(
+                    f"UID {uid} ({model_name}): NOT persisting KL={kl:.6f} "
+                    f"(early-stopped at {scored_prompts}/{n_prompts} prompts, "
+                    f"threshold={MIN_PROMPTS_FOR_SCORE_UPDATE}) — preserving prior score"
+                )
+            if early_stopped and scored_prompts < MIN_PROMPTS_DETHRONE:
                 logger.info(f"UID {uid} ({model_name}): KL={kl:.6f} (early-stopped, {scored_prompts}/{n_prompts} prompts — NOT marking as evaluated, will retry)")
             else:
                 state.evaluated_uids.add(str(uid))

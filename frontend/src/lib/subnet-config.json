@@ -19,7 +19,7 @@
     "epsilon": 0.03,
     "pairedTestAlpha": 0.03,
     "staleH2hEpochs": 50,
-    "topNAlwaysInclude": 5,
+    "topNAlwaysInclude": 7,
     "referenceModel": "Qwen/Qwen3.5-4B",
     "referenceUid": -1,
     "activationCopyThreshold": 0.99999,

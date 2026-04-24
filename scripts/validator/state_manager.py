@@ -17,6 +17,29 @@ from scripts.validator.config import (
 logger = logging.getLogger("distillation.remote_validator")
 
 
+# Minimum number of prompts the king must have completed for a round's
+# results to be trusted for persistent state updates (top-4 leaderboard,
+# state.scores, model_score_history, h2h_tested_against_king).
+#
+# Background (2026-04-24): the round at block 8037177 ran on HuggingFace
+# fallback with the old PER_MODEL_TIMEOUT=600 and the king early-stopped
+# at 129/300 prompts. Because every write-path unconditionally stamped
+# `h2h_results` into persistent state, the broken round's partial-prompt
+# KLs (~0.06 scale, measured against ONLY 129 paired prompts) overwrote
+# the correct global scores (~0.2 scale) and the top-4 leaderboard picked
+# challengers by those corrupted KLs. Pete warned us to kill the round
+# before it wrote — we didn't, and the cleanup was painful. This gate
+# prevents a repeat: any round where the king's n_prompts_scored is below
+# this threshold is allowed to exist in h2h_history (marked `_invalid`)
+# but CANNOT overwrite the leaderboard or rewrite scores. The paired
+# t-test gate in results.py already enforces the same threshold for
+# dethronement (see MIN_PROMPTS_DETHRONE=100); this is a stricter gate
+# because the full-round leaderboard needs a higher bar than "eligible to
+# dethrone on one round" — partial pipes through composite axes amplify
+# noise on fewer axes.
+MIN_PROMPTS_FOR_LEADERBOARD = 150
+
+
 def migrate_dq_entries(state: ValidatorState, commitments: dict):
     """Migrate bare-hotkey and stale bare-UID DQ entries to per-commit format."""
     hotkey_to_block = {
@@ -149,6 +172,26 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 f"but DQ'd — {entry['dq_reason']}"
             )
 
+    # Determine if the king's paired-prompt count is sufficient for this
+    # round to be treated as canonical. king_per_prompt is None when the
+    # king failed entirely; otherwise it's a list of per-prompt KL means
+    # whose length is the number of prompts the king actually completed.
+    # See MIN_PROMPTS_FOR_LEADERBOARD docstring above for the 2026-04-24
+    # Pete-warned-us incident this prevents.
+    king_prompts_completed = len(king_per_prompt) if king_per_prompt else 0
+    round_is_canonical = (
+        king_prompts_completed >= MIN_PROMPTS_FOR_LEADERBOARD
+        and not (king_uid is not None and king_h2h_kl is None)
+    )
+    if not round_is_canonical:
+        logger.warning(
+            f"🚧 Round at block {current_block} is PARTIAL "
+            f"(king completed {king_prompts_completed}/{n_prompts} prompts, "
+            f"threshold={MIN_PROMPTS_FOR_LEADERBOARD}). h2h_history entry will "
+            f"be marked `_invalid_for_leaderboard=True`; skipping "
+            f"top4_leaderboard/scores/h2h_tested_against_king writes."
+        )
+
     h2h_round = {
         "block": current_block, "block_hash": block_hash, "timestamp": time.time(),
         "shard_idx": shard_idx,
@@ -169,17 +212,25 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "type": "full_eval" if is_full_eval else "h2h",
         "elapsed_seconds": round(time.time() - epoch_start_time, 1) if epoch_start_time else None,
         "n_students": len(h2h_results),
+        "king_prompts_completed": king_prompts_completed,
+        "_invalid_for_leaderboard": not round_is_canonical,
+        "_min_prompts_for_leaderboard": MIN_PROMPTS_FOR_LEADERBOARD,
     }
 
-    state.h2h_latest = h2h_round
-    # Replace preliminary entries
+    # Only overwrite the canonical `h2h_latest` when the round is trustworthy.
+    # We still append to h2h_history so the dashboard can show the partial
+    # round (with a loud "invalid" flag) — useful for debugging and transparency.
+    if round_is_canonical:
+        state.h2h_latest = h2h_round
     state.h2h_history = [h for h in state.h2h_history if not (h.get("block") == current_block and h.get("_preliminary"))]
     state.h2h_history.append(h2h_round)
     state.h2h_history = state.h2h_history[-50:]
     state.save_h2h()
 
-    # Update tested-against-king tracker
-    if king_uid is not None:
+    # Only update "tested against king" tracker on canonical rounds — a partial
+    # round shouldn't mark a challenger as "already tested this king" because
+    # the paired test wasn't meaningful.
+    if round_is_canonical and king_uid is not None:
         for uid in challengers:
             uid_str = str(uid)
             if uid_str in state.scores and state.scores[uid_str] > 0:
@@ -284,7 +335,24 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
 def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl,
                             h2h_results, uid_to_model, valid_models, current_block,
                             epoch_count, disqualified):
-    """Update the top-4 leaderboard (initial eval → maintenance transition)."""
+    """Update the top-4 leaderboard (initial eval → maintenance transition).
+
+    Guard (2026-04-24): if the round that produced ``h2h_results`` is flagged
+    ``_invalid_for_leaderboard`` on ``state.h2h_latest`` (see
+    ``MIN_PROMPTS_FOR_LEADERBOARD`` above), skip the leaderboard overwrite
+    entirely. Partial-prompt KLs are on a different scale than full-round
+    KLs and silently clobbering the leaderboard with them is exactly what
+    caused the 2026-04-24 contender-selection regression.
+    """
+    latest = getattr(state, "h2h_latest", None) or {}
+    if latest.get("_invalid_for_leaderboard"):
+        logger.warning(
+            f"🚧 Skipping top4_leaderboard update for block {current_block} "
+            f"— round flagged _invalid_for_leaderboard "
+            f"(king_prompts_completed={latest.get('king_prompts_completed')})."
+        )
+        return
+
     try:
         if state.top4_leaderboard.get("phase") == "initial_eval":
             # Check if all models tested
@@ -307,10 +375,16 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                     "uid": int(tested_results[0][0]), "model": tested_results[0][2],
                     "h2h_kl": round(tested_results[0][1], 6), "block": current_block,
                 }
+                # Track up to TOP_N_ALWAYS_INCLUDE-1 contenders (slot 0 is the king).
+                # Bumped from 4 → 6 (TOP_N=7) on 2026-04-24 after leeroyjkin pointed
+                # out that only 4 contenders + king left too few "sticky" slots,
+                # which meant older good models rotated out of the leaderboard too
+                # fast and never came back for re-evaluation.
+                contender_cap = max(1, TOP_N_ALWAYS_INCLUDE - 1)
                 state.top4_leaderboard["contenders"] = [
                     {"uid": int(tested_results[i][0]), "model": tested_results[i][2],
                      "h2h_kl": round(tested_results[i][1], 6), "block": current_block}
-                    for i in range(1, min(4, len(tested_results)))
+                    for i in range(1, min(contender_cap + 1, len(tested_results)))
                 ]
                 state.top4_leaderboard["phase"] = "maintenance"
                 state.top4_leaderboard["initial_eval_complete"] = True
@@ -330,6 +404,7 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                 "h2h_kl": round(king_kl_lb, 6) if isinstance(king_kl_lb, float) else king_kl_lb,
                 "block": current_block,
             }
+            contender_cap = max(1, TOP_N_ALWAYS_INCLUDE - 1)
             contenders = []
             for r in sorted(h2h_results, key=lambda r: r.get("kl", float("inf"))):
                 if r["uid"] == actual_king:
@@ -342,7 +417,7 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                     "uid": r["uid"], "model": r["model"],
                     "h2h_kl": round(r["kl"], 6), "block": current_block,
                 })
-                if len(contenders) >= 4:
+                if len(contenders) >= contender_cap:
                     break
             state.top4_leaderboard["contenders"] = contenders
 
