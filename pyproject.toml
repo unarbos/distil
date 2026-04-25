@@ -13,7 +13,7 @@ dependencies = [
     "fastapi",
     "huggingface-hub",
     "httpx",
-    "lium",
+    #"lium",
     "numpy",
     "pydantic",
     "requests",
