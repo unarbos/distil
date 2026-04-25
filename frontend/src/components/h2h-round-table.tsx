@@ -31,6 +31,7 @@ const AXIS_DISPLAY: Array<{ key: keyof NonNullable<H2hComposite["axes"]>; label:
   { key: "long_context_bench", label: "long", group: "bench" },
   { key: "procedural_bench", label: "proc", group: "bench" },
   { key: "robustness_bench", label: "robust", group: "bench" },
+  { key: "noise_resistance_bench", label: "noise", group: "bench" },
   { key: "reasoning_density", label: "rd", group: "live" },
   { key: "chat_turns_probe", label: "chat", group: "live" },
 ];

@@ -246,6 +246,7 @@ export interface H2hCompositeAxes {
   long_context_bench?: number;
   procedural_bench?: number;
   robustness_bench?: number;
+  noise_resistance_bench?: number;
   reasoning_density?: number;
   chat_turns_probe?: number;
 }

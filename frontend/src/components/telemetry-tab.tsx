@@ -58,6 +58,11 @@ interface CompositeAxes {
   // under K block-rotated paraphrase wrappers. A model that only
   // memorizes the canonical wording fails here.
   robustness_bench?: number;
+  // Arena v3 Session 3.7 (LIVE) — adversarial-noise sibling of
+  // robustness_bench. Same pool, different attack class: typos, case
+  // jitter, distractor chatter, common misspellings. Surface-shift
+  // robustness rather than semantic.
+  noise_resistance_bench?: number;
   // Arena v3 Session 3.2 (LIVE) — bench-level token efficiency.
   // pass_frac * length_bonus averaged over each bench with correct items.
   // Overfit-resistant: short answers only score high if they're correct.
@@ -188,6 +193,8 @@ interface RoundResult {
   procedural_bench?: BenchBlock | null;
   // Arena v3 Session 3.7 (LIVE) — paraphrase-robustness on math items.
   robustness_bench?: BenchBlock | null;
+  // Arena v3 Session 3.7 (LIVE) — adversarial-noise sibling of robustness_bench.
+  noise_resistance_bench?: BenchBlock | null;
 }
 
 interface RoundDetail {
@@ -614,6 +621,7 @@ export function TelemetryTab() {
                     ax.long_context_bench,
                     ax.procedural_bench,
                     ax.robustness_bench,
+                    ax.noise_resistance_bench,
                   ].filter((v): v is number => v != null);
                   const v3Worst = v3AxisValues.length > 0 ? Math.min(...v3AxisValues) : undefined;
                   const pareto = r.composite?.pareto;
@@ -750,7 +758,7 @@ export function TelemetryTab() {
                               </div>
                             )}
                             {/* Arena v3 Session 3 — live axes */}
-                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench || r.truthful_bench || r.long_context_bench || r.procedural_bench || r.robustness_bench) && (
+                            {(r.aime_bench || r.mbpp_bench || r.tool_use_bench || r.self_consistency_bench || r.arc_bench || r.truthful_bench || r.long_context_bench || r.procedural_bench || r.robustness_bench || r.noise_resistance_bench) && (
                               <div className="mt-1 border-t border-border/10 pt-2">
                                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground/40 mb-1">
                                   Arena v3 — capability extension <span className={r.composite?.arena_v3_in_composite ? "text-emerald-400" : "text-amber-400/80"}>
@@ -767,6 +775,7 @@ export function TelemetryTab() {
                                   <BenchCell label="long_ctx" b={r.long_context_bench} />
                                   <BenchCell label="procedural" b={r.procedural_bench} />
                                   <BenchCell label="robustness" b={r.robustness_bench} />
+                                  <BenchCell label="noise" b={r.noise_resistance_bench} />
                                 </div>
                               </div>
                             )}

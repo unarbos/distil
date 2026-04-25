@@ -121,11 +121,12 @@ All axes are in `[0, 1]`, higher-is-better. Missing axes (e.g. probe outage) are
 |------------------------------|---------------------------------------------------------------------------------------------------------|
 | `procedural_bench`           | Block-seeded synthetic arithmetic, instruction-following string transforms, invented-fact retrieval, tabular aggregation, and constraint filtering, 6/round. Template order is block-shuffled and there is no static dataset; grading is strict exact-answer, so overfitting means learning the transformations and concise output discipline. |
 
-**Arena v3 Session 3.7 — LIVE, added 2026-04-25 (paraphrase-robustness):**
+**Arena v3 Session 3.7 — LIVE, added 2026-04-25 (paraphrase + noise robustness):**
 
 | Axis                         | What it tests                                                                                           |
 |------------------------------|---------------------------------------------------------------------------------------------------------|
 | `robustness_bench`           | Same items as `math_bench` (drawn under an independent stream offset, so usually different items in the same round) but each is asked under K block-rotated paraphrase wrappers. The wrapper set rotates per `block_seed`, so a model that memorizes the canonical wording of public math items passes `math_bench` and fails this one. Pure string transforms — no extra LLM call — so it's cheap and deterministic. |
+| `noise_resistance_bench`     | Sibling axis to `robustness_bench`. Same math pool, yet another independent stream offset (so its sampled items are usually disjoint from both `math_bench` and `robustness_bench` in the same round), but the wrappers are *adversarial input noise* — keyboard typos at low rate, case jitter, distractor chatter, common misspellings (`the→teh`), extra whitespace, dropped sentence-period — instead of semantic paraphrase. Wrappers never touch digits or operators, so the math is preserved. Catches models that break under realistic chat noise — a brittle model that aces clean public benchmarks but loses 30% under typos has bad UX and won't generalize. |
 
 All bench pools rotate per-round via `block_seed`, so every validator picks the same items but items differ between rounds (anti-memorization).
 
@@ -166,6 +167,7 @@ The fastest way to climb Arena v3 is to broaden your distillation data mix so th
 | `long_context_bench`         | General-purpose long-context retrieval data: RULER, NeedleBench, long-context SFT derived from books/Wikipedia (e.g. QuALITY, NarrativeQA), or anything in the 2k–16k-token range that forces the model to answer from document content rather than priors. Aggressive 4-bit quantization and LoRA-only training break long-context attention — if you're shipping either, verify this axis before dethrone attempts. |
 | `procedural_bench`           | Exact-answer synthetic tasks: arithmetic from records, deterministic string transforms, retrieval from invented registries, table aggregation, and multi-condition filtering. Train short deterministic outputs, not essays; verbose answers that merely contain the right value can fail this axis. |
 | `robustness_bench`           | Generalization under prompt paraphrase. The defense is: train on math problems with diverse wordings (mix gsm8k / math500 / Maxwell-Jia / KhanAcademy with paraphrase augmentation, or just shuffle prefixes/postfixes during SFT). A model that only sees one wording per problem will fail when the wrapper changes. If `robustness_bench` lags `math_bench` by 0.20+ on your dashboard, you're memorizing canonical wordings, not solving. |
+| `noise_resistance_bench`     | Generalization under surface noise (typos, case jitter, distractors, misspellings). The defense is: include noisy / chat-style training data, or apply augmentation at SFT time (random typos at 1-2%, random case flips at 3-5%, occasional distractor sentences before/after the problem). A model that gets near-perfect on `math_bench` but drops sharply on `noise_resistance_bench` is overfit to clean text — it'll be brittle in real chat. If both `robustness_bench` and `noise_resistance_bench` lag `math_bench`, you have a *general* canonical-wording problem; if only `noise_resistance_bench` lags, your training mix lacks chat-style messy text. |
 
 **Two anti-patterns to avoid:**
 

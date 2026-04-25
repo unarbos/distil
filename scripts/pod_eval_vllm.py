@@ -2307,6 +2307,16 @@ BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "6
 # anyone. Pure string transforms, no LLM call required.
 BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "4"))
 BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2"))
+# Session 3.7 (added 2026-04-25): noise_resistance_bench. Sibling of
+# ``robustness_bench``; same pool (alias of math) but the perturbations
+# are *adversarial input noise* — typos, case jitter, extra whitespace,
+# distractor chatter, common misspellings — rather than semantic
+# paraphrase. Designed so a model overfit to clean canonical wordings
+# of public math items breaks under realistic chat-noise distribution
+# shift. Pure string transforms (no LLM call), block-seeded rotation,
+# answer-extraction-safe (we never touch digits/operators).
+BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "4"))
+BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -2324,6 +2334,7 @@ BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"
 BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "32"))
 BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "64"))
 BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "384"))
+BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "384"))
 
 # Per-bench RNG stream offsets so the axes draw from independent
 # substreams even when given the same block_seed. Hex constants are
@@ -2344,6 +2355,7 @@ _BENCH_STREAM = {
     "long_context": 0x10C0001D,  # Session 3.5 — long context needle
     "procedural": 0x9E71C0DE,    # Session 3.6 — procedural synthesis
     "robustness": 0x80B057E5,    # Session 3.7 — robustness_bench (math-pool reuse)
+    "noise": 0x80152BE9,         # Session 3.7 — noise_resistance_bench (math-pool reuse)
 }
 
 _BENCH_BLOCK_SEED = None
@@ -2351,13 +2363,13 @@ _BENCH_POOLS: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [],
+    "robustness": [], "noise": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [],
+    "robustness": [], "noise": [],
 }
 
 
@@ -2770,6 +2782,11 @@ def _bench_load_pools(verbose: bool = True):
     # alias rather than copy so the pool grows as math_bench grows
     # (e.g. if we add new public-math sources later).
     _BENCH_POOLS["robustness"] = _BENCH_POOLS["math"]
+    # 2026-04-25 (Session 3.7): noise_resistance_bench is the
+    # adversarial-noise sibling of robustness_bench. Same alias model;
+    # different stream offset so its sampled items are usually disjoint
+    # from both math_bench and robustness_bench in a given round.
+    _BENCH_POOLS["noise"] = _BENCH_POOLS["math"]
 
     if verbose:
         print(
@@ -2787,7 +2804,8 @@ def _bench_load_pools(verbose: bool = True):
             f"truthful={len(_BENCH_POOLS['truthful'])}, "
             f"long_context=procedural ({BENCH_LC_DISTRACTORS} distractors/item), "
             f"procedural=procedural, "
-            f"robustness=alias(math)",
+            f"robustness=alias(math), "
+            f"noise=alias(math)",
             flush=True,
         )
 
@@ -2886,6 +2904,12 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["robustness"] = _pick_bench_items(
         "robustness", block_seed, BENCH_ROBUSTNESS_PER_ROUND,
     )
+    # Session 3.7: noise_resistance reuses math items but draws under
+    # yet another stream offset, so {math, robustness, noise} all
+    # typically score disjoint items in the same round.
+    _BENCH_SAMPLES["noise"] = _pick_bench_items(
+        "noise", block_seed, BENCH_NOISE_PER_ROUND,
+    )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -2900,7 +2924,8 @@ def set_bench_block_seed(block_seed):
         f"truthful={len(_BENCH_SAMPLES['truthful'])}, "
         f"long_context={len(_BENCH_SAMPLES['long_context'])}, "
         f"procedural={len(_BENCH_SAMPLES['procedural'])}, "
-        f"robustness={len(_BENCH_SAMPLES['robustness'])}",
+        f"robustness={len(_BENCH_SAMPLES['robustness'])}, "
+        f"noise={len(_BENCH_SAMPLES['noise'])}",
         flush=True,
     )
 
@@ -4340,6 +4365,237 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
+# ── noise_resistance_bench (Session 3.7 — adversarial-noise sibling) ──
+#
+# Goal: punish models that overfit to *clean* canonical wordings of
+# public math benchmarks. Real chatbot users send messy text — typos,
+# random capitalization, extra whitespace, distractor chatter, common
+# misspellings. A model that loses 30% of its math accuracy under
+# light typos is brittle and won't generalize. Together with
+# ``robustness_bench`` (paraphrase rotation), these two axes form a
+# "real-world robustness battery" — paraphrase invariance covers
+# *semantic* shift, noise resistance covers *surface* shift.
+#
+# Critical safety rule for these wrappers: NEVER touch digits or
+# arithmetic operators. The math is the same; we only perturb the
+# narrative/instructional text around it. Otherwise we'd be changing
+# the answer, not testing surface-noise robustness.
+def _noise_safe_letter_swap(text: str, rate: float, rng_seed: int) -> str:
+    """Substitute alpha chars with adjacent QWERTY keys at ``rate``.
+
+    Skips digits, punctuation, whitespace, and non-ASCII. Bounded so
+    we never mangle the actual numerical content of a math problem.
+    """
+    import random
+    rng = random.Random(rng_seed)
+    qwerty = {
+        "q": "wa", "w": "qes", "e": "wrd", "r": "etf", "t": "ryg",
+        "y": "tuh", "u": "yij", "i": "uok", "o": "ipl", "p": "o",
+        "a": "qsz", "s": "awdz", "d": "sefx", "f": "drgc", "g": "fthv",
+        "h": "gybn", "j": "hkun", "k": "jlim", "l": "ko",
+        "z": "asx", "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn",
+        "n": "bhjm", "m": "njk",
+    }
+    out_chars = []
+    for ch in text:
+        if ch.isalpha() and ch.isascii() and rng.random() < rate:
+            low = ch.lower()
+            if low in qwerty:
+                sub = rng.choice(qwerty[low])
+                out_chars.append(sub.upper() if ch.isupper() else sub)
+                continue
+        out_chars.append(ch)
+    return "".join(out_chars)
+
+
+def _noise_case_jitter(text: str, rate: float, rng_seed: int) -> str:
+    import random
+    rng = random.Random(rng_seed)
+    return "".join(
+        (ch.swapcase() if ch.isalpha() and ch.isascii() and rng.random() < rate else ch)
+        for ch in text
+    )
+
+
+def _noise_extra_whitespace(text: str, rng_seed: int) -> str:
+    """Replace some single spaces with 2-3 spaces, sprinkle a few blank lines."""
+    import random
+    rng = random.Random(rng_seed)
+    out = []
+    for ch in text:
+        if ch == " " and rng.random() < 0.10:
+            out.append(" " * rng.randint(2, 3))
+        elif ch == "\n" and rng.random() < 0.15:
+            out.append("\n\n")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _noise_common_misspellings(text: str) -> str:
+    """Apply common chat-typo replacements on whole-word boundaries."""
+    import re
+    table = [
+        (r"\bthe\b", "teh"),
+        (r"\byour\b", "youre"),
+        (r"\bbecause\b", "becuase"),
+        (r"\bdefinitely\b", "definately"),
+        (r"\bseparate\b", "seperate"),
+        (r"\bachieve\b", "acheive"),
+        (r"\boccur\b", "occure"),
+        (r"\bweird\b", "wierd"),
+        (r"\breceive\b", "recieve"),
+    ]
+    for pat, rep in table:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+    return text
+
+
+def _noise_drop_sentence_periods(text: str, rng_seed: int) -> str:
+    """Drop ~50% of sentence-ending periods; never touch decimal points.
+
+    A decimal point is a period flanked by digits (e.g. ``3.14``); we
+    only drop periods followed by whitespace, end-of-string, or a
+    capital letter (sentence-end). Question marks are left alone so
+    the question semantics are preserved.
+    """
+    import random
+    import re
+    rng = random.Random(rng_seed)
+
+    def _maybe_drop(m):
+        return "" if rng.random() < 0.5 else m.group(0)
+
+    return re.sub(r"\.(?=\s|$|[A-Z])", _maybe_drop, text)
+
+
+_NOISE_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str, int], str]"], ...] = (
+    (
+        "light_typos",
+        lambda p, s: _noise_safe_letter_swap(p, rate=0.025, rng_seed=s),
+    ),
+    (
+        "case_jitter",
+        lambda p, s: _noise_case_jitter(p, rate=0.04, rng_seed=s),
+    ),
+    (
+        "chatter_prefix",
+        lambda p, s: (
+            "Hey! I'm working through some practice problems — "
+            "could you take a look at this one?\n\n" + p
+        ),
+    ),
+    (
+        "chatter_suffix",
+        lambda p, s: p.rstrip() + "\n\nThanks in advance, really appreciate it!",
+    ),
+    (
+        "extra_whitespace",
+        lambda p, s: _noise_extra_whitespace(p, rng_seed=s),
+    ),
+    (
+        "common_misspellings",
+        lambda p, s: _noise_common_misspellings(p),
+    ),
+    (
+        "drop_periods",
+        lambda p, s: _noise_drop_sentence_periods(p, rng_seed=s),
+    ),
+    (
+        "polite_distractor",
+        lambda p, s: (
+            "(My cat just walked across the keyboard, sorry if anything "
+            "looks weird.)\n\n" + p
+        ),
+    ),
+)
+
+
+def _pick_noise_perturbations(
+    block_seed, k: int,
+) -> list[tuple[str, "callable[[str, int], str]"]]:
+    """Deterministically pick K noise wrappers for this round.
+
+    Same block-seeded rotation contract as ``_pick_robustness_perturbations``
+    but with an independent stream offset. ``k`` is clamped to the
+    template count and to at least 1 (we'd rather still emit one wrapper
+    than silently degrade the axis if k is misconfigured to 0).
+    """
+    import random
+    if not _NOISE_PERTURBATION_TEMPLATES:
+        return []
+    pool = list(_NOISE_PERTURBATION_TEMPLATES)
+    seed = _coerce_block_seed(block_seed)
+    if seed is None:
+        return pool[: max(1, k)]
+    rng = random.Random((seed ^ _BENCH_STREAM.get("noise", 0)) & 0xFFFFFFFF)
+    rng.shuffle(pool)
+    return pool[: max(1, min(int(k), len(pool)))]
+
+
+def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
+    out: dict = {
+        "n": 0, "correct": 0, "pass_frac": 0.0,
+        "items": [], "perturbations": [],
+    }
+    samples = _BENCH_SAMPLES.get("noise") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    perturbations = _pick_noise_perturbations(
+        _BENCH_BLOCK_SEED, BENCH_NOISE_PERTURB_K,
+    )
+    out["perturbations"] = [name for name, _ in perturbations]
+    if not perturbations:
+        return out
+    seed_root = int(_BENCH_BLOCK_SEED or 0) ^ _BENCH_STREAM.get("noise", 0)
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for item_idx, it in enumerate(samples):
+                base_prompt = _math_format_prompt(
+                    it["question"], it.get("src", ""),
+                )
+                for pert_idx, (name, perturb) in enumerate(perturbations):
+                    try:
+                        # Per-(item, pert) deterministic seed so internal
+                        # randomness inside a wrapper (typo positions, etc.)
+                        # is reproducible across validators in the same
+                        # round but rotates per block.
+                        sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
+                        prompt = perturb(base_prompt, sub_seed)
+                        text, tok = _bench_generate(
+                            model, tokenizer, prompt,
+                            BENCH_NOISE_MAX_TOKENS, device,
+                            enable_thinking=False,
+                        )
+                        pred = _math_extract_answer(text, it.get("src", ""))
+                        ok = _math_score_one(pred, it["gold"])
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "pred": (pred or "")[:80],
+                            "gold": str(it.get("gold", ""))[:40],
+                            "ok": bool(ok),
+                            "gen_tokens": int(tok),
+                        })
+                        out["n"] += 1
+                        out["correct"] += ok
+                    except Exception as e:
+                        out["items"].append({
+                            "src": it.get("src", ""),
+                            "perturbation": name,
+                            "error": str(e)[:120],
+                        })
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
 def procedural_bench_probe(model, tokenizer, device="cuda"):
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
     samples = _BENCH_SAMPLES.get("procedural") or []
@@ -4536,6 +4792,7 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("long_context_bench", long_context_bench_probe),
         ("procedural_bench", procedural_bench_probe),
         ("robustness_bench", robustness_bench_probe),
+        ("noise_resistance_bench", noise_resistance_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:

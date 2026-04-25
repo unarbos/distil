@@ -178,6 +178,15 @@ ARENA_V3_AXIS_WEIGHTS = {
     # math items will pass math_bench and fail this. Pure string
     # transforms, no extra LLM call.
     "robustness_bench":         float(os.environ.get("BENCH_ROBUSTNESS_WEIGHT", "0.04")),
+    # Session 3.7 — noise_resistance_bench (added 2026-04-25). Sibling
+    # of ``robustness_bench`` covering *adversarial input noise* —
+    # typos, case jitter, distractor chatter, common misspellings,
+    # extra whitespace — rather than semantic paraphrase. A miner whose
+    # SFT used only canonical-clean public math items breaks here.
+    # Together with ``robustness_bench`` these two axes form a
+    # real-world robustness battery: paraphrase invariance covers
+    # *semantic* shift; noise resistance covers *surface* shift.
+    "noise_resistance_bench":   float(os.environ.get("BENCH_NOISE_WEIGHT", "0.04")),
 }
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
@@ -218,6 +227,10 @@ REASONING_DENSITY_TARGET_TOKENS = {
     # tighter (the perturbation prefixes inflate input slightly; a
     # 380-token cap keeps the comparison fair across wrappers).
     "robustness_bench":      float(os.environ.get("RD_ROBUSTNESS_TARGET", "400")),
+    # Session 3.7 — noise_resistance reuses math items as well; same
+    # target token budget so reasoning-density comparisons across the
+    # math/robustness/noise triple are apples-to-apples.
+    "noise_resistance_bench": float(os.environ.get("RD_NOISE_TARGET", "400")),
 }
 REASONING_DENSITY_WEIGHT = float(os.environ.get("REASONING_DENSITY_WEIGHT", "0.05"))
 REASONING_DENSITY_IN_COMPOSITE = (
@@ -269,9 +282,13 @@ BENCH_MIN_VALID = {
     # a 4-item budget yields 8+ generations: hold the min_valid floor
     # at K_perturb so a single item drop doesn't kill the axis.
     "robustness_bench": 2,
+    # Session 3.7 — noise_resistance has the same shape as robustness
+    # (K perturbations × N items); use the same floor so a single
+    # tokenization or grader edge case can't drop the axis.
+    "noise_resistance_bench": 2,
 }
 
-COMPOSITE_SHADOW_VERSION = 11  # Session 3.7 — robustness_bench live
+COMPOSITE_SHADOW_VERSION = 12  # Session 3.7 — noise_resistance_bench live
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
@@ -547,6 +564,10 @@ def _axis_robustness_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "robustness_bench")
 
 
+def _axis_noise_resistance_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "noise_resistance_bench")
+
+
 def _axis_reasoning_density(student: dict) -> float | None:
     """Reasoning-density axis (Session 3.2, 2026-04-25).
 
@@ -676,6 +697,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "long_context_bench": _axis_long_context_bench(student),
         "procedural_bench": _axis_procedural_bench(student),
         "robustness_bench": _axis_robustness_bench(student),
+        "noise_resistance_bench": _axis_noise_resistance_bench(student),
         "reasoning_density": _axis_reasoning_density(student),
     }
 

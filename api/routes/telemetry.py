@@ -328,6 +328,9 @@ def _compact_round(h2h, last_eval):
             # Session 3.7 (2026-04-25, LIVE) — paraphrase-robustness on
             # math items; punishes prompt-pattern memorization.
             "robustness_bench": _compact_bench(s.get("robustness_bench")),
+            # Session 3.7 (2026-04-25, LIVE) — adversarial-noise sibling
+            # of robustness_bench (typos, distractors, surface-shift).
+            "noise_resistance_bench": _compact_bench(s.get("noise_resistance_bench")),
         })
     return {
         "block": h2h.get("block"),

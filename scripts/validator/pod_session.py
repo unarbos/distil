@@ -352,6 +352,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "BENCH_PROCEDURAL_PER_ROUND",
         "BENCH_ROBUSTNESS_PER_ROUND",
         "BENCH_ROBUSTNESS_PERTURB_K",
+        "BENCH_NOISE_PER_ROUND",
+        "BENCH_NOISE_PERTURB_K",
     ):
         _v = os.environ.get(_propagate)
         if _v is not None:

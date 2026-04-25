@@ -307,7 +307,7 @@ class TestSession3Production(unittest.TestCase):
             "tool_use_bench": 0.6, "self_consistency_bench": 0.6,
             "arc_bench": 0.6, "truthful_bench": 0.6,
             "long_context_bench": 0.6, "procedural_bench": 0.05,
-            "robustness_bench": 0.6,
+            "robustness_bench": 0.6, "noise_resistance_bench": 0.6,
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
         self.assertLessEqual(comp["worst"], 0.06)
@@ -333,6 +333,7 @@ class TestSession3Production(unittest.TestCase):
             "arc_bench": 0.6, "truthful_bench": 0.6,
             "long_context_bench": 0.6, "procedural_bench": 0.6,
             "robustness_bench": 0.10,  # canonical-only memorizer
+            "noise_resistance_bench": 0.6,
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
         self.assertLessEqual(
@@ -341,6 +342,38 @@ class TestSession3Production(unittest.TestCase):
             "miner who only memorizes canonical wording cannot win",
         )
         self.assertEqual(comp["axes"]["robustness_bench"], 0.10)
+
+    def test_noise_resistance_bench_is_v3_live(self):
+        """noise_resistance_bench (Session 3.7) gates the composite worst.
+
+        Sibling axis to robustness_bench: same pool (alias of math),
+        independent stream offset, but the perturbations are
+        adversarial input noise (typos, case jitter, distractor chatter)
+        rather than semantic paraphrase. A model that breaks under
+        light real-world chat noise has its composite worst dragged
+        down here even if math_bench scores high.
+        """
+        import scripts.validator.composite as _c
+        self.assertIn("noise_resistance_bench", _c.ARENA_V3_AXIS_WEIGHTS)
+        self.assertIn("noise_resistance_bench", _c.BENCH_MIN_VALID)
+        self.assertIn("noise_resistance_bench", _c.REASONING_DENSITY_TARGET_TOKENS)
+        student = _make_student(bench={
+            "math_bench": 0.95, "code_bench": 0.8, "reasoning_bench": 0.8,
+            "knowledge_bench": 0.8, "ifeval_bench": 0.8,
+            "aime_bench": 0.6, "mbpp_bench": 0.6,
+            "tool_use_bench": 0.6, "self_consistency_bench": 0.6,
+            "arc_bench": 0.6, "truthful_bench": 0.6,
+            "long_context_bench": 0.6, "procedural_bench": 0.6,
+            "robustness_bench": 0.6,
+            "noise_resistance_bench": 0.05,  # brittle-to-noise distillation
+        })
+        comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
+        self.assertLessEqual(
+            comp["worst"], 0.06,
+            "noise_resistance_bench=0.05 must drag worst below 0.06 — a "
+            "model that fails on typos/distractors cannot win",
+        )
+        self.assertEqual(comp["axes"]["noise_resistance_bench"], 0.05)
 
 
 class TestParetoDominance(unittest.TestCase):
