@@ -79,21 +79,44 @@ def _get_stale(name: str):
 
 _refresh_lock = threading.Lock()
 _refreshing = set()
+# Track last failure per cache name so we log each *distinct* error at most
+# once per window — previously a persistent upstream auth failure would print
+# the same stack every 30s for days and choke journalctl.
+_last_fail: dict = {}
+_FAIL_LOG_WINDOW_SEC = 300.0
 
 
 def _bg_refresh(name: str, fn):
-    """Refresh cache in background thread. Non-blocking."""
-    if name in _refreshing:
-        return
+    """Refresh cache in background thread. Non-blocking.
+
+    The guard + set.add was previously racy: many uvicorn threads could all
+    pass the ``name in _refreshing`` check before any worker started and added
+    itself, leading to dozens of concurrent fetches hammering upstream and
+    emitting one error line each when the call failed. Now the check-and-add
+    happens under ``_refresh_lock`` so only one refresh is ever in flight per
+    cache key.
+    """
+    with _refresh_lock:
+        if name in _refreshing:
+            return
+        _refreshing.add(name)
+
     def _do():
         try:
-            _refreshing.add(name)
             result = fn()
             if result:
                 _set_cached(name, result)
+                _last_fail.pop(name, None)
         except Exception as e:
-            print(f"[bg_refresh] {name} failed: {e}")
+            msg = f"{type(e).__name__}: {e}"
+            now = time.time()
+            prev = _last_fail.get(name)
+            if not prev or prev[0] != msg or now - prev[1] > _FAIL_LOG_WINDOW_SEC:
+                print(f"[bg_refresh] {name} failed: {msg}")
+                _last_fail[name] = (msg, now)
         finally:
-            _refreshing.discard(name)
+            with _refresh_lock:
+                _refreshing.discard(name)
+
     t = threading.Thread(target=_do, daemon=True)
     t.start()

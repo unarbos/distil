@@ -17,6 +17,7 @@ from routes.evaluation import router as evaluation_router
 from routes.market import router as market_router
 from routes.chat import router as chat_router
 from routes.debugging import router as debugging_router
+from routes.telemetry import router as telemetry_router
 
 
 app = FastAPI(
@@ -32,6 +33,7 @@ app = FastAPI(
         {"name": "Evaluation", "description": "Live eval progress, head-to-head rounds, and score history"},
         {"name": "Market", "description": "Token pricing, emission, and market data"},
         {"name": "Chat", "description": "Chat with the current king model (when GPU is available)"},
+        {"name": "Telemetry", "description": "Dashboard telemetry — composite axes, DQs, validator events, pod health"},
     ],
 )
 
@@ -72,6 +74,7 @@ app.include_router(evaluation_router)
 app.include_router(market_router)
 app.include_router(chat_router)
 app.include_router(debugging_router)
+app.include_router(telemetry_router)
 
 
 # ── Startup: prime caches ────────────────────────────────────────────────────

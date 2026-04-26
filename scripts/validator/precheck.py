@@ -226,6 +226,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 disqualified.add(uid)
                 continue
         uid_str = str(uid)
+        _needs_full_check = False
         if uid_str in state.evaluated_uids and uid_str in state.scores and state.scores[uid_str] <= MAX_KL_THRESHOLD:
             try:
                 from huggingface_hub import hf_hub_download
@@ -252,23 +253,45 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             except Exception:
                 pass
             expected_hash = state.model_hashes.get(str(uid))
-            integrity = verify_model_integrity(model_repo, revision, expected_hash)
-            if integrity.get("transient"):
-                pass
-            elif not integrity["pass"]:
-                logger.info(f"UID {uid} ({model_repo}): INTEGRITY FAIL — {integrity['reason']}")
-                state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                disqualify(hotkey, f"integrity: {integrity['reason']}", state.dq_reasons, commit_block=this_commit_block)
-                disqualified.add(uid)
+            stored_hotkey_quick = state.model_hashes.get(f"{uid}_hotkey")
+            stored_block_quick = state.model_hashes.get(f"{uid}_block")
+            hotkey_changed_quick = stored_hotkey_quick is not None and stored_hotkey_quick != hotkey
+            block_changed_quick = this_commit_block and stored_block_quick and this_commit_block != stored_block_quick
+            if hotkey_changed_quick or block_changed_quick:
+                reason = "hotkey changed (UID recycled)" if hotkey_changed_quick else "new commitment"
+                logger.info(f"UID {uid}: quick re-check: {reason} at block {this_commit_block} (was {stored_block_quick}), resetting hash")
+                expected_hash = None
+                state.model_hashes.pop(str(uid), None)
+                state.model_hashes.pop(f"{uid}_block", None)
+                state.model_hashes.pop(f"{uid}_hotkey", None)
+                for dq_hk in [hotkey, stored_hotkey_quick] if stored_hotkey_quick else [hotkey]:
+                    for dq_key in [f"{dq_hk}:{stored_block_quick}", dq_hk]:
+                        if dq_key and dq_key in state.dq_reasons:
+                            logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
+                            del state.dq_reasons[dq_key]
                 state.evaluated_uids.discard(uid_str)
+                state.scores.pop(uid_str, None)
+                _needs_full_check = True
+            if not _needs_full_check:
+                integrity = verify_model_integrity(model_repo, revision, expected_hash)
+                if integrity.get("transient"):
+                    pass
+                elif not integrity["pass"]:
+                    logger.info(f"UID {uid} ({model_repo}): INTEGRITY FAIL — {integrity['reason']}")
+                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(hotkey, f"integrity: {integrity['reason']}", state.dq_reasons, commit_block=this_commit_block)
+                    disqualified.add(uid)
+                    state.evaluated_uids.discard(uid_str)
+                    continue
+                valid_models[uid] = {
+                    "model": model_repo,
+                    "revision": revision,
+                    "params_b": None,
+                    "hotkey": hotkey,
+                    "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
+                }
                 continue
-            valid_models[uid] = {
-                "model": model_repo,
-                "revision": revision,
-                "params_b": None,
-                "hotkey": hotkey,
-                "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
-            }
+        if not _needs_full_check and uid_str in state.evaluated_uids:
             continue
         logger.info(f"Checking {model_repo}...")
         hf_user = model_repo.split("/")[0] if "/" in model_repo else None

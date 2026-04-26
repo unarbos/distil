@@ -16,8 +16,9 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
                       p_value=None):
     """Write a pending announcement to state for async Discord posting."""
     kl_diff_pct = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
+    import os as _os
+    single_eval_active = bool(int(_os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
 
-    # Fetch earnings data from prod API
     earnings_line = ""
     try:
         import urllib.request
@@ -36,9 +37,30 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
 
     role_ping = f"<@&{DISTIL_ROLE_ID}>"
     prompt_count = paired_prompts or total_prompts or EVAL_PROMPTS_H2H
-    prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
-    if total_prompts and paired_prompts and total_prompts != paired_prompts:
-        prompt_line = f"🧪 Compared on {paired_prompts}/{total_prompts} paired prompts"
+
+    # Wording branch: in single-eval mode the king is selected cross-round from
+    # composite_scores (different prompts per challenger), so "paired prompts"
+    # is misleading. Show the per-challenger prompt count instead and explain
+    # the actual gate. In legacy paired-t-test mode keep the old wording.
+    if single_eval_active:
+        prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
+        gate_explainer = (
+            "Dethronement uses an absolute composite across 20 axes (math, code, "
+            "reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, "
+            "arc, truthful, long-context, procedural, robustness, noise, judge, "
+            "chat-turns, length, degeneracy, KL). 3-stage gate: clear win on `worst` "
+            "(>3% margin) → take crown; clear regression on `worst` (<-3%) → reject; "
+            "tied region → fall back to `weighted` with the same 3% margin. KL "
+            "shown above is the global distillation distance, not the ranking key. "
+            "One eval per commitment; no re-evals."
+        )
+    else:
+        prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
+        if total_prompts and paired_prompts and total_prompts != paired_prompts:
+            prompt_line = f"🧪 Compared on {paired_prompts}/{total_prompts} paired prompts"
+        gate_explainer = (
+            f"Dethronement uses one-sided paired t-test (p<{PAIRED_TEST_ALPHA})."
+        )
     p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""
     announcement = {
         "type": "new_king",
@@ -53,13 +75,14 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
             f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
             f"{earnings_line}\n"
-            f"Dethronement uses one-sided paired t-test (p<{PAIRED_TEST_ALPHA}). "
+            f"{gate_explainer} "
             f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"
             f"📈 [Live Dashboard](<https://distil.arbos.life>)"
         ),
         "data": {
             "new_uid": new_uid, "new_model": new_model, "new_kl": new_kl,
             "old_uid": old_uid, "old_model": old_model, "old_kl": old_kl,
+            "single_eval_mode": single_eval_active,
         },
     }
     state.save_announcement(announcement)

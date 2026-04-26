@@ -39,7 +39,19 @@ TEACHER_ARCHITECTURE = TEACHER["architecture"]
 MAX_STUDENT_PARAMS = TEACHER["maxStudentParams"]
 
 MAX_KL_THRESHOLD = VALIDATOR["maxKlThreshold"]
-MAX_NEW_TOKENS = VALIDATOR["maxNewTokens"]
+# 2026-04-25 17:00 UTC: env-override added so we can shorten teacher generation
+# without redeploying. Subnet config baseline is 8192 but mean teacher length
+# is ~700 tokens; the rare 8192-cap hits dominate per-prompt wall time. Reduce
+# via TEACHER_MAX_NEW_TOKENS=2048 in distil.env to halve KL-pass wall.
+_ENV_MAX_NEW_TOKENS = (
+    os.environ.get("TEACHER_MAX_NEW_TOKENS")
+    or os.environ.get("EVAL_MAX_NEW_TOKENS")
+    or os.environ.get("MAX_NEW_TOKENS")
+)
+try:
+    MAX_NEW_TOKENS = int(_ENV_MAX_NEW_TOKENS) if _ENV_MAX_NEW_TOKENS else int(VALIDATOR["maxNewTokens"])
+except (TypeError, ValueError):
+    MAX_NEW_TOKENS = int(VALIDATOR["maxNewTokens"])
 MAX_PROMPT_TOKENS = VALIDATOR["maxPromptTokens"]
 EVAL_PROMPTS_FULL = VALIDATOR["evalPromptsFull"]
 EVAL_PROMPTS_H2H = VALIDATOR["evalPromptsH2h"]
@@ -59,8 +71,12 @@ PUBLIC_API_URL = API["publicUrl"]
 DASHBOARD_URL = API["dashboardUrl"]
 ALLOWED_ORIGINS = list(API["allowedOrigins"])
 
-CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "91.224.44.207")
-CHAT_POD_SSH_PORT = int(os.environ.get("CHAT_POD_SSH_PORT", "40070"))
+# Chat pod coordinates are intentionally env-only. Lium pods can be
+# reprovisioned, and a stale hardcoded host makes healthcheck/API repair loops
+# hammer the wrong machine. When unset, chat endpoints report unavailable
+# instead of trying old infrastructure.
+CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST") or os.environ.get("DISTIL_CHAT_POD_HOST", "")
+CHAT_POD_SSH_PORT = int(os.environ.get("CHAT_POD_SSH_PORT") or os.environ.get("DISTIL_CHAT_POD_SSH_PORT", "22"))
 CHAT_POD_APP_PORT = CHAT["appPort"]
 CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
 

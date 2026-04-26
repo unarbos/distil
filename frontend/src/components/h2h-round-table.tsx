@@ -1,10 +1,125 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { H2hHistoryResponse, H2hLatestResponse } from "@/lib/api";
+import type { H2hComposite, H2hHistoryResponse, H2hLatestResponse } from "@/lib/api";
 import { useRefreshKey } from "@/components/auto-refresh";
 import { CLIENT_API_BASE } from "@/lib/subnet";
 import { formatFixed, formatPromptCount, timeAgo } from "@/lib/utils";
+
+// Axis display order + short labels — stable across the UI so miners
+// can build mental models around what each abbreviation means. Grouped
+// into KL-like (relative), capability, judge/probe, benchmark, and
+// live v3 extension axes.
+const AXIS_DISPLAY: Array<{ key: keyof NonNullable<H2hComposite["axes"]>; label: string; group: string }> = [
+  { key: "kl", label: "KL", group: "rel" },
+  { key: "on_policy_rkl", label: "RKL", group: "rel" },
+  { key: "capability", label: "cap", group: "rel" },
+  { key: "length", label: "len", group: "rel" },
+  { key: "degeneracy", label: "deg", group: "rel" },
+  { key: "judge_probe", label: "judge", group: "probe" },
+  { key: "math_bench", label: "math", group: "bench" },
+  { key: "code_bench", label: "code", group: "bench" },
+  { key: "reasoning_bench", label: "reas", group: "bench" },
+  { key: "knowledge_bench", label: "know", group: "bench" },
+  { key: "ifeval_bench", label: "ifev", group: "bench" },
+  { key: "aime_bench", label: "aime", group: "bench" },
+  { key: "mbpp_bench", label: "mbpp", group: "bench" },
+  { key: "tool_use_bench", label: "tool", group: "bench" },
+  { key: "self_consistency_bench", label: "scon", group: "bench" },
+  { key: "arc_bench", label: "arc", group: "bench" },
+  { key: "truthful_bench", label: "truth", group: "bench" },
+  { key: "long_context_bench", label: "long", group: "bench" },
+  { key: "procedural_bench", label: "proc", group: "bench" },
+  { key: "robustness_bench", label: "robust", group: "bench" },
+  { key: "noise_resistance_bench", label: "noise", group: "bench" },
+  { key: "reasoning_density", label: "rd", group: "live" },
+  { key: "chat_turns_probe", label: "chat", group: "live" },
+];
+
+// Colour-code an axis value on a 0–1 scale. A floor of 0.8 is where
+// composite-dethrone starts to feel comfortable; we mirror the
+// dashboard convention used by the standalone telemetry panel.
+function axisColorClass(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "text-muted-foreground/30";
+  if (v >= 0.85) return "text-emerald-400/90";
+  if (v >= 0.70) return "text-lime-400/80";
+  if (v >= 0.55) return "text-amber-400/80";
+  if (v >= 0.40) return "text-orange-400/80";
+  return "text-rose-400/80";
+}
+
+function CompositeAxesRow({ composite, isKing }: { composite: H2hComposite; isKing: boolean }) {
+  const axes = composite.axes || {};
+  const pareto = composite.pareto || null;
+  const worst = composite.worst;
+  const weighted = composite.weighted;
+  const broken = new Set(composite.broken_axes || []);
+  const hasAny = AXIS_DISPLAY.some(({ key }) => {
+    const v = (axes as Record<string, unknown>)[key as string];
+    return typeof v === "number" && Number.isFinite(v);
+  });
+  if (!hasAny && !pareto) return null;
+  const axisItems = AXIS_DISPLAY.filter(({ key }) => {
+    const v = (axes as Record<string, unknown>)[key as string];
+    return typeof v === "number" && Number.isFinite(v);
+  });
+  return (
+    <div className="col-span-full px-5 pb-2 pt-0 text-[10px] font-mono text-muted-foreground/70 flex flex-wrap items-center gap-x-3 gap-y-1">
+      {/* Worst-axis + weighted chips — these are the PRIMARY ranking keys
+       * on a composite dethrone attempt. */}
+      {typeof worst === "number" && (
+        <span className="inline-flex items-center gap-1">
+          <span className="text-muted-foreground/40">worst</span>
+          <span className={axisColorClass(worst)}>{worst.toFixed(3)}</span>
+        </span>
+      )}
+      {typeof weighted === "number" && (
+        <span className="inline-flex items-center gap-1">
+          <span className="text-muted-foreground/40">wavg</span>
+          <span className={axisColorClass(weighted)}>{weighted.toFixed(3)}</span>
+        </span>
+      )}
+      {/* Pareto dominance vs king — shadow for now, but useful for miners
+       * to see which axes they win / lose vs the current king. */}
+      {!isKing && pareto && (
+        <span
+          className="inline-flex items-center gap-1"
+          title={`Pareto vs king: wins ${pareto.wins?.join(", ") || "—"}; losses ${pareto.losses?.join(", ") || "—"}; ties ${pareto.ties?.join(", ") || "—"}. margin=${pareto.margin ?? "—"} of min_comparable=${pareto.min_comparable ?? "—"}.`}
+        >
+          <span className="text-muted-foreground/40">pareto</span>
+          <span className={
+            pareto.pareto_wins
+              ? "text-emerald-400/80"
+              : (pareto.n_wins ?? 0) > (pareto.n_losses ?? 0)
+                ? "text-lime-400/70"
+                : "text-muted-foreground/50"
+          }>
+            {pareto.n_wins ?? 0}W / {pareto.n_losses ?? 0}L / {pareto.n_ties ?? 0}T
+          </span>
+        </span>
+      )}
+      {/* Per-axis chips. Broken axes (teacher failed this round) are
+       * rendered struck-through so miners know not to optimise to
+       * noise. */}
+      <span className="mx-1 text-muted-foreground/20">·</span>
+      {axisItems.map(({ key, label }) => {
+        const v = (axes as Record<string, number | undefined>)[key as string];
+        const cls = axisColorClass(v);
+        const isBroken = broken.has(key as string);
+        return (
+          <span
+            key={key as string}
+            title={`${key} = ${v?.toFixed(4) ?? "—"}${isBroken ? " (eval-broken this round — dropped from composite worst/weighted because the teacher or reference base scored below the sanity floor on this axis)" : ""}`}
+            className={`inline-flex items-center gap-1 ${isBroken ? "line-through opacity-50" : ""}`}
+          >
+            <span className="text-muted-foreground/40">{label}</span>
+            <span className={cls}>{v != null ? v.toFixed(2) : "—"}</span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 function formatTimestamp(ts: number): string {
   const d = new Date(ts * 1000);
@@ -289,6 +404,14 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
                     </div>
                   )}
                 </div>
+
+                {/* Composite axes (Arena v3) — shown below the main row so
+                 * the dashboard reflects the worst-axis + pareto gates, not
+                 * just raw KL. This is the difference between "model wins
+                 * KL" and "model is SOTA across the board". */}
+                {result.composite && (result.composite.axes || result.composite.pareto) && (
+                  <CompositeAxesRow composite={result.composite} isKing={isKing} />
+                )}
               </div>
             );
           })}

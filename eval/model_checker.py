@@ -13,14 +13,62 @@ import json
 import hashlib
 import logging
 import os
+import time
 import requests as _requests
 from pathlib import Path
 from typing import Optional
 
-from huggingface_hub import hf_hub_download, model_info
+from huggingface_hub import hf_hub_download, model_info as _raw_model_info
 from eval.runtime import STATE_DIR as RUNTIME_STATE_DIR, TEACHER_CONFIG_VOCAB_SIZE, TEACHER_MODEL
 
 logger = logging.getLogger("distillation.model_checker")
+
+
+# 2026-04-24 (distil-97): wrapper around huggingface_hub.model_info that
+# threads ``HF_TOKEN`` through and retries transient 429/5xx with backoff.
+# Prechecks run HEAD+metadata requests against HF for every UID every epoch
+# (~250 per pass); unauthenticated traffic gets rate-limited within minutes
+# and new miners (e.g. UID 77 Nikas982/golden) stay stuck in "TRANSIENT
+# ERROR" purgatory for hours. Authenticated calls get much higher quotas,
+# and the retry layer smooths over the occasional spike so one 429 doesn't
+# drop a model from an entire round.
+_HF_TOKEN = os.environ.get("HF_TOKEN") or None
+_MODEL_INFO_RETRY_DELAYS = (0.5, 1.5, 4.0)  # ~6s total, caller can still time-box
+
+
+def model_info(model_repo, revision=None, files_metadata=False, token=None, **kwargs):
+    """HF model_info with auth + bounded 429/5xx retries.
+
+    Preserves the original signature so every existing call site keeps
+    working. ``token`` defaults to the validator's ``HF_TOKEN`` so we don't
+    have to touch 5+ existing call sites.
+    """
+    effective_token = token if token is not None else _HF_TOKEN
+    last_exc = None
+    for attempt, delay in enumerate((0.0,) + _MODEL_INFO_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _raw_model_info(
+                model_repo,
+                revision=revision,
+                files_metadata=files_metadata,
+                token=effective_token,
+                **kwargs,
+            )
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if not any(k in msg for k in ("429", "rate limit", "too many", "503", "502", "timeout")):
+                raise
+            if attempt == len(_MODEL_INFO_RETRY_DELAYS):
+                raise
+            logger.debug(
+                f"model_info({model_repo}@{revision}) attempt {attempt + 1} hit transient "
+                f"{type(exc).__name__}; backing off {_MODEL_INFO_RETRY_DELAYS[attempt]}s"
+            )
+    if last_exc:
+        raise last_exc
 
 BASELINE_VOCAB_SIZE = TEACHER_CONFIG_VOCAB_SIZE
 STATE_DIR = Path(RUNTIME_STATE_DIR)
@@ -385,6 +433,18 @@ def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optio
         logger.warning(f"Tensor metadata hash failed for {model_repo}: {e}")
         return None
 
+# 2026-04-24 (distil-97): precheck hits HF for every UID every epoch
+# (~250 calls / pass). Without auth this trips the rate limiter within
+# minutes and new miners (UID 77 / Nikas982/golden stuck for 3h in
+# Discord) get bumped out of every round with "TRANSIENT ERROR". Cache
+# positive integrity results so the common "model exists, sha matches"
+# case needs at most one HEAD per ``_INTEGRITY_CACHE_TTL`` seconds.
+# We intentionally do NOT cache failures — miners fix config.json and
+# expect fast re-admission.
+_INTEGRITY_CACHE: dict = {}
+_INTEGRITY_CACHE_TTL = 900  # 15 min; shorter than a typical epoch gap
+
+
 def verify_model_integrity(
     model_repo: str,
     revision: str = None,
@@ -401,6 +461,24 @@ def verify_model_integrity(
       reason: str
       current_hash: str or None  (git SHA of repo HEAD, or weight hash for legacy)
     """
+    cache_key = (model_repo, revision or "", expected_hash or "")
+    cached = _INTEGRITY_CACHE.get(cache_key)
+    if cached is not None:
+        result, ts = cached
+        if (time.time() - ts) < _INTEGRITY_CACHE_TTL and result.get("pass") and not result.get("transient"):
+            return dict(result)  # copy so callers can't mutate cache
+    result = _verify_model_integrity_uncached(model_repo, revision, expected_hash)
+    if result.get("pass") and not result.get("transient"):
+        _INTEGRITY_CACHE[cache_key] = (dict(result), time.time())
+    return result
+
+
+def _verify_model_integrity_uncached(
+    model_repo: str,
+    revision: str = None,
+    expected_hash: Optional[str] = None,
+) -> dict:
+    """Inner impl — see ``verify_model_integrity`` for contract."""
     try:
         # 1. Check model is still public (HEAD request to repo)
         info = model_info(model_repo, revision=revision)

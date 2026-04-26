@@ -8,7 +8,12 @@ Type=simple
 User=distil
 WorkingDirectory=/opt/distil/repo/api
 Environment=HOME=/home/distil
-ExecStart=/opt/distil/venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 3710 --log-level warning --limit-concurrency 100 --timeout-keep-alive 10 --backlog 128 --workers 2
+# Load TMC_API_KEY, HF_TOKEN, etc. Leading `-` makes it optional — the service
+# still starts if the file is missing; individual fetchers fall back cleanly.
+# Without this the /public/v1/subnets/table/ calls hit Taostats unauthenticated
+# and we spam '[bg_refresh] price failed' in the journal every poll.
+EnvironmentFile=-/home/distil/.secrets/distil.env
+ExecStart=/opt/distil/venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port 3710 --log-level warning --limit-concurrency 500 --timeout-keep-alive 10 --backlog 128 --workers 1
 Restart=always
 RestartSec=5
 LimitNOFILE=65536

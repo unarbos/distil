@@ -528,8 +528,50 @@ def repair(report: dict[str, Any]) -> list[str]:
     if any(issue.startswith("chain:weight_mismatch:") for issue in report["issues"]):
         actions.append("notify:chain:weight_mismatch")
 
-    if any(issue.startswith("disk:") for issue in report["issues"]):
-        actions.append("notify:disk:full")
+    # Disk pressure. Two thresholds:
+    #   disk:      >= DISK_FAIL_PCT  (default 90)  → notify + attempt cleanup
+    #   disk_warn: >= DISK_WARN_PCT  (default 80)  → attempt cleanup only
+    # The cleanup target is ``/root/.cache/huggingface/hub/models--*`` — the
+    # scratch area where ad-hoc downloads for copy/re-save audits accumulate
+    # (each 9GB+). These caches are NOT touched by any service: the validator
+    # uses ``/home/distil/.cache/...`` so wiping /root's HF cache is safe
+    # even during a live eval. Before this hook the warning sat indefinitely
+    # at 82% until a human ran ``rm -rf`` by hand.
+    disk_issue_keys = [i for i in report["issues"] if i.startswith("disk:") or i.startswith("disk_warn:")]
+    if disk_issue_keys:
+        root_hub = os.path.expanduser("~/.cache/huggingface/hub")
+        reclaimed_bytes = 0
+        removed = 0
+        try:
+            for entry in os.listdir(root_hub):
+                if not entry.startswith("models--"):
+                    continue  # keep dataset caches (tiny, useful)
+                path = os.path.join(root_hub, entry)
+                if not os.path.isdir(path):
+                    continue
+                try:
+                    size = 0
+                    for dirpath, _, filenames in os.walk(path):
+                        for fn in filenames:
+                            try:
+                                size += os.path.getsize(os.path.join(dirpath, fn))
+                            except OSError:
+                                pass
+                    import shutil as _shutil
+                    _shutil.rmtree(path, ignore_errors=True)
+                    reclaimed_bytes += size
+                    removed += 1
+                except Exception as exc:
+                    actions.append(f"disk:cleanup_failed:{entry}:{exc}")
+        except FileNotFoundError:
+            pass
+        if removed:
+            reclaimed_gb = reclaimed_bytes / (1024 ** 3)
+            actions.append(
+                f"disk:reclaimed_hf_hub:{removed}_caches:{reclaimed_gb:.1f}GB"
+            )
+        if any(i.startswith("disk:") for i in disk_issue_keys):
+            actions.append("notify:disk:full")
 
     for issue in report["issues"]:
         if issue.startswith("journal:"):

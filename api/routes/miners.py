@@ -42,6 +42,27 @@ def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
     return fail_entry == repo
 
 
+def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | None, dq: dict):
+    """Resolve DQ using the same per-commit precedence everywhere.
+
+    Most validator DQs are keyed as ``hotkey:commit_block``. Some older API
+    endpoints only checked UID or bare hotkey, which incorrectly showed
+    current-commit DQs as clean in compare/batch/eval-status views.
+    """
+    uid_str = str(uid)
+    commit_block = commitment.get("block") if isinstance(commitment, dict) else None
+    if commit_block is not None and hotkey:
+        reason = dq.get(f"{hotkey}:{commit_block}")
+        if reason is not None:
+            return reason
+    if commit_block is None:
+        if uid_str in dq:
+            return dq.get(uid_str)
+        if hotkey and hotkey in dq:
+            return dq.get(hotkey)
+    return None
+
+
 @router.get("/api/commitments", tags=["Miners"], summary="Miner model commitments",
          description="""Returns all miner HuggingFace model commitments (on-chain).
 
@@ -166,6 +187,14 @@ def get_miner(uid: int):
     else:
         result["commitment"] = None
 
+    # Shortcut: surface the committed model repo at the top level too.
+    # Previously callers had to dig into `commitment.model`, and the dashboard
+    # kept showing "model: null" for perfectly-registered UIDs. 2026-04-24.
+    if isinstance(result.get("commitment"), dict):
+        result["model"] = result["commitment"].get("model") or result["commitment"].get("repo")
+    else:
+        result["model"] = None
+
     # KL score
     scores = load_scores()
     uid_str = str(uid)
@@ -174,13 +203,7 @@ def get_miner(uid: int):
     # Disqualification - check per-commit key first, fall back to legacy keys
     # only if no commit_block is known (same logic as eval/scoring.py is_disqualified)
     dq = disqualified()
-    commit_block = result.get("commitment", {}).get("block") if result.get("commitment") else None
-    dq_reason = None
-    if commit_block is not None and hotkey:
-        dq_reason = dq.get(f"{hotkey}:{commit_block}")
-    if dq_reason is None and commit_block is None:
-        # Only use legacy bare keys when we don't know the commit block
-        dq_reason = dq.get(uid_str) or dq.get(hotkey) if hotkey else dq.get(uid_str)
+    dq_reason = _dq_reason_for_commitment(uid, hotkey, result.get("commitment"), dq)
     result["disqualified"] = dq_reason
 
     # Top 5 / king status
@@ -256,8 +279,56 @@ def get_miner(uid: int):
     ]
     result["h2h_history"] = relevant
 
+    # Composite axes (Arena v3) — per miner request from #distil-97 on
+    # 2026-04-24: miners want to see their per-axis scores without parsing
+    # /api/eval-data. Pull the latest matching entry straight from
+    # h2h_latest.results, which ``annotate_h2h_with_composite`` stamps
+    # every round.
+    composite_entry = None
+    composite_block = latest.get("block")
+    for r in (latest.get("results") or []):
+        if r.get("uid") == uid and r.get("composite"):
+            composite_entry = r["composite"]
+            break
+    if composite_entry is None:
+        # If the miner was not in the latest H2H, surface the last known
+        # composite from history instead of returning null. This makes the
+        # per-miner endpoint stable for dashboards and miners tracking axes.
+        for item in rounds_for_uid(h2h_index, uid, limit=25):
+            row = item.get("row") or {}
+            comp = row.get("composite")
+            if comp:
+                composite_entry = comp
+                composite_block = (item.get("round") or {}).get("block")
+                break
+    if composite_entry:
+        result["composite"] = {
+            "worst": composite_entry.get("worst"),
+            "weighted": composite_entry.get("weighted"),
+            "axes": composite_entry.get("axes", {}),
+            "broken_axes": composite_entry.get("broken_axes", []),
+            "present_count": composite_entry.get("present_count"),
+            "version": composite_entry.get("version"),
+            "round_block": composite_block,
+            "is_latest_round": composite_block == latest.get("block"),
+        }
+        # King health (shadow telemetry, 2026-04-24). Only stamped on
+        # the king's row; surface alongside composite so the dashboard
+        # can render a "king at risk" badge when it's the current king.
+        kh = composite_entry.get("king_health")
+        if kh:
+            streak_file = _safe_json_load(
+                os.path.join(STATE_DIR, "king_regression_streak.json"), {}
+            )
+            result["king_health"] = {
+                **kh,
+                "streak": int(streak_file.get(str(uid), 0)),
+            }
+    else:
+        result["composite"] = None
+
     return JSONResponse(
-        content=result,
+        content=_sanitize_floats(result),
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
     )
 
@@ -459,7 +530,8 @@ def compare_miners(uids: str):
         else:
             entry["model"] = None
         entry["is_king"] = latest.get("king_uid") == uid
-        entry["disqualified"] = str(uid) in dq or (hotkey and hotkey in dq)
+        commitment = commitments.get(hotkey) if hotkey else None
+        entry["disqualified"] = _dq_reason_for_commitment(uid, hotkey, commitment, dq) is not None
         entry.update(uid_stats(idx.get(uid, [])))
         result.append(entry)
 
@@ -502,7 +574,9 @@ def miners_batch(uids: str):
             "model": model,
             "kl_score": scores.get(str(uid)),
             "is_king": latest.get("king_uid") == uid,
-            "disqualified": str(uid) in dq or (hotkey and hotkey in dq),
+            "disqualified": _dq_reason_for_commitment(
+                uid, hotkey, commitments.get(hotkey) if hotkey else None, dq
+            ) is not None,
         })
     return JSONResponse(
         content=_sanitize_floats({"miners": miners}),

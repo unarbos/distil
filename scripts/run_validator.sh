@@ -18,8 +18,13 @@ fi
 cd "$REPO_ROOT"
 
 if [ -f "$ENV_FILE" ]; then
+    # Auto-export all sourced vars so python subprocess inherits them.
+    # Matters for BENCH_BATTERY_SHADOW_AXES (2026-04-24) and any future
+    # tunables we want to flip without editing this script.
+    set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"
+    set +a
 fi
 
 export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || echo '')}"

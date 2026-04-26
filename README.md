@@ -27,25 +27,25 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
 
 2. **King identification** — The miner with the lowest KL score from state is the "king" (current emissions winner)
 
-3. **Challenger detection** — Only models that haven't been evaluated yet are challengers. Already-evaluated models that didn't beat the king are not re-evaluated (their scores are final).
+3. **Single-eval policy (live 2026-04-25)** — Each on-chain commitment is scored EXACTLY ONCE on its own block-seeded 300-prompt set. There is no king re-eval, no top-N rotation, and no dormant rotation. New commitments enter rounds FIFO by `commit_block`, capped at `SINGLE_EVAL_MAX_PER_ROUND` (default 10) plus the always-in reference baseline (UID -1, `Qwen/Qwen3.5-4B`). Re-evaluation triggers only when a UID re-commits a different model on-chain.
 
-4. **Head-to-head GPU eval** — The king, top-4 contenders, and all new challengers are scored together on the **same ~300 ClimbMix-400B prompts** (block-hash seeded, `min_chars=500`). All models see identical teacher continuations, making the comparison fair.
+4. **Per-UID eval on the pod** — Each student is loaded sequentially on the pod (vLLM teacher → student forward pass → bench battery). The reference baseline runs in every round so the asymmetric reference-broken-axes filter (see `composite.py::resolve_reference_broken_axes`) can drop axes the base model itself can't pass under the eval setup (token cap, etc.).
 
-5. **Top-5 always included** — The king plus the 4 best contenders are evaluated every round alongside new submissions, ensuring the leaderboard stays accurate.
+5. **20-axis composite, normalized per axis** — Every student gets a 20-axis vector covering relative distillation signals (KL, on-policy RKL, capability, length, judge-probe), absolute benches (math, code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, arc, truthful, long-context, procedural, robustness, noise-resistance), and probes (chat-turns, reasoning-density). Each axis is in [0, 1]. The composite stores both `worst = min(axes)` (after dropping reference-broken axes) and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ` (keeps broken axes when student > 0 so beating the reference still pays).
 
 6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. Teacher logits are precomputed and cached on GPU.
 
-7. **Paired t-test dethronement (p < 0.03)** — A challenger dethrones the king if a one-sided paired t-test on per-prompt KL deltas is statistically significant at p < 0.03. All ~300 prompt-level data points are used, not just mean scores. Minimum 20 paired observations required. This prevents noise spammers from getting lucky wins with random weight perturbations.
+7. **Cross-round dethronement gate (composite-worst, single-eval mode)** — King selection runs over `state/composite_scores.json` (records with `n_axes >= 17`, the Arena v3.7 schema floor). The king is whoever has the highest `composite.worst`. A challenger dethrones the incumbent only when `challenger.worst > incumbent.worst × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin). When both are at the saturated worst-floor (≤ 0.005), the same 3% margin applies to `composite.weighted` as a tiebreaker. The legacy paired t-test on KL is RETIRED — KL is one of 20 axes, not the ranking key. Different prompts per round are by design; the absolute composite supports cross-round comparison.
 
 9. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
-**Why this is better than evaluating all models every epoch:**
-- **~300 prompts per model** → tight confidence intervals and reliable statistical testing
-- **Top-5 always evaluated** — leaderboard stays fresh even without new challengers
-- **Fair comparison** — all models scored on identical prompts in the same run
-- **Paired t-test at p<0.03** — the king holds unless a challenger is *statistically significantly* better
-- **Scales to many miners** — 100 miners with 1 new challenger = top-5 + 1 new model evaluated, not 100
-- **Revision pinning** — models evaluated at the specific committed revision; new HF commits = DQ
+**Why this design beats round-local relative ranking:**
+- **One eval per commitment** — miners pay for the eval once via the on-chain registration burn; no infinite re-evals
+- **Block-seeded prompts** — the 300-prompt pool for each UID is fresh, deterministic from the round's block hash, and never re-used (no leakage)
+- **Absolute multi-axis floor** — `composite.worst` is normalized per axis, so a student that gets 0.95 KL and 0.0 math fails the gate even if KL alone is "better than the king"
+- **Asymmetric broken-axes filter** — eval-setup-fragile axes (e.g. AIME under a 768-token cap, MBPP function naming) drop out of `worst()` only when the reference itself scores 0 on them. They stay in `weighted` so a student beating the broken reference still gets credit.
+- **Stable across schema changes** — `_KING_SELECTION_MIN_AXES = 17` ensures only Arena v3.7 records compete for the crown. Older records remain tracked but ineligible until the miner re-commits.
+- **Revision pinning** — models evaluated at the specific committed revision; new HF commits without on-chain re-commitment = integrity DQ
 
 ### Disqualification
 
@@ -236,7 +236,7 @@ pip install "bittensor>=8.0.0" "bittensor-wallet>=2.0.0" "click>=8.0.0" \
 1. Loads the teacher model (Qwen3.5-35B-A3B) via vLLM for fast generation (~67GB VRAM)
 2. Draws 120 prompts from ClimbMix-400B (`karpathy/climbmix-400b-shuffle`, 6542 shards), seeded by on-chain block hash
 3. Polls for new challengers every epoch (~10 min)
-4. Head-to-head KL evaluation: king + top-4 contenders vs challengers on identical prompts, with early stopping for clearly worse models. Dethronement uses a paired t-test (p < 0.05) on per-prompt KL deltas.
+4. Per-UID block-seeded eval (single-eval policy): each commitment is scored once on its own 300-prompt set, including the reference baseline (UID -1) every round. The king is selected cross-round on `composite.worst` from `state/composite_scores.json`.
 5. Teacher logits are precomputed and cached on GPU for fast scoring
 6. Sets weights on-chain: king = 1.0, everyone else = 0.0
 
@@ -279,7 +279,7 @@ All endpoints are public, no authentication required.
 │   ├── kl_divergence.py      # Sparse top-128 KL on GPU (dense path available for offline replays)
 │   ├── model_checker.py      # Param counting, integrity, hash, duplicate detection
 │   ├── dataset.py            # ClimbMix-400B dataset loader (120 prompts, block-hash seeded shard selection)
-│   └── scoring.py            # Winner-take-all + paired t-test dethronement
+│   └── scoring.py            # Winner-take-all + cross-round composite-worst dethronement (single-eval mode)
 ├── api/
 │   └── server.py             # FastAPI dashboard backend (runs on separate API server behind Cloudflare)
 ├── scripts/

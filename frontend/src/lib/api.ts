@@ -103,6 +103,12 @@ export interface MinerEntry {
   perPrompt: PerPromptKL[];
   /** Total tokens evaluated */
   totalPositions: number;
+  /** Latest H2H KL if this UID was in the latest round */
+  latestH2hKl: number | null;
+  /** Latest/known composite worst-axis score, higher is better */
+  compositeWorst: number | null;
+  /** Axis currently limiting composite.worst */
+  limitingAxis: string | null;
 }
 
 export interface PriceResponse {
@@ -219,6 +225,61 @@ export async function fetchAllModelInfo(models: string[]): Promise<Record<string
   return results;
 }
 
+export interface H2hCompositeAxes {
+  kl?: number;
+  capability?: number;
+  length?: number;
+  degeneracy?: number;
+  on_policy_rkl?: number;
+  judge_probe?: number;
+  math_bench?: number;
+  code_bench?: number;
+  reasoning_bench?: number;
+  knowledge_bench?: number;
+  ifeval_bench?: number;
+  aime_bench?: number;
+  mbpp_bench?: number;
+  tool_use_bench?: number;
+  self_consistency_bench?: number;
+  arc_bench?: number;
+  truthful_bench?: number;
+  long_context_bench?: number;
+  procedural_bench?: number;
+  robustness_bench?: number;
+  noise_resistance_bench?: number;
+  reasoning_density?: number;
+  chat_turns_probe?: number;
+}
+
+export interface H2hComposite {
+  version?: string | null;
+  axes?: H2hCompositeAxes;
+  worst?: number | null;
+  weighted?: number | null;
+  present_count?: number;
+  broken_axes?: string[] | null;
+  judge_in_composite?: boolean;
+  bench_in_composite?: boolean;
+  arena_v3_in_composite?: boolean;
+  axis_spread?: number | null;
+  bench_vs_rel_gap?: number | null;
+  reasoning_density_in_composite?: boolean;
+  chat_turns_in_composite?: boolean;
+  pareto?: {
+    wins?: string[];
+    losses?: string[];
+    ties?: string[];
+    n_wins?: number;
+    n_losses?: number;
+    n_ties?: number;
+    comparable?: number;
+    pareto_wins?: boolean;
+    margin?: number | null;
+    min_comparable?: number | null;
+    reason?: string;
+  } | null;
+}
+
 export interface H2hResult {
   uid?: number;
   model: string;
@@ -232,6 +293,7 @@ export interface H2hResult {
   early_stopped?: boolean;
   disqualified?: boolean;
   dq_reason?: string;
+  composite?: H2hComposite | null;
   t_test?: {
     p?: number;
     t?: number;
@@ -327,6 +389,7 @@ export function buildMinerList(
   commitments: CommitmentsResponse | null,
   scores: ScoresResponse | null,
   kingUid?: number | null,
+  h2hLatest?: H2hLatestResponse | null,
 ): MinerEntry[] {
   if (!metagraph || !commitments) return [];
   const maxKl = VALIDATOR.maxKlThreshold;
@@ -340,6 +403,11 @@ export function buildMinerList(
     for (const [name, s] of Object.entries(scores.last_eval.students)) {
       if (s.kl_global_avg != null) modelKl[name] = s.kl_global_avg;
     }
+  }
+
+  const uidToH2h = new Map<number, H2hResult>();
+  for (const row of h2hLatest?.results ?? []) {
+    if (row.uid != null) uidToH2h.set(row.uid, row);
   }
 
   const miners: MinerEntry[] = [];
@@ -378,6 +446,17 @@ export function buildMinerList(
       ?? scores?.disqualified?.[neuron.hotkey]
       ?? null;
     const isDisqualified = dqReason != null || (ema != null && ema > maxKl);
+    const h2hRow = uidToH2h.get(uid);
+    const compAxes = h2hRow?.composite?.axes || {};
+    const compositeWorst = typeof h2hRow?.composite?.worst === "number" ? h2hRow.composite.worst : null;
+    const limitingAxis = compositeWorst == null
+      ? null
+      : Object.entries(compAxes).reduce<string | null>((best, [axis, value]) => {
+          if (typeof value !== "number") return best;
+          if (best == null) return axis;
+          const bestValue = compAxes[best as keyof typeof compAxes];
+          return typeof bestValue === "number" && bestValue <= value ? best : axis;
+        }, null);
 
     miners.push({
       uid,
@@ -397,13 +476,21 @@ export function buildMinerList(
       se,
       perPrompt,
       totalPositions,
+      latestH2hKl: typeof h2hRow?.kl === "number" ? h2hRow.kl : null,
+      compositeWorst,
+      limitingAxis,
     });
   }
 
-  // Sort: DQ last, then by KL (lower = better), nulls before DQ
+  // Sort: DQ last, then by live composite worst (higher = better), then KL.
   miners.sort((a, b) => {
     if (a.isDisqualified && !b.isDisqualified) return 1;
     if (!a.isDisqualified && b.isDisqualified) return -1;
+    if (a.compositeWorst != null && b.compositeWorst != null && a.compositeWorst !== b.compositeWorst) {
+      return b.compositeWorst - a.compositeWorst;
+    }
+    if (a.compositeWorst != null && b.compositeWorst == null) return -1;
+    if (a.compositeWorst == null && b.compositeWorst != null) return 1;
     if (a.klScore == null && b.klScore == null) return 0;
     if (a.klScore == null) return 1;
     if (b.klScore == null) return -1;

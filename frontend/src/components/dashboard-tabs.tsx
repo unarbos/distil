@@ -11,6 +11,7 @@ import { EvalProgressBar } from "@/components/eval-progress";
 import { ScoreTrend } from "@/components/score-trend";
 import { ValidatorStatus } from "@/components/validator-status";
 import { BenchmarksTab } from "@/components/benchmarks-tab";
+import { TelemetryTab } from "@/components/telemetry-tab";
 import { KingHistory } from "@/components/king-history";
 import { SCORE_TO_BEAT_FACTOR } from "@/lib/subnet";
 import { shortRevision } from "@/lib/utils";
@@ -30,6 +31,7 @@ interface DashboardTabsProps {
 const TABS = [
   { id: "live", label: "Live", hint: "king · eval · GPU" },
   { id: "rounds", label: "Rounds", hint: "H2H · dethronements" },
+  { id: "axes", label: "Axes", hint: "Arena v3 · composite · pareto" },
   { id: "miners", label: "Miners", hint: "leaderboard" },
   { id: "benchmarks", label: "Benchmarks", hint: "king vs baseline" },
 ] as const;
@@ -184,6 +186,10 @@ export function DashboardTabs({
             </div>
           )}
           <KingHistory />
+        </TabsContent>
+
+        <TabsContent value="axes" className="pt-4">
+          <TelemetryTab />
         </TabsContent>
 
         <TabsContent value="miners" className="pt-4 space-y-3">

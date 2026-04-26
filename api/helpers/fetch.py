@@ -112,10 +112,36 @@ print(json.dumps({"commitments": commits, "count": len(commits)}))
 
 
 def _fetch_price():
-    data = req.get(f"{TMC_BASE}/public/v1/subnets/table/", headers=TMC_HEADERS, timeout=10).json()
-    sn97 = next((item for item in data if item.get("subnet") == NETUID), None)
+    # TMC (Taostats) returns a list of subnet dicts on success, but on auth
+    # failure it returns `{"detail": "Authentication credentials were not
+    # provided."}` — iterating that dict yields its keys as strings, which
+    # then raise `'str' object has no attribute 'get'` inside the next()
+    # below and spammed the journal once per cache miss (every 30s). Raise a
+    # clear, grep-able error with the upstream status instead so operators
+    # can tell "key missing" from "Taostats is down".
+    resp = req.get(
+        f"{TMC_BASE}/public/v1/subnets/table/",
+        headers=TMC_HEADERS, timeout=10,
+    )
+    if resp.status_code != 200:
+        body = (resp.text or "")[:200]
+        raise RuntimeError(
+            f"TMC /subnets/table/ {resp.status_code}: {body!r}"
+            + ("  (TMC_API_KEY unset?)" if resp.status_code == 401 else "")
+        )
+    data = resp.json()
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"TMC /subnets/table/ unexpected payload type {type(data).__name__}: "
+            f"{str(data)[:200]!r}"
+        )
+    sn97 = next(
+        (item for item in data
+         if isinstance(item, dict) and item.get("subnet") == NETUID),
+        None,
+    )
     if not sn97:
-        raise ValueError("Subnet 97 not found")
+        raise ValueError(f"Subnet {NETUID} not found in TMC response (n={len(data)})")
 
     alpha_price_tao = sn97.get("price", 0)
     try:

@@ -17,7 +17,19 @@ EARLY_STOP_MIN = int(os.environ.get("DISTIL_EARLY_STOP_MIN", "0") or "0")
 logger = logging.getLogger("distillation.remote_validator")
 
 
-def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None):
+def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None, resume_pod_eval: dict | None = None):
+    """Drive a pod-side eval to completion, downloading results when done.
+
+    Normally this clears any prior eval state, uploads the prompts + eval
+    script, and starts a fresh detached run. Pass ``resume_pod_eval`` (a dict
+    with ``run_dir``/``pid_remote``/``done_marker_remote``/``results_remote``/
+    ``log_remote``/``eval_data_remote``/``progress_remote``/``started_at``)
+    to skip cleanup + upload + start and instead poll the existing pod
+    process to completion. The validator restart-and-resume path uses this
+    so a mid-eval ``systemctl restart`` does not destroy the running pod
+    eval (regression observed 2026-04-25 when the resume code re-entered
+    the cleanup branch and lost ~75 min of student scoring).
+    """
     import shutil
     import threading
 
@@ -27,6 +39,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     challenger_uids_sorted = sorted([uid for uid in models_to_eval if uid != king_uid], key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")))
     ordered_uids.extend(challenger_uids_sorted)
     now = time.time()
+    is_resuming = isinstance(resume_pod_eval, dict) and bool(resume_pod_eval.get("run_dir"))
+    if is_resuming:
+        # If the persisted started_at is recent enough, prefer it so the
+        # progress UI keeps showing the original elapsed wall time.
+        try:
+            now = float(resume_pod_eval.get("started_at") or now)
+        except (TypeError, ValueError):
+            pass
     est_teacher_s = 90
     est_per_student_s = 5 * n_prompts
     est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
@@ -51,99 +71,156 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "estimated_completion": now + est_total_s,
     }
     state.save_progress(progress)
-    run_dir = f"/home/distil_eval_{int(now)}_{os.getpid()}"
-    prompts_remote = f"{run_dir}/prompts.json"
-    remote_eval_script = f"{run_dir}/pod_eval.py"
-    progress_remote = f"{run_dir}/eval_progress.json"
-    results_remote = f"{run_dir}/eval_results.json"
-    done_marker_remote = f"{run_dir}/eval_done.marker"
-    log_remote = f"{run_dir}/eval_output.log"
-    eval_data_remote = f"{run_dir}/eval_data.json"
-    teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
-    pid_remote = f"{run_dir}/pod_eval.pid"
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
-        json.dump(prompt_texts, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-        prompts_file = handle.name
-    try:
-        pod.exec(f"mkdir -p {shlex.quote(run_dir)}", timeout=30)
-        pod.upload(prompts_file, prompts_remote, max_attempts=3)
-    finally:
-        os.unlink(prompts_file)
-    pod.upload(eval_script, remote_eval_script, max_attempts=5)
-    try:
-        # VLLM v1 spawns a child process that renames itself to "VLLM::EngineCore"
-        # via prctl(PR_SET_NAME). That process holds the GPU allocation but will
-        # NOT match `pkill -f 'vllm.entrypoints'` because its argv is literally
-        # just "VLLM::EngineCore" — same story for "VllmWorker". If the parent
-        # pod_eval dies without reaping the engine (as happens when the validator
-        # is stopped hard), the EngineCore lives on forever holding ~130 GB of
-        # GPU memory until the next reboot, causing OOMs in future rounds.
-        #
-        # To prevent that, we:
-        #   1. pkill by comm (matches "VLLM::EngineCor", 15-char kernel limit)
-        #   2. pkill by cmdline (belt and braces for any future vllm rename)
-        #   3. fall back on nvidia-smi: if anything is still holding the GPU
-        #      and it looks like a vllm/python worker, nuke it.
-        pod.exec(
-            "pkill -9 -f pod_eval 2>/dev/null; "
-            "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
-            "pkill -9 -f 'VllmWorker' 2>/dev/null; "
-            "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
-            "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "  # match comm (15-char trunc)
-            "sleep 2; "
-            "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
-            "  comm=$(cat /proc/$pid/comm 2>/dev/null); "
-            "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
-            "  case \"$cmd$comm\" in "
-            "    *vllm.entrypoints*|*VllmWorker*|*pod_eval*|*VLLM::EngineCor*) "
-            "      kill -9 $pid 2>/dev/null ;; "
-            "  esac; "
-            "done; "
-            "sleep 2; "
-            # Last-resort sweep: if GPU is still non-empty, something slipped
-            # through. Log the survivors so we can improve the patterns above.
-            "survivors=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
-            "if [ -n \"$survivors\" ]; then "
-            "  for pid in $survivors; do "
-            "    echo \"[cleanup] gpu still held by pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 200)\" >&2; "
-            "    kill -9 $pid 2>/dev/null; "
-            "  done; "
-            "  sleep 2; "
-            "fi; "
-            "rm -rf /dev/shm/vllm* 2>/dev/null; "
-            "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
-            "sleep 1",
-            timeout=40,
+    if is_resuming:
+        run_dir = str(resume_pod_eval.get("run_dir"))
+        prompts_remote = resume_pod_eval.get("prompts_remote") or f"{run_dir}/prompts.json"
+        remote_eval_script = resume_pod_eval.get("remote_eval_script") or f"{run_dir}/pod_eval.py"
+        progress_remote = resume_pod_eval.get("progress_remote") or f"{run_dir}/eval_progress.json"
+        results_remote = resume_pod_eval.get("results_remote") or f"{run_dir}/eval_results.json"
+        done_marker_remote = resume_pod_eval.get("done_marker_remote") or f"{run_dir}/eval_done.marker"
+        log_remote = resume_pod_eval.get("log_remote") or f"{run_dir}/eval_output.log"
+        eval_data_remote = resume_pod_eval.get("eval_data_remote") or f"{run_dir}/eval_data.json"
+        teacher_cache_remote = resume_pod_eval.get("teacher_cache_remote") or f"{run_dir}/teacher_cache.pt"
+        pid_remote = resume_pod_eval.get("pid_remote") or f"{run_dir}/pod_eval.pid"
+        logger.info(
+            "run_eval_on_pod RESUME: attaching to existing pod eval "
+            "run_dir=%s pid_remote=%s — skipping cleanup/upload/start.",
+            run_dir, pid_remote,
         )
-        logger.info("Killed existing eval/vllm processes and removed stale /home files")
-    except Exception as exc:
-        logger.debug(f"Pre-eval cleanup: {exc}")
-    try:
-        pod.exec(
-            f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
-            f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
-            f"{shlex.quote(done_marker_remote)}"
-        )
-        logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
-    except Exception:
-        pass
-    try:
-        disk_pct = pod.disk_cleanup(TEACHER_MODEL)
-        if disk_pct is not None:
-            log_event(f"Pod disk: {disk_pct}% used after cleanup", state_dir=str(state.state_dir))
-    except Exception as exc:
-        log_event(f"Pod disk cleanup failed: {str(exc)[:100]}", level="warn", state_dir=str(state.state_dir))
-    pod.clear_gpu()
-    try:
-        verify = pod.exec("pgrep -af pod_eval 2>/dev/null; ls /home/pod_eval.py 2>/dev/null; echo VERIFY_DONE", timeout=15)
-        vout = verify.get("stdout", "")
-        if "/home/pod_eval.py" in vout or ("pod_eval" in vout and "VERIFY_DONE" in vout and vout.strip() != "VERIFY_DONE"):
-            logger.warning("Stale competing eval detected after cleanup, killing again")
-            pod.exec("pkill -9 -f pod_eval 2>/dev/null; rm -f /home/pod_eval.py 2>/dev/null; sleep 2", timeout=20)
-    except Exception:
-        pass
+    else:
+        run_dir = f"/home/distil_eval_{int(now)}_{os.getpid()}"
+        prompts_remote = f"{run_dir}/prompts.json"
+        remote_eval_script = f"{run_dir}/pod_eval.py"
+        progress_remote = f"{run_dir}/eval_progress.json"
+        results_remote = f"{run_dir}/eval_results.json"
+        done_marker_remote = f"{run_dir}/eval_done.marker"
+        log_remote = f"{run_dir}/eval_output.log"
+        eval_data_remote = f"{run_dir}/eval_data.json"
+        teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
+        pid_remote = f"{run_dir}/pod_eval.pid"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+            json.dump(prompt_texts, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            prompts_file = handle.name
+        try:
+            pod.exec(f"mkdir -p {shlex.quote(run_dir)}", timeout=30)
+            pod.upload(prompts_file, prompts_remote, max_attempts=3)
+        finally:
+            os.unlink(prompts_file)
+        pod.upload(eval_script, remote_eval_script, max_attempts=5)
+    # 2026-04-24 — Pareto holistic eval v2 ships two small helper modules
+    # alongside pod_eval.py: a vendored IFEval verifier set and a HumanEval
+    # subprocess sandbox. They live next to pod_eval.py so the bench
+    # probes can import them without touching sys.path.
+    if not is_resuming:
+        _aux_modules = [
+            ("scripts/ifeval_vendor.py", "ifeval_vendor.py"),
+            ("scripts/humaneval_sandbox.py", "humaneval_sandbox.py"),
+        ]
+        for local_aux, remote_name in _aux_modules:
+            if os.path.isfile(local_aux):
+                try:
+                    pod.upload(local_aux, f"{run_dir}/{remote_name}", max_attempts=3)
+                except Exception as exc:
+                    logger.warning(f"Failed to upload {local_aux} (bench probes will skip): {exc}")
+    if is_resuming:
+        # On resume, double-check the in-flight pod process actually still
+        # exists (didn't crash while the validator was down) and that the
+        # done marker hasn't already been written. If either guard fails,
+        # bail out so the caller can decide to start fresh.
+        try:
+            pid_probe = pod.exec(
+                f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DONE; "
+                f"elif [ -f {shlex.quote(pid_remote)} ] && kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo ALIVE; "
+                "else echo MISSING; fi",
+                timeout=30,
+            )
+            pid_status = (pid_probe.get("stdout") or "").strip()
+        except Exception as exc:
+            logger.warning("Resume probe failed: %s — falling back to fresh run", exc)
+            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+        if pid_status not in ("ALIVE", "DONE"):
+            logger.warning(
+                "Resume target pid_remote=%s reports status=%r (not ALIVE/DONE) — "
+                "falling back to fresh run.",
+                pid_remote, pid_status,
+            )
+            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+        logger.info("Resume probe: pod eval is %s — skipping cleanup, attaching to existing process.", pid_status)
+    if not is_resuming:
+        try:
+            # VLLM v1 spawns a child process that renames itself to "VLLM::EngineCore"
+            # via prctl(PR_SET_NAME). That process holds the GPU allocation but will
+            # NOT match `pkill -f 'vllm.entrypoints'` because its argv is literally
+            # just "VLLM::EngineCore" — same story for "VllmWorker". If the parent
+            # pod_eval dies without reaping the engine (as happens when the validator
+            # is stopped hard), the EngineCore lives on forever holding ~130 GB of
+            # GPU memory until the next reboot, causing OOMs in future rounds.
+            #
+            # To prevent that, we:
+            #   1. pkill by comm (matches "VLLM::EngineCor", 15-char kernel limit)
+            #   2. pkill by cmdline (belt and braces for any future vllm rename)
+            #   3. fall back on nvidia-smi: if anything is still holding the GPU
+            #      and it looks like a vllm/python worker, nuke it.
+            pod.exec(
+                "pkill -9 -f pod_eval 2>/dev/null; "
+                "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
+                "pkill -9 -f 'VllmWorker' 2>/dev/null; "
+                "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
+                "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "  # match comm (15-char trunc)
+                "sleep 2; "
+                "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+                "  comm=$(cat /proc/$pid/comm 2>/dev/null); "
+                "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
+                "  case \"$cmd$comm\" in "
+                "    *vllm.entrypoints*|*VllmWorker*|*pod_eval*|*VLLM::EngineCor*) "
+                "      kill -9 $pid 2>/dev/null ;; "
+                "  esac; "
+                "done; "
+                "sleep 2; "
+                # Last-resort sweep: if GPU is still non-empty, something slipped
+                # through. Log the survivors so we can improve the patterns above.
+                "survivors=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
+                "if [ -n \"$survivors\" ]; then "
+                "  for pid in $survivors; do "
+                "    echo \"[cleanup] gpu still held by pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 200)\" >&2; "
+                "    kill -9 $pid 2>/dev/null; "
+                "  done; "
+                "  sleep 2; "
+                "fi; "
+                "rm -rf /dev/shm/vllm* 2>/dev/null; "
+                "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
+                "sleep 1",
+                timeout=40,
+            )
+            logger.info("Killed existing eval/vllm processes and removed stale /home files")
+        except Exception as exc:
+            logger.debug(f"Pre-eval cleanup: {exc}")
+        try:
+            pod.exec(
+                f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
+                f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
+                f"{shlex.quote(done_marker_remote)}"
+            )
+            logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
+        except Exception:
+            pass
+        try:
+            disk_pct = pod.disk_cleanup(TEACHER_MODEL)
+            if disk_pct is not None:
+                log_event(f"Pod disk: {disk_pct}% used after cleanup", state_dir=str(state.state_dir))
+        except Exception as exc:
+            log_event(f"Pod disk cleanup failed: {str(exc)[:100]}", level="warn", state_dir=str(state.state_dir))
+        pod.clear_gpu()
+        try:
+            verify = pod.exec("pgrep -af pod_eval 2>/dev/null; ls /home/pod_eval.py 2>/dev/null; echo VERIFY_DONE", timeout=15)
+            vout = verify.get("stdout", "")
+            if "/home/pod_eval.py" in vout or ("pod_eval" in vout and "VERIFY_DONE" in vout and vout.strip() != "VERIFY_DONE"):
+                logger.warning("Stale competing eval detected after cleanup, killing again")
+                pod.exec("pkill -9 -f pod_eval 2>/dev/null; rm -f /home/pod_eval.py 2>/dev/null; sleep 2", timeout=20)
+        except Exception:
+            pass
     student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
     revision_list = ",".join(models_to_eval[uid].get("revision", "main") for uid in ordered_uids)
     king_flag = ""
@@ -304,16 +381,106 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     poll_thread = threading.Thread(target=poll_pod_progress, daemon=True)
     poll_thread.start()
     n_eval_models = len(models_to_eval)
-    eval_timeout = 2 * 60 * 60
+    eval_timeout = 5 * 60 * 60
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", ""), "TOKENIZERS_PARALLELISM": "false"}
+    # 2026-04-24 (distil-97, leeroyjkin): the heavy bench battery (Session 3
+    # shadow axes: aime/mbpp/tool_use/self_consistency/arc/truthful/long_context)
+    # adds ~6 min/student (~84 min/round for 14 students). Propagate the
+    # tunables from validator env so we can flip them via systemd override
+    # without redeploying code. See ``scripts/pod_eval_vllm.py`` for semantics.
+    for _propagate in (
+        "BENCH_BATTERY_ENABLED",
+        "BENCH_BATTERY_SHADOW_AXES",
+        "BENCH_BATTERY_LITE",
+        "POD_PER_MODEL_TIMEOUT",
+        "ARENA_V3_AXES_IN_COMPOSITE",
+        "REASONING_DENSITY_IN_COMPOSITE",
+        "CHAT_TURNS_AXIS_IN_COMPOSITE",
+        "PARETO_DOMINANCE_GATE",
+        "KING_REGRESSION_GATE",
+        # Bench sample counts.
+        "BENCH_MATH_PER_ROUND",
+        "BENCH_CODE_PER_ROUND",
+        "BENCH_REASONING_PER_ROUND",
+        "BENCH_KNOWLEDGE_PER_ROUND",
+        "BENCH_IFEVAL_PER_ROUND",
+        "BENCH_AIME_PER_ROUND",
+        "BENCH_MBPP_PER_ROUND",
+        "BENCH_TOOL_USE_PER_ROUND",
+        "BENCH_SELF_CONSISTENCY_PER_ROUND",
+        "BENCH_SELF_CONSISTENCY_SAMPLES",
+        "BENCH_ARC_PER_ROUND",
+        "BENCH_TRUTHFUL_PER_ROUND",
+        "BENCH_LC_PER_ROUND",
+        "BENCH_PROCEDURAL_PER_ROUND",
+        "BENCH_ROBUSTNESS_PER_ROUND",
+        "BENCH_ROBUSTNESS_PERTURB_K",
+        "BENCH_NOISE_PER_ROUND",
+        "BENCH_NOISE_PERTURB_K",
+        # Bench max-token budgets — added 2026-04-25 17:00 UTC after live
+        # round wall-time observation pegged the bench battery at ~11 min/
+        # student. The default 1024-token AIME budget alone burns ~120 s/
+        # student even when the model can't get a single problem right;
+        # tightening it (and other budgets) is the single biggest lever.
+        "BENCH_MATH_MAX_TOKENS",
+        "BENCH_CODE_MAX_TOKENS",
+        "BENCH_REASONING_MAX_TOKENS",
+        "BENCH_KNOWLEDGE_MAX_TOKENS",
+        "BENCH_IFEVAL_MAX_TOKENS",
+        "BENCH_AIME_MAX_TOKENS",
+        "BENCH_MBPP_MAX_TOKENS",
+        "BENCH_TOOL_USE_MAX_TOKENS",
+        "BENCH_SELF_CONSISTENCY_MAX_TOKENS",
+        "BENCH_ARC_MAX_TOKENS",
+        "BENCH_TRUTHFUL_MAX_TOKENS",
+        "BENCH_LC_MAX_TOKENS",
+        "BENCH_PROCEDURAL_MAX_TOKENS",
+        "BENCH_ROBUSTNESS_MAX_TOKENS",
+        "BENCH_NOISE_MAX_TOKENS",
+        # Probe knobs.
+        "JUDGE_PROBE_PER_ROUND",
+        "JUDGE_PROBE_MAX_TOKENS",
+        "CHAT_TURNS_PROBE_PER_ROUND",
+        "CHAT_TURNS_PROBE_MAX_TOKENS",
+        "CHAT_TURNS_PROBE",
+    ):
+        _v = os.environ.get(_propagate)
+        if _v is not None:
+            eval_env[_propagate] = _v
     try:
-        start_res = pod.exec(start_cmd, env=eval_env, timeout=120)
-        if not start_res.get("success"):
-            logger.error("Failed to start detached eval: %s", start_res)
-            return None
-        logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
+        if is_resuming:
+            logger.info(
+                "RESUME: skipping start_cmd; attaching to existing pod eval at %s "
+                "(pid_remote=%s)", run_dir, pid_remote,
+            )
+        else:
+            start_res = pod.exec(start_cmd, env=eval_env, timeout=120)
+            if not start_res.get("success"):
+                logger.error("Failed to start detached eval: %s", start_res)
+                return None
+            logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
+        # 2026-04-24 (distil-97): persist pod paths so `_detect_resumable_round`
+        # can reattach after a validator restart mid-eval. Previously the
+        # `current_round.json.pod_eval` block was never populated, so a
+        # restart during eval tossed the in-flight round and forced
+        # re-planning (discarding partial results, corrupting state).
+        try:
+            if isinstance(state.current_round, dict):
+                state.current_round["pod_eval"] = {
+                    "run_dir": run_dir,
+                    "pid_remote": pid_remote,
+                    "done_marker_remote": done_marker_remote,
+                    "log_remote": log_remote,
+                    "progress_remote": progress_remote,
+                    "results_remote": results_remote,
+                    "eval_data_remote": eval_data_remote,
+                    "started_at": now,
+                }
+                state.save_round()
+        except Exception as _save_exc:
+            logger.warning("Failed to persist pod_eval meta (non-fatal): %s", _save_exc)
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
         starting_streak = 0

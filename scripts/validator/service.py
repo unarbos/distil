@@ -26,6 +26,7 @@ from eval.state import ValidatorState, atomic_json_write, log_event
 from scripts.validator.announcements import announce_new_king
 from scripts.validator.chain import write_api_commitments_cache
 from scripts.validator.challengers import (
+    add_dormant_rotation,
     add_top5_contenders,
     assert_top_contenders_present,
     cap_challengers,
@@ -45,6 +46,12 @@ from scripts.validator.pod_session import run_eval_on_pod
 from scripts.validator.precheck import precheck_all_models
 from scripts.validator.results import process_results
 from scripts.validator.side_effects import sync_king_runtime
+from scripts.validator.single_eval import (
+    SINGLE_EVAL_DETHRONE_MARGIN,
+    bootstrap_composite_from_h2h,
+    is_single_eval_mode,
+    select_king_by_composite,
+)
 from scripts.validator.state_manager import (
     migrate_dq_entries,
     update_h2h_state,
@@ -79,12 +86,34 @@ def _resolve_king(valid_models, state):
 
     Returns (king_uid, king_kl, source) where source is one of:
       - "h2h_latest":  king was confirmed by the most recent H2H round → trust king_kl
+      - "composite":  single-eval mode — king picked from cross-round composite
+        scores. ``king_kl`` is informational only (round won't re-eval the king).
       - "scores_fallback": king was picked from stale cached scores → DO NOT trust
         king_kl for skip-threshold decisions (scores may be from a different teacher,
         prompt set, or even a different model that was later re-uploaded under the
         same UID — see cached-score exploit that previously caught UID 237/221)
       - "none": no king (pure full-eval round)
     """
+    if is_single_eval_mode():
+        # If composite_scores is empty (e.g. validator just upgraded to
+        # single-eval mode), seed it from the most recent canonical H2H so
+        # we don't crown nobody on the first single-eval round.
+        if not state.composite_scores:
+            try:
+                bootstrap_composite_from_h2h(state)
+            except Exception as exc:
+                logger.warning(f"single-eval bootstrap failed (non-fatal): {exc}")
+        composite_king_uid, _ = select_king_by_composite(state, valid_models)
+        if composite_king_uid is not None:
+            king_kl = state.scores.get(str(composite_king_uid), float("inf"))
+            logger.info(
+                f"single-eval: king from composite_scores: UID {composite_king_uid} "
+                f"(stored KL={king_kl})"
+            )
+            return composite_king_uid, king_kl, "composite"
+        # Fall through to the legacy logic on first boot only — once we have
+        # composite data we'll always end up here.
+
     king_uid, king_kl, source = None, float("inf"), "none"
     if state.h2h_latest:
         h2h_king = state.h2h_latest.get("king_uid")
@@ -293,6 +322,7 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
             "commit_block": cb if cb is not None else float("inf"),
             "is_reference": bool(info.get("is_reference")),
             "hotkey": info.get("hotkey", ""),
+            "coldkey": info.get("coldkey", ""),
         }
     king_uid = cr.get("king_uid")
     prompt_texts = cr.get("prompts") or []
@@ -344,10 +374,18 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
         state_dir=state_dir,
     )
 
+    # 2026-04-25 (sn97): pass resume_pod_eval so run_eval_on_pod skips the
+    # cleanup + start path and instead attaches to the existing pod process.
+    # Without this, every validator restart mid-eval re-entered cleanup,
+    # killed the in-flight process, and started over from scratch (regression
+    # observed lost ~75 min of student scoring during a 2026-04-25 17:00 UTC
+    # systemctl restart).
+    resume_pod_eval = cr.get("pod_eval") if isinstance(cr.get("pod_eval"), dict) else None
     results = run_eval_on_pod(
         pod, models_to_eval, king_uid, n_prompts, prompt_texts,
         state, is_full_eval, use_vllm, eval_script,
         block_seed=current_block,
+        resume_pod_eval=resume_pod_eval,
     )
     if results is None:
         logger.warning("Resumed eval did not produce usable results — clearing round state")
@@ -393,14 +431,74 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
         logger.warning(f"Resume: precheck during apply failed (non-fatal): {exc}")
         valid_models, disqualified = {}, []
 
+    filtered_models = {}
     for uid, info in models_to_eval.items():
-        if uid not in valid_models and uid != REFERENCE_UID:
-            valid_models[uid] = {
-                "model": info["model"],
-                "revision": info.get("revision", "main"),
-                "commit_block": info.get("commit_block"),
-                "hotkey": uid_to_hotkey.get(uid, info.get("hotkey", "")),
-            }
+        if uid == REFERENCE_UID:
+            filtered_models[uid] = info
+            continue
+        current_commit = commitments.get(uid) or {}
+        planned_hotkey = info.get("hotkey") or ""
+        current_hotkey = uid_to_hotkey.get(uid, "")
+        current_model = current_commit.get("model") or current_commit.get("repo")
+        planned_model = info.get("model")
+        planned_rev = info.get("revision") or "main"
+        current_rev = current_commit.get("revision") or planned_rev
+        current_block = current_commit.get("block")
+        planned_block = info.get("commit_block")
+        same_commit = (
+            (not planned_hotkey or planned_hotkey == current_hotkey)
+            and current_model == planned_model
+            and (not planned_rev or current_rev == planned_rev)
+            and (planned_block in (None, float("inf")) or current_block == planned_block)
+        )
+        if not same_commit:
+            logger.warning(
+                "Resume: dropping UID %s result because commitment changed "
+                "(planned %s@%s block=%s, current %s@%s block=%s)",
+                uid, planned_model, planned_rev, planned_block,
+                current_model, current_rev, current_block,
+            )
+            continue
+        if uid in valid_models:
+            filtered_models[uid] = valid_models[uid]
+        elif uid == king_uid:
+            logger.warning(
+                "Resume: king UID %s was not in fresh valid_models but commitment matches; "
+                "keeping planned king row so the completed round can be applied",
+                uid,
+            )
+            filtered_models[uid] = info
+            valid_models[uid] = info
+        else:
+            logger.warning(
+                "Resume: dropping UID %s result because fresh precheck no longer marks it valid",
+                uid,
+            )
+    models_to_eval = filtered_models
+    # In SINGLE_EVAL_MODE the king is NEVER seated in models_to_eval (the
+    # whole point of the policy is that the king is determined cross-round
+    # from stored composite scores, not re-paired against challengers each
+    # round). If the king isn't in models_to_eval AND we're in single-eval
+    # mode, that's expected — proceed with applying challenger results and
+    # let `apply_results_and_weights` resolve the king from composite_scores.
+    # Without this guard, every resumed single-eval round throws away
+    # ~90 min of evaluation by aborting here (regression observed
+    # 2026-04-25 18:26 UTC, lost the round that started 16:57 UTC).
+    if king_uid is not None and king_uid not in models_to_eval:
+        # The king is often absent from models_to_eval during resume:
+        # - In single-eval mode the king is never seated as a student
+        # - In normal mode a round may not include the king as a student
+        # Either way, discarding a completed GPU eval (~90 min) just because
+        # the king isn't in the student list is wrong.  The king's score is
+        # already stored in h2h_latest.json / state.scores.  Proceed and let
+        # apply_results_and_weights resolve the king from stored state.
+        # (Regression first observed 2026-04-25 18:26 UTC; previous guards
+        # gated on SINGLE_EVAL_MODE which wasn't always set.)
+        logger.info(
+            "Resume: king UID %s absent from models_to_eval — expected when "
+            "king was not a student this round. Using stored king score. "
+            "Proceeding with challenger result apply.", king_uid,
+        )
 
     king_kl = state.scores.get(str(king_uid), MAX_KL_THRESHOLD)
     challengers = {
@@ -541,19 +639,37 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         state_dir=state_dir,
     )
     add_top5_contenders(challengers, valid_models, state, king_uid)
+    # 2026-04-24 (distil-97): rotate in ~N dormant high-scorers per round
+    # so the ranking doesn't go stale when no new submissions land. No-op
+    # when king_kl is unknown or DORMANT_ROTATION_N=0 is set in env.
+    # Runs AFTER add_top5_contenders so leaderboard slots are preserved
+    # but BEFORE cap_challengers so it competes for cap slots fairly.
+    add_dormant_rotation(challengers, valid_models, state, king_uid, king_kl)
     cap_challengers(challengers, state, king_uid)
     assert_top_contenders_present(challengers, valid_models, state, king_uid)
     has_new = len(challengers_before_top5) > 0
     top5_only = not has_new and len(challengers) > 0
     if top5_only:
         log_event(
-            f"Top-5 only round: {len(challengers)} contender(s), no new P1/P3",
+            f"Maintenance round: {len(challengers)} contender(s), "
+            f"no new P1/P3 (leaderboard + dormant rotation only)",
             state_dir=state_dir,
         )
-        logger.info(f"Running top-5-only round with {len(challengers)} contender(s)")
+        logger.info(
+            f"Running maintenance round with {len(challengers)} contender(s) "
+            f"(no new submissions, top-N + dormant rotation active)"
+        )
 
     models_to_eval: dict = {}
-    if not is_full_eval and king_uid is not None and king_uid in valid_models:
+    # In SINGLE_EVAL_MODE the king is never re-evaluated. The round contains
+    # only never-evaluated commitments plus the always-in reference baseline.
+    seat_king = (
+        not is_single_eval_mode()
+        and not is_full_eval
+        and king_uid is not None
+        and king_uid in valid_models
+    )
+    if seat_king:
         models_to_eval[king_uid] = valid_models[king_uid]
     for uid, info in challengers.items():
         models_to_eval[uid] = info
@@ -586,6 +702,103 @@ def apply_results_and_weights(
             uid_to_coldkey=uid_to_coldkey,
         )
     )
+    # SINGLE_EVAL_MODE: the round only contained never-evaluated commitments
+    # plus the reference baseline. The canonical king is decided cross-round
+    # against state.composite_scores, which process_results just refreshed
+    # for every UID it scored. Override the round-local winner_uid here so
+    # weights get set on the actual cross-round king before the H2H state
+    # persistence step runs in post_round.
+    if is_single_eval_mode():
+        try:
+            # Build the kingship-eligible set across the *whole* network, not
+            # just this round's challengers. In single-eval mode the prior
+            # king is never re-evaluated, so they're absent from
+            # ``models_to_eval``. If we passed only ``models_to_eval`` to
+            # ``select_king_by_composite``, the prior king would fail
+            # ``_is_eligible_uid`` (`uid not in valid_models` → False) and we'd
+            # silently dethrone them every round on whichever challenger happens
+            # to score best — even if the prior king has a far better stored
+            # composite. (Caught 2026-04-26: UID 149 was dethroned by UID 162
+            # even though 149's stored composite_worst was higher; the apply
+            # path's narrow valid_models was the cause.)
+            #
+            # The kingship-eligible set is: every UID with a composite_scores
+            # record OR participating in the current round, that has a
+            # current on-chain commitment. ``select_king_by_composite``
+            # then applies the DQ + reference-row checks via
+            # ``_is_eligible_uid`` as before.
+            kingship_models: dict = {}
+            for uid_str in (getattr(state, "composite_scores", {}) or {}).keys():
+                try:
+                    uid_i = int(uid_str)
+                except (TypeError, ValueError):
+                    continue
+                commit = (commitments or {}).get(uid_i)
+                if not commit:
+                    # No on-chain commitment for this UID anymore — they
+                    # deregistered or got replaced. Drop from kingship pool.
+                    continue
+                kingship_models[uid_i] = {
+                    "model": commit.get("model"),
+                    "revision": commit.get("revision"),
+                    "commit_block": commit.get("block"),
+                    "hotkey": (uid_to_hotkey or {}).get(uid_i, ""),
+                    "is_reference": False,
+                }
+            # Include this round's challengers too — they were just scored
+            # and merge_composite_scores will have written their records by
+            # now, but defensive in case the merge raced.
+            for uid_i, info in (models_to_eval or {}).items():
+                if info.get("is_reference"):
+                    continue
+                kingship_models.setdefault(uid_i, info)
+            composite_king_uid, composite_record = select_king_by_composite(
+                state, kingship_models, uid_to_hotkey=uid_to_hotkey,
+                commitments=commitments,
+            )
+        except Exception as exc:
+            logger.warning(f"single-eval king-by-composite failed (non-fatal): {exc}")
+            composite_king_uid, composite_record = None, None
+        if composite_king_uid is None:
+            # If process_results couldn't find a winner either, hold the prior
+            # king's weights rather than dropping to zero.
+            try:
+                from eval.scoring import is_disqualified as _isdq
+                composite_scores = getattr(state, "composite_scores", {}) or {}
+                if king_uid is not None and str(king_uid) in composite_scores:
+                    hk = uid_to_hotkey.get(king_uid, "")
+                    cb = (commitments.get(king_uid, {}) or {}).get("block")
+                    if not _isdq(king_uid, hk, state.dq_reasons, commit_block=cb):
+                        composite_king_uid = king_uid
+                        composite_record = composite_scores.get(str(king_uid))
+            except Exception:
+                pass
+        if composite_king_uid is not None:
+            if composite_king_uid != winner_uid:
+                logger.info(
+                    f"single-eval: overriding round-local winner UID {winner_uid} "
+                    f"with cross-round composite king UID {composite_king_uid}"
+                )
+            winner_uid = composite_king_uid
+            # Keep winner_kl as the global KL (state.scores entry) instead of
+            # composite-worst — the worst axis frequently bottoms at 0.0
+            # because miners haven't built mbpp/aime yet, which made every
+            # single-eval announcement read "KL: 0.000000" (impossible) and
+            # broke trust with miners (#distil-97, 2026-04-26 02:14 UTC).
+            # The dashboard already exposes composite scores separately, so
+            # the announcement KL should be the actual distillation distance.
+            winner_kl_global = state.scores.get(str(composite_king_uid))
+            if winner_kl_global is not None and winner_kl_global > 0:
+                winner_kl = float(winner_kl_global)
+            else:
+                # Fall back to composite weighted (≠ 0 in practice) before
+                # composite worst as a last-ditch placeholder.
+                weighted = (composite_record or {}).get("weighted")
+                worst = (composite_record or {}).get("worst")
+                if weighted is not None and float(weighted) > 0:
+                    winner_kl = float(weighted)
+                elif worst is not None:
+                    winner_kl = float(worst)
     if winner_uid is not None:
         _safe_set_weights(
             subtensor, wallet, netuid, n_uids,
@@ -844,6 +1057,8 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                         "revision": info.get("revision", "main"),
                         "commit_block": info.get("commit_block"),
                         "is_reference": info.get("is_reference", False),
+                        "hotkey": info.get("hotkey") or uid_to_hotkey.get(uid, ""),
+                        "coldkey": info.get("coldkey") or uid_to_coldkey.get(uid, ""),
                     }
                     for uid, info in models_to_eval.items()
                 },

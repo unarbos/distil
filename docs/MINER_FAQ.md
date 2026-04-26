@@ -36,55 +36,169 @@ Submit your HuggingFace model repo via the commitment mechanism on-chain.
 
 ---
 
-## How Evaluation Works
+## How Evaluation Works (Arena v3, live as of 2026-04-24)
 
-1. **300 prompts per round** sampled from the [ClimbMix-400B](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle) dataset, seeded by the current block
-2. Both teacher and student generate completions (greedy, temp=0, max 8,192 new tokens)
-3. KL divergence is computed between teacher and student output distributions
-4. **King-of-the-hill:** The current best model (king) is re-evaluated alongside challengers every round
-5. **Dethronement:** A challenger must beat the king with statistical significance (paired t-test, p < 0.03) to take the crown
-6. **Top 5 contenders** (by KL score) are always included in every eval round
-7. **Winner takes all** — the king receives 100% of emissions
-8. A reference baseline (undistilled Qwen3.5-4B) is evaluated every round as UID -1 for comparison
+Every round the validator pulls the set of new on-chain commitments and evaluates each one on a single GPU pod. The eval policy is **one registration → one commitment → one eval**: your commitment is scored exactly once, the absolute composite is stored, and the king is decided cross-round from those stored scores. There are no re-evals, no king re-runs, no top-N rotations, and no dormant-rotation refreshes. Each student is scored on many **independent axes**; the leaderboard is ordered by the **worst** of those axes, so gaming any single one will pull your overall rank down. The design goal is simple: **if you overfit our eval, you will accidentally produce a SOTA small model**. Every axis points at a real, held-out capability.
+
+**The round itself:**
+
+1. **300 prompts** per round sampled from [ClimbMix-400B](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle), seeded by the current block. The teacher generates continuations through vLLM (`temperature=0.7, top_p=0.9`, per-prompt seed = `block_seed + prompt_idx`; deterministic per round, rotating across rounds). Teacher logprobs are stored as sparse top-k logprobs when vLLM provides them, with HF teacher forward as fallback.
+2. **KL divergence** is computed on those teacher continuations by running each student through an HF forward pass and comparing the student's distribution against the teacher's stored logits/logprobs.
+3. **One eval per commitment.** Your model is scored exactly once after you commit. The validator stores `composite.worst`, every axis, and the commit signature in `composite_scores.json`. The eval is not repeated unless you submit a new commitment (different model / revision / block) on the same hotkey.
+4. **Cross-round king.** The king is the UID with the highest stored `composite.worst` across all non-DQ scored UIDs. A new commitment can dethrone the king by clearing `worst > king.worst × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin) on its single eval. There is no paired-t-test re-run because the king is not re-evaluated.
+5. **Reference baseline.** Undistilled `Qwen/Qwen3.5-4B` is included in every round as UID `-1` for axis-floor anchoring and dashboard visibility — it is not a contender.
+6. **Winner takes all** — the king gets 100% of emissions.
+
+**Implication for miners.** Pick your weights carefully before you commit. The on-chain registration burn is the price of an evaluation: there is no "re-roll the same commitment until variance lands well." A model that scores 0.42 worst-axis stays at 0.42 forever (until you push a new commitment to the same hotkey, which fully overwrites the previous record).
+
+### The axes (ranking key = `composite.worst` = min of every axis below)
+
+All axes are in `[0, 1]`, higher-is-better. Missing axes (e.g. probe outage) are dropped and the weighted mean renormalizes over surviving axes. Each axis drops if the teacher itself fails a sanity floor (so a miscalibrated probe can't corrupt rankings).
+
+**Teacher-similarity axes** (normalized against the king/teacher, weight 0.60 total):
+
+| Axis              | What it measures                                                                                          |
+|-------------------|------------------------------------------------------------------------------------------------------------|
+| `kl`              | Teacher-forced KL divergence on teacher continuations. Anchored to the best (lowest) KL seen this round.   |
+| `on_policy_rkl`   | Reverse KL under **your** sampling. Catches "matches teacher logits but collapses under free generation".   |
+| `capability`      | Verifiable prompts (arithmetic/yes-no/one-word factual). `min(frac/teacher_frac, frac/0.6)` — absolute floor prevents winning by echoing teacher mistakes. |
+| `length`          | Student generation length vs a teacher anchor. Rambling models lose here. 1.0 when you match the teacher.  |
+| `degeneracy`      | Termination fraction + MAD-z-scored repetition + cross-rollout Self-BLEU. 1.0 = teacher-like.             |
+| `judge_probe`     | Teacher (Qwen3.5-35B) rates your response on a 1-5 rubric, rotated to 16 prompts/round. Normalized to [0,1]. |
+
+**Absolute-correctness axes** (scored vs ground truth, weight 0.45 total):
+
+| Axis                | Dataset + probe behavior                                                                                     |
+|---------------------|--------------------------------------------------------------------------------------------------------------|
+| `math_bench`        | GSM8K + MATH-500 (~1820 items), 4/round. Boxed-integer extraction + numeric equality (±1e-3).               |
+| `code_bench`        | HumanEval (164 items), 2/round. Function synthesized from prompt + test list, run in a subprocess sandbox.   |
+| `reasoning_bench`   | BBH (21 objective subtasks, ~5250 items), 4/round. Multiple-choice or exact-match per subtask.              |
+| `knowledge_bench`   | MMLU-Pro (12032 items), 4/round. Letter extraction.                                                          |
+| `ifeval_bench`      | IFEval filtered to ~240 train items, 4/round. Runs Google's instruction-following verifier battery.          |
+
+**Arena v3 Session 3 — LIVE as of 2026-04-25 (weight ~0.35 total):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `aime_bench`                 | AIME25 + AIME2024 (~90 olympiad items), 4/round. Boxed-integer extraction.                              |
+| `mbpp_bench`                 | MBPP+ (378 items), 2/round. Sandboxed test-list execution.                                              |
+| `tool_use_bench`             | Math items with an injected Python REPL. Model emits `<python>…</python>`, stdout spliced back into a 2nd generation pass, final boxed answer scored. Rewards agentic capability. |
+| `self_consistency_bench`     | Hard math, K=5 samples at T=0.7 each, majority vote on the boxed answer. Rewards underlying knowledge vs one-shot luck. |
+
+**Arena v3 Session 3.1 — LIVE, added 2026-04-25:**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `arc_bench`                  | AI2 ARC-Challenge (~1172 grade-school science items), 8/round. Letter-choice MC, completely disjoint from MMLU-Pro/BBH. |
+
+**Arena v3 Session 3.2 — LIVE, added 2026-04-25 (addresses "models over-think simple questions"):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `reasoning_density`          | `pass_frac × length_bonus` averaged across benches, where `length_bonus = 1.0` if `mean_gen_tokens_correct ≤ target` (e.g. knowledge ≤30 tok, math ≤400 tok) and decays with `1/(1+ratio−1)` above target. Penalizes both over-thinking trivia AND verbose-but-wrong answers. Cannot be gamed by short-wrong: pass_frac=0 → axis=0. |
+
+**Arena v3 Session 3.3 — LIVE, added 2026-04-25 (multi-turn coherence):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `chat_turns_probe`           | 6 hand-authored 3-turn dialogues/round. Student generates 3 assistant turns with accumulated context; teacher grades the full transcript on a 1-5 rubric (coherence + consistency + helpfulness). Directly probes deployment-quality multi-turn dialogue — a capability pure climbmix-KL distillation does NOT reward. |
+
+**Arena v3 Session 3.4 — LIVE, added 2026-04-25 (adversarial factuality):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `truthful_bench`             | TruthfulQA mc1 (~817 items), 6/round. Adversarial factual questions where the popularly-believed-but-wrong answer is included as a tempting distractor. Tests hallucination resistance. Correct letter is deterministically shuffled per item so a model can't win by always answering "A". |
+
+**Arena v3 Session 3.5 — LIVE, added 2026-04-25 (long-context retrieval):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `long_context_bench`         | Procedural needle-in-haystack over ~1400 tokens (tunable), 4/round. Items are *generated fresh every round from `block_seed`* — there is no dataset to memorize. Each item inserts a single needle sentence (e.g. "The lost vault combination is 4ESGKG3.") into a document of 40 distractor sentences and asks the student to recall the needle. Tests whether the model actually reads its input window instead of leaning on priors. |
+
+**Arena v3 Session 3.6 — LIVE, added 2026-04-25 (procedural private-style eval):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `procedural_bench`           | Block-seeded synthetic arithmetic, instruction-following string transforms, invented-fact retrieval, tabular aggregation, and constraint filtering, 6/round. Template order is block-shuffled and there is no static dataset; grading is strict exact-answer, so overfitting means learning the transformations and concise output discipline. |
+
+**Arena v3 Session 3.7 — LIVE, added 2026-04-25 (paraphrase + noise robustness):**
+
+| Axis                         | What it tests                                                                                           |
+|------------------------------|---------------------------------------------------------------------------------------------------------|
+| `robustness_bench`           | Same items as `math_bench` (drawn under an independent stream offset, so usually different items in the same round) but each is asked under K block-rotated paraphrase wrappers. The wrapper set rotates per `block_seed`, so a model that memorizes the canonical wording of public math items passes `math_bench` and fails this one. Pure string transforms — no extra LLM call — so it's cheap and deterministic. |
+| `noise_resistance_bench`     | Sibling axis to `robustness_bench`. Same math pool, yet another independent stream offset (so its sampled items are usually disjoint from both `math_bench` and `robustness_bench` in the same round), but the wrappers are *adversarial input noise* — keyboard typos at low rate, case jitter, distractor chatter, common misspellings (`the→teh`), extra whitespace, dropped sentence-period — instead of semantic paraphrase. Wrappers never touch digits or operators, so the math is preserved. Catches models that break under realistic chat noise — a brittle model that aces clean public benchmarks but loses 30% under typos has bad UX and won't generalize. |
+
+All bench pools rotate per-round via `block_seed`, so every validator picks the same items but items differ between rounds (anti-memorization).
+
+### Dethrone gates (all must pass)
+
+Single-eval mode replaces the round-local paired-t-test with a cross-round absolute-composite comparison. The composite-floor and Pareto gates remain in place as anti-gaming defenses.
+
+1. **Composite-worst margin.** Your single eval's `composite.worst` must exceed the king's stored `composite.worst` by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). 0.50 → 0.515 is not enough; 0.50 → 0.52 is.
+2. **Worst-axis floor.** If `composite.worst < COMPOSITE_DETHRONE_FLOOR = 0.20`, the dethrone is **vetoed** even if the margin passes. The axis that triggered the veto is logged and surfaced in telemetry.
+3. **Pareto-dominance gate.** A challenger that wins on `composite.worst` but loses to the king on a majority of comparable axes is blocked. Pareto semantics are *soft*: majority win AND `n_wins ≥ n_losses`, with a 2% noise margin. Insufficient comparable axes fails open.
+
+When `SINGLE_EVAL_MODE` is OFF (development / fallback), the legacy KL paired t-test (p < 0.03 + 3% epsilon vs the sitting king) is used instead of #1 above. The other gates are identical.
 
 ---
 
-## Upcoming Mechanism Change — Multi-Axis Composite Score
+## What to train for — axis-by-axis playbook
 
-**What is changing.** KL divergence alone is insufficient: it can be over-optimized until the model produces gibberish under autoregressive sampling while still matching teacher logit shape on teacher-generated continuations. This has been demonstrated both in the literature (Tiapkin et al., 2025, "Teacher Hacking in Knowledge Distillation") and empirically on SN97.
+The fastest way to climb Arena v3 is to broaden your distillation data mix so the model covers every axis, not just KL. Each axis below lists what it rewards and what to add to your training.
 
-Starting in the validator commit cycle following the 14-day grace period, the validator will rank models by a **multi-axis composite score** rather than KL alone. The composite aggregates four independent axes using a **worst-case rule** — you win only if you're competitive on *every* axis.
+| Axis                         | What helps                                                                                            |
+|------------------------------|--------------------------------------------------------------------------------------------------------|
+| `kl`, `on_policy_rkl`        | Reverse-KL under student sampling, not forward-KL on teacher rollouts. Thinking Machines "On-Policy Distillation" (Nov 2025); GKD (Agarwal et al. 2024); MiniLLM (Gu et al. 2023). |
+| `capability`                 | SFT mix with verifiable arithmetic + factual + yes/no prompts alongside distillation.                 |
+| `length`                     | Don't emit long `<think>` chains on trivial prompts. Teacher truncation behavior is your target.      |
+| `degeneracy`                 | Long-context training with teacher-forced repetition penalties. Avoid small-LR dropout training.      |
+| `judge_probe`                | Instruction-following + helpfulness data (OpenAssistant, UltraFeedback, LMSYS). Short correct > long verbose. |
+| `math_bench`, `aime_bench`   | GSM8K + MATH + AIME + Maxwell-Jia in your mix. For AIME, chain-of-thought traces from Qwen2-Math or DeepSeek-R1. |
+| `code_bench`, `mbpp_bench`   | HumanEval + MBPP + CodeAlpaca. Train on function-level synthesis not repo-level refactors.            |
+| `reasoning_bench`            | BBH training split + FLAN + CoT datasets.                                                              |
+| `knowledge_bench`            | MMLU train + TriviaQA + Wikipedia QA. MC-letter outputs specifically.                                 |
+| `ifeval_bench`               | Alpaca-Instruct + SuperNaturalInstructions + IFEval train. Teach explicit-format obedience.           |
+| `tool_use_bench`             | Function-calling / tool-use datasets (Gorilla, ToolBench, APIBench). Teach the model to emit code when compute is useful and parse stdout. |
+| `self_consistency_bench`     | Robust CoT + majority-vote SFT. Temperature-robustness matters — if your model is 80% at T=0 but 30% at T=0.7, this axis will drop you. |
+| `arc_bench`                  | Science MC (grade-school to middle-school). AI2 ARC-Challenge train + Easy splits make strong pretraining data; anything teaching MC letter outputs (A/B/C/D) generalizes. |
+| `reasoning_density`          | Train your model to emit short correct answers on trivia and medium-length on reasoning. Use the teacher's own output length as the target (the `RD_*_TARGET` values). Long-CoT on `knowledge_bench` or `arc_bench` is strictly worse than short-CoT. |
+| `chat_turns_probe`           | Multi-turn SFT (OpenAssistant Conversations, ShareGPT, UltraChat, LMSYS-chat-1M). Teach the model to reference its own earlier turns when asked ("based on your last answer…"). A model that resets context every turn will score ~2/5. |
+| `truthful_bench`             | Hallucination-resistance data: TriviaQA-factual (short, gold-referenced answers), RefuseElseFalse, HaluEval-sft, the TruthfulQA train split (CC-BY). Teach the model to prefer precise short factual answers over confident-sounding prose. Avoid training data with speculative "facts" that aren't in the teacher's cutoff. |
+| `long_context_bench`         | General-purpose long-context retrieval data: RULER, NeedleBench, long-context SFT derived from books/Wikipedia (e.g. QuALITY, NarrativeQA), or anything in the 2k–16k-token range that forces the model to answer from document content rather than priors. Aggressive 4-bit quantization and LoRA-only training break long-context attention — if you're shipping either, verify this axis before dethrone attempts. |
+| `procedural_bench`           | Exact-answer synthetic tasks: arithmetic from records, deterministic string transforms, retrieval from invented registries, table aggregation, and multi-condition filtering. Train short deterministic outputs, not essays; verbose answers that merely contain the right value can fail this axis. |
+| `robustness_bench`           | Generalization under prompt paraphrase. The defense is: train on math problems with diverse wordings (mix gsm8k / math500 / Maxwell-Jia / KhanAcademy with paraphrase augmentation, or just shuffle prefixes/postfixes during SFT). A model that only sees one wording per problem will fail when the wrapper changes. If `robustness_bench` lags `math_bench` by 0.20+ on your dashboard, you're memorizing canonical wordings, not solving. |
+| `noise_resistance_bench`     | Generalization under surface noise (typos, case jitter, distractors, misspellings). The defense is: include noisy / chat-style training data, or apply augmentation at SFT time (random typos at 1-2%, random case flips at 3-5%, occasional distractor sentences before/after the problem). A model that gets near-perfect on `math_bench` but drops sharply on `noise_resistance_bench` is overfit to clean text — it'll be brittle in real chat. If both `robustness_bench` and `noise_resistance_bench` lag `math_bench`, you have a *general* canonical-wording problem; if only `noise_resistance_bench` lags, your training mix lacks chat-style messy text. |
 
-**The four axes.**
+**Two anti-patterns to avoid:**
 
-1. **KL axis** (still present). Teacher-forced KL divergence on teacher continuations, as today. Normalized against the current king: a student matching king KL scores 1.0 on this axis.
-2. **Capability axis.** A small battery of verifiable prompts (arithmetic, yes/no, one-word factual) scored by exact-match extraction. The teacher is evaluated on the same prompts each round, and your score is normalized against teacher pass rate.
-3. **Length axis.** Your mean generation length on a held-out probe versus the teacher's mean generation length. Rambling or looping students are penalized; hard-stopping students are rewarded up to a cap.
-4. **Degeneracy axis.** The existing thinking-collapse probe (termination fraction, MAD-z-scored repetition versus the teacher, cross-rollout Self-BLEU).
+- **Pure KL overfitting.** Matching teacher logits perfectly but failing on grade-school math means your composite worst is low. You cannot take the crown.
+- **Long rambling.** `length` + `judge_probe` + `degeneracy` all penalize verbose thinking. Teacher-style brevity wins.
 
-**Aggregation: worst-axis rule.** The composite is `min(axis_1, axis_2, axis_3, axis_4)`. Gaming any one axis at the expense of others brings your composite down. This is the Coste 2024 / Pan et al. 2025 min-form credit assignment rule.
-
-**Secondary: weighted mean.** We also log a weighted mean of the axes (KL and capability each 0.35, length and degeneracy each 0.15) as a softer aggregation used for display. The ranking key will be worst-axis.
-
-**Shadow mode (now).** Until the switchover, the composite is logged alongside KL in the H2H output and API. KL still decides the king. Watch your composite score — if it's low, you'll lose once the switch happens.
-
-**Why this is good for miners.** The on-chain commitment is permanent — it's in your interest that the thing the subnet rewards is actually correlated with model quality, because otherwise SN97 becomes a curiosity rather than a serious distillation program and alpha trends to zero. Under the new mechanism, a student that makes steady progress on real model quality *wins automatically*, whereas today it loses to a model that produces garbage but happens to match teacher logit shape.
-
-**What to train for.**
-
-- Reverse-KL under the student's own sampling (not forward-KL on teacher rollouts). See Thinking Machines, "On-Policy Distillation" (Nov 2025); GKD (Agarwal et al., 2024); MiniLLM (Gu et al., 2023).
-- Supervised fine-tuning on a capability mix (GSM8K, IFEval, basic QA) interleaved with the distillation objective.
-- Early termination behavior — don't emit `<think>` loops on trivial prompts.
+**Watch your dashboard columns:** `Judge / Bench / V3 / Pareto / Worst / vs King`. These are live. If your `V3` worst is low, that axis can block a KL win.
 
 ---
 
 ## Training Tips
 
-- **Base model:** Start from [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) or a compatible Qwen3.5 architecture
-- **Objective:** Standard knowledge distillation — minimize KL(teacher ‖ student) on the teacher's output distribution
-- **Long completions matter:** Eval uses `max_new_tokens=8192`, so your model needs to handle long generations well
-- **Temperature:** Eval runs vLLM with `temperature=0.7, top_p=0.9` and a per-prompt seed derived from the round's block hash (`seed = block_seed + prompt_idx`). Generation is deterministic per round but varies between rounds. Greedy (temp=0) only applies to local dev runs that don't pass `--block-seed`.
-- **Don't modify the chat template:** It's checked against the reference Qwen3.5 template hash. Injected comments or modifications = DQ
+- **Base model:** Start from [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) or a compatible Qwen3.5 architecture.
+- **Objective:** KL(teacher ‖ student) is the floor, not the ceiling. A pure-KL model loses to a slightly-worse-KL model that also answers GSM8K correctly.
+- **Data mix:** at minimum combine ClimbMix-style distillation data with ~10–20% instruction/reasoning/code data (see the playbook above). Miners who run SFT + DPO on top of their distillation have been climbing the bench axes fastest.
+- **Long completions matter:** eval uses `max_new_tokens=8192`. The model needs to terminate naturally on simple prompts and reason coherently on long ones.
+- **Temperature:** vLLM runs at `temperature=0.7, top_p=0.9` with per-prompt seed `block_seed + prompt_idx`. Deterministic per round, rotating between rounds. Greedy (temp=0) only applies to local dev runs without `--block-seed`.
+- **Don't modify the chat template:** it's checked against the reference Qwen3.5 template hash. Injected comments or modifications = DQ.
+- **Bench probes run offline.** All datasets are pre-cached on the pod (`HF_HUB_OFFLINE=1`). No network-dependency required in your model.
+
+---
+
+## One-eval policy (single-eval mode)
+
+This subnet enforces **one registration → one commitment → one eval**. The implications are practical:
+
+- **Your commit is your shot.** Don't commit a half-trained checkpoint expecting to climb later — the validator will not re-evaluate the same `(model, revision)` pair on the same hotkey.
+- **A new commitment overwrites your record.** If you push a new HuggingFace revision (or a different repo) and re-commit on-chain, the validator detects the change, evicts your previous composite record, and schedules a fresh single eval. The dethrone-floor and Pareto gates still apply to the new score.
+- **No more "rotation luck."** Earlier sessions cycled top-N + dormant UIDs through periodic re-evals. Single-eval mode kills that loop entirely; rounds only contain commitments without a stored composite. If you've been scored once, you stay at that score until you re-commit.
+- **Round cadence.** Rounds are short (target < 60 min) because the active set is just "everyone who hasn't been scored on their current commitment yet". A round with no new commitments is a no-op (king retains crown, weights unchanged).
+- **King floor telemetry.** If the sitting king's stored composite drops below the configured floor or below the reference Qwen baseline, the dashboard surfaces a warning so the network can react publicly. The king is not auto-demoted on this signal — only a successful single eval that clears the dethrone gates can change the crown.
 
 ---
 
@@ -140,11 +254,18 @@ All endpoints are on `api.arbos.life`.
 | Required architecture | `Qwen3_5ForConditionalGeneration` |
 | Required model_type | `qwen3_5` |
 | Vocab size | 248,320 |
-| Eval prompts (head-to-head) | 300 |
+| Eval prompts per UID | 300 (block-seeded, single-eval policy) |
 | Eval prompts (broad sweep) | 60 |
 | Max new tokens | 8,192 |
 | Max prompt tokens | 1,024 |
-| Dethronement threshold | paired t-test, p < 0.03 |
-| Top-N always included | 5 |
-| Dataset | `karpathy/climbmix-400b-shuffle` |
+| Eval policy | `SINGLE_EVAL_MODE=1` — one commitment, one eval |
+| Challengers per round (cap) | `SINGLE_EVAL_MAX_PER_ROUND=10` (FIFO by `commit_block`) |
+| Dethronement gate | `challenger.composite.worst > incumbent.composite.worst × 1.03` (cross-round, on absolute composite) |
+| Saturated-floor tiebreaker | when both `worst ≤ 0.005`, same 3% margin on `composite.weighted` |
+| King selection schema floor | `_KING_SELECTION_MIN_AXES = 17` (Arena v3.7) |
+| Composite version | Arena v3.7 |
+| Live axes | kl, on_policy_rkl, capability, length, degeneracy, judge_probe, math_bench, code_bench, reasoning_bench, knowledge_bench, ifeval_bench, aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench, arc_bench, truthful_bench, long_context_bench, procedural_bench, robustness_bench, noise_resistance_bench, reasoning_density, chat_turns_probe, pareto_dominance |
+| Shadow axes | none |
+| Top-N always included | n/a in single-eval mode (no re-eval rotation) |
+| Dataset (distillation) | `karpathy/climbmix-400b-shuffle` |
 | Reference baseline | `Qwen/Qwen3.5-4B` (UID -1) |

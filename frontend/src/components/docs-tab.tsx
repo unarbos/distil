@@ -18,8 +18,8 @@ export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
           <div>
             <p className="text-sm font-semibold text-orange-400">Score to Beat</p>
             <p className="text-xs text-muted-foreground">
-              KL divergence <strong className="text-foreground">&gt;1% lower</strong> than
-              the king to claim emissions. Models with KL &gt; 2.0 are disqualified.
+              Beat the king on paired KL and pass the live composite/Pareto gates.
+              Models with KL &gt; 2.0 are disqualified.
             </p>
           </div>
           <div className="text-right">
@@ -27,7 +27,7 @@ export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
               &lt;{scoreToBeat != null ? scoreToBeat.toFixed(4) : "—"}
             </p>
             <p className="text-[10px] text-muted-foreground">
-              {kingKl != null ? `king: ${kingKl.toFixed(4)} − 1%` : "target KL"}
+              {kingKl != null ? `king KL: ${kingKl.toFixed(4)} · gates apply` : "target KL + gates"}
             </p>
           </div>
         </CardContent>
@@ -42,8 +42,9 @@ export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
               {TEACHER.model}
             </a>{" "}
             ({formatParams(TEACHER.totalParams)} total, {formatParams(TEACHER.activeParams)} active MoE)
-            into a smaller model. The miner whose model most closely matches the
-            teacher&apos;s output distribution wins 100% of emissions.
+            into a smaller model. The winning model must match the teacher where
+            KL matters while also passing absolute-correctness, reasoning,
+            factuality, tool-use, long-context, and multi-turn gates.
           </p>
         </section>
 
@@ -56,7 +57,7 @@ export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
             Your model computes a full-vocab softmax over all {TEACHER.vocabSize.toLocaleString()} tokens,
             gathers + renormalizes over the teacher&apos;s top-128 support, and is compared using{" "}
             <strong className="text-foreground">sparse top-128 KL divergence</strong>.
-            Lower KL = better. (Full-vocab dense path exists for reference; disabled in prod — ~150 GB/round at vocab size.)
+            Lower KL is necessary but no longer sufficient. (Full-vocab dense path exists for reference; disabled in prod — ~150 GB/round at vocab size.)
           </p>
           <p>
             Each eval uses 60 prompts from{" "}
@@ -66,25 +67,27 @@ export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
             . Prompts are seeded by on-chain block hash — unpredictable before finalization.
           </p>
           <p>
-            <strong className="text-foreground">Winner-take-all:</strong> Lowest KL gets weight 1.0, everyone else gets 0.
+            <strong className="text-foreground">Winner-take-all:</strong> the king gets weight 1.0. A challenger can take the crown only by beating the king on the absolute composite-worst score across 20 axes by a meaningful margin (and passing axis floor + Pareto dominance gates).
           </p>
           <p className="text-xs italic text-muted-foreground/60">
-            KL scores from different rounds use different prompts and aren&apos;t directly comparable.
-            King is determined by head-to-head on identical prompts.
+            Single-eval mode (Session 3.7, live 2026-04-25): one registration → one commitment → one eval.
+            Each commitment is scored once on its own block-seeded prompts, the absolute composite is stored, and the king is selected cross-round from the highest worst-axis. Different prompts per round are by design — composite is an absolute (not paired-relative) signal.
           </p>
         </section>
 
         <section className="space-y-2">
           <h2 className="text-base font-semibold text-foreground">King-of-the-Hill</h2>
           <p>
-            The current best model (&quot;king&quot;) holds the crown until a challenger beats it by &gt;1%.
+            The current best model (&quot;king&quot;) holds the crown until a new commitment ships a higher composite-worst score across 20 axes (math, code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, arc, truthful, long-context, procedural, robustness, noise-resistance, judge, chat-turns, length, degeneracy, KL).
           </p>
           <ul className="list-disc pl-5 space-y-1">
             <li><strong className="text-foreground">Pre-checks first</strong> — architecture, hash, integrity verified before any GPU time</li>
-            <li><strong className="text-foreground">Only new challengers evaluated</strong> — already-scored models keep their scores</li>
-            <li><strong className="text-foreground">60 prompts, 95% CI</strong> — tight confidence intervals</li>
-            <li><strong className="text-foreground">Same prompts, fair comparison</strong> — king and challenger scored on identical continuations</li>
-            <li><strong className="text-foreground">Early stopping</strong> — clearly worse models stopped early to save GPU time</li>
+            <li><strong className="text-foreground">One eval per commitment</strong> — already-scored UIDs keep their scores; only new on-chain commitments trigger a new eval. No re-evals.</li>
+            <li><strong className="text-foreground">FIFO challenger cap</strong> — at most 10 new challengers per round, oldest commit_block first; the rest defer to the next round (typical round runs ~45 min wall).</li>
+            <li><strong className="text-foreground">Composite-worst margin</strong> — challenger.worst &gt; king.worst + 0.03 to dethrone</li>
+            <li><strong className="text-foreground">Pareto dominance gate</strong> — challenger must win or tie on a meaningful majority of axes; narrow wins on one axis with regressions across many others don&apos;t crown</li>
+            <li><strong className="text-foreground">Axis floor</strong> — collapse below the floor on any required axis (degeneracy, capability, etc.) blocks dethrone</li>
+            <li><strong className="text-foreground">Early stopping</strong> — clearly worse students cut short to save GPU time</li>
           </ul>
         </section>
 
@@ -127,6 +130,7 @@ python miner.py --wallet-name mywallet --hotkey-name myhotkey \\
           <ul className="list-disc pl-5 space-y-1">
             <li><strong className="text-foreground">Copy detection</strong> — SHA256 hash tracking; first committer owns the weights</li>
             <li><strong className="text-foreground">Block-hash seeded prompts</strong> — unpredictable before finalization</li>
+            <li><strong className="text-foreground">Procedural live axes</strong> — long-context and synthetic reasoning/instruction/factual tasks are generated from the block seed, so miners can only overfit by learning the skills</li>
             <li><strong className="text-foreground">Sparse top-128 KL</strong> — teacher returns top-128 logprobs per position via vLLM (<code className="font-mono text-muted-foreground">--max-logprobs 128</code>); student computes full-vocab softmax over all {TEACHER.vocabSize.toLocaleString()} tokens then gathers + renormalizes over the teacher&apos;s top-128 support. Proper KL over the shared 128-token support. Full-vocab path (dense teacher logits) is available in-code for reference but disabled in prod for bandwidth reasons.</li>
             <li><strong className="text-foreground">Integrity checks</strong> — models must stay public and unchanged</li>
           </ul>
