@@ -747,14 +747,12 @@ class ResolveDethroneTests(unittest.TestCase):
             single_eval.resolve_dethrone(7, inc, 8, {"worst": 0.0, "weighted": 0.78}, margin=0.03)
         )
 
-    def test_saturated_floor_only_kicks_in_when_both_at_floor(self):
-        """If incumbent has a non-saturated worst (>0.005), the legacy worst
-        threshold is the only gate — weighted differences must not allow a
-        challenger with lower worst to dethrone via the back door."""
+    def test_worst_regression_blocks_weighted_tiebreaker(self):
+        """If challenger's worst regressed past the margin compared to the
+        incumbent's, the weighted tiebreaker MUST NOT save them — the
+        no-axis-can-be-broken guarantee is what worst exists to enforce."""
         inc = {"worst": 0.30, "weighted": 0.50}
         ch = {"worst": 0.0, "weighted": 0.99}
-        # Challenger weighted is much higher, but their worst-axis collapse
-        # below the floor still blocks dethrone (axis-floor invariant).
         self.assertFalse(
             single_eval.resolve_dethrone(7, inc, 8, ch, margin=0.03)
         )
@@ -765,6 +763,35 @@ class ResolveDethroneTests(unittest.TestCase):
         inc = {"worst": 0.0}  # no weighted
         ch = {"worst": 0.0, "weighted": 0.78}
         self.assertFalse(
+            single_eval.resolve_dethrone(7, inc, 8, ch, margin=0.03)
+        )
+
+    def test_tied_non_saturated_worst_uses_weighted_tiebreaker(self):
+        """2026-04-26 fix (Round 9 reproduction): when both UIDs sit at the
+        same low-resolution-quantum worst (e.g. both 0.333 because n=3 on
+        the worst axis), the weighted score must decide — otherwise a
+        4%-better challenger gets silently rejected and the incumbent
+        keeps the crown by default (the original Round 9 bug: UID 93
+        weighted=0.6833 lost to UID 89 weighted=0.6567 on a worst tie)."""
+        inc = {"worst": 0.333, "weighted": 0.6567}
+        # Above weighted-margin (3% of 0.6567 = 0.0197 → threshold 0.6764).
+        ch_above = {"worst": 0.333, "weighted": 0.6833}
+        self.assertTrue(
+            single_eval.resolve_dethrone(7, inc, 8, ch_above, margin=0.03)
+        )
+        # Below weighted-margin → still rejected.
+        ch_below = {"worst": 0.333, "weighted": 0.6700}
+        self.assertFalse(
+            single_eval.resolve_dethrone(7, inc, 8, ch_below, margin=0.03)
+        )
+
+    def test_tied_worst_within_margin_uses_weighted(self):
+        """Worst values within ±margin still defer to weighted, even when
+        not exactly equal — the tied-region handling must be symmetric."""
+        inc = {"worst": 0.50, "weighted": 0.60}
+        # Within ±3% of 0.50: 0.485..0.515. Both sides land here.
+        ch = {"worst": 0.49, "weighted": 0.70}  # weighted clears 0.60*1.03=0.618.
+        self.assertTrue(
             single_eval.resolve_dethrone(7, inc, 8, ch, margin=0.03)
         )
 

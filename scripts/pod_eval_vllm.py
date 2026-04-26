@@ -2293,6 +2293,14 @@ BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
 # fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
 # needle + question ≈ 1400 tokens total input.
 BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
+# Number of confuser needles inserted alongside the real needle. Each
+# confuser uses a *different* template (different topic) with its own
+# fake 7-char code answer. With 1 confuser the 4B reference still scored
+# 1.0 (Round 9 telemetry); 3 confusers force the model to actually match
+# the question to the right named entity rather than regex-matching any
+# all-caps code in the document. Capped at len(_LC_NEEDLE_TEMPLATES)-1
+# at runtime so we always have a real template to reserve.
+BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "3"))
 # Session 3.6 (added 2026-04-25): block-seeded procedural tasks mixing
 # arithmetic reasoning, instruction following, and invented-fact retrieval.
 # This is intentionally synthetic: there is no public pool to memorize, but
@@ -4043,79 +4051,107 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
     """Create ``n_items`` fresh needle-in-haystack prompts seeded by the
     round's block_seed.
 
-    Each document contains a real needle (whose question is asked) AND a
-    confuser needle from a different template with a different fake
-    answer. Document structure:
+    Each document contains ONE real needle whose question is asked AND
+    ``BENCH_LC_N_CONFUSERS`` confuser needles drawn from different
+    templates, each with their own fake-answer 7-char code. Document
+    structure (positions chosen uniformly at random over the final doc):
 
         distractor_1
+        confuser_needle_A   <- fake answer for "What is X?"
         ...
-        confuser_needle      <- fake-answer needle from a different topic
+        real_needle         <- correct answer for the question we ask
         ...
-        real_needle          <- the one whose question is asked
+        confuser_needle_B   <- fake answer for "What is Y?"
         ...
 
-    Models that just regex out any 7-character ALL-CAPS code would grab
-    the confuser's answer and fail. To pass, the model must match the
-    question to the right needle in the document. Current 4B models pass
-    the no-confuser version 100% — this re-introduces signal.
+    Models that just regex out any 7-character ALL-CAPS code now have to
+    discriminate among (1 real + N confusers) candidates. With 1 confuser
+    the 4B reference still scored 1.0 (Round 9 telemetry: 3/3 on every
+    student). Bumping the default to 3 confusers drops the random-match
+    pass rate from 1/2 to 1/4 and forces the model to actually match the
+    question to the right named entity (archive vs vault vs guild vs
+    professor vs treasure-chest).
 
     The model must return the real ANS. Grading: case-insensitive
     substring containment so the model can answer "XYZ1234" or "the code
-    is XYZ1234". A response that contains *only* the confuser's answer
+    is XYZ1234". A response that contains *only* a confuser's answer
     fails because the substring check is for the real ANS.
+
+    All needle answers are guaranteed to be distinct so a stray substring
+    match against the wrong needle's answer is impossible.
     """
     import random
     out: list[dict] = []
     rng = random.Random((block_seed ^ _BENCH_STREAM["long_context"]) & 0xFFFFFFFF)
     alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
     n_templates = len(_LC_NEEDLE_TEMPLATES)
+    n_confusers = max(0, min(BENCH_LC_N_CONFUSERS, n_templates - 1))
     for i in range(n_items):
         # Seed each item independently so swapping n_items doesn't change
         # the first item's content.
         r = random.Random(rng.randint(0, 2**31 - 1))
-        # Pick two distinct templates: one real, one confuser.
-        idxs = r.sample(range(n_templates), 2) if n_templates >= 2 else [0, 0]
-        real_idx, confuser_idx = idxs[0], idxs[1]
+        # Pick (1 + n_confusers) distinct templates — one real, the rest
+        # confusers. Fewer templates → fewer confusers; the cap above
+        # guarantees we never duplicate the real template.
+        n_picked = 1 + n_confusers
+        idxs = r.sample(range(n_templates), min(n_picked, n_templates))
+        real_idx = idxs[0]
+        confuser_idxs = idxs[1:]
         needle_tpl, question = _LC_NEEDLE_TEMPLATES[real_idx]
-        confuser_tpl, _ = _LC_NEEDLE_TEMPLATES[confuser_idx]
-        # Real and confuser answers must be different. Make confuser answer
-        # the same length so it looks equally plausible.
-        answer = "".join(r.choice(alphabet) for _ in range(7))
-        confuser_answer = answer
-        while confuser_answer == answer:
-            confuser_answer = "".join(r.choice(alphabet) for _ in range(7))
-        # Pick distractors without replacement; fall back to sampling with
-        # replacement if n_distractors exceeds pool size.
+        # Generate distinct 7-char codes for real + every confuser. We
+        # need n_picked unique codes; redraw any duplicates against the
+        # whole pool to avoid biasing (collision probability is tiny but
+        # non-zero with a 31^7 alphabet).
+        codes: list[str] = []
+        seen_codes: set[str] = set()
+        while len(codes) < n_picked:
+            code = "".join(r.choice(alphabet) for _ in range(7))
+            if code in seen_codes:
+                continue
+            seen_codes.add(code)
+            codes.append(code)
+        answer = codes[0]
+        confuser_answers = codes[1:]
+        # Pick distractors without replacement; fall back to sampling
+        # with replacement if n_distractors exceeds pool size.
         if n_distractors <= len(_LC_DISTRACTORS):
             distractors = r.sample(_LC_DISTRACTORS, n_distractors)
         else:
             distractors = [r.choice(_LC_DISTRACTORS) for _ in range(n_distractors)]
+        # Build needle sentences (real + confusers).
         real_sentence = needle_tpl.format(ANS=answer)
-        confuser_sentence = confuser_tpl.format(ANS=confuser_answer)
-        # Pick positions in the FINAL-document index space so the recorded
-        # ``needle_position`` / ``confuser_position`` match the rendered
-        # context. Real needle in the middle half (NOT at start/end);
-        # confuser at least 3 lines away so the two don't cluster.
-        final_n = n_distractors + 2
+        confuser_sentences = [
+            _LC_NEEDLE_TEMPLATES[ci][0].format(ANS=ca)
+            for ci, ca in zip(confuser_idxs, confuser_answers)
+        ]
+        # Pick positions in the FINAL-document index space so the
+        # recorded positions match the rendered context. Real needle in
+        # the middle half (NOT at start/end); each confuser at least 3
+        # lines away from every other needle so they don't cluster.
+        final_n = n_distractors + n_picked
         real_pos = r.randint(final_n // 4, 3 * final_n // 4)
-        confuser_pos = real_pos
-        attempts = 0
-        while abs(confuser_pos - real_pos) < 3 and attempts < 16:
-            confuser_pos = r.randint(0, final_n - 1)
-            attempts += 1
-        # Build the final document directly so positions are exact. Two
-        # slots are reserved for the needles; the rest are distractors in
-        # order (their internal order doesn't matter for grading).
-        slot_positions = sorted([
-            (real_pos, real_sentence),
-            (confuser_pos, confuser_sentence),
-        ])
+        chosen_positions = [real_pos]
+        confuser_positions: list[int] = []
+        for _ in confuser_sentences:
+            cp = real_pos
+            attempts = 0
+            while attempts < 32 and any(abs(cp - p) < 3 for p in chosen_positions):
+                cp = r.randint(0, final_n - 1)
+                attempts += 1
+            confuser_positions.append(cp)
+            chosen_positions.append(cp)
+        # Build the final document directly so positions are exact.
+        # Slots are reserved for the needles; the rest are distractors
+        # in order (their internal order doesn't matter for grading).
+        slot_specs: list[tuple[int, str]] = [(real_pos, real_sentence)]
+        slot_specs.extend(zip(confuser_positions, confuser_sentences))
+        slot_specs.sort(key=lambda x: x[0])
         next_slot = 0
         distract_idx = 0
         lines: list[str] = []
         for j in range(final_n):
-            if next_slot < 2 and j == slot_positions[next_slot][0]:
-                lines.append(slot_positions[next_slot][1])
+            if next_slot < len(slot_specs) and j == slot_specs[next_slot][0]:
+                lines.append(slot_specs[next_slot][1])
                 next_slot += 1
             else:
                 lines.append(distractors[distract_idx])
@@ -4126,9 +4162,9 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
             "context": context,
             "question": question,
             "answer": answer,
-            "confuser_answer": confuser_answer,
+            "confuser_answers": confuser_answers,
             "needle_position": real_pos,
-            "confuser_position": confuser_pos,
+            "confuser_positions": confuser_positions,
         })
     return out
 
@@ -4787,6 +4823,16 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
                     cleaned = _strip_thinking_probe(text or "").strip()
                     gold = str(it.get("answer", ""))
                     ok = 1 if gold and gold.upper() in cleaned.upper() else 0
+                    # Detect "confuser hits": pred contains a confuser
+                    # answer but not the real one. Useful to debug whether
+                    # increasing confusers actually causes failures.
+                    confuser_answers = it.get("confuser_answers") or []
+                    pred_upper = cleaned.upper()
+                    confuser_hit = bool(
+                        confuser_answers
+                        and not ok
+                        and any(ca and ca.upper() in pred_upper for ca in confuser_answers)
+                    )
                     out["items"].append({
                         "src": it.get("src", ""),
                         "gold": gold,
@@ -4794,6 +4840,8 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
                         "ok": bool(ok),
                         "gen_tokens": int(tok),
                         "needle_position": it.get("needle_position"),
+                        "confuser_positions": it.get("confuser_positions", []),
+                        "confuser_hit": confuser_hit,
                     })
                     out["n"] += 1
                     out["correct"] += ok

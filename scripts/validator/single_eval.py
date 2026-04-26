@@ -432,16 +432,24 @@ def resolve_dethrone(
 ) -> bool:
     """Return True iff challenger should take the crown from incumbent.
 
-    Primary rule: ``challenger.worst > incumbent.worst * (1 + margin)``.
+    Three-stage decision:
 
-    Saturated-floor tiebreaker (added 2026-04-26): if both UIDs have
-    ``worst <= SINGLE_EVAL_WORST_FLOOR_EPSILON`` (effectively zero —
-    ~45% of current composite records sit here because any axis at 0.0
-    floors ``min(axes)``), fall back to ``weighted`` with the same
-    relative margin. Without this gate, two saturated-floor UIDs with
-    weighted scores 0.50 and 0.78 are indistinguishable and the prior
-    king wins via the king-selection prior_bonus, even though the
-    challenger is meaningfully better on the other 19 axes.
+    1. **Clear win on worst** — ``ch_worst > inc_worst * (1 + margin)``.
+       Challenger dominates on its worst axis. Take the crown.
+    2. **Clear regression on worst** — ``ch_worst < inc_worst * (1 - margin)``.
+       Challenger is meaningfully WORSE on at least one axis than the
+       king. Reject. This protects the "no-axis-can-be-broken"
+       guarantee that ``worst`` exists to enforce.
+    3. **Worst is effectively tied** (between the two thresholds) — fall
+       back to ``weighted`` with the same relative margin. Covers the
+       saturated-floor case (both ≤ ε, ~45% of records) AND the more
+       common low-resolution-quantum case (e.g. both at 1/3 because n=3
+       on the worst axis and each model missed exactly one sample).
+       Without this fallback the king is preserved by default whenever
+       ``worst`` quantizes to the same value, even when the challenger
+       is unambiguously better on every other axis (Round 9: UID 93
+       weighted=0.6833 lost to UID 89 weighted=0.6567 on a worst tie of
+       0.333; that's a 4% improvement getting silently rejected).
     """
     ch_worst = (challenger_record or {}).get("worst")
     if ch_worst is None:
@@ -455,29 +463,39 @@ def resolve_dethrone(
         return float(ch_worst) > 0.0
     inc_worst_f = float(inc_worst)
     ch_worst_f = float(ch_worst)
-    threshold = inc_worst_f * (1.0 + max(0.0, float(margin)))
-    if ch_worst_f > threshold:
-        return True
-    # Tiebreaker: when both are at the saturated floor (worst <= ε),
-    # use weighted with the same relative margin.
-    if (
+    rel_margin = max(0.0, float(margin))
+    # If both are at the saturated floor, skip the worst-thresholds
+    # entirely (they multiply to 0 and any positive ch_worst wins by
+    # default, which leaks past the saturation guard) and go straight to
+    # the weighted tiebreaker.
+    both_saturated = (
         inc_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
         and ch_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
-    ):
-        ch_w = (challenger_record or {}).get("weighted")
-        inc_w = incumbent_record.get("weighted")
-        if ch_w is None or inc_w is None:
+    )
+    if not both_saturated:
+        win_threshold = inc_worst_f * (1.0 + rel_margin)
+        if ch_worst_f > win_threshold:
+            return True
+        # If challenger regressed on worst by more than the margin,
+        # reject. Protects the "no-axis-can-be-broken" guarantee.
+        regress_threshold = inc_worst_f * (1.0 - rel_margin)
+        if ch_worst_f < regress_threshold:
             return False
-        try:
-            ch_w_f = float(ch_w)
-            inc_w_f = float(inc_w)
-        except (TypeError, ValueError):
-            return False
-        if inc_w_f <= 0.0:
-            return ch_w_f > 0.0
-        weighted_threshold = inc_w_f * (1.0 + max(0.0, float(margin)))
-        return ch_w_f > weighted_threshold
-    return False
+    # Tied region (within ±margin of inc_worst, or both saturated).
+    # Fall back to weighted with the same relative margin.
+    ch_w = (challenger_record or {}).get("weighted")
+    inc_w = incumbent_record.get("weighted")
+    if ch_w is None or inc_w is None:
+        return False
+    try:
+        ch_w_f = float(ch_w)
+        inc_w_f = float(inc_w)
+    except (TypeError, ValueError):
+        return False
+    if inc_w_f <= 0.0:
+        return ch_w_f > 0.0
+    weighted_threshold = inc_w_f * (1.0 + rel_margin)
+    return ch_w_f > weighted_threshold
 
 
 def _seed_one_h2h_round(state, latest: dict) -> int:
