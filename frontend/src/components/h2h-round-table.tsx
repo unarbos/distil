@@ -109,7 +109,7 @@ function CompositeAxesRow({ composite, isKing }: { composite: H2hComposite; isKi
         return (
           <span
             key={key as string}
-            title={`${key} = ${v?.toFixed(4) ?? "—"}${isBroken ? " (teacher-broken this round — dropped from composite)" : ""}`}
+            title={`${key} = ${v?.toFixed(4) ?? "—"}${isBroken ? " (eval-broken this round — dropped from composite worst/weighted because the teacher or reference base scored below the sanity floor on this axis)" : ""}`}
             className={`inline-flex items-center gap-1 ${isBroken ? "line-through opacity-50" : ""}`}
           >
             <span className="text-muted-foreground/40">{label}</span>
