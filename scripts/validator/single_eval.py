@@ -346,6 +346,22 @@ _KING_SELECTION_MIN_AXES = 17
 #         model whose chatty wrapping was previously masked recover the
 #         earned-but-blocked passes — the king filter quarantines old
 #         records until they're regraded.
+#   v19 — capability_probe procedural rebalance. Pre-v19 the
+#         capability axis drew 24 of its 36 items per round from an
+#         open-source static trivia pool (``_CAPABILITY_STATIC_POOL``).
+#         Sample rotation (24 of ~200) limited memorization but only
+#         marginally — a miner who memorizes the entire pool gets
+#         100% on the static portion every round. Round 18 logs caught
+#         this in the wild: ``ty4321/cc`` scored capability=1.000 while
+#         math_bench/code_bench/knowledge_bench were all ≤ 0.5 — a
+#         textbook overfit-one-axis signature. v19+ inverts the ratio
+#         (12 static + 24 procedural per round) and expands the
+#         procedural generator to cover number theory, string ops,
+#         list ops, and comparison. The block-seeded procedural items
+#         cannot be pre-memorised so the only way to climb capability
+#         is to actually be capable. Mixing v18 and v19 records would
+#         let an old static-pool memoriser keep their inflated floor;
+#         the king filter quarantines old records until regraded.
 # Mixing schema versions would let a stale-grader UID inherit the crown via
 # inflated/deflated axis scores. The selector therefore filters to v_current
 # first and only falls through to legacy records when no v_current candidate

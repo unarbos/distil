@@ -1874,12 +1874,150 @@ _CAPABILITY_STATIC_POOL = [
 ]
 
 CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", "48"))
-CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "24"))
-CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "12"))
+# Goodhart hardening (2026-04-26 round 19): the static pool is in the open-
+# source repo, so a miner can pre-train answers to every item and saturate
+# this 0.25-weight axis. Round 19 evidence: ``ty4321/cc`` scored capability=
+# 1.000 perfect while bombing math_bench=0.5, code_bench=0.5, aime=0.0 — a
+# textbook overfit signature. Rebalance toward procedural (block-seeded,
+# unmemorizable) items: 12 static (down from 24) + 24 procedural (up from
+# 12) per round, swapping the old 2:1 static-favoured ratio for a 1:2
+# procedural-favoured ratio. See COMPOSITE_SHADOW_VERSION==19 docstring.
+CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "12"))
+CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "24"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
+
+# Pool of common simple words used as random subjects for procedural
+# string-operation items (count_chars / count_vowels). Public but the
+# *combination* of (word, op) is per-round-block-seeded so a miner cannot
+# pre-cache the exact tuples.
+_PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = (
+    "apple", "banana", "cherry", "delta", "elephant", "garden",
+    "harbor", "island", "jungle", "kitten", "lemon", "morning",
+    "ocean", "puzzle", "river", "summer", "table", "umbrella",
+    "valley", "winter", "yellow", "zebra", "candle", "dinner",
+    "engine", "forest", "guitar", "hammer", "jacket", "knight",
+    "ladder", "magnet", "needle", "orange", "panda", "quilt",
+    "rabbit", "shadow", "thunder", "violet", "window", "yogurt",
+    "anchor", "basket", "circle", "diamond", "eagle", "feather",
+    "glacier", "horizon", "iguana", "journey", "kangaroo", "lighthouse",
+)
+
+
+def _procedural_capability_prompts(rng, n):
+    """Generate ``n`` verifiable, procedurally-derived capability prompts.
+
+    Goodhart hardening (round 19): the legacy ``_procedural_math_prompts``
+    only produced arithmetic which is a narrow capability surface — and
+    the static pool's broader trivia/format items were the primary target
+    of memorization attacks. This generator broadens to procedural
+    *non-trivia* tasks across multiple categories so saturating the
+    capability axis requires actually being able to reason at the prompt:
+
+    * Arithmetic (legacy): add, sub, mul, div, mod.
+    * Number theory: power, sum_digits, even_or_odd, divisible_by.
+    * String operations: count_chars, count_vowels.
+    * List operations: list_min, list_max, count_evens.
+    * Comparison: which_larger.
+
+    Every item is fully derived from ``rng`` so the realised set rotates
+    per round (block_seed-driven). All items use the existing kinds
+    (``int`` / ``yesno`` / ``word``) so ``_capability_score_one`` and
+    ``_extract_capability_answer`` need no changes. Backwards-compatible
+    alias ``_procedural_math_prompts`` retained below for old callers
+    that explicitly want arithmetic-only.
+    """
+    kinds = (
+        "add", "sub", "mul", "div", "mod",
+        "power_small", "sum_digits", "even_or_odd", "divisible_by",
+        "count_chars", "count_vowels",
+        "list_min", "list_max", "count_evens",
+        "which_larger",
+    )
+    out = []
+    for _ in range(n):
+        kind = rng.choice(kinds)
+        if kind == "add":
+            a, b = rng.randint(17, 499), rng.randint(17, 499)
+            out.append({"q": f"What is {a} + {b}? Answer with only the number.",
+                        "a": str(a + b), "kind": "int"})
+        elif kind == "sub":
+            a, b = rng.randint(100, 900), rng.randint(10, 99)
+            out.append({"q": f"What is {a} - {b}? Answer with only the number.",
+                        "a": str(a - b), "kind": "int"})
+        elif kind == "mul":
+            a, b = rng.randint(2, 15), rng.randint(2, 15)
+            out.append({"q": f"What is {a} * {b}? Answer with only the number.",
+                        "a": str(a * b), "kind": "int"})
+        elif kind == "div":
+            b = rng.randint(2, 12)
+            q = rng.randint(2, 25)
+            a = b * q
+            out.append({"q": f"What is {a} / {b}? Answer with only the number.",
+                        "a": str(q), "kind": "int"})
+        elif kind == "mod":
+            a, b = rng.randint(20, 200), rng.randint(3, 9)
+            out.append({"q": f"What is {a} mod {b}? Answer with only the number.",
+                        "a": str(a % b), "kind": "int"})
+        elif kind == "power_small":
+            base = rng.randint(2, 7)
+            exp = rng.randint(2, 4)
+            out.append({"q": f"What is {base} to the power of {exp}? Answer with only the number.",
+                        "a": str(base ** exp), "kind": "int"})
+        elif kind == "sum_digits":
+            v = rng.randint(100, 9999)
+            out.append({"q": f"What is the sum of the digits of {v}? Answer with only the number.",
+                        "a": str(sum(int(d) for d in str(v))), "kind": "int"})
+        elif kind == "even_or_odd":
+            v = rng.randint(10, 99999)
+            ans = "even" if v % 2 == 0 else "odd"
+            out.append({"q": f"Is {v} even or odd? Answer with one word: 'even' or 'odd'.",
+                        "a": ans, "kind": "word"})
+        elif kind == "divisible_by":
+            div = rng.choice([3, 4, 5, 6, 7, 8, 9])
+            v = rng.randint(20, 999)
+            ans = "yes" if v % div == 0 else "no"
+            out.append({"q": f"Is {v} divisible by {div}? Answer yes or no.",
+                        "a": ans, "kind": "yesno"})
+        elif kind == "count_chars":
+            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            out.append({"q": f"How many characters are in the word '{w}'? Answer with only the number.",
+                        "a": str(len(w)), "kind": "int"})
+        elif kind == "count_vowels":
+            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            n_vowels = sum(1 for c in w.lower() if c in "aeiou")
+            out.append({"q": f"How many vowels are in the word '{w}'? Answer with only the number.",
+                        "a": str(n_vowels), "kind": "int"})
+        elif kind == "list_min":
+            vals = [rng.randint(1, 99) for _ in range(rng.randint(4, 6))]
+            out.append({"q": f"What is the minimum of: {', '.join(str(v) for v in vals)}? Answer with only the number.",
+                        "a": str(min(vals)), "kind": "int"})
+        elif kind == "list_max":
+            vals = [rng.randint(1, 99) for _ in range(rng.randint(4, 6))]
+            out.append({"q": f"What is the maximum of: {', '.join(str(v) for v in vals)}? Answer with only the number.",
+                        "a": str(max(vals)), "kind": "int"})
+        elif kind == "count_evens":
+            vals = [rng.randint(1, 99) for _ in range(rng.randint(5, 8))]
+            count = sum(1 for v in vals if v % 2 == 0)
+            out.append({"q": f"How many even numbers are in this list: {', '.join(str(v) for v in vals)}? Answer with only the number.",
+                        "a": str(count), "kind": "int"})
+        elif kind == "which_larger":
+            a, b = rng.randint(100, 9999), rng.randint(100, 9999)
+            while a == b:
+                b = rng.randint(100, 9999)
+            ans = str(a) if a > b else str(b)
+            out.append({"q": f"Which is larger: {a} or {b}? Answer with just the number.",
+                        "a": ans, "kind": "int"})
+    return out
 
 
 def _procedural_math_prompts(rng, n):
+    """Backwards-compatible shim: arithmetic-only procedural prompts.
+
+    Existed before round 19 expansion. Internal callers should prefer
+    ``_procedural_capability_prompts``; this name is retained because
+    operators may have set the legacy ``CAPABILITY_PROBE_N_PROC_MATH``
+    env var expecting arithmetic-only behaviour.
+    """
     out = []
     for _ in range(n):
         kind = rng.choice(["add", "sub", "mul", "div", "mod"])
@@ -1904,12 +2042,20 @@ def _procedural_math_prompts(rng, n):
 
 
 def build_capability_prompts(block_seed=None):
-    """Return the per-round capability prompt list (static sample + procedural math).
+    """Return the per-round capability prompt list.
 
-    Determinism: seeded by ``block_seed`` so all validators compute the same
-    prompts for a given round, yet the set rotates every round preventing
-    memorization. If ``block_seed`` is None (local dev), fall back to a fixed
-    seed for repeatability.
+    Mix:
+    * ``CAPABILITY_PROBE_N`` items sampled from the static trivia pool
+      (rotated per round but pool is in source — capped at 12 per
+      round to limit memorization advantage).
+    * ``CAPABILITY_PROBE_N_PROC_MATH`` items procedurally generated
+      from ``block_seed`` covering arithmetic, number theory, string
+      operations, list operations, and comparisons. Cannot be
+      pre-memorized because the (operands, items) tuple is freshly
+      sampled every round.
+
+    Determinism: every validator with the same ``block_seed`` computes
+    the same prompt list. None falls back to a fixed dev seed.
     """
     import random
     rng = random.Random(int(block_seed) if block_seed is not None else 20260418)
@@ -1917,7 +2063,7 @@ def build_capability_prompts(block_seed=None):
     rng.shuffle(pool)
     k = min(CAPABILITY_PROBE_N, len(pool))
     sampled = pool[:k]
-    sampled.extend(_procedural_math_prompts(rng, CAPABILITY_PROBE_N_PROC_MATH))
+    sampled.extend(_procedural_capability_prompts(rng, CAPABILITY_PROBE_N_PROC_MATH))
     return sampled
 
 
