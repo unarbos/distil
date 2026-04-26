@@ -389,6 +389,136 @@ _KING_SELECTION_MIN_AXES = 17
 #         is unchanged; only the surface phrasing rotates. Mixing
 #         v20 and v21 records would let a wording-memoriser keep
 #         their AIME floor; the king filter quarantines old records.
+#   v22 — math_bench / tool_use_bench / self_consistency_bench
+#         problem paraphrase per round. v21 closed the AIME wording
+#         hole but left the much larger GSM8K + MATH-500 surface
+#         exposed (1 819 public items, 0.12 composite weight — 3×
+#         the robustness_bench weight that previously caught
+#         memorisers). A miner who memorised canonical wording could
+#         still saturate ``math_bench`` (+0.12) and only lose 0.04 on
+#         ``robustness_bench``, netting +0.08 weight. v22+ extends
+#         the round-21 paraphrase recipe to math_bench AND the two
+#         math-derived axes (``tool_use_bench`` reuses numerically-
+#         tractable math items; ``self_consistency_bench`` reuses
+#         hard math items), so a wording memoriser fails all three
+#         axes simultaneously instead of just one. Numeric constants,
+#         LaTeX (``$...$``, ``\\boxed{...}``), GSM8K ``####`` markers,
+#         and answer-extraction format are preserved verbatim by the
+#         math-domain-safe helpers — only the surface phrasing
+#         rotates. Mixing v21 and v22 records would let a math-
+#         wording-memoriser keep their inflated math_bench / tool_use
+#         / self_consistency floor; the king filter quarantines old
+#         records until regraded.
+#   v23 — code_bench (HumanEval) and mbpp_bench prompt paraphrase per
+#         round. After v22 closed the math surface, ``code_bench`` (164
+#         fully-public HumanEval items, weight 0.12 — tied largest) and
+#         ``mbpp_bench`` (378 MBPP+ items, weight 0.06) were the
+#         largest remaining un-rotated public-pool axes. Both ship the
+#         answer key in the dataset (``test`` field), so a miner who
+#         memorised canonical docstring wording can build a
+#         ``{prompt → solution}`` lookup and saturate both axes
+#         without ever passing the prompt through a Python compiler.
+#         Round-18 prose-stripping closed the conversational-wrapper
+#         bypass but did nothing for the prompt-memorisation bypass —
+#         a memoriser still recognises the docstring text and emits
+#         the canonical solution. v23+ introduces the structurally-
+#         aware ``_paraphrase_code_problem`` helper which line-by-line
+#         classifies each prompt line as PROSE or CODE (signatures,
+#         imports, ``>>>`` doctests, doctest outputs, ``return`` /
+#         ``assert`` lines, and bare triple-quote markers all
+#         classified as CODE) and applies the math-domain synonym
+#         swap PLUS a code-domain extension ("write a function" /
+#         "check if" / "given a") ONLY to PROSE lines. Test harnesses,
+#         function signatures, and doctest examples are preserved
+#         verbatim — a genuine solver still passes the gold tests.
+#         Mixing v22 and v23 records would let a HumanEval/MBPP
+#         wording-memoriser keep their stale ``code_bench=1.0`` /
+#         ``mbpp_bench=1.0`` floor while honest miners regrade
+#         against rotated phrasings; the king filter quarantines old
+#         records until they are regraded under v23.
+#   v24 — reasoning_bench (BBH) inline-MC option shuffle per round.
+#         BBH stores multiple-choice options inline in the question
+#         text (``Options:\n(A) ...\n(B) ...``) rather than as a
+#         separate ``options`` field, so the round-20 helper that
+#         shuffled ARC / MMLU-Pro / TruthfulQA letters could not
+#         protect this axis. ~12 of the 21 BBH subtasks ship a fixed
+#         correct-letter per item (logical_deduction_*, tracking_
+#         shuffled_objects_*, hyperbaton, etc.), giving a
+#         ``{question_text → letter}`` lookup attack equivalent to
+#         the one v20 closed for the other MC axes. Schema-version-0
+#         records reached ``reasoning_bench=0.88`` paired with
+#         ``arc_bench=0`` and ``code_bench=0`` — the saturated-on-
+#         memorisable-axis Goodhart signature. v24 introduces
+#         ``_shuffle_bbh_mc_options`` which detects the inline option
+#         block via a dedicated regex, shuffles option contents per
+#         ``(block_seed XOR sha256(question))``, and remaps the gold
+#         letter to point at where the original correct content
+#         lands. Boolean / numeric BBH subtasks (boolean_expressions,
+#         object_counting, web_of_lies, navigate) have no inline
+#         options block and pass through unchanged. Mixing v23 and
+#         v24 records would let a BBH letter-memoriser keep their
+#         stale ``reasoning_bench=0.88`` floor; the king filter
+#         quarantines old records until regraded under v24.
+#   v25 — judge_probe / chat_turns_probe canonical-response paraphrase.
+#         After v18-v24 closed every benchmark-axis canonical-
+#         wording attack vector, the two largest remaining un-
+#         rotated public-prompt-pool axes were ``judge_probe``
+#         (composite weight 0.15, 65-prompt static pool baked into
+#         ``pod_eval_vllm.py``) and ``chat_turns_probe`` (composite
+#         weight 0.08, ~25-conversation static pool of 3-turn
+#         dialogues). Combined attack surface = 0.23 weight, larger
+#         than ``code_bench`` + ``reasoning_bench`` combined (0.20).
+#         Both axes are graded by the teacher rubric on a 1-5 scale
+#         of "correct + clear + addresses the question + appropriate
+#         length" — a miner who pre-trains on canonical 5/5-quality
+#         responses to all ~90 prompts can saturate both axes from a
+#         ``{prompt_text → canonical_response}`` lookup. v25 adds
+#         ``_paraphrase_chat_prompt``, a region-aware paraphraser
+#         that splits each prompt into PROSE / PROTECTED chunks
+#         (anything inside backticks, quotes, or inline JSON is
+#         PROTECTED) and applies a curated chat-domain synonym swap
+#         (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline,
+#         give/provide/offer, show/demonstrate/illustrate, list/
+#         enumerate, briefly/concisely, suggest/recommend) ONLY to
+#         PROSE. Code identifiers, function names, format specs,
+#         regex literals, inline JSON, and tight format constraints
+#         ("no other text" / "only the JSON" / "exactly N words")
+#         are preserved verbatim. Each turn of a chat_turns_probe
+#         conversation is paraphrased independently. Mixing v24 and
+#         v25 records would let a chat-prompt memoriser keep their
+#         stale ``judge_probe=0.95`` / ``chat_turns_probe=0.95``
+#         floor; the king filter quarantines old records until
+#         regraded under v25.
+#   v26 — on_policy_rkl per-round chat-domain prompt paraphrase.
+#         After v25 closed the judge_probe / chat_turns_probe
+#         surfaces, ``on_policy_rkl`` (composite weight 0.35 — the
+#         SINGLE LARGEST axis weight in the entire composite) was
+#         the largest remaining un-rotated public-prompt-pool axis.
+#         The 80-prompt ``ON_POLICY_RKL_POOL`` is fully baked into
+#         the open-source ``pod_eval_vllm.py``; pre-v17 the per-
+#         round 16-of-80 sample was deterministic on ``block_seed``
+#         but the rollout-sampling seed was a constant ``42``, so
+#         a miner could pre-compute their student's exact deterministic
+#         rollout per pool entry and surgically train weights to
+#         align with the teacher's high-prob tokens at every position
+#         of that exact trajectory. v17 (Session 3.10) defeated
+#         *that* attack by rotating the rollout-sampling seed per
+#         ``block_seed`` — but it did NOT defeat the more fundamental
+#         Goodhart vector that prompt-rotation alone defeats: a
+#         miner who pre-distils onto teacher's outputs for the
+#         canonical wording of all 80 entries can saturate
+#         on_policy_rkl regardless of sampling-seed rotation. v26
+#         wires the v25 ``_paraphrase_chat_prompt`` into
+#         ``_pick_on_policy_rkl_prompts`` so each of the 16 sampled
+#         prompts gets a chat-domain synonym swap keyed on
+#         ``(block_seed, sha(prompt))``. Translation answer keys
+#         ("Translate to French: The cat sat on the mat.") are
+#         PROTECTED via the helper's quoted-region detection so the
+#         gold output is unchanged; only conversational PROSE
+#         rotates. Mixing v25 and v26 records would let an
+#         on_policy_rkl wording-memoriser keep their inflated low-KL
+#         floor under the old grading; the king filter quarantines
+#         old records until regraded under v26.
 # Mixing schema versions would let a stale-grader UID inherit the crown via
 # inflated/deflated axis scores. The selector therefore filters to v_current
 # first and only falls through to legacy records when no v_current candidate

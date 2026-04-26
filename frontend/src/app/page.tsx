@@ -25,7 +25,7 @@ export default async function HomePage() {
   ]);
 
   const kingUid = h2hLatest?.king_uid ?? null;
-  const miners = buildMinerList(metagraph, commitments, scores, kingUid);
+  const miners = buildMinerList(metagraph, commitments, scores, kingUid, h2hLatest);
   const modelInfoMap = await fetchAllModelInfo(miners.map((m) => m.model));
   const currentBlock = metagraph?.block ?? 0;
   const alphaPrice = price?.alpha_price_tao ?? 0;

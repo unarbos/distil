@@ -38,9 +38,10 @@ SERVICE_UNITS = {
     "api": "distil-api",
     "dashboard": "distil-dashboard",
     "benchmark_timer": "distil-benchmark-sync.timer",
-    "chat_tunnel": "chat-tunnel",
     "caddy": "caddy",
 }
+if CHAT_POD_HOST:
+    SERVICE_UNITS["chat_tunnel"] = "chat-tunnel"
 
 LOCAL_ENDPOINTS = {
     "api_local": "http://127.0.0.1:3710/api/health",
@@ -490,9 +491,11 @@ def repair(report: dict[str, Any]) -> list[str]:
         else:
             actions.append(f"failed_restart:{unit}:{reason}:{result.stderr.strip() or result.stdout.strip()}")
 
-    for name in ("validator", "api", "dashboard", "chat_tunnel", "caddy"):
+    for name in ("validator", "api", "dashboard", "caddy"):
         if not services[name]["ok"]:
             restart(services[name]["unit"], "inactive")
+    if "chat_tunnel" in services and not services["chat_tunnel"]["ok"]:
+        restart(services["chat_tunnel"]["unit"], "inactive")
 
     if not services["benchmark_timer"]["ok"]:
         result = run(["systemctl", "enable", "--now", services["benchmark_timer"]["unit"]], timeout=30)
@@ -513,7 +516,8 @@ def repair(report: dict[str, Any]) -> list[str]:
             actions.append(f"restarted:{OPEN_WEBUI_CONTAINER}:chat_unhealthy")
         else:
             actions.append(f"failed_restart:{OPEN_WEBUI_CONTAINER}:{result.stderr.strip() or result.stdout.strip()}")
-        restart("chat-tunnel", "chat_unhealthy")
+        if CHAT_POD_HOST:
+            restart("chat-tunnel", "chat_unhealthy")
         restart("caddy", "chat_unhealthy")
 
     if any(issue.startswith("validator:stale_eval_progress:") for issue in report["issues"]):

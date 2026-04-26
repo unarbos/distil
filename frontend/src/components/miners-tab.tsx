@@ -67,7 +67,7 @@ export function MinersTab({
   if (sortBy === "newest") {
     filtered = [...filtered].sort((a, b) => b.commitBlock - a.commitBlock);
   }
-  // "score" sort is the default from buildMinerList (DQ last, then by KL)
+  // "score" sort is the default from buildMinerList (DQ last, then live composite, then KL)
 
   return (
     <div className="space-y-3">
@@ -129,8 +129,8 @@ export function MinersTab({
               {" "}— Head-to-head KL on the <em>same prompts</em> as the king. This is the fair comparison used to determine the king.
             </p>
             <p>
-              <span className="text-blue-400/80 font-semibold">Global Score</span>
-              {" "}— KL from the last global eval using <em>different random prompts</em>. These vary between rounds and are <strong>not directly comparable</strong> across models.
+              <span className="text-blue-400/80 font-semibold">Composite Score</span>
+              {" "}— live worst-axis score from the latest H2H when available. This is now the miner-facing objective; KL remains necessary but not sufficient.
             </p>
           </div>
         </div>
@@ -287,16 +287,26 @@ export function MinersTab({
                   <div className="shrink-0 text-right">
                     {miner.isDisqualified ? (
                       <span className="font-mono text-sm text-red-400/30">—</span>
-                    ) : miner.klScore != null ? (
+                    ) : miner.compositeWorst != null || miner.klScore != null ? (
                       <div>
                         <span className={`font-mono text-base font-bold tabular-nums ${
                           miner.isWinner ? "text-yellow-400" : "text-foreground/80"
                         }`}>
-                          {miner.klScore.toFixed(4)}
+                          {miner.compositeWorst != null ? miner.compositeWorst.toFixed(3) : miner.klScore?.toFixed(4)}
                         </span>
                         <div className="text-[9px] text-blue-400/50 font-mono">
-                          Global
+                          {miner.compositeWorst != null ? "Composite" : "Global KL"}
                         </div>
+                        {miner.limitingAxis && (
+                          <div className="text-[9px] text-amber-400/50 font-mono max-w-[90px] truncate" title={`limiting axis: ${miner.limitingAxis}`}>
+                            min: {miner.limitingAxis}
+                          </div>
+                        )}
+                        {miner.latestH2hKl != null && (
+                          <div className="text-[9px] text-muted-foreground/40 font-mono">
+                            H2H KL {miner.latestH2hKl.toFixed(4)}
+                          </div>
+                        )}
                         {miner.ci95 && (
                           <div className="text-[9px] text-muted-foreground/40 font-mono">
                             [{Number.isFinite(miner.ci95[0]) ? miner.ci95[0].toFixed(3) : "?"},{Number.isFinite(miner.ci95[1]) ? miner.ci95[1].toFixed(3) : "?"}]

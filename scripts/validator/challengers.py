@@ -5,6 +5,7 @@ from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 from scripts.validator import single_eval as single_eval_mod
+from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
 from scripts.validator.single_eval import (
     bootstrap_composite_from_h2h,
     evict_stale_evaluated_uids,
@@ -75,6 +76,31 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
     if is_single_eval_mode():
         evict_stale_evaluated_uids(state, valid_models)
         challengers = {}
+        # Force-eligible UIDs: the current king when its composite is on a
+        # stale schema version. Without this, a king crowned under an older
+        # schema (e.g. v15) gets compared against challengers scored under
+        # the newer schema (v27) and ALWAYS wins by accidentally measuring
+        # different things — exactly the "king cached on old prompts /
+        # challengers get fresh ones" Discord fairness complaint. Forcing
+        # the king back through this round's procedural items pins both
+        # sides to the same axis definitions and grader code, after which
+        # ``resolve_dethrone`` is a fair like-for-like comparison.
+        force_eligible: set[str] = set()
+        if king_uid is not None:
+            king_record = (state.composite_scores or {}).get(str(king_uid))
+            if isinstance(king_record, dict):
+                try:
+                    king_version = int(king_record.get("version") or 0)
+                except (TypeError, ValueError):
+                    king_version = 0
+                if king_version < int(COMPOSITE_SHADOW_VERSION):
+                    force_eligible.add(str(king_uid))
+                    logger.info(
+                        f"single-eval: forcing king UID {king_uid} re-eval "
+                        f"(stored composite version {king_version} < "
+                        f"current schema {COMPOSITE_SHADOW_VERSION}); ensures "
+                        f"like-for-like comparison against challengers."
+                    )
         for uid, info in valid_models.items():
             uid_str = str(uid)
             model_name = info["model"]
@@ -83,7 +109,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             if model_name in state.permanently_bad_models:
                 state.evaluated_uids.add(uid_str)
                 continue
-            if uid_str in state.composite_scores:
+            if uid_str in state.composite_scores and uid_str not in force_eligible:
                 continue
             # Strict no-re-eval: a UID in evaluated_uids has been through a
             # full round once already. Even if its score row got dropped
@@ -94,7 +120,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             # both ``evaluated_uids`` AND ``scores`` to be set, which let
             # historical UIDs sneak back into the queue when state was
             # partially rebuilt.
-            if uid_str in state.evaluated_uids:
+            if uid_str in state.evaluated_uids and uid_str not in force_eligible:
                 continue
             challengers[uid] = info
         # FIFO cap: oldest commitment first. Without this the planner

@@ -219,9 +219,13 @@ class SelectChallengersSingleEvalTests(unittest.TestCase):
         os.environ.pop("SINGLE_EVAL_MODE", None)
 
     def test_returns_only_never_composite_scored(self):
+        from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
         state = _FakeState()
         state.composite_scores = {
-            "1": {"model": "miner/a", "revision": "main", "block": 100, "worst": 0.5},
+            "1": {
+                "model": "miner/a", "revision": "main", "block": 100,
+                "worst": 0.5, "version": COMPOSITE_SHADOW_VERSION,
+            },
         }
         state.evaluated_uids = {"1"}
         state.scores = {"1": 0.1}
@@ -233,6 +237,35 @@ class SelectChallengersSingleEvalTests(unittest.TestCase):
             valid_models, state, king_uid=1, king_kl=0.1, epoch_count=1,
         )
         self.assertEqual(set(challengers.keys()), {2, 3})
+
+    def test_forces_king_when_composite_version_stale(self):
+        """v27: when the king's stored composite is from an older schema
+        (composite_shadow_version), select_challengers must force the
+        king back into the round so dethronement comparisons stay
+        apples-to-apples with challengers evaluated under the new
+        schema. This closes the prompt-variance unfairness that surfaced
+        in the Discord thread on 2026-04-26."""
+        from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
+        stale = max(0, int(COMPOSITE_SHADOW_VERSION) - 5)
+        state = _FakeState()
+        state.composite_scores = {
+            "1": {
+                "model": "miner/a", "revision": "main", "block": 100,
+                "worst": 0.5, "version": stale,
+            },
+        }
+        state.evaluated_uids = {"1"}
+        state.scores = {"1": 0.1}
+        valid_models = {}
+        valid_models.update(_commit(1, "miner/a", 100))
+        valid_models.update(_commit(2, "miner/b", 200))
+        challengers = ch_mod.select_challengers(
+            valid_models, state, king_uid=1, king_kl=0.1, epoch_count=1,
+        )
+        self.assertIn(1, challengers,
+                      "stale-version king must be re-evaluated under v27")
+        self.assertIn(2, challengers,
+                      "non-king challengers should still be picked up")
 
     def test_picks_up_re_commits(self):
         state = _FakeState()

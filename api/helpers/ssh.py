@@ -23,6 +23,8 @@ def _ssh_exec(cmd: str, timeout: int = 30, check: bool = True) -> str:
     Raises :class:`SshExecError` on non-zero exit (when ``check`` is True).
     Callers that want the old best-effort behaviour can pass ``check=False``.
     """
+    if not CHAT_POD_HOST:
+        raise SshExecError(1, "chat pod is not configured")
     ssh_cmd = [
         "ssh",
         "-o", "ConnectTimeout=10",

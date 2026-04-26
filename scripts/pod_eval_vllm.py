@@ -781,12 +781,42 @@ ON_POLICY_RKL_PER_ROUND = int(os.environ.get("ON_POLICY_RKL_PER_ROUND", "16"))
 
 
 def _pick_on_policy_rkl_prompts(block_seed):
-    """Deterministically sample ON_POLICY_RKL_PER_ROUND prompts per round.
+    """Deterministically sample ON_POLICY_RKL_PER_ROUND prompts per round
+    AND paraphrase each picked prompt under the chat-domain helper so
+    surface wording rotates per round (Session 3.19 / v26 hardening).
 
     Mirrors ``_pick_think_probe_prompts``: uses ``random.Random(int(seed))``
     so every validator computes the same set for a given round, yet the
     set rotates unpredictably between rounds. Falls back to the first
-    16 entries when ``block_seed`` is None (local dev).
+    16 entries when ``block_seed`` is None (local dev / replay) — and
+    in that path we also skip the paraphrase so dev replay matches the
+    pool verbatim.
+
+    Why paraphrase here. Pre-v26 the on_policy_rkl axis (composite
+    weight 0.35 — the highest single-axis weight in the entire
+    composite) drew its 16-of-80 prompts deterministically from a
+    *fixed* public pool baked into this file. The 2026-04-26 v17
+    rotation of the rollout-sampling seed defeated the
+    "predict-your-own-trajectory" attack but did NOT defeat the more
+    fundamental Goodhart vector: a miner who pre-distils their
+    student onto teacher's outputs for the canonical wording of all
+    80 pool entries can saturate ``on_policy_rkl`` regardless of
+    sampling-seed rotation, because the student has been trained to
+    place teacher-likely tokens at every position the teacher would.
+    Rotating the *surface form* of the prompt every round forces a
+    student that wants to keep its low-KL floor to actually generalise
+    across phrasings — exactly what we want from distillation. The
+    chat-domain ``_paraphrase_chat_prompt`` is the right helper here
+    because the on_policy_rkl pool consists of chat-style open-ended
+    prompts (explanations, reasoning prose, instruction-following,
+    creative writing, translation, factual Q&A) — i.e. the same
+    distribution as ``judge_probe`` and ``chat_turns_probe``, both of
+    which use the same paraphrase in v25. Code blocks, JSON examples,
+    and quoted strings ("Translate to French: The cat sat on the mat.")
+    are PROTECTED by the helper's region-aware split, so the
+    translation answer key, JSON-output spec, and bash one-liner
+    requests survive byte-identical — only conversational PROSE
+    rotates.
     """
     import random
     if block_seed is None:
@@ -798,7 +828,8 @@ def _pick_on_policy_rkl_prompts(block_seed):
     pool = list(ON_POLICY_RKL_POOL)
     rng.shuffle(pool)
     k = min(ON_POLICY_RKL_PER_ROUND, len(pool))
-    return pool[:k]
+    picked = pool[:k]
+    return [_paraphrase_chat_prompt(p, block_seed) for p in picked]
 
 
 # Backward-compatibility alias so the rest of the file (and any caller
@@ -950,11 +981,39 @@ JUDGE_PROBE_ENABLED = os.environ.get("JUDGE_PROBE", "1") != "0"
 # Composite inclusion gate. Kept distinct from JUDGE_PROBE_ENABLED so we
 # can flip "promote from shadow to production" without also toggling the
 # probe itself. See Session 2 in the design doc.
-JUDGE_PROBE_IN_COMPOSITE = os.environ.get("JUDGE_PROBE_IN_COMPOSITE", "0") != "0"
+#
+# 2026-04-26 — single source of truth alignment: the validator's
+# composite.py (line 117) reads ``JUDGE_AXIS_IN_COMPOSITE`` with default
+# "1" (PRODUCTION). The pod-side flag previously read a *different* env
+# var (``JUDGE_PROBE_IN_COMPOSITE``) with default "0" (SHADOW), causing
+# the eval log + per-student JSON ``in_composite`` field to claim the
+# axis was shadow even when it was actually contributing to composite.
+# This silently corrupted dashboards and confused operators auditing
+# whether a deployed change had taken effect.
+#
+# Resolution: read the validator's authoritative env var, fall back to
+# the legacy pod-side name for back-compat, default to "1" so the
+# pod-side label matches the validator default. Operators who need to
+# pin to shadow on the pod side (e.g. for an A/B comparison) can still
+# set ``JUDGE_PROBE_IN_COMPOSITE=0`` explicitly.
+JUDGE_PROBE_IN_COMPOSITE = os.environ.get(
+    "JUDGE_AXIS_IN_COMPOSITE",
+    os.environ.get("JUDGE_PROBE_IN_COMPOSITE", "1"),
+) != "0"
 
 
 def _pick_judge_probe_prompts(block_seed):
-    """Deterministically sample JUDGE_PROBE_PER_ROUND prompts per round."""
+    """Deterministically sample JUDGE_PROBE_PER_ROUND prompts per round.
+
+    Round 25 Goodhart hardening: each picked prompt is rewritten via
+    ``_paraphrase_chat_prompt`` so a miner who memorised canonical
+    5/5-quality responses to the static pool sees the prompt arrive
+    wrapped in a different verb / adverb pair every round. The
+    paraphrase is region-aware (preserves code, JSON, format specs,
+    quoted strings) and deterministic per ``(prompt, block_seed)``,
+    so every validator agrees on the rewritten prompt while honest
+    miners still answer the same intent.
+    """
     import random
     if block_seed is None:
         return list(JUDGE_PROBE_POOL[:JUDGE_PROBE_PER_ROUND])
@@ -965,7 +1024,8 @@ def _pick_judge_probe_prompts(block_seed):
     rng = random.Random(seed_val ^ 0x6A09E667F3BCC908)  # distinct sub-stream vs think/rkl
     pool = list(JUDGE_PROBE_POOL)
     rng.shuffle(pool)
-    return pool[:min(JUDGE_PROBE_PER_ROUND, len(pool))]
+    picked = pool[:min(JUDGE_PROBE_PER_ROUND, len(pool))]
+    return [_paraphrase_chat_prompt(p, block_seed) for p in picked]
 
 
 JUDGE_PROBE_PROMPTS = _pick_judge_probe_prompts(None)
@@ -1426,7 +1486,16 @@ CHAT_TURNS_PROBE_POOL = (
 CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "6"))
 CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "200"))
 CHAT_TURNS_PROBE_ENABLED = os.environ.get("CHAT_TURNS_PROBE", "1") != "0"
-CHAT_TURNS_PROBE_IN_COMPOSITE = os.environ.get("CHAT_TURNS_PROBE_IN_COMPOSITE", "0") != "0"
+# 2026-04-26 — same alignment fix as JUDGE_PROBE_IN_COMPOSITE above.
+# composite.py (line 254-256) reads ``CHAT_TURNS_AXIS_IN_COMPOSITE`` with
+# default "1"; pod side previously read its own env var with default "0",
+# producing misleading "SHADOW" labels in the log and a wrong
+# ``in_composite`` field in per-student JSON. Validator-authoritative
+# env var, legacy fallback, default "1".
+CHAT_TURNS_PROBE_IN_COMPOSITE = os.environ.get(
+    "CHAT_TURNS_AXIS_IN_COMPOSITE",
+    os.environ.get("CHAT_TURNS_PROBE_IN_COMPOSITE", "1"),
+) != "0"
 
 
 def _pick_chat_turns_prompts(block_seed):
@@ -1434,6 +1503,16 @@ def _pick_chat_turns_prompts(block_seed):
 
     Uses a sub-stream distinct from judge_probe / think_probe / rkl so
     rotations don't phase-lock.
+
+    Round 25 Goodhart hardening: each turn of each picked conversation
+    is rewritten via ``_paraphrase_chat_prompt`` so a miner who
+    memorised canonical 3-turn transcripts sees a rotated phrasing on
+    every turn every round. The paraphrase is region-aware (preserves
+    code, JSON, format specs, quoted strings) and per-turn-deterministic
+    so every validator agrees on the rewritten conversation while honest
+    miners still answer the same intent. We paraphrase at conversation-
+    pick time (not at probe time) so the phase-A student rollout and
+    the phase-B teacher rubric see byte-identical transcripts.
     """
     import random
     if block_seed is None:
@@ -1445,7 +1524,11 @@ def _pick_chat_turns_prompts(block_seed):
     rng = random.Random(seed_val ^ 0xBF58476D1CE4E5B9)  # distinct mixer
     pool = list(CHAT_TURNS_PROBE_POOL)
     rng.shuffle(pool)
-    return pool[:min(CHAT_TURNS_PROBE_PER_ROUND, len(pool))]
+    picked = pool[:min(CHAT_TURNS_PROBE_PER_ROUND, len(pool))]
+    return [
+        tuple(_paraphrase_chat_prompt(turn, block_seed) for turn in convo)
+        for convo in picked
+    ]
 
 
 CHAT_TURNS_PROBE_PROMPTS = _pick_chat_turns_prompts(None)
@@ -3134,15 +3217,25 @@ def _coerce_block_seed(block_seed) -> int | None:
             return None
 
 
-def _paraphrase_aime_problem(question: str, block_seed) -> str:
-    """Per-round paraphrase wrapper for AIME problems.
+def _paraphrase_math_problem(question: str, block_seed) -> str:
+    """Per-round paraphrase wrapper for math word problems.
 
-    Goodhart hardening (round 21): the AIME pool is ~90 public items
-    drawn from ``HuggingFaceH4/aime_2025`` + ``Maxwell-Jia/AIME_2024`` +
-    ``AI-MO/aimo-validation-aime``. Answers are integers 0–999. A miner
-    who pre-trained on the public datasets can build a
+    Originally added in round 21 (``_paraphrase_aime_problem``) for the
+    AIME pool; promoted in round 22 to cover ``math_bench`` (GSM8K +
+    MATH-500) too, since the same memorisation attack applies and
+    ``math_bench`` carries 3× the composite weight (0.12 vs 0.04).
+
+    Goodhart hardening: every public math benchmark we evaluate
+    (``aime_bench``, ``math_bench``, ``robustness_bench``,
+    ``noise_resistance_bench``) draws from a static set of canonical
+    items. AIME has ~90 public problems; GSM8K has 1 319 + MATH-500
+    adds 500. A miner who pre-trains on those datasets can build a
     ``{problem_text → answer}`` lookup keyed on the canonical wording
-    and answer ``aime_bench`` from cache without doing any math.
+    and saturate the axis from cache without doing any math. Round 21
+    audit confirmed the attack vector (``ty4321/cc`` + several others
+    showing capability=1.0 / aime=0 / math_bench≈0.5 — the textbook
+    wording-memorisation signature). Round 22 extends the same defence
+    to the larger math axis where the weight payoff is bigger.
 
     Defence: reuse the math-domain-safe paraphrase machinery already
     used by ``robustness_bench`` (``_apply_instruction_synonyms`` +
@@ -3152,12 +3245,21 @@ def _paraphrase_aime_problem(question: str, block_seed) -> str:
     and the imperative→question rewrite only touches the closing
     sentence, so:
 
-    * Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), and answer
-      format are untouched — the math reasoning remains identical.
+    * Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), GSM8K
+      "####" answer markers, and the ``\\n\\n`` format suffix are all
+      untouched — the math reasoning and answer-extraction remain
+      identical.
     * Exact-text and naive-substring lookups break because the wording
       rotates per round.
     * A model that genuinely understands the problem still solves it
       because the underlying math is unchanged.
+
+    Layered with ``robustness_bench`` (heavier paraphrase wrappers on a
+    disjoint sample of the same pool) and ``noise_resistance_bench``
+    (typo / case / whitespace noise) this gives a tiered defence: a
+    pure memoriser fails all three; a model that handles light
+    paraphrase but not heavier wrappers fails robustness + noise; a
+    truly capable model passes all three.
 
     Forward reference note: ``_apply_instruction_synonyms`` and
     ``_imperative_to_question`` are defined later in this module
@@ -3188,6 +3290,458 @@ def _paraphrase_aime_problem(question: str, block_seed) -> str:
         out = _imperative_to_question(out, stable_seed)
     out = _apply_instruction_synonyms(out, stable_seed)
     return out
+
+
+# ── Backwards-compatible alias (round 21 name) ────────────────────────
+# The function was originally added as ``_paraphrase_aime_problem`` in
+# round 21 and external tests reference that name. Keeping the alias so
+# existing imports keep working after the round-22 generalisation.
+_paraphrase_aime_problem = _paraphrase_math_problem
+
+
+# ── Round 23: code-domain paraphrase (HumanEval / MBPP) ─────────────
+# Code-prose-only synonym table. These are layered on top of the
+# math-domain defaults via ``_apply_instruction_synonyms(extra_table=)``.
+# Every entry must be safe to apply inside a HumanEval-style docstring
+# or an MBPP natural-language description WITHOUT corrupting any code
+# token, identifier, or doctest. Word boundaries are enforced by the
+# helper so multi-word entries like ``"check if"`` only match the full
+# bigram (``"check if"`` matches; ``"check_if_xyz"`` does not because
+# the underscore is a word character and breaks the trailing ``\b``).
+# We deliberately avoid:
+#   * ``"return"`` / ``"returns"``  — Python keyword + appears in many
+#     prose phrasings ("the function returns N"). Risk of corrupting
+#     example doctests is too high.
+#   * ``"a list"`` / ``"a string"`` / ``"a dict"`` — changes type
+#     semantics. ``"a list"`` → ``"an array"`` would be technically
+#     wrong and confuse the model.
+#   * ``"function"`` standalone — matches inside ``"functional"``,
+#     ``"functions"`` requires its own entry, and the standalone form
+#     can clash with method-name idioms.
+# The candidate phrases below pass all of: (a) appears commonly in
+# HumanEval / MBPP prose, (b) replacement is semantically identical,
+# (c) no risk of clashing with code identifiers under ``\b…\b`` matching.
+_CODE_INSTRUCTION_SYNONYMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # "Write a function" framings (most common MBPP opener; also appears
+    # in some HumanEval docstrings).
+    ("write a function", ("define a function", "implement a function", "create a function")),
+    ("write a python function", ("define a python function", "implement a python function")),
+    # Common docstring relativisers (prose-only; no code-side collision).
+    ("function that", ("function which",)),
+    ("function which", ("function that",)),
+    # "Check if" / "Given a" — extremely common HumanEval docstring
+    # phrasings, semantically interchangeable, never appear as code
+    # identifiers under word-boundary matching.
+    ("check if", ("determine if", "test whether", "verify whether")),
+    ("checks if", ("determines if", "tests whether", "verifies whether")),
+    ("given a", ("for a",)),
+    # Doc-style noun rotations. ``"the input"`` / ``"the output"`` /
+    # ``"the result"`` are docstring-prose phrases; the matching code-
+    # identifier idioms (``input(``, ``output =``, ``result =``) are
+    # unaffected by word-boundary regex because the prose form requires
+    # a leading article.
+    ("the input", ("the argument",)),
+    ("the output", ("the result",)),
+    ("the result", ("the output",)),
+)
+
+
+def _paraphrase_code_problem(prompt: str, block_seed) -> str:
+    """Per-round paraphrase wrapper for code problems (HumanEval / MBPP).
+
+    Round 23 Goodhart hardening: ``code_bench`` (HumanEval, 164 public
+    items) carries the same composite weight as ``math_bench`` (0.12)
+    and is the largest remaining un-rotated public-pool axis after
+    rounds 18-22. ``mbpp_bench`` (378 MBPP+ items, weight 0.06) shares
+    the attack profile — both pull from a small fully-public pool with
+    canonical wordings the entire community can pre-train on, and the
+    ``test`` field is the gold answer key (a miner who sees the
+    canonical prompt can emit the canonical solution from a lookup
+    table without compiling Python). Round 18 closed the prose-strip
+    gap; round 23 closes the prompt-memorisation gap.
+
+    Why this is harder than the math case
+    -------------------------------------
+    The math-paraphrase helper (``_paraphrase_math_problem``) rewrites
+    the entire question stem because the stem is pure natural language.
+    Code prompts MIX prose and code: a HumanEval prompt is typically::
+
+        from typing import List
+
+        def has_close_elements(numbers: List[float], threshold: float) -> bool:
+            \"\"\" Check if in given list of numbers, are any two numbers
+            closer to each other than given threshold.
+            >>> has_close_elements([1.0, 2.0, 3.0], 0.5)
+            False
+            >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)
+            True
+            \"\"\"
+
+    If we naively apply the math synonym table to the whole prompt:
+    ``\\bfind\\b`` would match ``"abc".find("b")`` inside a doctest
+    and rewrite it to ``"abc".determine("b")`` — *actively breaking*
+    the test harness. The defence has to be **structurally aware**: it
+    must paraphrase only the prose lines and leave every code token
+    (function signatures, imports, ``>>>`` doctests, doctest outputs,
+    ``assert`` lines, decorators, ``return`` statements) untouched.
+
+    Algorithm
+    ---------
+    Line-by-line classification:
+      * **CODE line** (never paraphrased) — starts with one of:
+        ``def`` / ``class`` / ``from`` / ``import`` / ``@`` /
+        ``return`` / ``assert`` / ``>>>`` / ``...`` (continuation),
+        OR is the line immediately following a ``>>>`` (doctest
+        output), OR is a bare triple-quote marker (\\\"\\\"\\\" or
+        \\'\\'\\').
+      * **PROSE line** (paraphrased) — everything else.
+
+    The paraphrase itself is the same word-boundary synonym swap used
+    by the math helper, but with an extra code-domain table
+    (``_CODE_INSTRUCTION_SYNONYMS``) layered on top so common code-
+    prose phrasings like "write a function" and "check if" rotate too.
+
+    We deliberately do **not** apply the imperative→question rewrite
+    here: ``"Check if X."`` → ``"What is X?"`` is grammatically wrong
+    for a docstring-spec, and the line-by-line scope means each prose
+    line gets one independent swap which already gives 4-8 surface
+    variants per multi-line docstring across the seed space.
+
+    Determinism: the per-prompt seed is mixed via
+    ``_stable_seed_from_text`` so every validator picks the same swap
+    in the same round, but the swap rotates per ``block_seed``.
+    Returns ``prompt`` unchanged when ``block_seed`` is None
+    (dev/replay mode) so the helper is safe to call on any path.
+
+    Forward-reference note: ``_apply_instruction_synonyms`` is defined
+    later in this module (alongside the rest of the robustness-bench
+    infrastructure). That's fine because this function is only called
+    at round-start from ``set_bench_block_seed``, by which point all
+    module-level defs exist.
+    """
+    seed = _coerce_block_seed(block_seed)
+    if seed is None or not prompt:
+        return prompt
+    stable = _stable_seed_from_text(prompt, block_seed)
+
+    lines = prompt.split("\n")
+    if not lines:
+        return prompt
+
+    # Classify each line as PROSE (paraphrase) or CODE (preserve).
+    is_prose: list[bool] = []
+    prev_was_doctest = False
+    for line in lines:
+        stripped = line.lstrip()
+        is_doctest = (
+            stripped.startswith(">>> ") or stripped == ">>>"
+            or stripped.startswith("... ") or stripped == "..."
+        )
+        # A doctest *output* line is the line immediately after a >>> /
+        # ... continuation line, EXCEPT when it's blank, another doctest,
+        # or a triple-quote marker (those reset the state). We count
+        # exactly one output line per >>> input by clearing
+        # prev_was_doctest after consuming it.
+        is_doctest_output = (
+            prev_was_doctest and stripped != ""
+            and not is_doctest
+            and not stripped.startswith('"""')
+            and not stripped.startswith("'''")
+        )
+        is_python_stmt = (
+            stripped.startswith("def ")
+            or stripped.startswith("class ")
+            or stripped.startswith("from ")
+            or stripped.startswith("import ")
+            or stripped.startswith("@")
+            or stripped.startswith("assert ")
+            or stripped.startswith("return ")
+            or stripped == "return"
+        )
+        is_quote_only = stripped in ('"""', "'''")
+        prose = not (
+            is_doctest or is_doctest_output or is_python_stmt or is_quote_only
+        )
+        is_prose.append(prose)
+        # "prev_was_doctest" flips on for one following line, then off.
+        # If we see two >>> lines back-to-back the second resets the
+        # one-shot output expectation correctly.
+        if is_doctest:
+            prev_was_doctest = True
+        elif is_doctest_output:
+            prev_was_doctest = False
+        else:
+            prev_was_doctest = False
+
+    # Apply synonym swap line-by-line on prose lines only. Each line
+    # gets the same per-prompt seed; the swap helper picks ONE source
+    # phrase per line that appears in that line and rewrites all
+    # occurrences inside that line. Different prose lines in the same
+    # prompt may pick different swaps (because their candidate sets
+    # differ), giving better wording rotation than a single global
+    # swap would.
+    out_lines: list[str] = []
+    for line, prose in zip(lines, is_prose):
+        if not prose or not line.strip():
+            out_lines.append(line)
+            continue
+        rewritten = _apply_instruction_synonyms(
+            line, stable, extra_table=_CODE_INSTRUCTION_SYNONYMS,
+        )
+        out_lines.append(rewritten)
+    return "\n".join(out_lines)
+
+
+# ── Round 25: judge_probe / chat_turns_probe canonical-response defence
+# ====================================================================
+# After v18-v24 closed every benchmark-axis canonical-wording attack
+# vector, the two largest remaining un-rotated public-prompt-pool axes
+# on the validator are:
+#
+#   * ``judge_probe``       — composite weight 0.15, drawn from a
+#                             65-prompt static pool baked into this
+#                             source file (``JUDGE_PROBE_POOL``);
+#                             16 prompts sampled per round.
+#   * ``chat_turns_probe``  — composite weight 0.08, drawn from a
+#                             ~25-conversation static pool of 3-turn
+#                             dialogues (``CHAT_TURNS_PROBE_POOL``);
+#                             6 conversations sampled per round.
+#
+# Combined attack surface = 0.23 weight, larger than ``code_bench`` +
+# ``reasoning_bench`` combined (0.20). Both axes are graded by the
+# teacher rubric on a 1-5 scale of "correct + clear + addresses the
+# question + appropriate length". A miner who pre-trains their student
+# on canonical 5/5-quality responses to all 65 + ~25 = ~90 prompts can
+# saturate both axes from a ``{prompt_text → canonical_response}``
+# lookup table without doing any genuine chat work — the same
+# canonical-wording memorisation Goodhart vector that hit math /
+# code / BBH in earlier rounds, just on a smaller surface.
+#
+# v25 closes this by extending the per-round paraphrase machinery
+# (already proven on math / code / BBH / aime / robustness) to chat
+# prompts. The paraphrased prompt is semantically identical, so a
+# model that genuinely understands the request still scores well; a
+# model whose lookup keys on canonical text loses signal because the
+# same intent now arrives wrapped in a different verb / adverb pair
+# every round.
+#
+# Why a separate helper is required
+# ---------------------------------
+# Chat prompts mix instruction prose with code samples, JSON, quoted
+# strings, regex literals, and tight format specifications:
+#
+#     "What is the output of `print(list(range(3, 10, 2)))` in Python? "
+#     "Just the output."
+#
+# A naive word-boundary swap of ``"list" → "enumerate"`` would corrupt
+# the inner ``list(...)`` token and either break the prompt or change
+# the gold answer. The chat helper is *region-aware*: it splits each
+# prompt into ALTERNATING prose and protected segments (anything
+# inside backticks ``` ``` ``` / ``` ` ``` /, single quotes, double
+# quotes, JSON braces) and applies the synonym swap ONLY to the prose
+# regions. Every protected segment passes through byte-identical so
+# code, function names, format specs, and embedded examples are
+# preserved. The same ``_apply_instruction_synonyms`` helper used by
+# every other paraphrase axis powers the swap, with a chat-domain
+# extension table layered in via the v23-introduced ``extra_table``
+# parameter.
+#
+# Why the chat synonym table is small and conservative
+# ----------------------------------------------------
+# Many judge_probe prompts already include strict format constraints
+# ("List five countries... no other text", "Reply in the format:
+# 'PROS: <a, b>; CONS: <c, d>'", "Respond with only the JSON"). Those
+# constraints are scored by the rubric under "addresses the question";
+# we MUST preserve them verbatim. The chat synonym table is therefore
+# limited to high-frequency conversational verb / adverb rotations
+# whose every replacement is grammatically interchangeable across
+# every domain in the pool (factual, reasoning, instruction-following,
+# coding-prose, creative writing, common-sense). The math-domain
+# defaults (``find / calculate / determine``) are NOT layered in
+# because chat prompts contain English homonyms ("find a movie" /
+# "calculate the cost") whose math-domain rewrites would read awkward
+# in conversational prose.
+_CHAT_INSTRUCTION_SYNONYMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Conversational verb-of-instruction rotations.
+    ("explain", ("describe", "outline")),
+    ("describe", ("explain", "outline")),
+    ("outline", ("explain", "describe")),
+    # "Provide" / "Give" / "Offer" — extremely high frequency in the
+    # pool ("Give three tips", "Provide three synonyms", "Offer one
+    # creative metaphor"). All three are direct substitutes.
+    ("provide", ("give", "offer")),
+    ("give", ("provide", "offer")),
+    ("offer", ("give", "provide")),
+    # "Show" / "Demonstrate" / "Illustrate" — covers "Show how to ..."
+    # and "Demonstrate ..." family openers.
+    ("show", ("demonstrate", "illustrate")),
+    ("demonstrate", ("show", "illustrate")),
+    ("illustrate", ("show", "demonstrate")),
+    # "List" / "Enumerate" — both are valid in instruction prose; the
+    # protected-region split keeps Python's ``list(...)`` and similar
+    # code tokens out of scope.
+    ("list", ("enumerate",)),
+    ("enumerate", ("list",)),
+    # "Briefly" / "Concisely" — adverb rotation. Both common and
+    # interchangeable.
+    ("briefly", ("concisely",)),
+    ("concisely", ("briefly",)),
+    # "Suggest" / "Recommend" — appears in chat_turns_probe ("Can you
+    # suggest some indoor activities", "Recommend a starting point").
+    ("suggest", ("recommend",)),
+    ("recommend", ("suggest",)),
+    # "Sketch" / "Walk me through" — chat-turns-style request rotations.
+    ("sketch", ("walk through",)),
+    # "Should I" / "Do I need to" — second-person request rewordings
+    # used in some chat_turns scenarios. Only fires if exact phrase is
+    # present, so risk-free on the rest of the pool.
+    ("should i", ("do i need to",)),
+    ("do i need to", ("should i",)),
+)
+
+
+# Regex tokenizer that splits a chat prompt into PROSE / PROTECTED
+# alternating chunks. Protected chunks (any kind of quoted region) pass
+# through verbatim; prose chunks are paraphrased. The order matters:
+# triple-backtick fences must be matched BEFORE single-backticks so a
+# multi-line code block isn't split into three single-backtick chunks.
+# Single quotes / double quotes are matched non-greedily so we don't
+# greedy-match across paragraph boundaries on a quote-heavy prompt.
+_CHAT_PROTECTED_RE = re.compile(
+    r"(```.*?```"      # triple-backtick fenced code
+    r"|`[^`]*`"        # inline single-backtick code
+    r"|'[^'\n]*'"      # single-quoted strings (non-multiline)
+    r"|\"[^\"\n]*\"" # double-quoted strings (non-multiline)
+    r"|\{[^{}\n]*\})", # inline JSON-like {...} blocks (one line, no nesting)
+    re.DOTALL,
+)
+
+
+def _paraphrase_chat_prompt(prompt: str, block_seed) -> str:
+    """Per-round paraphrase wrapper for chat-style prompts.
+
+    Goodhart hardening (round 25): ``judge_probe`` and ``chat_turns_probe``
+    both draw from small, fully-public, fully-static prompt pools (~65
+    + ~25 conversations). Combined the two axes carry 0.23 composite
+    weight (0.15 + 0.08), the largest remaining canonical-prompt
+    attack surface after v18-v24 closed the bench-axis side. A miner
+    who pre-trains on canonical 5/5-quality responses to every prompt
+    in the source file can saturate both axes from a lookup table.
+    See the block-comment header above this helper for the full
+    motivation.
+
+    Algorithm
+    ---------
+    The helper is *region-aware*: it splits the input into alternating
+    PROSE and PROTECTED chunks and applies the synonym swap ONLY to
+    the prose chunks. Protected chunks are anything inside:
+
+      * Triple-backtick fenced code blocks (``\\`\\`\\`...\\`\\`\\```).
+      * Inline single-backtick code (``\\`code\\```).
+      * Single-quoted or double-quoted strings (non-multiline).
+      * Inline JSON-like ``{...}`` blocks (one line, no nesting).
+
+    These cover every code / format-spec idiom in the current judge
+    and chat-turns pools (verified against
+    ``JUDGE_PROBE_POOL`` / ``CHAT_TURNS_PROBE_POOL``). Anything we
+    miss falls back to the word-boundary regex inside
+    ``_apply_instruction_synonyms`` which already refuses to match
+    inside identifiers (``\\bfind\\b`` does not match ``finding``).
+
+    Each prose chunk is paraphrased independently with the same
+    per-prompt seed. ``_apply_instruction_synonyms`` picks one swap
+    that fires anywhere in that chunk; different prose chunks in the
+    same prompt may pick different swaps because their candidate sets
+    differ. Net effect: a multi-sentence prompt typically rotates
+    through ≥ 2 surface variants per round, ≥ 4 across the seed space.
+
+    The chat-domain synonym table (``_CHAT_INSTRUCTION_SYNONYMS``)
+    is layered on top of the math-domain defaults via the
+    ``extra_table`` parameter introduced in round 23 — but the
+    math-domain defaults are filtered out for chat prompts because
+    English homonyms (``find a movie`` vs ``find the area``) make
+    indiscriminate ``find / calculate / determine`` rewrites read
+    awkward in conversational prose. The math defaults are still
+    safe to apply on benches that derive from math word problems;
+    only the chat path narrows the table. This is achieved by
+    re-running the helper at module level with an ``extra_table``
+    that fully replaces the math defaults — see the
+    ``_apply_chat_synonyms`` inner helper below.
+
+    Determinism
+    -----------
+    Per-prompt seed is mixed via ``_stable_seed_from_text`` so
+    every validator paraphrases identically in the same round, but
+    the swap rotates per ``block_seed``. Returns ``prompt`` unchanged
+    when ``block_seed`` is None (dev / replay mode) so the helper is
+    safe to call on any path.
+    """
+    seed = _coerce_block_seed(block_seed)
+    if seed is None or not prompt:
+        return prompt
+    stable = _stable_seed_from_text(prompt, block_seed)
+
+    parts = _CHAT_PROTECTED_RE.split(prompt)
+    # ``re.split`` with a single capturing group produces alternating
+    # [prose, protected, prose, protected, ...] — even indices are
+    # prose, odd indices are protected. If the prompt starts with a
+    # protected region, ``parts[0]`` is an empty string, which is
+    # still safely handled by ``_apply_instruction_synonyms`` (no
+    # candidates → returns input unchanged).
+    out_parts: list[str] = []
+    for i, part in enumerate(parts):
+        if i % 2 == 1:
+            out_parts.append(part)
+            continue
+        if not part:
+            out_parts.append(part)
+            continue
+        out_parts.append(
+            _apply_chat_synonyms(part, stable)
+        )
+    return "".join(out_parts)
+
+
+def _apply_chat_synonyms(text: str, seed: int) -> str:
+    """Chat-domain synonym swap.
+
+    Applies ONLY ``_CHAT_INSTRUCTION_SYNONYMS`` (no math-domain
+    defaults). We bypass ``_apply_instruction_synonyms``'s default
+    table because conversational prose has English homonyms with
+    math-domain rewrite rules ("find a movie" → "determine a movie"
+    reads awkward) and the chat table is curated to avoid them.
+
+    The implementation mirrors ``_apply_instruction_synonyms`` to keep
+    behaviour, casing, and word-boundary semantics identical across
+    the math / code / chat paraphrase paths.
+    """
+    import random
+    import re as _re
+
+    rng = random.Random(seed & 0xFFFFFFFF)
+    candidates = [
+        (src, alts) for src, alts in _CHAT_INSTRUCTION_SYNONYMS
+        if _re.search(rf"\b{_re.escape(src)}\b", text, flags=_re.IGNORECASE)
+    ]
+    if not candidates:
+        return text
+    src, alts = rng.choice(candidates)
+    rep = rng.choice(alts)
+
+    def _swap(match: "_re.Match[str]") -> str:
+        word = match.group(0)
+        if word.isupper():
+            return rep.upper()
+        if word[:1].isupper():
+            return rep[:1].upper() + rep[1:]
+        return rep
+
+    return _re.sub(
+        rf"\b{_re.escape(src)}\b",
+        _swap,
+        text,
+        flags=_re.IGNORECASE,
+    )
 
 
 def _shuffle_mc_options_for_round(item: dict, block_seed) -> dict:
@@ -3270,6 +3824,140 @@ def _shuffle_mc_options_for_round(item: dict, block_seed) -> dict:
     return out
 
 
+# ── Round 24: BBH (reasoning_bench) inline-MC option shuffle ────────
+# BBH stores options inline in the ``input`` text rather than as a
+# separate ``options`` field, so the round-20 ``_shuffle_mc_options_for_round``
+# helper (which operates on ``labels`` / ``texts`` / ``options`` fields)
+# can't be reused directly. A miner who pre-trained on the public
+# ``lukaemon/bbh`` dataset can still build a ``{question_text → letter}``
+# lookup for the ~12 multi-choice subtasks (logical_deduction_*,
+# tracking_shuffled_objects_*, disambiguation_qa, geometric_shapes,
+# hyperbaton, movie_recommendation, penguins_in_a_table, ruin_names,
+# snarks, temporal_sequences) and saturate those subtasks without
+# reading the option text. Evidence: schema-version=0 records (pre any
+# Goodhart hardening) hit reasoning_bench=0.88 paired with capability=
+# 0.99 / arc_bench=0 / code_bench=0 — the textbook "saturated on the
+# memorisable axis, zero everywhere else" Goodhart signature.
+#
+# Round 24 closes this gap by parsing the inline ``Options:\n(A) ...
+# \n(B) ...`` block, shuffling the option contents per
+# ``(block_seed XOR sha256(question))``, and remapping the gold letter
+# to point to where the original correct content lands. Boolean and
+# numeric BBH subtasks (boolean_expressions, web_of_lies, navigate,
+# object_counting, etc.) have no inline-options block and pass through
+# unchanged. The option-block detection is anchored on the literal
+# header ``Options:`` plus a leading ``(letter) `` pattern, matching
+# the canonical BBH format used by every MC subtask in the dataset
+# (verified against ``logical_deduction_three_objects``,
+# ``tracking_shuffled_objects_three_objects``, ``hyperbaton``).
+
+_BBH_OPTION_BLOCK_RE = re.compile(
+    r"(?P<header>(?:^|\n)Options:\s*\n)"
+    r"(?P<options>(?:\([A-Z]\)\s*[^\n]*\n?)+)",
+    re.IGNORECASE,
+)
+_BBH_OPTION_LINE_RE = re.compile(r"^\(([A-Z])\)\s*(.*)$")
+_BBH_GOLD_LETTER_RE = re.compile(r"^\(([A-Z])\)$")
+
+
+def _shuffle_bbh_mc_options(item: dict, block_seed) -> dict:
+    """Per-round, per-question deterministic shuffle of inline BBH options.
+
+    Goodhart hardening (round 24): see the block comment above for the
+    motivation. Implementation parallels ``_shuffle_mc_options_for_round``
+    but operates on the inline ``Options:\\n(A) ...\\n(B) ...`` block in
+    the question text (BBH's storage format) rather than on a separate
+    ``options`` list. Returns the item unchanged when:
+
+      * ``block_seed`` is None (dev/replay mode).
+      * The item has no inline options block (boolean / numeric BBH
+        subtasks like ``boolean_expressions`` or ``object_counting``).
+      * The gold field isn't in the canonical ``"(X)"`` letter format
+        (some BBH subtasks have free-form gold answers we shouldn't
+        touch).
+      * Parsing the option block yields fewer than 2 options or the
+        gold letter doesn't index into the parsed options.
+
+    Cross-validator agreement: the per-item key is
+    ``block_seed XOR int.from_bytes(sha256(question).digest()[:8])``,
+    matching the round-20 helper's keying. Two items with different
+    question text shuffle independently in the same round.
+
+    Schema preservation: the output keeps the same ``Options:\\n(A) ...
+    \\n(B) ...`` shape so the model sees a familiar BBH format and
+    answer-extraction (``_reasoning_extract_answer``'s ``\\(?[A-Z]\\)?``
+    regex) keeps working.
+    """
+    import hashlib as _hashlib
+    import random as _rnd
+
+    seed = _coerce_block_seed(block_seed)
+    if seed is None:
+        return item
+
+    question = item.get("question") or ""
+    gold = (item.get("gold") or "").strip()
+    if not question or not gold:
+        return item
+
+    gm = _BBH_GOLD_LETTER_RE.match(gold)
+    if not gm:
+        return item
+    gold_letter = gm.group(1).upper()
+
+    block_match = _BBH_OPTION_BLOCK_RE.search(question)
+    if not block_match:
+        return item
+
+    options_text = block_match.group("options")
+    parsed: list[tuple[str, str]] = []
+    for line in options_text.splitlines():
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+        om = _BBH_OPTION_LINE_RE.match(line_strip)
+        if not om:
+            continue
+        parsed.append((om.group(1).upper(), om.group(2).rstrip()))
+
+    if len(parsed) < 2:
+        return item
+
+    labels = [lbl for lbl, _ in parsed]
+    texts = [txt for _, txt in parsed]
+    try:
+        gold_idx = labels.index(gold_letter)
+    except ValueError:
+        return item
+
+    h = _hashlib.sha256(question.encode("utf-8", errors="ignore")).digest()
+    mix = (seed ^ int.from_bytes(h[:8], "big")) & 0xFFFFFFFF
+    order = list(range(len(texts)))
+    _rnd.Random(mix).shuffle(order)
+
+    new_texts = [texts[i] for i in order]
+    new_gold_idx = order.index(gold_idx)
+    new_gold_letter = labels[new_gold_idx]
+
+    new_block_lines = [
+        f"({labels[i]}) {new_texts[i]}" for i in range(len(new_texts))
+    ]
+    new_block = block_match.group("header") + "\n".join(new_block_lines)
+    if options_text.endswith("\n"):
+        new_block += "\n"
+
+    new_question = (
+        question[: block_match.start()]
+        + new_block
+        + question[block_match.end():]
+    )
+
+    out = dict(item)
+    out["question"] = new_question
+    out["gold"] = f"({new_gold_letter})"
+    return out
+
+
 def _pick_bench_items(bench_key: str, block_seed, k: int) -> list[dict]:
     """Deterministic per-round sample from ``_BENCH_POOLS[bench_key]``.
 
@@ -3323,48 +4011,56 @@ def set_bench_block_seed(block_seed):
     if block_seed == _BENCH_BLOCK_SEED and all(_BENCH_SAMPLES[k] for k in _BENCH_SAMPLES):
         return
     _BENCH_BLOCK_SEED = block_seed
-    _BENCH_SAMPLES["math"] = _pick_bench_items("math", block_seed, BENCH_MATH_PER_ROUND)
-    _BENCH_SAMPLES["code"] = _pick_bench_items("code", block_seed, BENCH_CODE_PER_ROUND)
-    _BENCH_SAMPLES["reasoning"] = _pick_bench_items("reasoning", block_seed, BENCH_REASONING_PER_ROUND)
-    _BENCH_SAMPLES["knowledge"] = _pick_bench_items("knowledge", block_seed, BENCH_KNOWLEDGE_PER_ROUND)
-    _BENCH_SAMPLES["ifeval"] = _pick_bench_items("ifeval", block_seed, BENCH_IFEVAL_PER_ROUND)
-    _BENCH_SAMPLES["aime"] = _pick_bench_items("aime", block_seed, BENCH_AIME_PER_ROUND)
-    # Round 21 Goodhart hardening: paraphrase the AIME problem text per
-    # round so a miner who memorised the canonical public wordings sees
-    # a rotated phrasing each round. Math-content is preserved by the
-    # synonym table (only instruction verbs / imperative→question
-    # transforms; never digits, LaTeX, or boxed format).
-    _BENCH_SAMPLES["aime"] = [
-        {**it, "question": _paraphrase_aime_problem(it["question"], block_seed)}
-        for it in _BENCH_SAMPLES["aime"]
-    ]
-    _BENCH_SAMPLES["mbpp"] = _pick_bench_items("mbpp", block_seed, BENCH_MBPP_PER_ROUND)
-    _BENCH_SAMPLES["tool_use"] = _pick_bench_items("tool_use", block_seed, BENCH_TOOL_USE_PER_ROUND)
-    _BENCH_SAMPLES["self_consistency"] = _pick_bench_items(
-        "self_consistency", block_seed, BENCH_SELF_CONSISTENCY_PER_ROUND,
+    # ── v27 Session 3.20 (2026-04-26 Goodhart hardening, full procedural switch) ──
+    # Public-dataset items are unsafe: every (question, gold) pair is
+    # discoverable on disk, so a miner can pre-compute answers for the
+    # whole pool. v22-v26 paraphrase / option-shuffle rotated wording
+    # but not semantics, so a {paraphrased_question → answer} lookup
+    # still saturated the axis. v27 generates the bench items per round
+    # from ``block_seed``: there is no offline dataset, so memorisation
+    # is not even available as a strategy. Round duration is unchanged
+    # because per-item generation is microseconds. The public datasets
+    # remain available for ``scripts/eval_pod/auto_benchmark.sh`` to run
+    # post-hoc evalscope verification against the king on a separate
+    # pod, but the validator never trains-or-evals against the public
+    # items.
+    _BENCH_SAMPLES["math"] = _generate_math_items(block_seed, BENCH_MATH_PER_ROUND)
+    _BENCH_SAMPLES["code"] = _generate_code_items(block_seed, BENCH_CODE_PER_ROUND)
+    _BENCH_SAMPLES["reasoning"] = _generate_reasoning_items(
+        block_seed, BENCH_REASONING_PER_ROUND,
     )
-    _BENCH_SAMPLES["arc"] = _pick_bench_items("arc", block_seed, BENCH_ARC_PER_ROUND)
-    _BENCH_SAMPLES["truthful"] = _pick_bench_items("truthful", block_seed, BENCH_TRUTHFUL_PER_ROUND)
-    # Round 20 Goodhart hardening: ARC and MMLU-Pro ship with a fixed
-    # correct-letter per question; a miner who memorised the public
-    # datasets can answer "C" to question N every time without parsing.
-    # We rotate option order per (block_seed, question) so memorising
-    # {question → letter} is wrong on every refresh. Also re-applied to
-    # truthful_bench so its load-time per-question shuffle is now also
-    # round-rotated. Items without a recognisable MC shape pass through
-    # unchanged.
-    _BENCH_SAMPLES["arc"] = [
-        _shuffle_mc_options_for_round(it, block_seed)
-        for it in _BENCH_SAMPLES["arc"]
-    ]
-    _BENCH_SAMPLES["knowledge"] = [
-        _shuffle_mc_options_for_round(it, block_seed)
-        for it in _BENCH_SAMPLES["knowledge"]
-    ]
-    _BENCH_SAMPLES["truthful"] = [
-        _shuffle_mc_options_for_round(it, block_seed)
-        for it in _BENCH_SAMPLES["truthful"]
-    ]
+    # ``knowledge_bench`` was MMLU-Pro: ~12k canonical questions with a
+    # static {question → letter} mapping. Replacing it with the
+    # procedural multiple-choice generator removes the memorisation
+    # surface. Knowledge *recall* is still measured by capability_probe
+    # (mixed static/procedural), and the validator's primary driver
+    # remains on_policy_rkl (0.35) which uses paraphrased chat prompts.
+    # Note: knowledge/arc/truthful all consume the MMLU-shape
+    # (bare question + structured options + gold_letter) emitted by
+    # ``_generate_mc_items``, while reasoning_bench consumes the
+    # inline-options shape from ``_generate_reasoning_items``.
+    _BENCH_SAMPLES["knowledge"] = _generate_mc_items(
+        block_seed ^ 0x73CC, BENCH_KNOWLEDGE_PER_ROUND,
+    )
+    _BENCH_SAMPLES["ifeval"] = _generate_ifeval_items(
+        block_seed, BENCH_IFEVAL_PER_ROUND,
+    )
+    _BENCH_SAMPLES["aime"] = _generate_aime_items(block_seed, BENCH_AIME_PER_ROUND)
+    _BENCH_SAMPLES["mbpp"] = _generate_code_items(
+        block_seed ^ 0x4D42, BENCH_MBPP_PER_ROUND,
+    )
+    _BENCH_SAMPLES["tool_use"] = _generate_math_items(
+        block_seed ^ 0x546F, BENCH_TOOL_USE_PER_ROUND,
+    )
+    _BENCH_SAMPLES["self_consistency"] = _generate_math_items(
+        block_seed ^ 0x5343, BENCH_SELF_CONSISTENCY_PER_ROUND,
+    )
+    _BENCH_SAMPLES["arc"] = _generate_mc_items(
+        block_seed ^ 0x4143, BENCH_ARC_PER_ROUND,
+    )
+    _BENCH_SAMPLES["truthful"] = _generate_mc_items(
+        block_seed ^ 0x5452, BENCH_TRUTHFUL_PER_ROUND,
+    )
     # Session 3.5: long-context needle is procedural — generate fresh items
     # per round from a seed mixed with the block_seed so pools rotate but
     # every validator generates the same items this round.
@@ -3374,17 +4070,18 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["procedural"] = _generate_procedural_items(
         block_seed, BENCH_PROCEDURAL_PER_ROUND,
     )
-    # Session 3.7: robustness reuses math items but draws under its own
-    # stream offset, so the canonical math probe and the robustness
-    # probe are usually scored on disjoint items in the same round.
-    _BENCH_SAMPLES["robustness"] = _pick_bench_items(
-        "robustness", block_seed, BENCH_ROBUSTNESS_PER_ROUND,
+    # v27: ``robustness`` and ``noise`` test paraphrase / typo invariance.
+    # We generate fresh procedural math items under disjoint stream
+    # offsets, then let ``robustness_bench_probe`` apply its runtime
+    # paraphrase and ``noise_resistance_bench_probe`` its runtime typo
+    # injection. The signal — "does the model still solve the same
+    # problem under wording perturbation / character noise?" — is
+    # preserved, but every (question, answer) pair is fresh per round.
+    _BENCH_SAMPLES["robustness"] = _generate_math_items(
+        block_seed ^ 0x524F, BENCH_ROBUSTNESS_PER_ROUND,
     )
-    # Session 3.7: noise_resistance reuses math items but draws under
-    # yet another stream offset, so {math, robustness, noise} all
-    # typically score disjoint items in the same round.
-    _BENCH_SAMPLES["noise"] = _pick_bench_items(
-        "noise", block_seed, BENCH_NOISE_PER_ROUND,
+    _BENCH_SAMPLES["noise"] = _generate_math_items(
+        block_seed ^ 0x4E4F, BENCH_NOISE_PER_ROUND,
     )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
@@ -4652,6 +5349,1436 @@ def _rot_text(s: str, n: int) -> str:
     return s[n:] + s[:n]
 
 
+# ── v27 (Session 3.20) — fully-procedural skill probes ─────────────────────
+#
+# Pre-v27 the bench battery sampled from public HuggingFace datasets
+# (GSM8K / MATH-500 / HumanEval / MBPP / BBH / MMLU-Pro / IFEval / ARC /
+# TruthfulQA / AIME / climbmix). Even with v18-v26 paraphrase / option-shuffle /
+# prompt-rotation hardening, a miner can still memorise the **answer** to
+# every public question. Paraphrase rotates the wording but the semantic
+# content (and thus the gold answer) is unchanged, so a model that has
+# overfit ``{problem_text → answer}`` lookups still saturates the axis.
+#
+# v27 closes this hole at the source: each round we **generate** the
+# bench items from the round's ``block_seed``. The (parameters, gold)
+# pair is fresh every round and exists nowhere on disk — there is no
+# dataset to memorise. A miner cannot pre-compute answers for items the
+# validator has not generated yet.
+#
+# We retain the public datasets for separate **post-hoc verification**
+# benchmarks (``scripts/eval_pod/auto_benchmark.sh`` runs evalscope on
+# HumanEval/GSM8K/MATH-500/MBPP/BBH/MMLU-Pro/IFEval/AIME against the
+# current king on a separate Lium pod). If the procedural eval drives
+# real skill improvement, that improvement should also show up on the
+# public benchmarks — but the validator NEVER trains-or-evals against
+# the public items, so Goodhart's Law is broken at the metric layer.
+#
+# The procedural generators below test the same SKILLS as their public
+# counterparts:
+#
+#   _generate_math_items        ← replaces math_bench (GSM8K + MATH-500)
+#                                 + robustness_bench + noise_resistance_bench
+#                                 + self_consistency_bench + tool_use_bench
+#                                 + aime_bench
+#   _generate_code_items        ← replaces code_bench (HumanEval) + mbpp_bench
+#   _generate_reasoning_items   ← replaces reasoning_bench (BBH) + arc_bench
+#                                 + truthful_bench + knowledge_bench
+#   _generate_ifeval_items      ← replaces ifeval_bench
+#
+# Together with the existing _generate_long_context_items and
+# _generate_procedural_items, this gives the validator a fully
+# procedural bench battery — every axis derives its items from
+# ``block_seed`` and nothing else.
+
+import math as _v27_math
+
+
+def _v27_int_to_words(n: int) -> str:
+    """Tiny number-words helper for word-problem prompts."""
+    units = ["zero","one","two","three","four","five","six","seven","eight",
+             "nine","ten","eleven","twelve","thirteen","fourteen","fifteen",
+             "sixteen","seventeen","eighteen","nineteen"]
+    tens = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
+    if n < 20:
+        return units[n]
+    if n < 100:
+        t, u = divmod(n, 10)
+        return tens[t] + ("-" + units[u] if u else "")
+    return str(n)
+
+
+def _generate_math_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural math items for math_bench (v27).
+
+    Subtypes (rotated per round, per item):
+      * ``modular_linear``    — ((a*x + b*y + c) mod m), small primes
+      * ``rate_distance``     — relative-velocity word problems
+      * ``mixture``           — concentration/blend word problems
+      * ``percentage``        — applied percent of a base, with a twist
+      * ``gcd_lcm``           — number-theory short forms
+      * ``polynomial_eval``   — evaluate ax^2 + bx + c at integer point
+      * ``arithmetic_series`` — sum of arithmetic progression
+      * ``geometric_series``  — finite geometric series with small r
+      * ``digit_sum``         — multi-step digit manipulation
+      * ``unit_conversion``   — currency / percentage / time conversions
+      * ``simultaneous``      — solve 2-variable linear system
+      * ``factorial_mod``     — n! mod p with Wilson's-theorem checkable
+      * ``set_intersect``     — counting from inclusion-exclusion
+      * ``probability_count`` — combinatorial probability with small N
+      * ``triangle_area``     — Heron's formula, integer outcomes
+      * ``coin_change``       — exact-change combinations (DP-checkable)
+      * ``time_arithmetic``   — duration / clock arithmetic
+      * ``proportion``        — ratio with one unknown leg
+    All items use the GSM8K-style ``#### N`` answer marker so the
+    existing ``_math_extract_answer`` pipeline grades them unchanged.
+
+    Difficulty calibration: targets a 4B-class instruction-tuned model
+    at ~50% pass-rate on a clean reference (Qwen3.5-4B baseline). Easier
+    subtypes (digit_sum, percentage) balance harder ones (factorial_mod,
+    simultaneous) so the round mean lands ~0.4-0.6 with low variance.
+    """
+    import random
+    from math import gcd
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["math"]) & 0xFFFFFFFF)
+    kinds = [
+        "modular_linear", "rate_distance", "mixture", "percentage",
+        "gcd_lcm", "polynomial_eval", "arithmetic_series", "geometric_series",
+        "digit_sum", "unit_conversion", "simultaneous", "factorial_mod",
+        "set_intersect", "probability_count", "triangle_area", "coin_change",
+        "time_arithmetic", "proportion",
+    ]
+    rng.shuffle(kinds)
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        question = ""
+        gold = ""
+        if kind == "modular_linear":
+            a, b, c = r.randint(2, 11), r.randint(2, 11), r.randint(1, 49)
+            x, y = r.randint(7, 39), r.randint(7, 39)
+            m = r.choice([7, 11, 13, 17, 19, 23, 29, 31])
+            gold_n = (a * x + b * y + c) % m
+            question = (
+                f"Compute (({a} * {x}) + ({b} * {y}) + {c}) mod {m}.\n"
+                f"Give your final answer as the integer remainder."
+            )
+            gold = str(gold_n)
+        elif kind == "rate_distance":
+            v_a = r.randint(40, 80)
+            v_b = v_a + r.randint(8, 28)
+            t = r.randint(2, 9)
+            head_start = r.randint(0, 30)
+            gold_n = (v_b - v_a) * t - head_start
+            question = (
+                f"Two cars start traveling east on the same highway. "
+                f"Car A travels at {v_a} kilometers per hour. "
+                f"Car B starts {head_start} kilometers behind Car A "
+                f"and travels at {v_b} kilometers per hour. "
+                f"After {t} hours of driving, how many kilometers ahead of Car A is Car B?"
+            )
+            gold = str(gold_n)
+        elif kind == "mixture":
+            v1, p1 = r.randint(20, 80), r.choice([10, 15, 20, 25, 30, 40])
+            v2, p2 = r.randint(20, 80), r.choice([50, 60, 70, 80, 90])
+            total_solute_centigrams = v1 * p1 + v2 * p2
+            gold = str(total_solute_centigrams)
+            question = (
+                f"A chemist mixes {v1} grams of solution A (at {p1}% solute) "
+                f"with {v2} grams of solution B (at {p2}% solute). "
+                f"Compute the total mass of solute across both solutions in "
+                f"centigrams (1 centigram = 0.01 grams). Give the integer "
+                f"(equal to v1*p1 + v2*p2)."
+            )
+        elif kind == "percentage":
+            base = r.randint(200, 1500)
+            pct = r.choice([5, 8, 10, 12, 15, 20, 25, 30, 40])
+            extra = r.randint(7, 80)
+            gold_n = (base * pct) // 100 + extra
+            question = (
+                f"A shop has {base} items in stock. "
+                f"They sell {pct}% of them on Monday, then receive {extra} new items. "
+                f"How many items have left the shop, plus the new arrivals "
+                f"(i.e. {pct}% of {base} plus {extra})?"
+            )
+            gold = str(gold_n)
+        elif kind == "gcd_lcm":
+            x, y = r.randint(60, 999), r.randint(60, 999)
+            choice = r.choice(["gcd", "lcm"])
+            if choice == "gcd":
+                gold_n = gcd(x, y)
+                question = f"Compute the greatest common divisor of {x} and {y}."
+            else:
+                gold_n = (x * y) // gcd(x, y)
+                question = f"Compute the least common multiple of {x} and {y}."
+            gold = str(gold_n)
+        elif kind == "polynomial_eval":
+            a, b, c = r.randint(-7, 7), r.randint(-12, 12), r.randint(-25, 25)
+            x = r.randint(-6, 6)
+            gold_n = a * x * x + b * x + c
+            question = (
+                f"Evaluate the polynomial p(x) = {a}x^2 + {b}x + {c} at x = {x}. "
+                f"Give the integer p({x})."
+            )
+            gold = str(gold_n)
+        elif kind == "arithmetic_series":
+            a1, d = r.randint(1, 25), r.randint(1, 9)
+            n = r.randint(8, 30)
+            gold_n = n * (2 * a1 + (n - 1) * d) // 2
+            question = (
+                f"Compute the sum of the first {n} terms of the arithmetic "
+                f"sequence whose first term is {a1} and whose common difference is {d}."
+            )
+            gold = str(gold_n)
+        elif kind == "geometric_series":
+            a1 = r.randint(2, 9)
+            ratio = r.choice([2, 3])
+            n = r.randint(4, 8)
+            gold_n = a1 * (ratio**n - 1) // (ratio - 1)
+            question = (
+                f"Compute the sum of the first {n} terms of the geometric "
+                f"sequence with first term {a1} and common ratio {ratio}."
+            )
+            gold = str(gold_n)
+        elif kind == "digit_sum":
+            n_val = r.randint(10000, 999999)
+            target = r.randint(2, 9)
+            digits = [int(d) for d in str(n_val)]
+            digit_sum = sum(digits)
+            mult = r.choice(["minus", "plus"])
+            if mult == "minus":
+                gold_n = digit_sum * target - r.randint(1, 19)
+            else:
+                gold_n = digit_sum * target + r.randint(1, 19)
+            offset = abs(gold_n - digit_sum * target)
+            sign = "minus" if mult == "minus" else "plus"
+            question = (
+                f"Let S be the sum of the digits of {n_val}. "
+                f"Compute (S * {target}) {sign} {offset}."
+            )
+            gold = str(gold_n)
+        elif kind == "unit_conversion":
+            hours = r.randint(2, 14)
+            mins_per_hour = 60
+            extra_min = r.randint(0, 59)
+            gold_n = hours * mins_per_hour + extra_min
+            question = (
+                f"How many total minutes are in {hours} hours and {extra_min} minutes?"
+            )
+            gold = str(gold_n)
+        elif kind == "simultaneous":
+            x = r.randint(-9, 12)
+            y = r.randint(-9, 12)
+            a1, b1 = r.randint(1, 7), r.randint(1, 7)
+            a2, b2 = r.randint(1, 7), r.randint(1, 7)
+            while a1 * b2 - a2 * b1 == 0:
+                a2 = r.randint(1, 7)
+                b2 = r.randint(1, 7)
+            c1 = a1 * x + b1 * y
+            c2 = a2 * x + b2 * y
+            ask = r.choice(["x_minus_y", "x_plus_y", "x_times_y"])
+            if ask == "x_minus_y":
+                gold_n = x - y
+                tail = "x - y"
+            elif ask == "x_plus_y":
+                gold_n = x + y
+                tail = "x + y"
+            else:
+                gold_n = x * y
+                tail = "x * y"
+            question = (
+                f"Solve the system:\n"
+                f"  {a1} x + {b1} y = {c1}\n"
+                f"  {a2} x + {b2} y = {c2}\n"
+                f"Then compute {tail} as an integer."
+            )
+            gold = str(gold_n)
+        elif kind == "factorial_mod":
+            p = r.choice([7, 11, 13, 17, 19, 23])
+            n = r.randint(2, p - 1)
+            fact = 1
+            for k in range(1, n + 1):
+                fact = (fact * k) % p
+            gold = str(fact)
+            question = (
+                f"Compute {n}! mod {p}. (That is, the remainder when "
+                f"{n} factorial is divided by {p}.)"
+            )
+        elif kind == "set_intersect":
+            a = r.randint(40, 80)
+            b = r.randint(40, 80)
+            ab = r.randint(5, min(a, b) - 5)
+            gold_n = a + b - ab
+            question = (
+                f"In a class, {a} students study Spanish, {b} study French, "
+                f"and {ab} study both. How many students study Spanish or "
+                f"French (or both)?"
+            )
+            gold = str(gold_n)
+        elif kind == "probability_count":
+            total = r.randint(8, 18)
+            red = r.randint(2, total - 4)
+            blue = r.randint(2, total - red - 1)
+            other = total - red - blue
+            colour = r.choice(["red", "blue", "neither red nor blue"])
+            if colour == "red":
+                gold_n = red * 100 // total
+            elif colour == "blue":
+                gold_n = blue * 100 // total
+            else:
+                gold_n = other * 100 // total
+            question = (
+                f"A bag contains {red} red, {blue} blue, and {other} green marbles. "
+                f"You draw one at random. What is the probability (in whole percent, "
+                f"rounded down) of drawing a {colour} marble?"
+            )
+            gold = str(gold_n)
+        elif kind == "triangle_area":
+            base = r.choice([6, 8, 10, 12, 14, 16])
+            height = r.choice([5, 7, 9, 11, 13, 15])
+            gold_n = base * height // 2
+            question = (
+                f"A triangle has base {base} cm and corresponding height {height} cm. "
+                f"What is its area in square centimeters? (Use the formula "
+                f"area = base * height / 2 and give the integer.)"
+            )
+            gold = str(gold_n)
+        elif kind == "coin_change":
+            target = r.choice([12, 15, 20, 25, 30, 35])
+            count_5 = target // 5
+            gold_n = count_5 + 1
+            question = (
+                f"How many ways can you make exactly {target} cents using only "
+                f"5-cent and 1-cent coins (each combination differing in the "
+                f"number of 5-cent coins counts as distinct, including the "
+                f"all-1-cent combination)?"
+            )
+            gold = str(gold_n)
+        elif kind == "time_arithmetic":
+            start_h = r.randint(1, 12)
+            start_m = r.randint(0, 59)
+            add_h = r.randint(2, 14)
+            add_m = r.randint(5, 55)
+            total_min = (start_h * 60 + start_m + add_h * 60 + add_m) % (12 * 60)
+            end_h, end_m = divmod(total_min, 60)
+            if end_h == 0:
+                end_h = 12
+            gold_n = end_h * 100 + end_m
+            question = (
+                f"A meeting starts at {start_h:02d}:{start_m:02d} on a 12-hour clock. "
+                f"It runs for {add_h} hours and {add_m} minutes. At what time does "
+                f"it end? Give the answer as the integer HHMM (e.g. 03:25 → 325, "
+                f"11:45 → 1145)."
+            )
+            gold = str(gold_n)
+        else:  # proportion
+            scale = r.choice([3, 4, 5, 6, 7, 8])
+            base = r.randint(20, 90)
+            other = r.randint(40, 200)
+            gold_n = (base * other) // scale
+            question = (
+                f"If {scale} units of resource A produce {base} widgets, and we "
+                f"have {other} units of resource A, how many widgets can be "
+                f"produced (rounded down to a whole number)?"
+            )
+            gold = str(gold_n)
+        question = question + (
+            "\n\nSolve step by step and end with '#### N' where N is the final integer answer."
+        )
+        out.append({
+            "src": f"procedural_math/{kind}",
+            "question": question,
+            "gold": gold,
+        })
+    return out
+
+
+def _generate_aime_items(block_seed, n_items: int) -> list[dict]:
+    """Harder procedural math for the (renamed) ``aime_bench`` axis (v27).
+
+    Drops the public AIME pool entirely; instead generates olympiad-flavoured
+    multi-step problems whose answer is a positive integer 0-999 (matching
+    the AIME convention so existing answer extraction works). Each item
+    requires combining two operations (e.g. solve a quadratic AND apply a
+    modular constraint) so a 4B-class model with brittle reasoning fails
+    at ~70-90% on the reference, while a strong distillation reaches 30-50%.
+    """
+    import random
+    from math import gcd
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["aime"]) & 0xFFFFFFFF)
+    kinds = ["chained_modular", "diophantine", "factor_chain", "lcm_residue", "iterated_digit"]
+    rng.shuffle(kinds)
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        if kind == "chained_modular":
+            a = r.randint(2, 9)
+            b = r.randint(2, 9)
+            n = r.randint(7, 19)
+            mod = r.choice([97, 101, 103, 107, 109, 113])
+            val = pow(a, n, mod) * b % mod
+            gold = str(val)
+            question = (
+                f"Compute the value of (({a}^{n}) * {b}) mod {mod}, where ^ "
+                f"denotes integer exponentiation. The final answer is a "
+                f"non-negative integer less than {mod}."
+            )
+        elif kind == "diophantine":
+            x = r.randint(2, 11)
+            y = r.randint(x, 13)
+            s = x + y
+            p = x * y
+            gold = str(x * x + y * y)
+            question = (
+                f"Two positive integers x and y satisfy x + y = {s} and "
+                f"x * y = {p}, with 2 <= x <= y. Compute the integer x^2 + y^2."
+            )
+        elif kind == "factor_chain":
+            primes = [3, 5, 7, 11, 13, 17, 19]
+            r.shuffle(primes)
+            p1, p2, p3 = primes[0], primes[1], primes[2]
+            n_val = p1 * p2 * p3
+            extra = r.randint(0, 50)
+            gold = str(p1 + p2 + p3 + extra)
+            question = (
+                f"The integer {n_val} factors uniquely as a product of three "
+                f"distinct primes. Let s be the sum of those three primes. "
+                f"Compute s + {extra}."
+            )
+        elif kind == "lcm_residue":
+            a = r.choice([6, 8, 10, 12, 14, 15])
+            b = r.choice([7, 9, 11, 13, 16])
+            while gcd(a, b) != 1:
+                b = r.choice([7, 9, 11, 13, 16, 17, 19])
+            modulus = a * b
+            target = r.randint(2, modulus - 2)
+            gold = str(target)
+            question = (
+                f"Find the smallest positive integer x with x mod {a} = "
+                f"{target % a} and x mod {b} = {target % b}. The answer is "
+                f"a positive integer less than {modulus}."
+            )
+        else:  # iterated_digit
+            seed_n = r.randint(50, 500)
+            cur = seed_n
+            for _ in range(3):
+                cur = sum(int(d) for d in str(cur)) * 7 + 3
+            gold = str(cur)
+            question = (
+                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at n_0 = "
+                f"{seed_n}, compute n_3 = f(f(f(n_0)))."
+            )
+        question = question + (
+            "\n\nSolve carefully and end with '#### N' where N is the final integer answer."
+        )
+        out.append({
+            "src": f"procedural_aime/{kind}",
+            "question": question,
+            "gold": gold,
+        })
+    return out
+
+
+def _generate_code_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural code-synthesis tasks for code_bench (v27).
+
+    Each item produces ``{prompt, test, entry_point, task_id}`` so the
+    existing ``humaneval_sandbox`` grader runs unchanged. The function
+    signatures and docstrings are generated freshly per round; the test
+    harness uses random inputs (also block-seeded) and a reference
+    implementation to derive expected outputs.
+
+    Subtypes (each tests a distinct skill cluster):
+      * ``transform_list``   — map/filter/reverse/dedupe over a list
+      * ``aggregate_list``   — sum/min/max/count with predicate
+      * ``string_predicate`` — palindrome / anagram / valid-id checks
+      * ``digit_sum``        — recurrent digit-sum / divisor checks
+      * ``window_sum``       — sliding-window aggregation
+      * ``pair_count``       — count pairs satisfying a relation
+      * ``run_length``       — encode/decode run-length pairs
+      * ``string_transform`` — case / repeat / interleave variants
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
+    kinds = [
+        "transform_list", "aggregate_list", "string_predicate",
+        "digit_sum", "window_sum", "pair_count", "run_length",
+        "string_transform",
+    ]
+    rng.shuffle(kinds)
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        # Each branch fills (entry_point, prompt, test_lines)
+        entry_point = ""
+        prompt = ""
+        test_lines: list[str] = []
+        if kind == "transform_list":
+            op = r.choice(["double", "square", "abs", "negate", "increment_by_k"])
+            if op == "increment_by_k":
+                k = r.randint(2, 9)
+                entry_point = "transform"
+                prompt = (
+                    f"def transform(xs):\n"
+                    f"    \"\"\"Return a new list where every element of ``xs`` "
+                    f"is incremented by {k}.\n\n"
+                    f"    >>> transform([1, 2, 3])\n"
+                    f"    [{1+k}, {2+k}, {3+k}]\n"
+                    f"    \"\"\"\n"
+                )
+                ref = lambda xs: [x + k for x in xs]
+            elif op == "square":
+                entry_point = "transform"
+                prompt = (
+                    "def transform(xs):\n"
+                    "    \"\"\"Return a list of the squares of each element of ``xs``.\n\n"
+                    "    >>> transform([1, 2, 3])\n"
+                    "    [1, 4, 9]\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: [x * x for x in xs]
+            elif op == "double":
+                entry_point = "transform"
+                prompt = (
+                    "def transform(xs):\n"
+                    "    \"\"\"Return a list where every element of ``xs`` is doubled.\n\n"
+                    "    >>> transform([1, 2, 3])\n"
+                    "    [2, 4, 6]\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: [x * 2 for x in xs]
+            elif op == "abs":
+                entry_point = "transform"
+                prompt = (
+                    "def transform(xs):\n"
+                    "    \"\"\"Return a list of the absolute values of each element of ``xs``.\n\n"
+                    "    >>> transform([-1, 2, -3])\n"
+                    "    [1, 2, 3]\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: [abs(x) for x in xs]
+            else:  # negate
+                entry_point = "transform"
+                prompt = (
+                    "def transform(xs):\n"
+                    "    \"\"\"Return a list where every element of ``xs`` is negated.\n\n"
+                    "    >>> transform([1, -2, 3])\n"
+                    "    [-1, 2, -3]\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: [-x for x in xs]
+            test_inputs = [
+                [r.randint(-9, 9) for _ in range(r.randint(2, 6))]
+                for _ in range(4)
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "aggregate_list":
+            op = r.choice(["sum_evens", "max_minus_min", "count_positives", "product_nonzero"])
+            if op == "sum_evens":
+                entry_point = "aggregate"
+                prompt = (
+                    "def aggregate(xs):\n"
+                    "    \"\"\"Return the sum of the even integers in ``xs``.\n\n"
+                    "    If there are no even integers, return 0.\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: sum(x for x in xs if x % 2 == 0)
+            elif op == "max_minus_min":
+                entry_point = "aggregate"
+                prompt = (
+                    "def aggregate(xs):\n"
+                    "    \"\"\"Return the difference between the largest and the smallest "
+                    "value in ``xs``. The list always has at least one element.\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: max(xs) - min(xs)
+            elif op == "count_positives":
+                entry_point = "aggregate"
+                prompt = (
+                    "def aggregate(xs):\n"
+                    "    \"\"\"Return the number of strictly positive elements of ``xs``.\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda xs: sum(1 for x in xs if x > 0)
+            else:
+                entry_point = "aggregate"
+                prompt = (
+                    "def aggregate(xs):\n"
+                    "    \"\"\"Return the product of the non-zero elements of ``xs``. "
+                    "If every element is zero, return 0.\n"
+                    "    \"\"\"\n"
+                )
+                def _ref_prod(xs):
+                    nz = [x for x in xs if x != 0]
+                    if not nz:
+                        return 0
+                    p = 1
+                    for x in nz:
+                        p *= x
+                    return p
+                ref = _ref_prod
+            test_inputs = [
+                [r.randint(-7, 7) for _ in range(r.randint(2, 8))]
+                for _ in range(4)
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "string_predicate":
+            op = r.choice(["is_palindrome", "is_anagram_pair", "is_balanced_brackets"])
+            if op == "is_palindrome":
+                entry_point = "is_palindrome"
+                prompt = (
+                    "def is_palindrome(s):\n"
+                    "    \"\"\"Return True if the string ``s`` reads the same forwards and "
+                    "backwards (case-sensitive, no spaces stripped). Empty string is True.\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda s: s == s[::-1]
+                strings = []
+                for _ in range(4):
+                    if r.random() < 0.5:
+                        half = "".join(r.choice("abcdef") for _ in range(r.randint(1, 4)))
+                        strings.append(half + half[::-1])
+                    else:
+                        strings.append("".join(r.choice("abcdef") for _ in range(r.randint(2, 6))))
+                strings.append("")
+            elif op == "is_anagram_pair":
+                entry_point = "is_anagram"
+                prompt = (
+                    "def is_anagram(a, b):\n"
+                    "    \"\"\"Return True if string ``a`` is an anagram of string ``b`` "
+                    "(case-sensitive). Different lengths return False.\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda a, b: sorted(a) == sorted(b)
+                strings = []
+                for _ in range(4):
+                    base = "".join(r.choice("abcdef") for _ in range(r.randint(3, 6)))
+                    if r.random() < 0.5:
+                        chars = list(base)
+                        r.shuffle(chars)
+                        strings.append(("".join(chars), base))
+                    else:
+                        strings.append((base, base[:-1] + r.choice("xyz")))
+            else:  # is_balanced_brackets
+                entry_point = "is_balanced"
+                prompt = (
+                    "def is_balanced(s):\n"
+                    "    \"\"\"Return True if every '(' in ``s`` has a matching ')' to its "
+                    "right and the brackets are properly nested. Other characters are "
+                    "ignored. The empty string is balanced.\n"
+                    "    \"\"\"\n"
+                )
+                def _ref_bal(s):
+                    d = 0
+                    for c in s:
+                        if c == "(":
+                            d += 1
+                        elif c == ")":
+                            d -= 1
+                            if d < 0:
+                                return False
+                    return d == 0
+                ref = _ref_bal
+                strings = []
+                for _ in range(4):
+                    n = r.randint(0, 4)
+                    if r.random() < 0.5:
+                        s = "(" * n + ")" * n
+                    else:
+                        chars = ["(" if r.random() < 0.5 else ")" for _ in range(2 * n)]
+                        s = "".join(chars)
+                    strings.append(s)
+                strings.append("(a(b)c)d")
+            for s in strings:
+                if isinstance(s, tuple):
+                    test_lines.append(f"    assert candidate({s[0]!r}, {s[1]!r}) == {ref(*s)!r}")
+                else:
+                    test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "digit_sum":
+            op = r.choice(["digit_sum", "digital_root", "count_divisors"])
+            if op == "digit_sum":
+                entry_point = "digit_sum"
+                prompt = (
+                    "def digit_sum(n):\n"
+                    "    \"\"\"Return the sum of the decimal digits of the non-negative "
+                    "integer ``n``. ``digit_sum(0)`` is 0.\n"
+                    "    \"\"\"\n"
+                )
+                ref = lambda n: sum(int(d) for d in str(n))
+            elif op == "digital_root":
+                entry_point = "digital_root"
+                prompt = (
+                    "def digital_root(n):\n"
+                    "    \"\"\"Return the digital root of the non-negative integer ``n``: "
+                    "repeatedly sum the decimal digits until the result has a single digit.\n"
+                    "    \"\"\"\n"
+                )
+                def _ref_dr(n):
+                    while n >= 10:
+                        n = sum(int(d) for d in str(n))
+                    return n
+                ref = _ref_dr
+            else:  # count_divisors
+                entry_point = "count_divisors"
+                prompt = (
+                    "def count_divisors(n):\n"
+                    "    \"\"\"Return the number of positive divisors of the positive "
+                    "integer ``n`` (including 1 and ``n`` itself).\n"
+                    "    \"\"\"\n"
+                )
+                def _ref_cd(n):
+                    return sum(1 for k in range(1, n + 1) if n % k == 0)
+                ref = _ref_cd
+            test_inputs = [r.randint(1, 999) for _ in range(4)] + [1]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "window_sum":
+            entry_point = "window_max_sum"
+            prompt = (
+                "def window_max_sum(xs, k):\n"
+                "    \"\"\"Return the maximum sum of any contiguous window of "
+                "exactly ``k`` consecutive elements in the list ``xs``. "
+                "If ``k`` is larger than the length of ``xs`` or ``xs`` is empty, "
+                "return 0.\n"
+                "    \"\"\"\n"
+            )
+            def _ref_w(xs, k):
+                if not xs or k > len(xs) or k <= 0:
+                    return 0
+                return max(sum(xs[i:i+k]) for i in range(len(xs) - k + 1))
+            ref = _ref_w
+            for _ in range(5):
+                xs = [r.randint(-5, 9) for _ in range(r.randint(3, 8))]
+                k = r.randint(1, max(1, len(xs)))
+                test_lines.append(
+                    f"    assert candidate({xs!r}, {k!r}) == {ref(xs, k)!r}"
+                )
+        elif kind == "pair_count":
+            entry_point = "pair_count"
+            target = r.randint(3, 12)
+            prompt = (
+                f"def pair_count(xs):\n"
+                f"    \"\"\"Return the number of unordered pairs (i, j) with i < j "
+                f"such that ``xs[i] + xs[j] == {target}``.\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_pc(xs, t=target):
+                c = 0
+                for i in range(len(xs)):
+                    for j in range(i + 1, len(xs)):
+                        if xs[i] + xs[j] == t:
+                            c += 1
+                return c
+            ref = _ref_pc
+            for _ in range(5):
+                xs = [r.randint(0, target) for _ in range(r.randint(3, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "run_length":
+            entry_point = "rle"
+            prompt = (
+                "def rle(s):\n"
+                "    \"\"\"Return the run-length encoding of the string ``s`` as a list "
+                "of (char, count) tuples. ``rle('')`` is ``[]``. ``rle('aaabb')`` is "
+                "``[('a', 3), ('b', 2)]``.\n"
+                "    \"\"\"\n"
+            )
+            def _ref_rle(s):
+                if not s:
+                    return []
+                out_pairs: list = []
+                cur = s[0]
+                cnt = 1
+                for ch in s[1:]:
+                    if ch == cur:
+                        cnt += 1
+                    else:
+                        out_pairs.append((cur, cnt))
+                        cur = ch
+                        cnt = 1
+                out_pairs.append((cur, cnt))
+                return out_pairs
+            ref = _ref_rle
+            for _ in range(5):
+                s = "".join(r.choice("abcd") * r.randint(1, 3) for _ in range(r.randint(1, 4)))
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        else:  # string_transform
+            op = r.choice(["alternate_case", "repeat_each_char", "swap_pairs"])
+            if op == "alternate_case":
+                entry_point = "alternate_case"
+                prompt = (
+                    "def alternate_case(s):\n"
+                    "    \"\"\"Return a new string where the i-th letter is uppercased "
+                    "for even i (0, 2, 4, ...) and lowercased for odd i. Non-letter "
+                    "characters are passed through unchanged. Indexes count all "
+                    "characters, including non-letters.\n"
+                    "    \"\"\"\n"
+                )
+                def _ref_ac(s):
+                    return "".join(
+                        ch.upper() if i % 2 == 0 else ch.lower()
+                        for i, ch in enumerate(s)
+                    )
+                ref = _ref_ac
+            elif op == "repeat_each_char":
+                k = r.randint(2, 4)
+                entry_point = "repeat_chars"
+                prompt = (
+                    f"def repeat_chars(s):\n"
+                    f"    \"\"\"Return a string where every character of ``s`` is repeated "
+                    f"{k} times in place. ``repeat_chars('ab')`` is "
+                    f"``'{'a'*k}{'b'*k}'``.\n"
+                    f"    \"\"\"\n"
+                )
+                ref = lambda s, n=k: "".join(c * n for c in s)
+            else:  # swap_pairs
+                entry_point = "swap_pairs"
+                prompt = (
+                    "def swap_pairs(s):\n"
+                    "    \"\"\"Return a string where every pair of adjacent characters has "
+                    "been swapped (so ``'abcd'`` becomes ``'badc'``). If the length is "
+                    "odd, the trailing character stays in place.\n"
+                    "    \"\"\"\n"
+                )
+                def _ref_sp(s):
+                    out_chars: list[str] = []
+                    i = 0
+                    while i < len(s):
+                        if i + 1 < len(s):
+                            out_chars.append(s[i+1])
+                            out_chars.append(s[i])
+                            i += 2
+                        else:
+                            out_chars.append(s[i])
+                            i += 1
+                    return "".join(out_chars)
+                ref = _ref_sp
+            for _ in range(5):
+                s = "".join(r.choice("abcdefABCDEF12!?") for _ in range(r.randint(0, 7)))
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        test_block = "def check(candidate):\n" + "\n".join(test_lines) + "\n"
+        out.append({
+            "src": f"procedural_code/{kind}",
+            "task_id": f"v27/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry_point,
+        })
+    return out
+
+
+def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural reasoning / multiple-choice items for reasoning_bench (v27).
+
+    Subtypes:
+      * ``boolean_eval``    — evaluate a small boolean expression
+      * ``ordering``        — pick the correct ordering of items by a rule
+      * ``deduction``       — small constraint-satisfaction with 3-4 entities
+      * ``sequence_next``   — guess the next term of a procedurally-generated sequence
+      * ``odd_one_out``     — pick the entry that violates a procedural rule
+      * ``analogy_letter``  — letter-arithmetic A→B :: C→? (Caesar shift)
+
+    Items are emitted in BBH ``(A)/(B)/...`` MC format so the existing
+    ``_reasoning_extract_answer`` grader handles them unchanged.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["reasoning"]) & 0xFFFFFFFF)
+    kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
+             "odd_one_out", "analogy_letter"]
+    rng.shuffle(kinds)
+    out: list[dict] = []
+
+    def _mc(question: str, options: list[str], gold_idx: int, src: str):
+        letters = "ABCDEFGH"
+        opts_lines = "\n".join(
+            f"({letters[k]}) {opt}" for k, opt in enumerate(options)
+        )
+        return {
+            "src": src,
+            "input": question,  # so existing reasoning_format_prompt works
+            "question": f"{question}\n\nOptions:\n{opts_lines}",
+            "target": f"({letters[gold_idx]})",
+            "gold": f"({letters[gold_idx]})",
+        }
+
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        if kind == "boolean_eval":
+            ops = ["and", "or"]
+            terms = []
+            vals = []
+            for _ in range(r.randint(2, 3)):
+                v = r.choice([True, False])
+                if r.random() < 0.4:
+                    terms.append("not " + ("True" if v else "False"))
+                    vals.append(not v)
+                else:
+                    terms.append("True" if v else "False")
+                    vals.append(v)
+            expr = terms[0]
+            cur = vals[0]
+            for t, v in zip(terms[1:], vals[1:]):
+                op = r.choice(ops)
+                expr = f"({expr}) {op} ({t})"
+                cur = (cur and v) if op == "and" else (cur or v)
+            answer = "True" if cur else "False"
+            opts = ["True", "False"]
+            gold_idx = opts.index(answer)
+            r.shuffle(opts)
+            gold_idx = opts.index(answer)
+            out.append(_mc(
+                f"Evaluate the boolean expression and pick the correct value:\n\n{expr}",
+                opts, gold_idx, "procedural_reasoning/boolean_eval",
+            ))
+        elif kind == "ordering":
+            n = r.randint(3, 4)
+            heights = r.sample(range(140, 200), n)
+            names = r.sample(_PROC_NAMES, n)
+            sort_dir = r.choice(["tallest", "shortest"])
+            paired = sorted(zip(heights, names), reverse=(sort_dir == "tallest"))
+            correct_order = [p[1] for p in paired]
+            options: list[str] = []
+            options.append(", ".join(correct_order))
+            seen_orders = {tuple(correct_order)}
+            attempts = 0
+            while len(options) < 4 and attempts < 32:
+                attempts += 1
+                cand = list(correct_order)
+                r.shuffle(cand)
+                if tuple(cand) not in seen_orders:
+                    seen_orders.add(tuple(cand))
+                    options.append(", ".join(cand))
+            r.shuffle(options)
+            gold_idx = options.index(", ".join(correct_order))
+            facts = "\n".join(
+                f"- {names[k]} is {heights[k]} cm tall." for k in range(n)
+            )
+            qtext = (
+                f"Given the heights:\n{facts}\n\nWhich list orders the people from {sort_dir} to {'shortest' if sort_dir == 'tallest' else 'tallest'}?"
+            )
+            out.append(_mc(qtext, options, gold_idx, "procedural_reasoning/ordering"))
+        elif kind == "deduction":
+            people = r.sample(_PROC_NAMES, 3)
+            colours = r.sample(["red", "blue", "green", "yellow", "purple"], 3)
+            mapping = dict(zip(people, colours))
+            clue1 = f"{people[0]}'s favorite colour is not {mapping[people[1]]}."
+            clue2 = f"{people[2]}'s favorite colour is {mapping[people[2]]}."
+            clue3 = f"{people[0]}'s favorite colour is {mapping[people[0]]}."
+            clues = [clue1, clue2, clue3]
+            r.shuffle(clues)
+            target = r.choice(people)
+            options = list(colours)
+            r.shuffle(options)
+            gold_idx = options.index(mapping[target])
+            qtext = (
+                "Three friends each have a different favorite colour. "
+                "Use the clues below to deduce who likes which colour.\n\n"
+                + "\n".join(f"- {c}" for c in clues)
+                + f"\n\nWhat is {target}'s favorite colour?"
+            )
+            out.append(_mc(qtext, options, gold_idx, "procedural_reasoning/deduction"))
+        elif kind == "sequence_next":
+            kind2 = r.choice(["arith", "geom", "alt", "square"])
+            if kind2 == "arith":
+                a, d = r.randint(1, 12), r.randint(2, 9)
+                seq = [a + d * k for k in range(5)]
+            elif kind2 == "geom":
+                a, ratio = r.randint(2, 9), r.choice([2, 3])
+                seq = [a * ratio**k for k in range(5)]
+            elif kind2 == "alt":
+                a, d = r.randint(2, 9), r.randint(2, 7)
+                seq = [a + (-1)**k * d * k for k in range(5)]
+            else:
+                start = r.randint(1, 5)
+                seq = [(start + k) * (start + k) for k in range(5)]
+            answer = seq[-1]
+            displayed = seq[:-1]
+            options = [answer, answer + r.choice([-1, 1, 2, -3]), answer + r.randint(5, 19), answer * 2]
+            r.shuffle(options)
+            gold_idx = options.index(answer)
+            qtext = (
+                f"What is the next term of the sequence "
+                f"{', '.join(str(x) for x in displayed)}, ?"
+            )
+            out.append(_mc(qtext, [str(o) for o in options], gold_idx,
+                           "procedural_reasoning/sequence_next"))
+        elif kind == "odd_one_out":
+            kind2 = r.choice(["multiples", "vowels", "consonants_double"])
+            if kind2 == "multiples":
+                base = r.choice([3, 4, 5, 6, 7])
+                ok_items = [base * r.randint(2, 9) for _ in range(3)]
+                bad = ok_items[0] + r.choice([1, -1, 2])
+                while bad % base == 0:
+                    bad += 1
+                items = ok_items + [bad]
+                r.shuffle(items)
+                gold_idx = items.index(bad)
+                opts = [str(x) for x in items]
+                qtext = (
+                    f"Three of these numbers are divisible by {base}. "
+                    f"Which one is not?"
+                )
+            elif kind2 == "vowels":
+                vowel_strings = []
+                for _ in range(3):
+                    s = "".join(r.choice("aeiou") for _ in range(r.randint(3, 5)))
+                    vowel_strings.append(s)
+                bad = "".join(r.choice("bcdfg") for _ in range(4))
+                items = vowel_strings + [bad]
+                r.shuffle(items)
+                gold_idx = items.index(bad)
+                opts = items
+                qtext = "Three of these strings contain only vowels. Which one does not?"
+            else:
+                doubles = []
+                for _ in range(3):
+                    c = r.choice("bcdfg")
+                    doubles.append(c * 2 + r.choice("aeiou"))
+                bad = r.choice("bcdfg") + r.choice("aeiou") + r.choice("bcdfg")
+                items = doubles + [bad]
+                r.shuffle(items)
+                gold_idx = items.index(bad)
+                opts = items
+                qtext = (
+                    "Three of these strings begin with the same consonant repeated twice. "
+                    "Which one does not?"
+                )
+            out.append(_mc(qtext, opts, gold_idx, "procedural_reasoning/odd_one_out"))
+        else:  # analogy_letter
+            shift = r.randint(1, 12)
+            a = r.choice("ABCDEFGHIJ")
+            b = chr(((ord(a) - ord("A") + shift) % 26) + ord("A"))
+            c = r.choice("KLMNOPQRST")
+            answer = chr(((ord(c) - ord("A") + shift) % 26) + ord("A"))
+            distractors = []
+            for off in (-2, -1, 1, 2, 3):
+                distractors.append(chr(((ord(c) - ord("A") + shift + off) % 26) + ord("A")))
+            r.shuffle(distractors)
+            options = [answer] + distractors[:3]
+            r.shuffle(options)
+            gold_idx = options.index(answer)
+            qtext = (
+                f"The letter {a} is to {b} as the letter {c} is to which letter?"
+            )
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/analogy_letter"))
+    return out
+
+
+def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> list[dict]:
+    """Procedural multiple-choice items in MMLU/ARC/TruthfulQA shape (v27).
+
+    Item schema (consumed by ``knowledge_bench_probe``, ``arc_bench_probe``,
+    ``truthful_bench_probe`` unchanged):
+
+      * ``question``     — the bare question stem (no inline Options block;
+                           the probe formats options itself)
+      * ``options``      — list of option-text strings (knowledge_bench)
+      * ``labels``       — list of single-letter labels (ARC / TruthfulQA)
+      * ``texts``        — list of option texts (ARC / TruthfulQA)
+      * ``gold_letter``  — single uppercase letter
+      * ``category``     — telemetry tag (knowledge_bench groups by this)
+      * ``src``          — telemetry tag
+
+    All items are 4-way MC (max_letter="D") so the existing
+    ``_extract_mmlu_letter`` regex can ignore stray letters from the
+    body of the response.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["knowledge"]) & 0xFFFFFFFF)
+    kinds = ["arithmetic_mc", "ordering_mc", "analogy_mc", "boolean_mc",
+             "sequence_mc", "fact_mc", "geometric_mc", "pattern_mc"]
+    rng.shuffle(kinds)
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        question = ""
+        opts: list[str] = []
+        gold = ""
+        category = "general"
+        if kind == "arithmetic_mc":
+            arith_kind = r.choice(["multi_op", "percent", "fraction", "exponent"])
+            if arith_kind == "multi_op":
+                a, b, c = r.randint(15, 90), r.randint(15, 90), r.randint(2, 19)
+                offset = r.randint(1, 99)
+                ans = (a + b) * c - offset
+                question = f"Compute ({a} + {b}) * {c} - {offset}."
+            elif arith_kind == "percent":
+                base = r.choice([120, 150, 200, 240, 300, 400, 500])
+                pct = r.choice([15, 18, 22, 35, 45, 55, 65, 75])
+                ans = base * pct // 100
+                question = f"What is {pct}% of {base}? (Answer is an integer.)"
+            elif arith_kind == "fraction":
+                num = r.randint(2, 9)
+                denom = r.choice([4, 5, 6, 8, 10])
+                whole = r.choice([60, 72, 80, 90, 120, 180])
+                while whole % denom != 0:
+                    whole += 1
+                ans = (whole // denom) * num
+                question = f"Compute {num}/{denom} of {whole}."
+            else:  # exponent
+                base = r.randint(2, 6)
+                power = r.randint(3, 5)
+                add = r.randint(7, 41)
+                ans = base ** power + add
+                question = f"Compute {base}^{power} + {add}."
+            distractors = {ans + r.choice([-7, -3, 3, 7]),
+                           ans + r.randint(10, 25),
+                           ans - r.randint(10, 25)}
+            distractors.discard(ans)
+            distractors = list(distractors)[:3]
+            while len(distractors) < 3:
+                distractors.append(ans + r.randint(30, 80))
+            opts = [str(ans)] + [str(d) for d in distractors]
+            r.shuffle(opts)
+            gold = str(ans)
+            category = "arithmetic"
+        elif kind == "ordering_mc":
+            n = 3
+            heights = r.sample(range(140, 200), n)
+            names = r.sample(_PROC_NAMES, n)
+            sort_dir = r.choice(["tallest", "shortest"])
+            paired = sorted(zip(heights, names), reverse=(sort_dir == "tallest"))
+            correct = ", ".join(p[1] for p in paired)
+            distractors: list[str] = []
+            seen = {correct}
+            attempts = 0
+            while len(distractors) < 3 and attempts < 32:
+                cand = list(p[1] for p in paired)
+                r.shuffle(cand)
+                joined = ", ".join(cand)
+                if joined not in seen:
+                    seen.add(joined)
+                    distractors.append(joined)
+                attempts += 1
+            while len(distractors) < 3:
+                distractors.append(correct + " (alt)")
+            opts = [correct] + distractors
+            r.shuffle(opts)
+            gold = correct
+            facts = "; ".join(f"{names[k]} is {heights[k]} cm tall" for k in range(n))
+            question = (
+                f"{facts}. Which list orders these people from "
+                f"{sort_dir} to {'shortest' if sort_dir == 'tallest' else 'tallest'}?"
+            )
+            category = "reasoning"
+        elif kind == "analogy_mc":
+            shift = r.randint(2, 12)
+            a = r.choice("ABCDEFGHIJ")
+            b = chr(((ord(a) - ord("A") + shift) % 26) + ord("A"))
+            c = r.choice("KLMNOPQRST")
+            ans = chr(((ord(c) - ord("A") + shift) % 26) + ord("A"))
+            distract_offsets = r.sample([-3, -2, -1, 1, 2, 3, 4], 3)
+            distractors = [chr(((ord(c) - ord("A") + shift + off) % 26) + ord("A"))
+                           for off in distract_offsets]
+            opts = [ans] + distractors
+            r.shuffle(opts)
+            gold = ans
+            question = f"The letter {a} is to {b} as the letter {c} is to which letter?"
+            category = "analogy"
+        elif kind == "boolean_mc":
+            terms: list[str] = []
+            vals: list[bool] = []
+            for _ in range(r.randint(2, 3)):
+                v = r.choice([True, False])
+                if r.random() < 0.4:
+                    terms.append("not " + ("True" if v else "False"))
+                    vals.append(not v)
+                else:
+                    terms.append("True" if v else "False")
+                    vals.append(v)
+            expr = terms[0]
+            cur = vals[0]
+            for t, v in zip(terms[1:], vals[1:]):
+                op = r.choice(["and", "or"])
+                expr = f"({expr}) {op} ({t})"
+                cur = (cur and v) if op == "and" else (cur or v)
+            ans = "True" if cur else "False"
+            opts = ["True", "False", "Cannot determine", "Both true and false"]
+            r.shuffle(opts)
+            gold = ans
+            question = f"What is the value of the boolean expression: {expr}?"
+            category = "logic"
+        elif kind == "sequence_mc":
+            kind2 = r.choice(["arith", "geom", "square"])
+            if kind2 == "arith":
+                a, d = r.randint(1, 12), r.randint(2, 9)
+                seq = [a + d * k for k in range(5)]
+            elif kind2 == "geom":
+                a, ratio = r.randint(2, 9), r.choice([2, 3])
+                seq = [a * ratio**k for k in range(5)]
+            else:
+                start = r.randint(1, 5)
+                seq = [(start + k) * (start + k) for k in range(5)]
+            ans = seq[-1]
+            displayed = seq[:-1]
+            distractors = [ans + r.choice([-1, 1, 2]), ans + r.randint(5, 19), ans * 2]
+            opts = [str(ans)] + [str(d) for d in distractors]
+            r.shuffle(opts)
+            gold = str(ans)
+            question = (
+                f"What is the next term of the sequence "
+                f"{', '.join(str(x) for x in displayed)}?"
+            )
+            category = "pattern"
+        elif kind == "fact_mc":
+            choice = r.choice([
+                ("Which gas do plants primarily absorb during photosynthesis?",
+                 "carbon dioxide", ["nitrogen", "oxygen", "argon"], "science"),
+                ("Which planet has the largest mass in the solar system?",
+                 "Jupiter", ["Saturn", "Earth", "Neptune"], "science"),
+                ("In computing, what does CPU stand for?",
+                 "Central Processing Unit",
+                 ["Central Program Utility", "Computer Processing Unit",
+                  "Central Pico Unit"], "computing"),
+                ("Which is the longest river by length?",
+                 "Nile", ["Amazon", "Mississippi", "Yangtze"], "geography"),
+                ("What is the boiling point of water at standard atmospheric pressure?",
+                 "100 degrees Celsius",
+                 ["80 degrees Celsius", "120 degrees Celsius", "212 degrees Celsius"],
+                 "science"),
+                ("Which language uses 'def' to declare functions?",
+                 "Python", ["Java", "C", "Rust"], "computing"),
+                ("In music, how many lines does a standard staff have?",
+                 "5", ["4", "6", "7"], "music"),
+            ])
+            q, ans, distractors, cat = choice
+            opts = [ans] + list(distractors)
+            r.shuffle(opts)
+            gold = ans
+            question = q
+            category = cat
+        elif kind == "geometric_mc":
+            shape = r.choice(["square", "rectangle", "triangle"])
+            if shape == "square":
+                side = r.randint(3, 14)
+                ans = side * side
+                question = f"What is the area of a square with side {side}?"
+                distractors = [ans + r.choice([-2, -1, 1, 2]) * side,
+                               ans + r.randint(3, 9), ans * 2]
+            elif shape == "rectangle":
+                w, h = r.randint(3, 12), r.randint(3, 12)
+                ans = w * h
+                question = (f"What is the area of a rectangle with "
+                            f"width {w} and height {h}?")
+                distractors = [w + h, ans + r.randint(2, 7), ans - r.randint(2, 7)]
+            else:
+                base, height = r.choice([6, 8, 10, 12]), r.choice([5, 7, 9, 11])
+                ans = base * height // 2
+                question = (f"What is the area of a triangle with "
+                            f"base {base} and height {height}?")
+                distractors = [base * height, ans + r.randint(2, 8), ans - r.randint(2, 8)]
+            opts = [str(ans)] + [str(d) for d in distractors]
+            r.shuffle(opts)
+            gold = str(ans)
+            category = "geometry"
+        else:  # pattern_mc
+            n = r.randint(3, 6)
+            base = r.choice("abcdef")
+            other = r.choice("xyz")
+            kind2 = r.choice(["repeat_count", "alt_letters"])
+            if kind2 == "repeat_count":
+                question = (
+                    f"How many times does the letter {base!r} appear in the "
+                    f"string {(base * n + other * 2)!r}?"
+                )
+                ans = n
+            else:
+                pattern = "".join(base + other for _ in range(n))
+                question = (
+                    f"Count the number of {other!r} characters in {pattern!r}."
+                )
+                ans = n
+            distractors = [ans - 1, ans + 1, ans + r.randint(2, 5)]
+            opts = [str(ans)] + [str(d) for d in distractors]
+            r.shuffle(opts)
+            gold = str(ans)
+            category = "counting"
+        # Trim/pad to exactly 4 options.
+        opts = list(dict.fromkeys(opts))
+        while len(opts) < 4:
+            opts.append(f"None of the above ({len(opts)})")
+        opts = opts[:4]
+        if gold not in opts:
+            opts[0] = gold
+        labels = ["A", "B", "C", "D"]
+        gold_letter = labels[opts.index(gold)]
+        out.append({
+            "src": f"procedural_mc/{kind}",
+            "category": category,
+            "question": question,
+            "options": opts,
+            "labels": labels,
+            "texts": opts,
+            "gold_letter": gold_letter,
+        })
+    return out
+
+
+def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural instruction-following items for ifeval_bench (v27).
+
+    Each item carries:
+      * ``prompt``         — the user-facing instruction
+      * ``instruction_ids`` — list of canonical constraint identifiers
+                              (parallel to ``kwargs``); the existing
+                              ``ifeval_vendor`` evaluator reads these
+      * ``kwargs``         — list of per-instruction kwargs dicts
+      * ``src``            — telemetry tag
+
+    All constraints are drawn from ``ifeval_vendor.SUPPORTED_VERIFIERS``
+    so the existing grader works unchanged.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["ifeval"]) & 0xFFFFFFFF)
+    kinds = [
+        "exact_words", "min_words", "max_words",
+        "all_lowercase", "all_uppercase",
+        "ends_with_phrase",
+        "include_keyword", "forbid_keyword",
+        "json_format",
+        "exact_sentences",
+        "no_comma",
+        "title_format",
+        "bullet_list",
+    ]
+    rng.shuffle(kinds)
+    nouns = ["pelican", "lighthouse", "harbor", "compass", "blueprint",
+             "magnolia", "obsidian", "carousel", "satellite", "sycamore"]
+    topics = ["a daily commute by bicycle", "the joys of urban gardening",
+              "long-distance lighthouse keepers", "weather forecasting at sea",
+              "early-morning bakery routines", "alpine railway engineering",
+              "the migration habits of monarch butterflies",
+              "a small library reopening after renovation"]
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        kind = kinds[i % len(kinds)]
+        topic = r.choice(topics)
+        keyword = r.choice(nouns)
+        instruction_ids: list[str] = []
+        kwargs_list: list[dict] = []
+        if kind == "exact_words":
+            n = r.choice([20, 25, 30, 40, 50])
+            prompt = (
+                f"Write a single paragraph about {topic}. "
+                f"It must contain exactly {n} words. Do not include any markdown, "
+                f"lists, or numbered headings."
+            )
+            instruction_ids = ["length_constraints:number_words"]
+            kwargs_list = [{"num_words": n, "relation": "exactly"}]
+        elif kind == "min_words":
+            n = r.choice([30, 40, 60, 80])
+            prompt = (
+                f"Write a short essay about {topic}. "
+                f"The essay must contain at least {n} words."
+            )
+            instruction_ids = ["length_constraints:number_words"]
+            kwargs_list = [{"num_words": n, "relation": "at least"}]
+        elif kind == "max_words":
+            n = r.choice([20, 30, 40])
+            prompt = (
+                f"In at most {n} words, summarise {topic}."
+            )
+            instruction_ids = ["length_constraints:number_words"]
+            kwargs_list = [{"num_words": n, "relation": "at most"}]
+        elif kind == "all_lowercase":
+            prompt = (
+                f"Describe {topic} in three sentences. Use only lowercase letters "
+                f"in your entire response. Do not use any uppercase letters."
+            )
+            instruction_ids = ["change_case:english_lowercase"]
+            kwargs_list = [{}]
+        elif kind == "all_uppercase":
+            prompt = (
+                f"Describe {topic} in two sentences. Write your entire response "
+                f"in all UPPERCASE letters. Do not use any lowercase letters."
+            )
+            instruction_ids = ["change_case:english_capital"]
+            kwargs_list = [{}]
+        elif kind == "ends_with_phrase":
+            phrase = r.choice([
+                "Is there anything else I can help with?",
+                "Thank you for reading.",
+                "End of report.",
+            ])
+            prompt = (
+                f"Write a brief note about {topic}. "
+                f"Your reply must end with the exact phrase: {phrase!r}. "
+                f"The very last characters of your response should be that phrase."
+            )
+            instruction_ids = ["startend:end_checker"]
+            kwargs_list = [{"end_phrase": phrase}]
+        elif kind == "include_keyword":
+            n = r.randint(2, 4)
+            prompt = (
+                f"Write a paragraph about {topic}. "
+                f"The word {keyword!r} must appear at least {n} times."
+            )
+            instruction_ids = ["keywords:frequency"]
+            kwargs_list = [{"keyword": keyword, "relation": "at least",
+                            "frequency": n}]
+        elif kind == "forbid_keyword":
+            forbidden = r.choice(nouns)
+            prompt = (
+                f"Write a short reflection on {topic}. "
+                f"Do not use the word {forbidden!r} anywhere in your response."
+            )
+            instruction_ids = ["keywords:forbidden_words"]
+            kwargs_list = [{"forbidden_words": [forbidden]}]
+        elif kind == "json_format":
+            prompt = (
+                f"Provide the following information about {topic} as a single JSON object "
+                f"with exactly the keys 'topic', 'summary' (string), and 'keywords' "
+                f"(list of strings). Output only the JSON object, no surrounding prose."
+            )
+            instruction_ids = ["detectable_format:json_format"]
+            kwargs_list = [{}]
+        elif kind == "exact_sentences":
+            n = r.choice([2, 3, 4])
+            prompt = (
+                f"Describe {topic} in exactly {n} sentences. "
+                f"Each sentence must end with a period."
+            )
+            instruction_ids = ["length_constraints:number_sentences"]
+            kwargs_list = [{"num_sentences": n, "relation": "exactly"}]
+        elif kind == "no_comma":
+            prompt = (
+                f"Describe {topic} briefly. Do not use any commas anywhere in "
+                f"your response."
+            )
+            instruction_ids = ["punctuation:no_comma"]
+            kwargs_list = [{}]
+        elif kind == "title_format":
+            prompt = (
+                f"Write an engaging short note about {topic}. Begin with a title "
+                f"wrapped in double angle brackets, like ``<<Title Goes Here>>``, "
+                f"on the first line."
+            )
+            instruction_ids = ["detectable_format:title"]
+            kwargs_list = [{}]
+        else:  # bullet_list
+            n = r.randint(3, 5)
+            prompt = (
+                f"List {n} interesting facts about {topic}. Format the list with "
+                f"exactly {n} markdown bullet points (lines starting with `* ` or `- `)."
+            )
+            instruction_ids = ["detectable_format:number_bullet_lists"]
+            kwargs_list = [{"num_bullets": n}]
+        out.append({
+            "src": f"procedural_ifeval/{kind}",
+            "prompt": prompt,
+            "instruction_ids": instruction_ids,
+            "kwargs": kwargs_list,
+        })
+    return out
+
+
 def _generate_procedural_items(block_seed: int, n_items: int) -> list[dict]:
     """Generate block-seeded exact-answer tasks.
 
@@ -4826,7 +6953,11 @@ def _answer_exact_in_text(gold: str, text: str, strict: bool = False) -> bool:
 #    would pass every wrapper-family round under v3.7 — the paraphrase
 #    family closes that hole. We stratify (see ``_pick_robustness_
 #    perturbations``) so at least one paraphrase fires per round.
-def _apply_instruction_synonyms(text: str, seed: int) -> str:
+def _apply_instruction_synonyms(
+    text: str,
+    seed: int,
+    extra_table: tuple = (),
+) -> str:
     """Word-boundary synonym swap on instruction-domain verbs/nouns.
 
     Picks ONE source word that appears in ``text`` (deterministic given
@@ -4841,9 +6972,28 @@ def _apply_instruction_synonyms(text: str, seed: int) -> str:
     delimiters, or LaTeX ``$...$`` blocks. Word boundaries are enforced
     so ``"find"`` does not match ``"finding"`` and ``"sum"`` does not
     match inside ``"summary"``.
+
+    Round 23 (Goodhart hardening for ``code_bench`` / ``mbpp_bench``):
+    callers may pass an ``extra_table`` of additional ``(src, alts)``
+    tuples to layer on top of the math-domain defaults. Code prose has
+    its own common phrasings ("write a function", "check if",
+    "given a list") that the math table doesn't cover; the code
+    paraphrase helper passes those in via ``extra_table`` rather than
+    polluting the math defaults (every entry has to be safe for both
+    domains, and "check if" / "given a" are unsafe in dense LaTeX
+    word problems where they'd interact with the imperative rewriter).
     """
     import random
     import re as _re
+    # Round 22 cleanup: removed the ``("what is", ("compute the value of",))``
+    # entry. When ``_imperative_to_question`` rewrites ``Find the value of X``
+    # to ``What is the value of X?`` and THEN the synonym swap fires on
+    # ``what is``, the result is the awkward ``Compute the value of the
+    # value of X?``. Confirmed via manual repro on ``\boxed{42}`` AIME
+    # samples. Removing the entry costs us one rotation but eliminates
+    # the duplication; the remaining swaps (find/calculate/compute/
+    # determine + each/every + answer/result/value) plus the question-
+    # rewrite still give ≥ 4 surface variants per imperative problem.
     table: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("find", ("determine", "calculate", "compute")),
         ("calculate", ("find", "compute", "determine")),
@@ -4858,8 +7008,9 @@ def _apply_instruction_synonyms(text: str, seed: int) -> str:
         ("total", ("sum",)),
         ("how many", ("what number of",)),
         ("how much", ("what amount of",)),
-        ("what is", ("compute the value of",)),
     )
+    if extra_table:
+        table = table + tuple(extra_table)
     rng = random.Random(seed & 0xFFFFFFFF)
     candidates = [
         (src, alts) for src, alts in table
@@ -8812,8 +10963,12 @@ def main():
                     except Exception as e:
                         print(f"  [{sn}] judge scoring error: {str(e)[:160]}", flush=True)
                 timings["judge_probe"] = time.time() - _jb_t0
+                _judge_label = (
+                    "in composite" if JUDGE_PROBE_IN_COMPOSITE
+                    else "SHADOW — not in composite"
+                )
                 print(f"[eval] Judge probe: scored {judge_scored}/{len(_judge_store)} students "
-                      f"in {timings['judge_probe']:.1f}s (SHADOW — not in composite)",
+                      f"in {timings['judge_probe']:.1f}s ({_judge_label})",
                       flush=True)
 
             # ── Phase B.3: chat_turns probe scoring (SHADOW) ────────
@@ -8856,10 +11011,14 @@ def main():
                         print(f"  [{sn}] chat_turns scoring error: "
                               f"{str(e)[:160]}", flush=True)
                 timings["chat_turns_probe"] = time.time() - _ct_t0
+                _chat_label = (
+                    "in composite" if CHAT_TURNS_PROBE_IN_COMPOSITE
+                    else "SHADOW — not in composite"
+                )
                 print(f"[eval] Chat-turns probe: scored {chat_scored}/"
                       f"{len(_chat_store)} students in "
                       f"{timings['chat_turns_probe']:.1f}s "
-                      f"(SHADOW — not in composite)",
+                      f"({_chat_label})",
                       flush=True)
 
             try:

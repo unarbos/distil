@@ -226,7 +226,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     king_flag = ""
     vllm_flag = " --no-vllm"
     if use_vllm:
-        vllm_flag = " --vllm-gpu-util 0.90"
+        # Eval shares the GPU with the chat-king vLLM (~0.15 of total GPU
+        # for a 4B model + KV cache). Going to 0.90 here used to OOM the
+        # chat server during rounds, leaving chat.arbos.life dark for ~30
+        # minutes per epoch. 0.78 leaves a 7-15GB headroom on H200/H100
+        # for chat to coexist; tune via VLLM_EVAL_GPU_UTIL when the chat
+        # pod gets its own GPU.
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.78")
+        vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
     tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""
@@ -397,6 +404,15 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "POD_PER_MODEL_TIMEOUT",
         "ARENA_V3_AXES_IN_COMPOSITE",
         "REASONING_DENSITY_IN_COMPOSITE",
+        # 2026-04-26 — propagate validator-authoritative composite gates
+        # so the pod-side `pod_eval_vllm.py` reports `in_composite` /
+        # log labels that match what the validator will actually do
+        # downstream. Previously the pod read separate ``*_PROBE_IN_COMPOSITE``
+        # variables that defaulted to "0" while these axes defaulted to
+        # "1" in composite.py, so the eval log lied about whether axes
+        # were in production. See pod_eval_vllm.py JUDGE_PROBE_IN_COMPOSITE
+        # alignment patch.
+        "JUDGE_AXIS_IN_COMPOSITE",
         "CHAT_TURNS_AXIS_IN_COMPOSITE",
         "PARETO_DOMINANCE_GATE",
         "KING_REGRESSION_GATE",

@@ -53,6 +53,8 @@ def _get_king_info():
 # ── Shared SSH-curl helpers ──────────────────────────────────────────────────
 
 def _ssh_args():
+    if not CHAT_POD_HOST:
+        raise SshExecError(1, "chat pod is not configured")
     return [
         "ssh",
         "-o", "ConnectTimeout=10",
@@ -64,7 +66,35 @@ def _ssh_args():
     ]
 
 
+# chat_server.py always serves the king under the stable name "sn97-king".
+# The HF repo id changes every time a new king is crowned, but vLLM only
+# registers what we boot it with, so any client-sent model name has to be
+# rewritten before forwarding or vLLM 404s with `does not exist`.
+CHAT_POD_SERVED_MODEL = "sn97-king"
+
+
+def _normalize_chat_payload(payload: dict) -> dict:
+    """Rewrite the OpenAI-shaped payload for the chat pod's vLLM.
+
+    1. Force ``model`` to the stable served name. We expose the live king's
+       repo id at ``/v1/models`` and at the response level (so clients can
+       attribute completions correctly), but vLLM is booted with a fixed
+       served name so it can't honor anything else.
+    2. Default ``enable_thinking`` off. Distil's king models are reasoners;
+       leaving thinking on means small ``max_tokens`` budgets get eaten by
+       the reasoning trace and ``content`` comes back null. Clients that
+       want thinking can opt in via ``chat_template_kwargs``.
+    """
+    payload = dict(payload)
+    payload["model"] = CHAT_POD_SERVED_MODEL
+    kwargs = dict(payload.get("chat_template_kwargs") or {})
+    kwargs.setdefault("enable_thinking", False)
+    payload["chat_template_kwargs"] = kwargs
+    return payload
+
+
 def _curl_cmd(payload: dict, stream: bool) -> str:
+    payload = _normalize_chat_payload(payload)
     payload_b64 = base64.b64encode(json.dumps(payload).encode()).decode()
     flag = "-sN" if stream else "-s"
     return (
@@ -97,19 +127,39 @@ def stream_remote_chat(payload: dict):
 
 # ── Chat helpers ──────────────────────────────────────────────────────────────
 
+def _extract_message_content(message: dict) -> tuple[str, str | None]:
+    """Pull (content, thinking) from a vLLM choices[0].message.
+
+    vLLM in reasoner mode puts the assistant text in ``content`` when
+    thinking is disabled. When thinking is enabled, it splits the model
+    output: ``reasoning`` holds the chain-of-thought, ``content`` may end
+    up null if max_tokens cuts the reply mid-thought. We always fall back
+    to ``reasoning`` so chat.arbos.life never shows a blank bubble even
+    when a client opts back into thinking.
+    """
+    content = message.get("content") or ""
+    thinking = message.get("reasoning") or message.get("thinking")
+    if not content and thinking:
+        content = thinking
+        thinking = None
+    return content, thinking
+
+
 def _sync_chat(payload, king_uid, king_model):
     payload["stream"] = False
     stdout = run_remote_chat(payload, stream=False, timeout=60)
     try:
         data = json.loads(stdout)
         if "choices" in data:
+            message = data["choices"][0].get("message") or {}
+            content, thinking = _extract_message_content(message)
             resp = {
-                "response": data["choices"][0]["message"]["content"],
+                "response": content,
                 "model": king_model,
                 "king_uid": king_uid,
             }
-            if "thinking" in data:
-                resp["thinking"] = data["thinking"]
+            if thinking:
+                resp["thinking"] = thinking
             if "usage" in data:
                 resp["usage"] = data["usage"]
             return resp
@@ -275,18 +325,19 @@ def chat_status():
     eval_active = progress.get("active", False)
 
     server_ok = False
-    try:
-        stdout = _ssh_exec(
-            f"curl -fsS http://localhost:{CHAT_POD_PORT}/v1/models >/dev/null && cat /root/model_name.txt 2>/dev/null",
-            check=False,
-        )
-        served = (stdout or "").strip()
-        if served and (king_model is None or served == king_model):
-            server_ok = True
-        elif not eval_active:
-            _ensure_chat_server(king_model)
-    except SshExecError:
-        pass
+    if CHAT_POD_HOST:
+        try:
+            stdout = _ssh_exec(
+                f"curl -fsS http://localhost:{CHAT_POD_PORT}/v1/models >/dev/null && cat /root/model_name.txt 2>/dev/null",
+                check=False,
+            )
+            served = (stdout or "").strip()
+            if served and (king_model is None or served == king_model):
+                server_ok = True
+            elif not eval_active:
+                _ensure_chat_server(king_model)
+        except SshExecError:
+            pass
 
     return {
         "available": server_ok and king_uid is not None,
@@ -297,7 +348,11 @@ def chat_status():
         "note": (
             "King model is loaded on GPU and ready for chat."
             if server_ok
-            else "Chat server is starting or unavailable."
+            else (
+                "Chat pod is not configured."
+                if not CHAT_POD_HOST
+                else "Chat server is starting or unavailable."
+            )
         ),
     }
 
@@ -335,14 +390,12 @@ async def openai_chat_completions(request: Request):
     if not messages:
         return JSONResponse(status_code=400, content={"error": {"message": "messages required"}})
 
-    body.setdefault("chat_template_kwargs", {})
-    body["chat_template_kwargs"].setdefault("enable_thinking", False)
-
     king_uid, king_model = _get_king_info()
     if king_uid is None:
         return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
 
     stream = body.get("stream", False)
+    # _normalize_chat_payload (called inside _curl_cmd) rewrites model + thinking.
     try:
         if stream:
             def generate():
@@ -368,6 +421,12 @@ async def openai_chat_completions(request: Request):
         stdout = run_remote_chat(body, stream=False, timeout=120)
         try:
             data = json.loads(stdout)
+            # Stamp the response with the live king's HF repo id so OpenAI
+            # clients (Open WebUI etc.) display the correct lineage even
+            # though vLLM serves under the stable "sn97-king" name.
+            if isinstance(data, dict) and king_model:
+                data["model"] = king_model
+                data["king_uid"] = king_uid
             return JSONResponse(content=data)
         except json.JSONDecodeError:
             return JSONResponse(

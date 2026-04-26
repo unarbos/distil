@@ -71,18 +71,66 @@ PUBLIC_API_URL = API["publicUrl"]
 DASHBOARD_URL = API["dashboardUrl"]
 ALLOWED_ORIGINS = list(API["allowedOrigins"])
 
-# Chat pod coordinates are intentionally env-only. Lium pods can be
-# reprovisioned, and a stale hardcoded host makes healthcheck/API repair loops
-# hammer the wrong machine. When unset, chat endpoints report unavailable
-# instead of trying old infrastructure.
-CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST") or os.environ.get("DISTIL_CHAT_POD_HOST", "")
-CHAT_POD_SSH_PORT = int(os.environ.get("CHAT_POD_SSH_PORT") or os.environ.get("DISTIL_CHAT_POD_SSH_PORT", "22"))
-CHAT_POD_APP_PORT = CHAT["appPort"]
-CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
-
 STATE_DIR = os.environ.get("DISTIL_STATE_DIR", str(REPO_ROOT / "state"))
 DISK_CACHE_DIR = os.path.join(STATE_DIR, "api_cache")
 os.makedirs(DISK_CACHE_DIR, exist_ok=True)
+
+
+# ── Chat pod coordinates ─────────────────────────────────────────────────────
+# Resolution order (first non-empty wins):
+#   1. CHAT_POD_HOST / CHAT_POD_SSH_PORT / CHAT_POD_SSH_KEY env vars
+#   2. DISTIL_CHAT_POD_* env vars (legacy alias)
+#   3. ``state/chat_pod.json`` (single source of truth, updated via
+#      ``python -m scripts.validator.chat_pod_admin set ...``)
+#
+# Why a state file: Lium pods get reprovisioned, the king's serving pod
+# gets reaped, and miners ship new checkpoints continuously. Hardcoding the
+# host in systemd / .env means every churn triggers a manual edit on the
+# validator host. Reading from a JSON state file lets the validator (and
+# the chat-tunnel.path systemd watcher) pick up new coordinates without
+# reloading services. Pre-2026-04-26 every churn caused chat.arbos.life to
+# 502 until ops noticed; the state-file + watcher loop closes that gap.
+def _load_chat_pod_state() -> dict:
+    state_path = os.path.join(STATE_DIR, "chat_pod.json")
+    try:
+        import json as _json
+        with open(state_path) as f:
+            data = _json.load(f) or {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+_chat_pod_state = _load_chat_pod_state()
+
+
+def _chat_pod_value(env_keys: tuple[str, ...], state_key: str, default: str = "") -> str:
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val:
+            return val
+    raw = _chat_pod_state.get(state_key)
+    if raw is None:
+        return default
+    return str(raw)
+
+
+CHAT_POD_HOST = _chat_pod_value(("CHAT_POD_HOST", "DISTIL_CHAT_POD_HOST"), "host", "")
+CHAT_POD_SSH_PORT = int(
+    _chat_pod_value(("CHAT_POD_SSH_PORT", "DISTIL_CHAT_POD_SSH_PORT"), "ssh_port", "22")
+)
+CHAT_POD_APP_PORT = int(
+    _chat_pod_value(("CHAT_POD_APP_PORT", "DISTIL_CHAT_POD_APP_PORT"), "app_port", str(CHAT["appPort"]))
+)
+CHAT_POD_SSH_KEY = _chat_pod_value(
+    ("CHAT_POD_SSH_KEY",), "ssh_key", os.path.expanduser("~/.ssh/id_ed25519"),
+)
+# Persisted ``model`` is informational — the validator's side_effects loop
+# rewrites chat_pod.json with the actual king on every restart_chat_server,
+# but at module-load time we don't know yet which UID is reigning.
+CHAT_POD_MODEL = _chat_pod_state.get("model") or ""
 
 TMC_KEY = os.environ.get("TMC_API_KEY", "")
 TMC_HEADERS = {"Authorization": TMC_KEY} if TMC_KEY else {}
