@@ -128,7 +128,11 @@ def health():
     return {
         "status": "ok",
         "netuid": NETUID,
-        "dethrone_method": "paired_t_test",
+        "dethrone_method": (
+            "single_eval_composite_worst"
+            if int(os.environ.get("SINGLE_EVAL_MODE", "0") or 0)
+            else "paired_t_test"
+        ),
         "king_uid": king_uid,
         "king_kl": round(king_kl, 6) if king_kl is not None else None,
         "n_scored": n_scored,
