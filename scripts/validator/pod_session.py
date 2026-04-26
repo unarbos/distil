@@ -164,13 +164,37 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             #   3. fall back on nvidia-smi: if anything is still holding the GPU
             #      and it looks like a vllm/python worker, nuke it.
             pod.exec(
-                "pkill -9 -f pod_eval 2>/dev/null; "
-                "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
-                "pkill -9 -f 'VllmWorker' 2>/dev/null; "
-                "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
-                "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "  # match comm (15-char trunc)
+                # Build a deny-list of PIDs we MUST NOT kill: the chat-king
+                # vLLM (chat_server.py + vllm.entrypoints --served-model-name
+                # sn97-king on port 8100) and its descendants. Pre-2026-04-26
+                # this cleanup blanket-killed every vllm.entrypoints process,
+                # which is why chat.arbos.life went dark for ~30 minutes
+                # every round. The chat-king and the eval-teacher coexist on
+                # the same H200; eval-teacher is on port 9100 and uses
+                # served-model-name "teacher", so the deny-list is precise.
+                "preserve=''; "
+                "for pid in $(pgrep -f 'chat_server.py' 2>/dev/null) "
+                "             $(pgrep -f 'served-model-name sn97-king' 2>/dev/null) "
+                "             $(pgrep -f 'port 8100' 2>/dev/null); do "
+                "  preserve=\"$preserve $pid\"; "
+                "  for desc in $(pgrep -P $pid 2>/dev/null); do "
+                "    preserve=\"$preserve $desc\"; "
+                "    for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                "  done; "
+                "done; "
+                "kill_unless_chat() { "
+                "  for pid in \"$@\"; do "
+                "    case \" $preserve \" in (*\" $pid \"*) ;; (*) kill -9 $pid 2>/dev/null ;; esac; "
+                "  done; "
+                "}; "
+                "kill_unless_chat $(pgrep -f pod_eval 2>/dev/null); "
+                "kill_unless_chat $(pgrep -f 'vllm.entrypoints' 2>/dev/null); "
+                "kill_unless_chat $(pgrep -f 'VllmWorker' 2>/dev/null); "
+                "kill_unless_chat $(pgrep -f 'VLLM::EngineCore' 2>/dev/null); "
+                "kill_unless_chat $(pgrep -x 'VLLM::EngineCor' 2>/dev/null); "  # match comm (15-char trunc)
                 "sleep 2; "
                 "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+                "  case \" $preserve \" in (*\" $pid \"*) continue ;; esac; "
                 "  comm=$(cat /proc/$pid/comm 2>/dev/null); "
                 "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
                 "  case \"$cmd$comm\" in "
@@ -181,20 +205,25 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 "sleep 2; "
                 # Last-resort sweep: if GPU is still non-empty, something slipped
                 # through. Log the survivors so we can improve the patterns above.
+                # Survivors that match the preserve list are NOT killed — that
+                # would dark chat.arbos.life again.
                 "survivors=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
                 "if [ -n \"$survivors\" ]; then "
                 "  for pid in $survivors; do "
+                "    case \" $preserve \" in (*\" $pid \"*) continue ;; esac; "
                 "    echo \"[cleanup] gpu still held by pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 200)\" >&2; "
                 "    kill -9 $pid 2>/dev/null; "
                 "  done; "
                 "  sleep 2; "
                 "fi; "
-                "rm -rf /dev/shm/vllm* 2>/dev/null; "
+                # /dev/shm/vllm* is per-process; only safe to wipe when no
+                # vllm process survives. Skip if chat-king still holds a slot.
+                "if [ -z \"$preserve\" ]; then rm -rf /dev/shm/vllm* 2>/dev/null; fi; "
                 "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
                 "sleep 1",
                 timeout=40,
             )
-            logger.info("Killed existing eval/vllm processes and removed stale /home files")
+            logger.info("Killed existing eval/vllm processes (chat-king preserved) and removed stale /home files")
         except Exception as exc:
             logger.debug(f"Pre-eval cleanup: {exc}")
         try:

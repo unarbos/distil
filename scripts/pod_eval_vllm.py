@@ -8864,17 +8864,61 @@ def stop_vllm_server():
     # "VLLM::EngineCore" — cmdline-based pkill -f 'vllm.entrypoints' WILL NOT
     # match it. If pod_eval exits without the engine being reaped, the engine
     # survives holding the entire GPU, OOM-ing every future round on this pod.
-    for pattern in ("vllm.entrypoints", "VllmWorker", "VLLM::EngineCore"):
-        try:
-            subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, timeout=5)
-        except Exception:
-            pass
-    # comm is capped at 15 chars so "VLLM::EngineCore" shows up as
-    # "VLLM::EngineCor" — match that too.
+    #
+    # 2026-04-26 — also build a `preserve` set so we never kill the
+    # chat-king vLLM that co-tenants this pod (chat_server.py launches
+    # vllm.entrypoints with --served-model-name sn97-king on port 8100,
+    # while eval-teacher uses --served-model-name teacher on VLLM_PORT).
+    # Pre-2026-04-26, post-eval cleanup blanket-killed every
+    # vllm.entrypoints process and dark'd chat.arbos.life every round.
+    preserve_pids: set[int] = set()
     try:
-        subprocess.run(["pkill", "-9", "-x", "VLLM::EngineCor"], capture_output=True, timeout=5)
+        for tag in (
+            "chat_server.py",
+            "served-model-name sn97-king",
+            "port 8100",
+        ):
+            r = subprocess.run(["pgrep", "-f", tag], capture_output=True, text=True, timeout=5)
+            for line in (r.stdout or "").split():
+                line = line.strip()
+                if line.isdigit():
+                    preserve_pids.add(int(line))
+        # Walk descendants two levels deep — covers vllm.entrypoints'
+        # APIServer + EngineCore worker chain.
+        frontier = list(preserve_pids)
+        for pid in frontier:
+            try:
+                r = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=5)
+                for line in (r.stdout or "").split():
+                    if line.strip().isdigit():
+                        kid = int(line.strip())
+                        if kid not in preserve_pids:
+                            preserve_pids.add(kid)
+                            frontier.append(kid)
+            except Exception:
+                continue
     except Exception:
         pass
+
+    def _pgrep_to_pids(pattern: str, *, comm: bool = False) -> list[int]:
+        flag = "-x" if comm else "-f"
+        try:
+            r = subprocess.run(["pgrep", flag, pattern], capture_output=True, text=True, timeout=5)
+            return [int(x) for x in (r.stdout or "").split() if x.strip().isdigit()]
+        except Exception:
+            return []
+
+    candidates = set()
+    for pattern in ("vllm.entrypoints", "VllmWorker", "VLLM::EngineCore"):
+        candidates.update(_pgrep_to_pids(pattern))
+    # comm is capped at 15 chars so "VLLM::EngineCore" shows up as
+    # "VLLM::EngineCor" — match that too.
+    candidates.update(_pgrep_to_pids("VLLM::EngineCor", comm=True))
+    for pid in candidates - preserve_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
     my_pid = os.getpid()
     for _ in range(3):
         try:
@@ -8882,7 +8926,12 @@ def stop_vllm_server():
                 ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
                 capture_output=True, text=True, timeout=10
             )
-            candidates = [int(p.strip()) for p in result.stdout.strip().split("\n") if p.strip().isdigit() and int(p.strip()) != my_pid]
+            candidates = [
+                int(p.strip()) for p in result.stdout.strip().split("\n")
+                if p.strip().isdigit()
+                and int(p.strip()) != my_pid
+                and int(p.strip()) not in preserve_pids
+            ]
             if not candidates:
                 break
             killed_any = False
@@ -8910,8 +8959,13 @@ def stop_vllm_server():
         except Exception:
             break
     try:
-        for shm in Path("/dev/shm").glob("vllm*"):
-            shm.unlink(missing_ok=True)
+        # /dev/shm/vllm* is per-process; only safe to wipe when no
+        # surviving vllm process exists (i.e. preserve_pids is empty).
+        # If chat-king is running we leave its shm files alone — wiping
+        # them can lock up the live server in flight.
+        if not preserve_pids:
+            for shm in Path("/dev/shm").glob("vllm*"):
+                shm.unlink(missing_ok=True)
     except Exception:
         pass
     free_gpu()
