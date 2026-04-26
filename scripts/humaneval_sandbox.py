@@ -112,16 +112,50 @@ def _assemble_program(prompt: str, generation: str, test: str, entry_point: str,
 
     A per-sample ``nonce`` is printed only after ``check()`` returns
     successfully, so miners cannot spoof a pass with ``os._exit(0)``.
+
+    Format-recovery (2026-04-26 Goodhart hardening): the bench prompt
+    instructs models to output "only the function body". Many models
+    comply but emit the body **without leading indentation** — when
+    concatenated to a prompt that ends inside a ``def`` block, that's
+    a SyntaxError instead of a real capability signal (Round 15 audit
+    on Qwen/Qwen3.5-4B: 2 of 4 failures were ``return outside function``
+    on bare ``return ...`` outputs). We add an auto-indent recovery so
+    the grader measures coding ability, not prompt-format compliance.
+    A bare ``return ...`` without indentation cannot mean anything else
+    when continuing a HumanEval prompt that ends mid-``def`` block, so
+    the recovery only ever fixes a format mistake — it never changes a
+    semantically valid program.
     """
     gen = _strip_code_fences(generation)
     def_marker = f"def {entry_point}("
-    if gen.count(def_marker) > 0 and prompt.count(def_marker) >= 1:
+    has_def_in_gen = gen.count(def_marker) > 0 and prompt.count(def_marker) >= 1
+    if has_def_in_gen:
         idx = gen.find(def_marker)
         gen_tail = gen[idx:]
         lines = gen_tail.splitlines()
         if lines and lines[0].strip().startswith("def ") and lines[0].strip() in prompt:
             lines = lines[1:]
         gen = "\n".join(lines)
+    elif prompt.count(def_marker) >= 1:
+        # Auto-indent recovery only fires when the prompt itself ends
+        # mid-``def`` block (HumanEval-style "complete the body" prompts).
+        # If the prompt is empty or the body is unindented, the gen is a
+        # bare body that needs the indentation reattached. We skip this
+        # branch when the prompt has no ``def {entry}(`` (e.g. MBPP-style
+        # tests that pass ``prompt=""`` and a complete function in gen).
+        body_lines = gen.splitlines()
+        first_nonblank = next(
+            (line for line in body_lines if line.strip()), None
+        )
+        if (
+            first_nonblank is not None
+            and not first_nonblank.startswith((" ", "\t"))
+            and not first_nonblank.lstrip().startswith(("def ", "class ", "@"))
+        ):
+            gen = "\n".join(
+                ("    " + line) if line.strip() else line
+                for line in body_lines
+            )
     program = _RLIMIT_PREAMBLE
     program += prompt
     if not prompt.endswith("\n"):

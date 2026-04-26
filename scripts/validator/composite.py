@@ -297,7 +297,7 @@ BENCH_MIN_VALID = {
     "noise_resistance_bench": 2,
 }
 
-COMPOSITE_SHADOW_VERSION = 13  # Session 3.8 — long_context_bench confuser-rejection grader (lenient substring match → strict gold-AND-no-confuser). Old records' lc_bench=1.0 is gameable; v13+ records use the hardened grader.
+COMPOSITE_SHADOW_VERSION = 14  # Session 3.9 — code_bench auto-indent recovery in humaneval_sandbox._assemble_program. Pre-v14 records penalize models that emit unindented function bodies even when the logic is correct (Round 15 audit on Qwen/Qwen3.5-4B: 2 of 4 code_bench failures were ``return outside function`` SyntaxErrors on bare ``return ...`` outputs). v14+ records measure coding ability rather than prompt-format compliance, which materially shifts the code_bench distribution; the king-selection version gate keeps cross-grader comparisons honest.
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
