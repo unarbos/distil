@@ -283,18 +283,29 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     king_flag = ""
     vllm_flag = " --no-vllm"
     if use_vllm:
-        # Eval shares the GPU with the chat-king vLLM. The chat-king
-        # *targets* 0.15 of GPU memory but in practice we've seen
-        # leaked duplicate workers holding ~46 GB on a single H200
-        # (45.6 GB on 2026-04-27 — two engine-core processes from
-        # earlier chat-king restarts that weren't reaped). When the
-        # eval teacher then asks for 0.78 of 139.8 GB (109 GB) it
-        # fails with `Free memory ... is less than desired GPU memory
-        # utilization`, falls back to HF, and the round takes 80
-        # minutes of sequential generation instead of 5 minutes.
-        # 0.65 leaves headroom for ~50 GB of chat-king occupancy
-        # (whether legit or leaked) without falling back. Tune up
-        # via VLLM_EVAL_GPU_UTIL when the chat pod gets its own GPU.
+        # Eval shares the GPU with the chat-king vLLM. Two regimes:
+        #
+        #   1. Co-located chat-king (default today): chat-king *targets*
+        #      0.15 of GPU memory but in practice we've seen leaked
+        #      duplicate workers holding ~46 GB on a single H200
+        #      (2026-04-27 — two engine-core processes from earlier
+        #      chat-king restarts that weren't reaped). When the eval
+        #      teacher then asks for 0.78 of 139.8 GB (109 GB) it fails
+        #      with `Free memory ... is less than desired GPU memory
+        #      utilization`, falls back to HF, and the round takes 80
+        #      minutes of sequential generation instead of 5 minutes.
+        #      0.65 leaves headroom for ~50 GB of chat-king occupancy
+        #      (whether legit or leaked) without falling back.
+        #
+        #   2. Dedicated chat pod (recommended next step): use
+        #      ``scripts/provision_chat_pod.py`` to rent a small GPU
+        #      (RTX 4090 or H100) just for the chat king. Once chat is
+        #      on its own pod the eval pod has the whole GPU; bump
+        #      VLLM_EVAL_GPU_UTIL=0.92 in /home/distil/.secrets/distil.env
+        #      to unlock it. Eval rounds finish in ~30-45 min instead of
+        #      90+ min.
+        #
+        # Tune via VLLM_EVAL_GPU_UTIL.
         eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.65")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:

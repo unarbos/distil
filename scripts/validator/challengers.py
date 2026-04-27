@@ -76,30 +76,42 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
     if is_single_eval_mode():
         evict_stale_evaluated_uids(state, valid_models)
         challengers = {}
-        # Force-eligible UIDs: the current king when its composite is on a
-        # stale schema version. Without this, a king crowned under an older
-        # schema (e.g. v15) gets compared against challengers scored under
-        # the newer schema (v27) and ALWAYS wins by accidentally measuring
-        # different things — exactly the "king cached on old prompts /
-        # challengers get fresh ones" Discord fairness complaint. Forcing
-        # the king back through this round's procedural items pins both
-        # sides to the same axis definitions and grader code, after which
-        # ``resolve_dethrone`` is a fair like-for-like comparison.
+        # Force-eligible UIDs:
+        #
+        #   - The current king ALWAYS gets force-eligible (2026-04-27).
+        #     Even with procedural per-round bench items the king's
+        #     stored composite came from a different prompt sample than
+        #     this round's challengers, so worst-axis comparison is
+        #     cross-sample. SE on bench axes with n=8-12 binomial items
+        #     is ~0.14, which is bigger than the dethrone margin.
+        #     Re-evaluating the king on the same prompts as challengers
+        #     restores paired evaluation. (Discord 2026-04-27, coffieex
+        #     +crypsick: "the variance is extreme across shards".)
+        #
+        #   - Historically: also re-eval'd on schema bumps. Now
+        #     redundant because we re-eval every round, but the
+        #     code path still works as a safety net if king-in-round
+        #     ever gets disabled.
         force_eligible: set[str] = set()
         if king_uid is not None:
             king_record = (state.composite_scores or {}).get(str(king_uid))
+            force_eligible.add(str(king_uid))
             if isinstance(king_record, dict):
                 try:
                     king_version = int(king_record.get("version") or 0)
                 except (TypeError, ValueError):
                     king_version = 0
                 if king_version < int(COMPOSITE_SHADOW_VERSION):
-                    force_eligible.add(str(king_uid))
                     logger.info(
                         f"single-eval: forcing king UID {king_uid} re-eval "
                         f"(stored composite version {king_version} < "
                         f"current schema {COMPOSITE_SHADOW_VERSION}); ensures "
                         f"like-for-like comparison against challengers."
+                    )
+                else:
+                    logger.info(
+                        f"single-eval: king UID {king_uid} included in "
+                        f"this round (paired re-eval on shared prompts)."
                     )
         for uid, info in valid_models.items():
             uid_str = str(uid)
@@ -148,9 +160,12 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             )
             challengers = kept
         if challengers:
+            n_king = 1 if (king_uid is not None and str(king_uid) in {str(u) for u in challengers}) else 0
+            n_others = len(challengers) - n_king
             logger.info(
-                f"single-eval: {len(challengers)} new commitment(s) to evaluate "
-                f"(no king re-eval, no top-N rotation, no dormant rotation)"
+                f"single-eval: {n_others} new commitment(s) to evaluate"
+                + (" + king (paired re-eval, 2026-04-27 fairness fix)" if n_king else "")
+                + " (no top-N rotation, no dormant rotation)"
             )
         else:
             logger.info(

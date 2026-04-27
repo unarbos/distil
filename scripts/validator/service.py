@@ -661,11 +661,31 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         )
 
     models_to_eval: dict = {}
-    # In SINGLE_EVAL_MODE the king is never re-evaluated. The round contains
-    # only never-evaluated commitments plus the always-in reference baseline.
+    # As of 2026-04-27, the king IS re-evaluated every round on the same
+    # block-seeded prompts as the challengers. The earlier single-eval
+    # design (king isn't re-evaluated, dethrone gate compares cached
+    # composite-worst against fresh challenger composite-worst) was
+    # statistically unsound: prompt-level variance on n=8-12 bench items
+    # produces SE ~0.14 on bench axes, so a challenger that "beats" the
+    # king's cached composite.worst by 3% may just be drawing easier
+    # items. Including the king in every round restores paired
+    # evaluation — challenger and king face the same prompts and same
+    # bench items, so worst-axis comparison is no longer cross-sample.
+    #
+    # The dethrone gate (see ``apply_results_and_weights``) now uses the
+    # king's *fresh* composite from this round when present, falling
+    # back to the stored composite only if the king somehow couldn't
+    # be evaluated (DQ, integrity fail, OOM).
+    #
+    # We dropped the reference baseline (Qwen3.5-4B, UID -1) from the
+    # per-round student list to make room for the king without inflating
+    # round duration. The reference is still useful for the dashboard's
+    # held-out canary, but it doesn't need to be re-evaluated on every
+    # round to serve that purpose. Run ``scripts/run_teacher_benchmark.sh``
+    # / its sibling against an idle pod to refresh held-out reference
+    # numbers when needed.
     seat_king = (
-        not is_single_eval_mode()
-        and not is_full_eval
+        not is_full_eval
         and king_uid is not None
         and king_uid in valid_models
     )
@@ -673,7 +693,14 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         models_to_eval[king_uid] = valid_models[king_uid]
     for uid, info in challengers.items():
         models_to_eval[uid] = info
-    if REFERENCE_MODEL and REFERENCE_UID not in models_to_eval:
+    # 2026-04-27: reference baseline removed from per-round eval.
+    # Setting INCLUDE_REFERENCE_IN_ROUND=1 in the env restores the
+    # legacy behaviour for emergency rollback.
+    if (
+        os.environ.get("INCLUDE_REFERENCE_IN_ROUND", "0") == "1"
+        and REFERENCE_MODEL
+        and REFERENCE_UID not in models_to_eval
+    ):
         models_to_eval[REFERENCE_UID] = {
             "model": REFERENCE_MODEL, "commit_block": 0,
             "hotkey": "reference", "is_reference": True,
