@@ -25,68 +25,77 @@
   --color-warning: var(--warning);
   --color-danger: var(--danger);
   --color-ok: var(--ok);
-  --radius-sm: 0.25rem;
-  --radius-md: 0.375rem;
-  --radius-lg: 0.5rem;
-  --radius-xl: 0.75rem;
+  --color-meta: var(--ink-meta);
+  --radius-sm: 0;
+  --radius-md: 2px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
 }
 
+/*
+ * Monochrome light theme. Idiom from the v2 design reference: white
+ * surface, near-black ink, hairline borders, single live-pulse accent.
+ * Deliberately drops the previous dark-mode + blue-gradient palette —
+ * the eval is composite, not just KL, and the surface should look like
+ * a piece of typography, not a trading dashboard.
+ */
 :root {
-  --surface: #09090b;
-  --surface-elevated: #09090b;
-  --surface-sunken: #27272a;
-  --ink: #fafafa;
-  --ink-inverse: #18181b;
-  --ink-muted: #a1a1aa;
-  --border: #27272a;
-  --king: #facc15;
-  --eval: #60a5fa;
-  --warning: #f59e0b;
-  --danger: #ef4444;
-  --ok: #22c55e;
-}
-
-:root[data-theme="light"] {
-  --surface: #fafafa;
+  --surface: #ffffff;
   --surface-elevated: #ffffff;
-  --surface-sunken: #f4f4f5;
-  --ink: #18181b;
-  --ink-inverse: #fafafa;
+  --surface-soft: #fcfcfc;
+  --surface-sunken: #fafafa;
+  --ink: #0a0a0a;
+  --ink-inverse: #ffffff;
   --ink-muted: #52525b;
-  --border: #e4e4e7;
-  --king: #b45309;
-  --eval: #2563eb;
-  --warning: #b45309;
-  --danger: #b91c1c;
-  --ok: #15803d;
-}
-
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme]) {
-    --surface: #fafafa;
-    --surface-elevated: #ffffff;
-    --surface-sunken: #f4f4f5;
-    --ink: #18181b;
-    --ink-inverse: #fafafa;
-    --ink-muted: #52525b;
-    --border: #e4e4e7;
-    --king: #b45309;
-    --eval: #2563eb;
-    --warning: #b45309;
-    --danger: #b91c1c;
-    --ok: #15803d;
-  }
+  --ink-meta: #8a8a8a;
+  --ink-meta-soft: #bdbdbd;
+  --border: #ebebeb;
+  --border-strong: #d4d4d8;
+  --king: #0a0a0a;
+  --eval: #0a0a0a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --ok: #16a34a;
 }
 
 body {
   background: var(--surface);
   color: var(--ink);
-  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  font-family:
+    "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    system-ui, sans-serif;
+  font-feature-settings: "ss01", "cv11", "tnum";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* Italicised serif accent (used for the wordmark and subline tags). */
+.serif {
+  font-family: "Times New Roman", Times, serif;
+  font-style: italic;
+}
+
+/* Tabular numerics everywhere we display numbers. Composite scores,
+ * KL, blocks, τ — they all need to align. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle live indicator pulse — the only animated element in the
+ * header. Not used on a wide surface so it never causes layout reflow. */
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.live-pulse {
+  animation: live-pulse 1.6s ease-in-out infinite;
 }
 
 @keyframes eval-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.25); }
-  50% { box-shadow: 0 0 0 6px rgba(96, 165, 250, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(10, 10, 10, 0.18); }
+  50% { box-shadow: 0 0 0 5px rgba(10, 10, 10, 0); }
 }
 
 .eval-glow {
@@ -105,14 +114,36 @@ body {
   100% { background-position: -200% 0; }
 }
 
+/* Active-phase bar scan animation (Live tab pipeline). */
+@keyframes phase-scan {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(220%); }
+}
+
+.phase-scan {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.85),
+    transparent
+  );
+  animation: phase-scan 1.6s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
-  .eval-glow { animation: none; box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.2); }
+  .eval-glow { animation: none; box-shadow: 0 0 0 2px rgba(10, 10, 10, 0.2); }
   .skeleton { animation: none; background: var(--surface-sunken); }
+  .live-pulse { animation: none; }
+  .phase-scan { display: none; }
 }
 
 .scroll-snap-x {
@@ -121,3 +152,88 @@ body {
 .scroll-snap-item {
   scroll-snap-align: start;
 }
+
+/* Hide native details marker on summary tags so we can render our own
+ * indicator. */
+summary { list-style: none; }
+summary::-webkit-details-marker { display: none; }
+
+/* Docs body — Times-italic body copy for the lead, Inter for ui. The
+ * idea is to look like a piece of typography, not a webform. */
+.docs-body h2 {
+  font-size: 38px;
+  font-weight: 500;
+  letter-spacing: -0.035em;
+  margin-bottom: 10px;
+  color: var(--ink);
+}
+.docs-body .lead {
+  font-family: "Times New Roman", Times, serif;
+  font-size: 18px;
+  color: #444;
+  margin-bottom: 24px;
+  line-height: 1.45;
+}
+.docs-body h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--ink-meta);
+  font-weight: 500;
+  margin: 28px 0 10px;
+}
+.docs-body p {
+  font-family: "Times New Roman", Times, serif;
+  font-size: 15px;
+  color: #222;
+  margin-bottom: 12px;
+  line-height: 1.6;
+}
+.docs-body ol,
+.docs-body ul {
+  margin: 0 0 12px 22px;
+  font-family: "Times New Roman", Times, serif;
+  font-size: 15px;
+  color: #222;
+  line-height: 1.7;
+}
+.docs-body li { margin-bottom: 4px; }
+.docs-body code {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 12px;
+  background: var(--surface-sunken);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+.docs-body pre {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 12px;
+  background: var(--ink);
+  color: #fff;
+  padding: 14px 18px;
+  overflow: auto;
+  margin: 8px 0 16px;
+  border-radius: 2px;
+  white-space: pre-wrap;
+}
+.docs-body .kv {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 8px 18px;
+  font-family: "Inter", sans-serif;
+  font-size: 13px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.docs-body .kv dt {
+  color: var(--ink-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 10px;
+  align-self: center;
+}
+.docs-body .kv dd {
+  font-variant-numeric: tabular-nums;
+}
+.docs-body a { color: var(--ink); text-decoration: underline; }
