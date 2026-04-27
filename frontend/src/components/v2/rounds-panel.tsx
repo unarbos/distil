@@ -226,12 +226,24 @@ function BoutCard({ round }: { round: H2hRound }) {
 
 /**
  * Per-round per-axis grid. Rows = miners (king first, then by worst
- * desc, then DQ at bottom). Columns = the headline 12 axes (we don't
- * show all 17 here — too wide; the full 17 lives on /miner/[uid] and
- * the Axes tab). Cell = score, colour-coded.
+ * desc, then DQ at bottom). Columns = the headline 11 composite axes
+ * + a leading `KL` column for the raw H2H KL.
+ *
+ * Note: the *composite* `kl` axis (a teacher-anchor normalised
+ * value) is omitted intentionally. When the king's anchor is
+ * unavailable that axis evaluates to null and gets rendered as "—"
+ * for every UID, which gave the misleading "KL is broken" surface
+ * miners reported on 2026-04-27. The raw H2H KL (``r.kl``, lower =
+ * better, on the round's prompts) is always populated and is what
+ * miners actually mean when they say "KL". We render it here so the
+ * column is never empty.
+ *
+ * The composite-normalised KL axis is still scored and still drives
+ * composite.worst — it just isn't surfaced in this grid because
+ * "—-for-every-row" is worse than "render the underlying number".
  */
-const ROUND_AXIS_COLS: { key: string; label: string }[] = [
-  { key: "kl", label: "kl" },
+const ROUND_AXIS_COLS: { key: string; label: string; group?: "raw" | "axis" }[] = [
+  { key: "raw_kl", label: "KL ↓", group: "raw" },
   { key: "on_policy_rkl", label: "rkl" },
   { key: "capability", label: "cap" },
   { key: "math_bench", label: "math" },
@@ -269,7 +281,11 @@ function RoundAxisGrid({ round }: { round: H2hRound }) {
               <th
                 key={c.key}
                 className="text-right text-meta font-medium px-2 py-1.5"
-                title={c.key}
+                title={
+                  c.key === "raw_kl"
+                    ? "raw H2H KL on this round's prompts (lower is better; absolute scale, NOT a 0..1 axis score)"
+                    : c.key
+                }
               >
                 {c.label}
               </th>
@@ -302,6 +318,38 @@ function RoundAxisGrid({ round }: { round: H2hRound }) {
                   {r.composite?.weighted != null ? r.composite.weighted.toFixed(3) : "—"}
                 </td>
                 {ROUND_AXIS_COLS.map((c) => {
+                  // Raw H2H KL column — read from the result, not the
+                  // composite axes. Lower = better; format with 4dp,
+                  // colour heat inverted (low KL = strong, high =
+                  // danger). Cap reference: ~0.18 = strong, > 0.30 =
+                  // danger.
+                  if (c.key === "raw_kl") {
+                    const v = typeof r.kl === "number" && Number.isFinite(r.kl) ? r.kl : null;
+                    if (v == null) {
+                      return (
+                        <td key={c.key} className="text-right px-2 py-1.5 text-meta">
+                          —
+                        </td>
+                      );
+                    }
+                    const color =
+                      v <= 0.16
+                        ? "text-foreground font-medium"
+                        : v <= 0.20
+                          ? "text-foreground"
+                          : v <= 0.30
+                            ? "text-warning"
+                            : "text-danger";
+                    return (
+                      <td
+                        key={c.key}
+                        className={["text-right px-2 py-1.5 num", color].join(" ")}
+                        title="raw H2H KL (this round); lower = better"
+                      >
+                        {v.toFixed(4)}
+                      </td>
+                    );
+                  }
                   const v = ax[c.key];
                   if (typeof v !== "number" || !Number.isFinite(v)) {
                     return (
