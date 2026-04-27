@@ -238,6 +238,14 @@ export function BenchPanel() {
         {" "}A bench shown as <strong className="text-foreground">n/a</strong> means
         neither source has data for it. The full held-out evalscope reports
         live at <code className="font-mono">benchmark_results/v28-full/</code>.
+        {teacher?.label && /placeholder/i.test(teacher.label) && (
+          <>
+            {" "}<strong className="text-foreground">Note:</strong> the teacher
+            row is a model-card placeholder (not a first-party evalscope run).
+            Run <code className="font-mono">scripts/run_teacher_benchmark.sh</code>{" "}
+            against an idle teacher pod to replace with consistent numbers.
+          </>
+        )}
       </div>
     </div>
   );
