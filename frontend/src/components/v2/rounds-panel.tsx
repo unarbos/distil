@@ -178,7 +178,7 @@ function BoutCard({ round }: { round: H2hRound }) {
       ].join(" ")}
     >
       <button
-        className="grid grid-cols-[1fr_28px_1fr_18px] gap-2.5 items-center w-full text-left hover:bg-white/40 -mx-2 px-2 py-1 transition-colors"
+        className="grid grid-cols-[1fr_28px_1fr_18px] gap-2.5 items-center w-full text-left hover:bg-[var(--surface-elevated)]/40 -mx-2 px-2 py-1 transition-colors"
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
       >
@@ -301,7 +301,7 @@ function RoundAxisGrid({ round }: { round: H2hRound }) {
                 className={[
                   "border-t border-border",
                   r.disqualified ? "opacity-50" : "",
-                  r.is_king ? "bg-white" : "",
+                  r.is_king ? "bg-[var(--surface-elevated)]" : "",
                 ].join(" ")}
               >
                 <td className="text-left px-2 py-1.5 sticky left-0 bg-inherit whitespace-nowrap">
@@ -491,11 +491,11 @@ function CompositeTrend({ rounds }: { rounds: H2hRound[] }) {
       {[0, 1, 2, 3].map((i) => {
         const y = P + (i * (H - P * 2)) / 3;
         return (
-          <line key={i} x1={P} x2={W - P} y1={y} y2={y} stroke="#f1f1f1" />
+          <line key={i} x1={P} x2={W - P} y1={y} y2={y} stroke="var(--track)" />
         );
       })}
-      <path d={areaPath} fill="#f7f7f7" />
-      <path d={linePath} stroke="#0a0a0a" strokeWidth={1.5} fill="none" />
+      <path d={areaPath} fill="var(--surface-soft)" />
+      <path d={linePath} stroke="var(--ink)" strokeWidth={1.5} fill="none" />
       {points.map((p, i) => {
         const isLast = i === points.length - 1;
         return (
@@ -515,7 +515,7 @@ function CompositeTrend({ rounds }: { rounds: H2hRound[] }) {
         fontFamily="Inter, sans-serif"
         fontSize={11}
         textAnchor="end"
-        fill="#0a0a0a"
+        fill="var(--ink)"
         fontWeight={500}
       >
         worst {last.worst.toFixed(3)}
@@ -584,7 +584,7 @@ function ReignChart({ entries }: { entries: KingHistoryRound[] }) {
               fontFamily="Inter, sans-serif"
               fontSize={10}
               textAnchor="middle"
-              fill="#8a8a8a"
+              fill="var(--ink-meta)"
             >
               {r.uid}
             </text>
@@ -594,7 +594,7 @@ function ReignChart({ entries }: { entries: KingHistoryRound[] }) {
               fontFamily="Inter, sans-serif"
               fontSize={10}
               textAnchor="middle"
-              fill="#0a0a0a"
+              fill="var(--ink)"
             >
               {r.blocks}
             </text>

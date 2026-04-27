@@ -56,7 +56,7 @@ export function DocsPanel() {
                   "block w-full text-left text-[13px] px-2 py-1.5 transition-colors",
                   active === item.key
                     ? "bg-foreground text-white"
-                    : "text-foreground hover:bg-white",
+                    : "text-foreground hover:bg-[var(--surface-elevated)]",
                 ].join(" ")}
               >
                 {item.label}

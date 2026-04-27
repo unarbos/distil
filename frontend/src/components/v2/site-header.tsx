@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 /**
  * Sticky top header — single 56px row.
@@ -114,14 +114,101 @@ export function SiteHeader({
           </>
         )}
         <span className="w-px h-3.5 bg-border" />
+        <ThemeToggle />
+        <span className="w-px h-3.5 bg-border" />
         <LiveBadge live={live} onClick={() => setOpen((v) => !v)} />
       </div>
 
-      {/* Mobile: just the live badge */}
-      <div className="flex md:hidden ml-auto">
+      {/* Mobile: theme toggle + live badge */}
+      <div className="flex md:hidden ml-auto items-center gap-2">
+        <ThemeToggle />
         <LiveBadge live={live} />
       </div>
     </header>
+  );
+}
+
+type Theme = "light" | "dark" | "system";
+
+/**
+ * Theme cycle button. Three states (system → light → dark → system)
+ * persisted to localStorage. Writes data-theme on <html> so the
+ * globals.css palette swap fires immediately. Reading both
+ * prefers-color-scheme + the stored value, with stored winning.
+ *
+ * "system" removes the data-theme attribute so the @media
+ * (prefers-color-scheme: dark) block in globals.css takes effect —
+ * matches OS appearance.
+ *
+ * Initial paint: NO_THEME on the server-rendered HTML. The script
+ * below runs before paint via useEffect to apply the saved theme;
+ * there is a single-frame flash of light-mode on first load when
+ * the user's preference is dark, which is acceptable. (Could be
+ * eliminated by inlining a tiny script in <head>; not worth the
+ * Next.js complexity for now.)
+ */
+function ThemeToggle() {
+  const [theme, setTheme] = useState<Theme>("system");
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+    let saved: Theme = "system";
+    try {
+      const v = window.localStorage.getItem("distil:theme") as Theme | null;
+      if (v === "light" || v === "dark" || v === "system") saved = v;
+    } catch {}
+    setTheme(saved);
+    apply(saved);
+  }, []);
+
+  function apply(next: Theme) {
+    if (typeof document === "undefined") return;
+    const el = document.documentElement;
+    if (next === "system") {
+      el.removeAttribute("data-theme");
+    } else {
+      el.setAttribute("data-theme", next);
+    }
+  }
+
+  function cycle() {
+    const order: Theme[] = ["system", "dark", "light"];
+    const next = order[(order.indexOf(theme) + 1) % order.length];
+    setTheme(next);
+    apply(next);
+    try {
+      window.localStorage.setItem("distil:theme", next);
+    } catch {}
+  }
+
+  // Avoid hydration mismatch — render placeholder until mounted.
+  if (!mounted) {
+    return (
+      <button
+        type="button"
+        aria-label="Theme"
+        className="text-[10px] uppercase tracking-[0.16em] text-meta hover:text-foreground"
+      >
+        ◐
+      </button>
+    );
+  }
+
+  const glyph = theme === "dark" ? "●" : theme === "light" ? "○" : "◐";
+  const label =
+    theme === "dark" ? "Dark" : theme === "light" ? "Light" : "Auto";
+  return (
+    <button
+      type="button"
+      onClick={cycle}
+      title={`Theme: ${label} (click to cycle)`}
+      aria-label={`Theme: ${label}. Click to cycle.`}
+      className="inline-flex items-center gap-1 text-[10px] uppercase tracking-[0.16em] text-meta hover:text-foreground transition-colors"
+    >
+      <span aria-hidden className="text-[12px] leading-none">{glyph}</span>
+      <span className="hidden sm:inline">{label}</span>
+    </button>
   );
 }
 

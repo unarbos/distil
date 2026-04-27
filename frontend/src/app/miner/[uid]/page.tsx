@@ -375,11 +375,11 @@ function AxisGroup({
                 {prettyAxis(axis)}
                 {isLim && <span className="text-meta ml-1.5">← limit</span>}
               </span>
-              <div className="h-1.5 bg-[#f1f1f1] relative">
+              <div className="h-1.5 bg-[var(--track)] relative">
                 <div
                   className={[
                     "absolute inset-y-0 left-0",
-                    isLim ? "bg-foreground" : "bg-[#bdbdbd]",
+                    isLim ? "bg-foreground" : "bg-[var(--track-fill-soft)]",
                   ].join(" ")}
                   style={{ width: `${Math.max(0, Math.min(1, v)) * 100}%` }}
                 />

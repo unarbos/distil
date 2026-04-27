@@ -7886,7 +7886,7 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
 
 
-def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None):
+def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None, concurrency=16):
     """Same as the HF variant but using the live vLLM server. Greedy only.
 
     Returns ``(think_samples, cap_answers, cap_gen_lens, chat_gen_lens)``.
@@ -7894,6 +7894,15 @@ def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None):
     teacher's greedy ``enable_thinking=False`` response on each
     CHAT_PROBE_PROMPTS entry; the composite length axis uses its mean as a
     stable anchor so the axis stays defined even with THINK_COLLAPSE_PROBE=0.
+
+    2026-04-27: rewritten to use ThreadPoolExecutor for concurrent
+    requests against vLLM. The previous sequential implementation took
+    ~13 minutes per round (~800s in our timing dump) because each
+    requests.post() blocks on a network round-trip. With concurrency=16
+    vLLM's continuous batching handles 8-16 concurrent prompts per
+    request and the total drops to ~1-2 minutes. Saves ~10 minutes
+    per round, no quality difference (same prompts, same temperature=0
+    deterministic completions).
     """
     import requests
     think_samples = []
@@ -7903,75 +7912,93 @@ def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None):
     if tokenizer is None:
         return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
     think_prompts = _pick_think_probe_prompts(block_seed)
+
+    def _post(rendered, max_tokens):
+        resp = requests.post(
+            f"{VLLM_URL}/v1/completions",
+            json={
+                "model": "teacher",
+                "prompt": rendered,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "top_p": 1.0,
+            },
+            timeout=VLLM_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["text"]
+
+    def _do_think(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
+            return idx, _post(rendered, THINK_PROBE_MAX_TOKENS), None
+        except Exception as e:
+            return idx, "", e
+
+    def _do_cap(idx_item):
+        idx, item = idx_item
+        try:
+            rendered = _render_chat_prompt(tokenizer, item["q"], enable_thinking=False)
+            txt = _post(rendered, CAPABILITY_PROBE_MAX_TOKENS)
+            try:
+                gen_len = len(tokenizer(txt, return_tensors="pt").input_ids[0])
+            except Exception:
+                gen_len = 0
+            return idx, _extract_capability_answer(txt, item["kind"]), gen_len, None
+        except Exception as e:
+            return idx, "", 0, e
+
+    def _do_chat(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+            txt = _post(rendered, CHAT_PROBE_MAX_TOKENS)
+            try:
+                gen_len = len(
+                    tokenizer(txt, return_tensors="pt", truncation=False).input_ids[0]
+                )
+            except Exception:
+                gen_len = 0
+            return idx, gen_len, None
+        except Exception as e:
+            return idx, 0, e
+
     try:
-        for prompt in think_prompts:
-            try:
-                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
-                resp = requests.post(
-                    f"{VLLM_URL}/v1/completions",
-                    json={
-                        "model": "teacher",
-                        "prompt": rendered,
-                        "max_tokens": THINK_PROBE_MAX_TOKENS,
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                    },
-                    timeout=VLLM_REQUEST_TIMEOUT,
-                )
-                resp.raise_for_status()
-                think_samples.append(resp.json()["choices"][0]["text"])
-            except Exception as e:
-                print(f"[eval] vLLM teacher think-probe failed: {e}", flush=True)
-        for item in CAPABILITY_PROBE_PROMPTS:
-            try:
-                rendered = _render_chat_prompt(tokenizer, item["q"], enable_thinking=False)
-                resp = requests.post(
-                    f"{VLLM_URL}/v1/completions",
-                    json={
-                        "model": "teacher",
-                        "prompt": rendered,
-                        "max_tokens": CAPABILITY_PROBE_MAX_TOKENS,
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                    },
-                    timeout=VLLM_REQUEST_TIMEOUT,
-                )
-                resp.raise_for_status()
-                txt = resp.json()["choices"][0]["text"]
-                cap_answers.append(_extract_capability_answer(txt, item["kind"]))
-                try:
-                    cap_gen_lens.append(len(tokenizer(txt, return_tensors="pt").input_ids[0]))
-                except Exception:
-                    cap_gen_lens.append(0)
-            except Exception as e:
-                print(f"[eval] vLLM teacher capability failed: {e}", flush=True)
-                cap_answers.append("")
-                cap_gen_lens.append(0)
-        # Chat-probe teacher anchor for the length axis — see matching
-        # comment in the HF variant for rationale.
-        for prompt in CHAT_PROBE_PROMPTS:
-            try:
-                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                resp = requests.post(
-                    f"{VLLM_URL}/v1/completions",
-                    json={
-                        "model": "teacher",
-                        "prompt": rendered,
-                        "max_tokens": CHAT_PROBE_MAX_TOKENS,
-                        "temperature": 0.0,
-                        "top_p": 1.0,
-                    },
-                    timeout=VLLM_REQUEST_TIMEOUT,
-                )
-                resp.raise_for_status()
-                txt = resp.json()["choices"][0]["text"]
-                try:
-                    chat_gen_lens.append(len(tokenizer(txt, return_tensors="pt",
-                                                       truncation=False).input_ids[0]))
-                except Exception:
-                    chat_gen_lens.append(0)
-            except Exception as e:
-                print(f"[eval] vLLM teacher chat-probe failed: {e}", flush=True)
+        # Run all three concurrent batches sequentially per-batch but
+        # parallel within. Each batch is small (~3-30 prompts) so a
+        # single shared ThreadPoolExecutor for the whole function
+        # would over-subscribe vLLM during the first batch and idle
+        # during the next. Keeping batches separate keeps vLLM's
+        # internal queue saturated without breaching the concurrency
+        # budget.
+        think_samples = [""] * len(think_prompts)
+        with ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(think_prompts)))) as ex:
+            for idx, txt, err in ex.map(_do_think, list(enumerate(think_prompts))):
+                if err is not None:
+                    print(f"[eval] vLLM teacher think-probe failed: {err}", flush=True)
+                think_samples[idx] = txt
+
+        cap_answers = [""] * len(CAPABILITY_PROBE_PROMPTS)
+        cap_gen_lens = [0] * len(CAPABILITY_PROBE_PROMPTS)
+        with ThreadPoolExecutor(
+            max_workers=min(concurrency, max(1, len(CAPABILITY_PROBE_PROMPTS)))
+        ) as ex:
+            for idx, ans, glen, err in ex.map(_do_cap, list(enumerate(CAPABILITY_PROBE_PROMPTS))):
+                if err is not None:
+                    print(f"[eval] vLLM teacher capability failed: {err}", flush=True)
+                cap_answers[idx] = ans
+                cap_gen_lens[idx] = glen
+
+        # Chat-probe teacher anchor for the length axis.
+        chat_gen_lens = [0] * len(CHAT_PROBE_PROMPTS)
+        with ThreadPoolExecutor(
+            max_workers=min(concurrency, max(1, len(CHAT_PROBE_PROMPTS)))
+        ) as ex:
+            for idx, glen, err in ex.map(_do_chat, list(enumerate(CHAT_PROBE_PROMPTS))):
+                if err is not None:
+                    print(f"[eval] vLLM teacher chat-probe failed: {err}", flush=True)
+                chat_gen_lens[idx] = glen
     except Exception as e:
         print(f"[eval] prepare_teacher_probe_refs_vllm error: {e}", flush=True)
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens

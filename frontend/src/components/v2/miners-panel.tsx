@@ -100,7 +100,7 @@ export function MinersPanel({
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="search uid, model, or hotkey…"
-          className="h-7 w-56 border border-border bg-white px-2.5 text-[12px] num placeholder:text-meta focus:outline-none focus:border-foreground"
+          className="h-7 w-56 border border-border bg-[var(--surface-elevated)] px-2.5 text-[12px] num placeholder:text-meta focus:outline-none focus:border-foreground"
         />
         <div className="flex items-center gap-1 text-[11px]">
           {(
@@ -287,7 +287,7 @@ function Th({
       title={title}
       className={[
         "text-[10px] uppercase tracking-[0.18em] text-meta font-medium px-2.5 py-2.5",
-        "border-b border-border bg-white sticky top-0",
+        "border-b border-border bg-[var(--surface-elevated)] sticky top-0",
         align === "right" ? "text-right" : "text-left",
       ].join(" ")}
     >

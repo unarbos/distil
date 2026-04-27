@@ -389,7 +389,7 @@ function QueueRow({ status, uid, model, role, completed, current }: QueueRowProp
     <div
       className={[
         "grid grid-cols-[16px_60px_1fr_auto] items-center gap-2.5 py-2 border-b border-border last:border-b-0 text-[13px]",
-        status === "current" ? "bg-white -mx-2 px-2 ring-1 ring-foreground/10" : "",
+        status === "current" ? "bg-[var(--surface-elevated)] -mx-2 px-2 ring-1 ring-foreground/10" : "",
       ].join(" ")}
     >
       <span className={["text-center font-medium", markerClass].join(" ")}>
@@ -592,7 +592,7 @@ function PhaseRow({ phase }: { phase: PhaseEntry }) {
         <span className="truncate">{phase.label}</span>
       </div>
       <div className={["text-[11px] text-right num", pctClass].join(" ")}>{pctText}</div>
-      <div className="col-span-2 h-[3px] bg-[#f1f1f1] relative overflow-hidden">
+      <div className="col-span-2 h-[3px] bg-[var(--track)] relative overflow-hidden">
         <div
           className={["absolute inset-y-0 left-0", fillBg].join(" ")}
           style={{ width: `${phase.pct}%` }}

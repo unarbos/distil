@@ -45,7 +45,12 @@ export function DitheredSurface() {
       } catch {
         return; // No WebGL.
       }
-      renderer.setClearColor(0xffffff, 1);
+      // Read the live --surface CSS var so the WebGL clear color
+      // tracks the theme (white in light, near-black in dark).
+      // Falls back to white if the var isn't readable.
+      const css = getComputedStyle(document.documentElement);
+      const themedSurface = css.getPropertyValue("--surface").trim() || "#ffffff";
+      renderer.setClearColor(new THREE.Color(themedSurface), 1);
       renderer.setSize(width, height);
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
       mount.appendChild(renderer.domElement);
@@ -74,6 +79,8 @@ export function DitheredSurface() {
       const FS = `
         varying vec2 vUv;
         varying float vElevation;
+        uniform vec3 uBgColor;
+        uniform vec3 uFgColor;
 
         float dither(vec2 p, float b) {
           int x = int(mod(p.x, 4.0));
@@ -105,17 +112,30 @@ export function DitheredSurface() {
           light += scan;
           vec2 sp = gl_FragCoord.xy / 2.0;
           float c = dither(sp, light);
-          vec3 col = mix(vec3(0.97), vec3(0.05), c);
+          vec3 col = mix(uBgColor, uFgColor, c);
           gl_FragColor = vec4(col, 1.0);
         }
       `;
 
       const geo = new THREE.PlaneGeometry(3, 3, 128, 128);
       geo.rotateX(-Math.PI * 0.5);
+      // Drive bg/fg colors from CSS so the dither tracks the theme.
+      // Light: bg=0.97 (white-ish), fg=0.05 (near-black).
+      // Dark:  bg=0.05 (near-black), fg=0.97 (white-ish).
+      const isDark = themedSurface.startsWith("#0") ||
+        themedSurface.startsWith("#1") ||
+        themedSurface.toLowerCase().includes("0a0a") ||
+        themedSurface.toLowerCase().includes("0b0b");
+      const bg3 = isDark ? new THREE.Vector3(0.04, 0.04, 0.05) : new THREE.Vector3(0.97, 0.97, 0.97);
+      const fg3 = isDark ? new THREE.Vector3(0.78, 0.78, 0.80) : new THREE.Vector3(0.05, 0.05, 0.05);
       const mat = new THREE.ShaderMaterial({
         vertexShader: VS,
         fragmentShader: FS,
-        uniforms: { uTime: { value: 0 } },
+        uniforms: {
+          uTime: { value: 0 },
+          uBgColor: { value: bg3 },
+          uFgColor: { value: fg3 },
+        },
         transparent: true,
       });
       const mesh = new THREE.Mesh(geo, mat);
@@ -152,10 +172,40 @@ export function DitheredSurface() {
       };
       window.addEventListener("mousemove", onMouse);
 
+      // Live theme tracking: re-read --surface and flip the dither
+      // bg/fg + clear color whenever the data-theme attribute changes.
+      // Without this, switching to dark mode leaves the surface
+      // rendered in light-mode colors until a page reload.
+      const themeObserver = new MutationObserver(() => {
+        const cssNow = getComputedStyle(document.documentElement);
+        const surfNow = cssNow.getPropertyValue("--surface").trim() || "#ffffff";
+        const isDarkNow =
+          surfNow.startsWith("#0") ||
+          surfNow.startsWith("#1") ||
+          surfNow.toLowerCase().includes("0a0a") ||
+          surfNow.toLowerCase().includes("0b0b");
+        renderer.setClearColor(new THREE.Color(surfNow), 1);
+        const newBg = isDarkNow
+          ? [0.04, 0.04, 0.05]
+          : [0.97, 0.97, 0.97];
+        const newFg = isDarkNow
+          ? [0.78, 0.78, 0.80]
+          : [0.05, 0.05, 0.05];
+        const u = mat.uniforms.uBgColor.value;
+        const v = mat.uniforms.uFgColor.value;
+        u.set(newBg[0], newBg[1], newBg[2]);
+        v.set(newFg[0], newFg[1], newFg[2]);
+      });
+      themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-theme"],
+      });
+
       cleanup = () => {
         cancelAnimationFrame(raf);
         window.removeEventListener("resize", onResize);
         window.removeEventListener("mousemove", onMouse);
+        themeObserver.disconnect();
         renderer.dispose();
         geo.dispose();
         mat.dispose();

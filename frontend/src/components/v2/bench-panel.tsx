@@ -364,12 +364,12 @@ function BenchRow({
       >
         {label}
       </span>
-      <div className="h-1.5 bg-[#f1f1f1] relative">
+      <div className="h-1.5 bg-[var(--track)] relative">
         {measured && (
           <div
             className={[
               "absolute inset-y-0 left-0",
-              highlight ? "bg-foreground" : "bg-[#dcdcdc]",
+              highlight ? "bg-foreground" : "bg-[var(--track-fill-softer)]",
             ].join(" ")}
             style={{ width: `${pct}%` }}
           />
@@ -434,9 +434,9 @@ function BenchSkeleton() {
                 key={row}
                 className="grid grid-cols-[60px_1fr_44px] gap-3 items-center text-[11px] mb-2.5"
               >
-                <span className="h-2 bg-[#f1f1f1] rounded-sm" />
-                <div className="h-1.5 bg-[#f1f1f1]" />
-                <span className="h-2 bg-[#f1f1f1] rounded-sm" />
+                <span className="h-2 bg-[var(--track)] rounded-sm" />
+                <div className="h-1.5 bg-[var(--track)]" />
+                <span className="h-2 bg-[var(--track)] rounded-sm" />
               </div>
             ))}
           </div>

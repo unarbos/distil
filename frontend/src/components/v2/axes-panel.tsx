@@ -261,7 +261,7 @@ function UidPicker({
         onChange={(e) =>
           onChange(e.target.value === "" ? null : Number(e.target.value))
         }
-        className="h-7 border border-border bg-white px-2 text-[12px] num focus:outline-none focus:border-foreground"
+        className="h-7 border border-border bg-[var(--surface-elevated)] px-2 text-[12px] num focus:outline-none focus:border-foreground"
       >
         {allowClear && <option value="">— none —</option>}
         {!allowClear && value == null && <option value="">— pick —</option>}
@@ -425,7 +425,7 @@ function RadialChart({
           key={frac}
           d={ringPath(frac)}
           fill="none"
-          stroke="#ebebeb"
+          stroke="var(--border)"
           strokeWidth={1}
         />
       ))}
@@ -437,7 +437,7 @@ function RadialChart({
           y={cy - R * frac + 4}
           fontFamily="Inter, sans-serif"
           fontSize={9}
-          fill="#bdbdbd"
+          fill="var(--track-fill-soft)"
         >
           {frac.toFixed(2)}
         </text>
@@ -453,7 +453,7 @@ function RadialChart({
             y1={cy}
             x2={cx + R * Math.cos(a)}
             y2={cy + R * Math.sin(a)}
-            stroke="#ebebeb"
+            stroke="var(--border)"
             strokeWidth={1}
           />
         );
@@ -464,8 +464,8 @@ function RadialChart({
         <>
           <path
             d={polygonPath(compareVals)}
-            fill="rgba(189,189,189,0.18)"
-            stroke="#888"
+            fill="rgba(127,127,127,0.18)"
+            stroke="var(--ink-meta)"
             strokeWidth={1.25}
             strokeDasharray="4 3"
           />
@@ -478,7 +478,7 @@ function RadialChart({
                 cx={cx + r * Math.cos(a)}
                 cy={cy + r * Math.sin(a)}
                 r={3.25}
-                fill="#888"
+                fill="var(--ink-meta)"
               />
             );
           })}
@@ -488,8 +488,8 @@ function RadialChart({
       {/* Primary polygon */}
       <path
         d={polygonPath(primaryVals)}
-        fill="rgba(206,141,67,0.13)"
-        stroke="#ce8d43"
+        fill="var(--accent-amber-fill)"
+        stroke="var(--accent-amber)"
         strokeWidth={1.85}
       />
       {primaryVals.map((v, i) => {
@@ -501,7 +501,7 @@ function RadialChart({
             cx={cx + r * Math.cos(a)}
             cy={cy + r * Math.sin(a)}
             r={4.5}
-            fill="#ce8d43"
+            fill="var(--accent-amber)"
           />
         );
       })}
@@ -526,7 +526,7 @@ function RadialChart({
               fontFamily="Inter, sans-serif"
               fontSize={11}
               letterSpacing={2.2}
-              fill="#0a0a0a"
+              fill="var(--ink)"
             >
               <title>{m.description}</title>
               {m.label}
@@ -537,7 +537,7 @@ function RadialChart({
               textAnchor={anchor}
               fontFamily="Inter, sans-serif"
               fontSize={11}
-              fill="#ce8d43"
+              fill="var(--accent-amber)"
               style={{ fontVariantNumeric: "tabular-nums" }}
             >
               {v.toFixed(2)}
@@ -764,7 +764,7 @@ function ScoreRow({
         {label}
         {isLimiting && <span className="text-meta ml-1.5 text-[10px]">← limit</span>}
       </div>
-      <div className="w-full h-1.5 bg-[#f1f1f1] relative">
+      <div className="w-full h-1.5 bg-[var(--track)] relative">
         {primary != null && (
           <div
             className="absolute inset-y-0 left-0 bg-[#ce8d43]"
