@@ -699,6 +699,56 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         else:
             check_pass("KL fraud check", f"KL={kl_global:.6f} (legitimate)")
 
+        # ── CHECK 12: Reasoning-spiral probe ──────────────────────────
+        # KL alone doesn't catch the failure mode that crowned UID 107
+        # on 2026-04-17: a 4B student that mimics the teacher's
+        # `<think>` filler well enough to win KL but loops forever
+        # answering "Hi". The validator runs a fuller version of this
+        # probe with per-round teacher-distribution thresholds; we run
+        # a lighter standalone version against three trivial prompts
+        # so miners can catch the obvious cases before submitting.
+        # See `scripts/probes/spiral.py` for thresholds + provenance,
+        # and `paper/off_policy_cot_collapse.md` for the diagnosis.
+        banner("CHECK 12: Reasoning-Spiral Probe")
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+
+            probe_dir = _Path(__file__).parent
+            if str(probe_dir) not in _sys.path:
+                _sys.path.insert(0, str(probe_dir))
+            from scripts.probes.spiral import spiral_probe
+
+            spiral_result = spiral_probe(student, tokenizer, device=str(student.device))
+            if not spiral_result.passed:
+                check_fail(
+                    "Spiral probe",
+                    f"REASONING SPIRAL DETECTED — {spiral_result.summary}",
+                )
+                failures.append(("spiral", spiral_result.summary))
+                # Echo the per-prompt detail so miners can see exactly
+                # what's looping.
+                for s in spiral_result.samples:
+                    if not s.terminated or s.max_ngram_repeat >= 15:
+                        snippet = s.output_text[:160].replace("\n", " ")
+                        print(
+                            f"    prompt={s.prompt[:30]!r:<32} "
+                            f"tokens={s.output_tokens:>4} "
+                            f"terminated={s.terminated} "
+                            f"max-rep={s.max_ngram_repeat}× "
+                            f"\n    out: {snippet}…"
+                        )
+            else:
+                check_pass("Spiral probe", spiral_result.summary)
+        except Exception as exc:
+            # Probe failure is non-fatal — KL fraud + KL score still
+            # caught the obvious cases historically.
+            check_warn(
+                "Spiral probe",
+                f"could not run ({exc}). Submitting anyway is at your own risk; "
+                f"the validator runs a stricter version on its own pod.",
+            )
+
         # ── Compare against king ──────────────────────────────────────
         if king_repo:
             banner("KING COMPARISON")

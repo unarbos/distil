@@ -2,6 +2,40 @@
 """
 KL Distillation Training for Bittensor Subnet 97 (distil)
 
+⚠️  HEADS UP — KL is one of 17 axes. Don't expect this script alone to win.
+
+This is a pure forward-KL training recipe: minimise KL(teacher || student)
+on teacher rollouts of climbmix text. It's a good *starting point* — every
+strong submission has a distillation phase like this — but the SN97
+production eval (composite v28) ranks miners on `composite.worst`, which
+covers 17 axes including:
+
+  * on_policy_rkl (35% of the relative tier) — reverse-KL under the
+    student's own samples. Pure forward-KL doesn't optimise this.
+  * reasoning_density — punishes thinking-without-answering. The
+    2026-04-17 reasoning-spiral king (UID 107: 4096-token loops on
+    "Hi") used this exact recipe and was retroactively DQ'd. See
+    `paper/off_policy_cot_collapse.md` for the post-mortem.
+  * 9 absolute-correctness benches (math, code, IFEval, AIME, MBPP,
+    tool-use, long-context, robustness, reasoning).
+  * judge_probe + chat_turns_probe — instruction-following + multi-turn
+    coherence under teacher rubric grading.
+
+Recommended additions on top of this script:
+  1. After KL distillation, do a few thousand steps of on-policy RKL
+     (student samples + teacher NLL). See thinkingmachines.ai/blog/
+     on-policy-distillation/ or arXiv:2306.08543 (MiniLLM).
+  2. Mix in instruction data (UltraChat / OpenAssistant / IFEval train)
+     so judge_probe and chat_turns_probe don't crater.
+  3. Mix in math / code / reasoning SFT (GSM8K + MATH + HumanEval +
+     MBPP + BBH train splits) so the bench axes don't crater.
+  4. Verify no spiral with `python check_model.py --hf-repo <yours>` —
+     CHECK 12 runs the spiral probe.
+
+See `docs/MINER_FAQ.md` for the per-axis training data playbook.
+
+──── original docs ────
+
 Train a student model to match the teacher's (Qwen3.5-35B-A3B) output distribution
 using forward KL divergence on raw text from karpathy/climbmix-400b-shuffle.
 
