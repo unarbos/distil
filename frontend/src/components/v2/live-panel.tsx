@@ -3,6 +3,23 @@
 import { useEffect, useState } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
 
+interface EvalOrderItem {
+  uid: number;
+  model: string;
+  role: "king" | "challenger";
+}
+
+interface CompletedStudent {
+  student_idx?: number;
+  student_name: string;
+  status: string;
+  status_detail?: string;
+  kl?: number;
+  prompts_scored?: number;
+  prompts_total?: number;
+  scoring_time_s?: number;
+}
+
 interface EvalProgress {
   active: boolean;
   phase?: string;
@@ -15,6 +32,12 @@ interface EvalProgress {
   current_kl?: number;
   teacher_prompts_done?: number;
   started_at?: number;
+  estimated_completion?: number;
+  estimated_duration_s?: number;
+  eval_order?: EvalOrderItem[];
+  king_uid?: number;
+  completed?: CompletedStudent[];
+  models?: Record<string, string>;
 }
 
 interface LogLine {
@@ -29,15 +52,57 @@ const PHASE_LABELS: Record<string, string> = {
   arch_check: "Architecture check",
   copy_check: "Duplicate detection",
   fingerprint: "Logit fingerprinting",
+  vllm_starting: "Starting vLLM teacher pod",
   teacher_warmup: "Teacher vLLM warmup",
+  teacher_generation: "Teacher continuations",
   teacher_generate: "Teacher continuations",
+  teacher_logits: "Teacher logit precompute",
+  loading_student: "Loading student model",
   scoring: "Student scoring",
   bench: "Bench battery (math/code/reasoning/...)",
   composite: "Composite assembly",
-  king_select: "King selection",
+  king_select: "King selection (composite.worst)",
   weights: "Setting weights on chain",
   cleanup: "Pod cleanup",
   idle: "Idle — waiting for next round",
+};
+
+/**
+ * Human-readable explainer per phase. The dashboard's job is to make
+ * sure miners can answer the question "is the eval running?" without
+ * pinging the Discord channel — that question came up three times in
+ * 50 minutes on 2026-04-27. So when a miner opens the Live tab they
+ * should see a sentence telling them what is happening RIGHT NOW.
+ */
+const PHASE_EXPLAINERS: Record<string, string> = {
+  precheck:
+    "Pre-checks (architecture / duplicate / integrity). No GPU yet. Models that fail here are skipped.",
+  vllm_starting:
+    "Spinning up the teacher vLLM pod (~30s). After this we'll generate teacher continuations on every prompt.",
+  teacher_warmup:
+    "Warming up the teacher (~30s). After this we'll generate teacher continuations on every prompt.",
+  teacher_generation:
+    "Teacher generating continuations on the round's 300 block-seeded prompts. Counts go up here, students wait their turn.",
+  teacher_generate:
+    "Teacher generating continuations on the round's 300 block-seeded prompts.",
+  teacher_logits:
+    "Caching teacher logits (~1 min) — final teacher phase before students score.",
+  loading_student:
+    "Loading the next student into vLLM (~1 min). Students score sequentially, one at a time.",
+  scoring:
+    "Scoring the current student against the cached teacher logits. ~3 min/student typical. KL is one of 17 axes — the bench battery follows.",
+  bench:
+    "Running the bench battery: math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness. Procedural items, block-seeded.",
+  composite:
+    "Computing composite.worst across 17 axes for every student. composite.worst is the ranking key.",
+  king_select:
+    "Selecting the king (highest composite.worst, 3% margin to dethrone the incumbent).",
+  weights:
+    "Setting weights on chain. King gets 1.0, everyone else 0.0.",
+  cleanup:
+    "Round finished. Cleaning up the pod and resuming the chat-king vLLM.",
+  idle:
+    "Validator idle. New on-chain commitments will be picked up at the next round boundary.",
 };
 
 /**
@@ -137,19 +202,38 @@ export function LivePanel() {
   }, []);
 
   const phases = derivePhases(progress);
+  const phase = progress?.phase ?? (progress?.active ? "running" : "idle");
+  const explainer =
+    PHASE_EXPLAINERS[phase] ??
+    (progress?.active ? "Validator running…" : PHASE_EXPLAINERS.idle);
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
-      {/* Pipeline */}
+      {/* Pipeline + queue + log */}
       <div className="px-6 sm:px-9 py-8 border-b lg:border-b-0 lg:border-r border-border overflow-y-auto flex flex-col gap-6">
         <HeadRow
           title="Eval pipeline"
-          meta={
-            progress?.active
-              ? buildMetaText(progress)
-              : "validator idle"
-          }
+          meta={progress?.active ? buildMetaText(progress) : "validator idle"}
         />
+
+        {/* Plain-English explainer — addresses the 'is the eval running?'
+            question that came up 3× in 50 minutes on Discord. */}
+        <div className="-mt-2 px-3.5 py-2.5 border border-border bg-[var(--surface-soft)] text-[12px] leading-relaxed">
+          <div className="text-[10px] uppercase tracking-[0.18em] text-meta mb-1">
+            Right now
+          </div>
+          <div>
+            <strong className="text-foreground">{PHASE_LABELS[phase] ?? phase}</strong>
+            {progress?.current_student && (
+              <span className="text-meta">
+                {" · "}
+                {progress.current_student}
+              </span>
+            )}
+          </div>
+          <div className="text-meta mt-1">{explainer}</div>
+        </div>
+
         <div className="flex flex-col gap-3">
           {phases.map((p) => (
             <PhaseRow key={p.label} phase={p} />
@@ -158,18 +242,175 @@ export function LivePanel() {
         <StatTiles progress={progress} elapsed={elapsed} />
       </div>
 
-      {/* Log tail */}
+      {/* Right column: eval queue + log tail */}
       <div className="px-6 sm:px-9 py-8 bg-[var(--surface-soft)] overflow-y-auto flex flex-col gap-6">
-        <HeadRow title="Validator log" meta={`tail · ${logs.length}`} />
-        <div className="text-[12px] leading-[1.85] num space-y-0.5">
-          {logs.length === 0 && (
-            <div className="text-meta">Waiting for events…</div>
-          )}
-          {logs.map((line, i) => (
-            <LogRow key={`${line.ts}-${i}`} line={line} />
-          ))}
+        <EvalQueue progress={progress} />
+
+        <div>
+          <HeadRow title="Validator log" meta={`tail · ${logs.length}`} />
+          <div className="text-[12px] leading-[1.85] num space-y-0.5 mt-3">
+            {logs.length === 0 && (
+              <div className="text-meta">Waiting for events…</div>
+            )}
+            {logs.map((line, i) => (
+              <LogRow key={`${line.ts}-${i}`} line={line} />
+            ))}
+          </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Eval queue with per-student status.
+ *
+ * Status derives from `eval_order` + `completed`. A student is:
+ *  - ✓ completed: present in `completed[]` with status set.
+ *  - ● current: matches `current_student`.
+ *  - ○ queued: in `eval_order` but not yet completed or current.
+ */
+interface EvalQueueProps {
+  progress: EvalProgress | null;
+}
+
+function EvalQueue({ progress }: EvalQueueProps) {
+  const queue = progress?.eval_order ?? [];
+  if (!progress?.active && queue.length === 0) {
+    return (
+      <div>
+        <HeadRow title="Eval queue" meta="—" />
+        <p className="text-[12px] text-meta mt-3">
+          Validator idle. New on-chain commitments will be picked up at the next
+          round boundary.
+        </p>
+      </div>
+    );
+  }
+
+  const completed: Record<string, CompletedStudent> = {};
+  for (const c of progress?.completed ?? []) {
+    completed[c.student_name] = c;
+  }
+  const currentName = progress?.current_student;
+  const totalDone = Object.keys(completed).length;
+  const eta = progress?.estimated_completion;
+  const etaText = (() => {
+    if (!eta || eta < Date.now() / 1000) return null;
+    const dt = Math.max(0, eta - Date.now() / 1000);
+    if (dt < 60) return `~${Math.round(dt)}s`;
+    const m = Math.floor(dt / 60);
+    if (m < 60) return `~${m}m`;
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    return `~${h}h ${rm}m`;
+  })();
+
+  return (
+    <div>
+      <HeadRow
+        title="Eval queue"
+        meta={
+          queue.length > 0
+            ? `${totalDone} of ${queue.length} done${etaText ? ` · ETA ${etaText}` : ""}`
+            : `ETA ${etaText ?? "—"}`
+        }
+      />
+      <div className="mt-3 flex flex-col">
+        {queue.map((item, idx) => {
+          const isCurrent = currentName === item.model;
+          const isDone = !isCurrent && item.model in completed;
+          const status: "done" | "current" | "queued" = isDone
+            ? "done"
+            : isCurrent
+              ? "current"
+              : "queued";
+          const c = completed[item.model];
+          return (
+            <QueueRow
+              key={`${item.uid}-${idx}`}
+              status={status}
+              uid={item.uid}
+              model={item.model}
+              role={item.role}
+              completed={c}
+              current={isCurrent ? progress : null}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+interface QueueRowProps {
+  status: "done" | "current" | "queued";
+  uid: number;
+  model: string;
+  role: "king" | "challenger";
+  completed?: CompletedStudent;
+  current?: EvalProgress | null;
+}
+
+function QueueRow({ status, uid, model, role, completed, current }: QueueRowProps) {
+  const marker =
+    status === "done" ? "✓" : status === "current" ? "●" : "○";
+  const markerClass =
+    status === "done"
+      ? "text-ok"
+      : status === "current"
+        ? "text-foreground"
+        : "text-[var(--border-strong)]";
+  const labelClass = status === "queued" ? "text-meta" : "text-foreground";
+  const isReference = uid === -1;
+  const isKing = role === "king";
+
+  const detail = (() => {
+    if (status === "done" && completed) {
+      const klPart =
+        typeof completed.kl === "number" && Number.isFinite(completed.kl)
+          ? `KL ${completed.kl.toFixed(4)}`
+          : completed.status_detail ?? completed.status;
+      return klPart;
+    }
+    if (status === "current" && current) {
+      const pd = current.current_prompt ?? current.prompts_done ?? 0;
+      const pt = current.prompts_total ?? 0;
+      const klPart =
+        typeof current.current_kl === "number"
+          ? ` · KL ${current.current_kl.toFixed(4)}`
+          : "";
+      return `${pd}/${pt} prompts${klPart}`;
+    }
+    return "queued";
+  })();
+
+  return (
+    <div
+      className={[
+        "grid grid-cols-[16px_60px_1fr_auto] items-center gap-2.5 py-2 border-b border-border last:border-b-0 text-[13px]",
+        status === "current" ? "bg-white -mx-2 px-2 ring-1 ring-foreground/10" : "",
+      ].join(" ")}
+    >
+      <span className={["text-center font-medium", markerClass].join(" ")}>
+        {marker}
+      </span>
+      <span className={["num", labelClass].join(" ")}>
+        {isReference ? "ref" : `#${uid}`}
+        {isKing && <span className="text-meta text-[10px] ml-1">♛</span>}
+      </span>
+      <span
+        className={[
+          "truncate min-w-0",
+          status === "queued" ? "text-meta" : "text-foreground",
+        ].join(" ")}
+        title={model}
+      >
+        {model}
+      </span>
+      <span className="text-[11px] text-meta num text-right whitespace-nowrap">
+        {detail}
+      </span>
     </div>
   );
 }
@@ -180,6 +421,26 @@ interface PhaseEntry {
   pct: number;
 }
 
+// Set of phase tags emitted by the validator. Comprehensive enough that
+// derivePhases() can always classify a phase as before/at/after each
+// pipeline step. Source of truth: ``state/eval_progress.json`` updates
+// in pod_eval_vllm.py.
+const TEACHER_PHASES = new Set([
+  "vllm_starting",
+  "teacher_warmup",
+  "teacher_generation",
+  "teacher_generate",
+  "teacher_logits",
+]);
+const STUDENT_PHASES = new Set(["loading_student", "scoring"]);
+const BENCH_PHASES = new Set(["bench"]);
+const POST_PHASES = new Set([
+  "composite",
+  "king_select",
+  "weights",
+  "cleanup",
+]);
+
 function derivePhases(progress: EvalProgress | null): PhaseEntry[] {
   if (!progress?.active) {
     return [
@@ -189,61 +450,67 @@ function derivePhases(progress: EvalProgress | null): PhaseEntry[] {
   const phase = progress.phase ?? "scoring";
   const studentsDone = progress.students_done ?? 0;
   const studentsTotal = progress.students_total ?? 0;
-  const promptsDone = progress.prompts_done ?? progress.current_prompt ?? 0;
   const promptsTotal = progress.prompts_total ?? 1;
   const teacherDone = progress.teacher_prompts_done ?? 0;
+  const currentPrompt = progress.current_prompt ?? 0;
 
   const phases: PhaseEntry[] = [];
-
-  // Pre-checks
   phases.push({ state: "done", label: "Pre-checks (no GPU)", pct: 100 });
 
-  // Teacher generation
-  if (phase === "teacher_warmup" || phase === "teacher_generate") {
+  // ── Teacher continuations + logit cache. The right counter here is
+  //    teacher_prompts_done — NOT prompts_done. The latter only ticks
+  //    once a student starts scoring; reading it during the teacher
+  //    phase produces the misleading "98 min · 0 prompts" that miners
+  //    were seeing on Discord on 2026-04-27. ─────────────────────────
+  if (TEACHER_PHASES.has(phase)) {
+    const pct = promptsTotal > 0
+      ? Math.min(99, Math.round((teacherDone / promptsTotal) * 100))
+      : 0;
     phases.push({
       state: "active",
-      label: PHASE_LABELS[phase] ?? phase,
-      pct: Math.min(99, Math.round((teacherDone / promptsTotal) * 100)),
+      label: PHASE_LABELS[phase] ?? "Teacher continuations",
+      pct,
     });
   } else {
     phases.push({ state: "done", label: "Teacher continuations", pct: 100 });
   }
 
-  // Student scoring
-  if (phase === "scoring") {
+  // ── Student scoring. During `loading_student` we count the
+  //    just-completed students (studentsDone of studentsTotal). During
+  //    `scoring` we add the current_prompt fraction of the active
+  //    student's slice. ────────────────────────────────────────────────
+  if (STUDENT_PHASES.has(phase)) {
     const studentLabel = progress.current_student
       ? `Scoring · ${progress.current_student}`
-      : "Scoring students";
+      : phase === "loading_student"
+        ? "Loading student"
+        : "Scoring students";
     const overall = studentsTotal > 0
-      ? (studentsDone + Math.min(1, promptsDone / Math.max(1, promptsTotal))) / studentsTotal
+      ? (studentsDone +
+          (phase === "scoring"
+            ? Math.min(1, currentPrompt / Math.max(1, promptsTotal))
+            : 0)) / studentsTotal
       : 0;
     phases.push({
       state: "active",
       label: studentLabel,
       pct: Math.min(99, Math.round(overall * 100)),
     });
-  } else if (
-    phase === "bench" ||
-    phase === "composite" ||
-    phase === "king_select" ||
-    phase === "weights" ||
-    phase === "cleanup"
-  ) {
+  } else if (BENCH_PHASES.has(phase) || POST_PHASES.has(phase)) {
     phases.push({ state: "done", label: "Scoring students", pct: 100 });
   } else {
     phases.push({ state: "queued", label: "Scoring students", pct: 0 });
   }
 
-  // Bench battery
-  if (phase === "bench") {
+  // ── Bench battery + composite + king select ──────────────────────
+  if (BENCH_PHASES.has(phase)) {
     phases.push({ state: "active", label: PHASE_LABELS.bench, pct: 60 });
-  } else if (phase === "composite" || phase === "king_select" || phase === "weights" || phase === "cleanup") {
+  } else if (POST_PHASES.has(phase)) {
     phases.push({ state: "done", label: PHASE_LABELS.bench, pct: 100 });
   } else {
     phases.push({ state: "queued", label: PHASE_LABELS.bench, pct: 0 });
   }
 
-  // Composite + king
   if (phase === "composite" || phase === "king_select") {
     phases.push({
       state: "active",
@@ -259,16 +526,33 @@ function derivePhases(progress: EvalProgress | null): PhaseEntry[] {
   return phases;
 }
 
+/**
+ * Phase-aware meta text for the pipeline header. The right counter
+ * depends on which phase we're in. Reading prompts_done during teacher
+ * generation gives 0 (the misleading "0 prompts" surface bug).
+ */
 function buildMetaText(p: EvalProgress): string {
-  const sd = p.students_done ?? 0;
-  const st = p.students_total ?? 0;
-  const pd = p.prompts_done ?? p.current_prompt ?? 0;
-  const pt = p.prompts_total ?? 0;
-  if (st > 0 && pt > 0) {
-    return `${sd} of ${st} students · ${pd}/${pt} prompts`;
+  const phase = p.phase ?? "";
+  const teacherDone = p.teacher_prompts_done ?? 0;
+  const promptsTotal = p.prompts_total ?? 0;
+  const studentsDone = p.students_done ?? 0;
+  const studentsTotal = p.students_total ?? 0;
+  const currentPrompt = p.current_prompt ?? 0;
+
+  if (TEACHER_PHASES.has(phase)) {
+    if (promptsTotal > 0) {
+      return `teacher ${teacherDone}/${promptsTotal} prompts`;
+    }
+    return PHASE_LABELS[phase] ?? phase;
   }
-  if (st > 0) return `${sd} of ${st} students`;
-  if (pt > 0) return `${pd}/${pt} prompts`;
+  if (STUDENT_PHASES.has(phase)) {
+    if (studentsTotal > 0 && promptsTotal > 0) {
+      return `${studentsDone}/${studentsTotal} students · ${currentPrompt}/${promptsTotal} on current`;
+    }
+    return PHASE_LABELS[phase] ?? phase;
+  }
+  if (BENCH_PHASES.has(phase)) return "bench battery running";
+  if (POST_PHASES.has(phase)) return PHASE_LABELS[phase] ?? phase;
   return p.phase ?? "running";
 }
 
@@ -328,14 +612,31 @@ function StatTiles({
 }) {
   const sd = progress?.students_done ?? 0;
   const st = progress?.students_total ?? 0;
-  const pd = progress?.prompts_done ?? progress?.current_prompt ?? 0;
   const pt = progress?.prompts_total ?? 0;
+  const phase = progress?.phase ?? "";
+  // The "Prompts" tile shows whichever counter is currently advancing
+  // — teacher_prompts_done during teacher phases, current_prompt
+  // during scoring. This mirrors the validator's mental model so the
+  // dashboard agrees with what miners see in Discord screenshots.
+  const promptsValue = TEACHER_PHASES.has(phase)
+    ? progress?.teacher_prompts_done ?? 0
+    : progress?.current_prompt ?? progress?.prompts_done ?? 0;
+  const promptsLabel = TEACHER_PHASES.has(phase)
+    ? "Teacher prompts"
+    : STUDENT_PHASES.has(phase)
+      ? "Current student"
+      : "Prompts";
+
   const min = Math.floor(elapsed / 60);
   const sec = Math.floor(elapsed % 60);
   return (
     <div className="grid grid-cols-3 border-t border-border pt-5 gap-0">
       <Tile label="Students" big={String(sd)} small={st > 0 ? `/${st}` : ""} />
-      <Tile label="Prompts" big={String(pd)} small={pt > 0 ? `/${pt}` : ""} />
+      <Tile
+        label={promptsLabel}
+        big={String(promptsValue)}
+        small={pt > 0 ? `/${pt}` : ""}
+      />
       <Tile
         label="Elapsed"
         big={progress?.active ? String(min) : "—"}
