@@ -2,9 +2,11 @@
 
 ## What is Subnet 97?
 
-Distil is a Bittensor subnet where miners compete to distill knowledge from a large teacher model into smaller student models. The teacher is **Qwen/Qwen3.5-35B-A3B** (35B total params, ~3B active — it's a Mixture-of-Experts model). Your job: produce the most faithful small model (≤5.25B params), measured by KL divergence against the teacher's output distribution.
+Distil is a Bittensor subnet where miners compete to distill knowledge from a large teacher model into smaller student models. The teacher is **Qwen/Qwen3.5-35B-A3B** (35B total params, ~3B active — it's a Mixture-of-Experts model). Your job: produce the most faithful small model (≤5.25B params), measured on a **17-axis composite** that covers distribution match, capability against ground truth, conversational quality, generation discipline, and robustness to prompt rewrites.
 
-Lower KL = better. Winner takes all — the king gets 100% of emissions.
+The ranking key is **`composite.worst`** — the single weakest axis. KL is one of those 17 axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
+
+> **Heads up.** If you've miner'd here before and remember "lower KL = win", that framing is wrong under the current eval. The 2026-04-17 reasoning-spiral king (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench) was the wake-up call. The composite, the on-policy RKL axis, and the `reasoning_density` axis exist specifically to close that gap. Read the axis-by-axis playbook below before training. See [`paper/off_policy_cot_collapse.md`](../paper/off_policy_cot_collapse.md) for the full diagnosis.
 
 ---
 
@@ -169,19 +171,20 @@ The fastest way to climb Arena v3 is to broaden your distillation data mix so th
 | `robustness_bench`           | Generalization under prompt paraphrase. The defense is: train on math problems with diverse wordings (mix gsm8k / math500 / Maxwell-Jia / KhanAcademy with paraphrase augmentation, or just shuffle prefixes/postfixes during SFT). A model that only sees one wording per problem will fail when the wrapper changes. If `robustness_bench` lags `math_bench` by 0.20+ on your dashboard, you're memorizing canonical wordings, not solving. |
 | `noise_resistance_bench`     | Generalization under surface noise (typos, case jitter, distractors, misspellings). The defense is: include noisy / chat-style training data, or apply augmentation at SFT time (random typos at 1-2%, random case flips at 3-5%, occasional distractor sentences before/after the problem). A model that gets near-perfect on `math_bench` but drops sharply on `noise_resistance_bench` is overfit to clean text — it'll be brittle in real chat. If both `robustness_bench` and `noise_resistance_bench` lag `math_bench`, you have a *general* canonical-wording problem; if only `noise_resistance_bench` lags, your training mix lacks chat-style messy text. |
 
-**Two anti-patterns to avoid:**
+**Three anti-patterns to avoid:**
 
-- **Pure KL overfitting.** Matching teacher logits perfectly but failing on grade-school math means your composite worst is low. You cannot take the crown.
-- **Long rambling.** `length` + `judge_probe` + `degeneracy` all penalize verbose thinking. Teacher-style brevity wins.
+- **Pure KL overfitting.** Matching teacher logits perfectly but failing on grade-school math means your composite worst is low. You cannot take the crown. KL is 0.15 of the relative tier, and the relative tier is itself one of five concerns the composite covers.
+- **Long rambling / reasoning spiral.** `length` + `judge_probe` + `degeneracy` + `reasoning_density` all penalize verbose thinking-without-answering. Teacher-style brevity wins. Past kings have been retroactively DQ'd for failing the `thinking_collapse_probe` (looping on trivial prompts like `"Hi"` or `"largest planet one word"`). See `paper/off_policy_cot_collapse.md`.
+- **Memorising canonical wordings.** `robustness_bench` re-asks math items under K block-rotated paraphrases + noise wrappers. A model that aces clean public benchmarks but loses 30% under typos will fail this axis.
 
-**Watch your dashboard columns:** `Judge / Bench / V3 / Pareto / Worst / vs King`. These are live. If your `V3` worst is low, that axis can block a KL win.
+**Watch your dashboard columns:** `Worst / Weighted / Judge / Bench / V3 / Pareto / vs King`. These are live. The single weakest axis is your ranking key — a high KL score never compensates for a 0.0 anywhere else.
 
 ---
 
 ## Training Tips
 
 - **Base model:** Start from [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) or a compatible Qwen3.5 architecture.
-- **Objective:** KL(teacher ‖ student) is the floor, not the ceiling. A pure-KL model loses to a slightly-worse-KL model that also answers GSM8K correctly.
+- **Objective:** Optimise for `composite.worst`, not KL. KL(teacher ‖ student) is one of 17 axes — useful but never sufficient. A pure-KL model loses to a slightly-worse-KL model that also answers GSM8K correctly, doesn't loop on `"Hi"`, and survives prompt paraphrase.
 - **Data mix:** at minimum combine ClimbMix-style distillation data with ~10–20% instruction/reasoning/code data (see the playbook above). Miners who run SFT + DPO on top of their distillation have been climbing the bench axes fastest.
 - **Long completions matter:** eval uses `max_new_tokens=8192`. The model needs to terminate naturally on simple prompts and reason coherently on long ones.
 - **Temperature:** vLLM runs at `temperature=0.7, top_p=0.9` with per-prompt seed `block_seed + prompt_idx`. Deterministic per round, rotating between rounds. Greedy (temp=0) only applies to local dev runs without `--block-seed`.

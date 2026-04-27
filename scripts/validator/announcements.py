@@ -50,9 +50,20 @@ def _active_axis_summary() -> tuple[int, str]:
 
 def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
                       state: ValidatorState, paired_prompts=None, total_prompts=None,
-                      p_value=None):
-    """Write a pending announcement to state for async Discord posting."""
-    kl_diff_pct = ((old_kl - new_kl) / old_kl * 100) if old_kl > 0 else 0
+                      p_value=None, *, new_composite_worst=None,
+                      new_composite_weighted=None, new_limiting_axis=None,
+                      old_composite_worst=None, old_composite_weighted=None):
+    """Write a pending announcement to state for async Discord posting.
+
+    Composite-worst is the production ranking key (since v27). When the
+    caller passes ``new_composite_worst``, the Discord post leads with the
+    composite scores and demotes KL to a parenthetical "axis component"
+    line so the public framing matches the eval mechanism. KL-only
+    framing was the headline through 2026-04-26 and contributed to the
+    reasoning-spiral failure mode (see paper/off_policy_cot_collapse.md);
+    this signature keeps backward compatibility for callers that don't
+    know the composite yet (the headline falls back to KL in that case).
+    """
     import os as _os
     single_eval_active = bool(int(_os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
 
@@ -98,6 +109,32 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             f"Dethronement uses one-sided paired t-test (p<{PAIRED_TEST_ALPHA})."
         )
     p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""
+
+    # Build the headline. Composite-worst is the production ranking key
+    # under v28 (see ``select_king_by_composite``); KL is one of 17 axes,
+    # never the gate. Fall back to the KL-only line only when the caller
+    # didn't pass composite payloads (legacy callers, dev mode).
+    if new_composite_worst is not None:
+        worst_line = f"📊 **Composite worst: {new_composite_worst:.3f}**"
+        if new_limiting_axis:
+            axis_pretty = new_limiting_axis.replace("_bench", "").replace("_", " ")
+            worst_line += f" (limiting axis: {axis_pretty})"
+        if old_composite_worst is not None:
+            worst_line += f" — previous king: {old_composite_worst:.3f}"
+        weighted_part = ""
+        if new_composite_weighted is not None:
+            weighted_part = f"\n📐 Weighted mean: {new_composite_weighted:.3f}"
+            if old_composite_weighted is not None:
+                weighted_part += f" (was {old_composite_weighted:.3f})"
+        kl_part = f"\n└ KL component: {new_kl:.6f} (1 of 17 axes — not the ranking key)"
+        headline = worst_line + weighted_part + kl_part
+    else:
+        # Backward-compat path. Lead with KL but explicitly note it's
+        # one of N axes so the framing isn't misleading even here.
+        headline = (
+            f"📊 **KL: {new_kl:.6f}** (one of 17 axes; previous king's KL: {old_kl:.6f})"
+        )
+
     announcement = {
         "type": "new_king",
         "timestamp": time.time(),
@@ -106,7 +143,7 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             f"{role_ping}\n"
             f"## 🏆 New King of Distil SN97!\n\n"
             f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
-            f"📊 **KL: {new_kl:.6f}** (previous king scored {old_kl:.6f} last eval)\n"
+            f"{headline}\n"
             f"{prompt_line}{p_line}\n"
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
             f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
@@ -118,6 +155,11 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         "data": {
             "new_uid": new_uid, "new_model": new_model, "new_kl": new_kl,
             "old_uid": old_uid, "old_model": old_model, "old_kl": old_kl,
+            "new_composite_worst": new_composite_worst,
+            "new_composite_weighted": new_composite_weighted,
+            "new_limiting_axis": new_limiting_axis,
+            "old_composite_worst": old_composite_worst,
+            "old_composite_weighted": old_composite_weighted,
             "single_eval_mode": single_eval_active,
         },
     }
