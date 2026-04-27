@@ -103,12 +103,31 @@ def _resolve_king(valid_models, state):
                 bootstrap_composite_from_h2h(state)
             except Exception as exc:
                 logger.warning(f"single-eval bootstrap failed (non-fatal): {exc}")
+        # Trust the king persisted by the previous round's apply_results
+        # over a network-wide composite re-rank. Cross-sample re-ranking
+        # at epoch start is precisely the bug mrchen caught (round
+        # 8062909): a UID 144 stored composite from a different prompt
+        # sample beat UID 123's fresh composite from the in-flight
+        # round, even though UID 144 wasn't in the round.
+        # h2h_latest is the canonical "who won the last actually-run
+        # round?" field, written by ``post_round`` after weights are set.
+        if state.h2h_latest:
+            persisted_king = state.h2h_latest.get("king_uid")
+            if persisted_king is not None and persisted_king in valid_models:
+                king_kl = state.scores.get(str(persisted_king), float("inf"))
+                logger.info(
+                    f"single-eval: king from h2h_latest: UID {persisted_king} "
+                    f"(KL={king_kl})"
+                )
+                return persisted_king, king_kl, "composite"
+        # Fallback: bootstrap from composite_scores only when h2h_latest
+        # is empty (cold start, first round after upgrade).
         composite_king_uid, _ = select_king_by_composite(state, valid_models)
         if composite_king_uid is not None:
             king_kl = state.scores.get(str(composite_king_uid), float("inf"))
             logger.info(
-                f"single-eval: king from composite_scores: UID {composite_king_uid} "
-                f"(stored KL={king_kl})"
+                f"single-eval: king from composite_scores (h2h_latest empty): "
+                f"UID {composite_king_uid} (stored KL={king_kl})"
             )
             return composite_king_uid, king_kl, "composite"
         # Fall through to the legacy logic on first boot only — once we have
@@ -737,52 +756,73 @@ def apply_results_and_weights(
     # persistence step runs in post_round.
     if is_single_eval_mode():
         try:
-            # Build the kingship-eligible set across the *whole* network, not
-            # just this round's challengers. In single-eval mode the prior
-            # king is never re-evaluated, so they're absent from
-            # ``models_to_eval``. If we passed only ``models_to_eval`` to
-            # ``select_king_by_composite``, the prior king would fail
-            # ``_is_eligible_uid`` (`uid not in valid_models` → False) and we'd
-            # silently dethrone them every round on whichever challenger happens
-            # to score best — even if the prior king has a far better stored
-            # composite. (Caught 2026-04-26: UID 149 was dethroned by UID 162
-            # even though 149's stored composite_worst was higher; the apply
-            # path's narrow valid_models was the cause.)
+            # Dethrone candidates = THIS ROUND's participants only.
             #
-            # The kingship-eligible set is: every UID with a composite_scores
-            # record OR participating in the current round, that has a
-            # current on-chain commitment. ``select_king_by_composite``
-            # then applies the DQ + reference-row checks via
-            # ``_is_eligible_uid`` as before.
+            # 2026-04-27 (mrchen) caught the bug: previously we built
+            # ``kingship_models`` from every UID in ``state.composite_scores``,
+            # which is network-wide and includes UIDs scored on prior
+            # rounds' prompts. That cross-sample leak meant a UID with a
+            # stale composite from a different prompt sample could
+            # "win" against a fresh challenger in this round, even
+            # though they weren't actually evaluated head-to-head.
+            #
+            # Round 8062909 reproduction: king UID 123 fresh
+            # worst=0.600 (on this round's prompts) lost to UID 144
+            # stale worst=0.667 (from an earlier round's prompts).
+            # UID 144 wasn't even in the round.
+            #
+            # The whole point of seating the king as a student was to
+            # restore paired evaluation — but that paired evaluation
+            # only meaningfully ranks UIDs that were ALSO in the same
+            # round. UIDs scored on different prompts can't fairly
+            # compete head-to-head against this round's miners.
+            #
+            # Fix: kingship pool = (king_uid, this round's challengers).
+            # The prior king is in models_to_eval too (king-in-round
+            # change from commit f7c786c) so this naturally includes
+            # them when present. If the king somehow couldn't be
+            # evaluated this round (DQ, OOM, load fail), the stored
+            # composite fallback below kicks in to hold the prior
+            # king rather than crowning a stale candidate.
             kingship_models: dict = {}
-            for uid_str in (getattr(state, "composite_scores", {}) or {}).keys():
-                try:
-                    uid_i = int(uid_str)
-                except (TypeError, ValueError):
-                    continue
-                commit = (commitments or {}).get(uid_i)
-                if not commit:
-                    # No on-chain commitment for this UID anymore — they
-                    # deregistered or got replaced. Drop from kingship pool.
-                    continue
-                kingship_models[uid_i] = {
-                    "model": commit.get("model"),
-                    "revision": commit.get("revision"),
-                    "commit_block": commit.get("block"),
-                    "hotkey": (uid_to_hotkey or {}).get(uid_i, ""),
-                    "is_reference": False,
-                }
-            # Include this round's challengers too — they were just scored
-            # and merge_composite_scores will have written their records by
-            # now, but defensive in case the merge raced.
             for uid_i, info in (models_to_eval or {}).items():
                 if info.get("is_reference"):
                     continue
-                kingship_models.setdefault(uid_i, info)
+                kingship_models[uid_i] = info
+            # Defensive: if the prior king isn't in models_to_eval
+            # (shouldn't happen post f7c786c, but kept as a safety
+            # net) AND has a stored composite, include them so they
+            # can hold the crown via stability bias rather than
+            # being dropped silently.
+            if (
+                king_uid is not None
+                and king_uid not in kingship_models
+                and str(king_uid) in (getattr(state, "composite_scores", {}) or {})
+            ):
+                commit = (commitments or {}).get(king_uid)
+                if commit:
+                    kingship_models[king_uid] = {
+                        "model": commit.get("model"),
+                        "revision": commit.get("revision"),
+                        "commit_block": commit.get("block"),
+                        "hotkey": (uid_to_hotkey or {}).get(king_uid, ""),
+                        "is_reference": False,
+                    }
+                    logger.warning(
+                        f"single-eval: prior king UID {king_uid} not in "
+                        f"models_to_eval — falling back to stored composite "
+                        f"for kingship eligibility"
+                    )
             composite_king_uid, composite_record = select_king_by_composite(
                 state, kingship_models, uid_to_hotkey=uid_to_hotkey,
                 commitments=commitments,
             )
+            if composite_king_uid is not None:
+                logger.info(
+                    f"single-eval: kingship pool restricted to {len(kingship_models)} "
+                    f"round participants (was network-wide, fixed 2026-04-27 to "
+                    f"prevent cross-sample leak)"
+                )
         except Exception as exc:
             logger.warning(f"single-eval king-by-composite failed (non-fatal): {exc}")
             composite_king_uid, composite_record = None, None
