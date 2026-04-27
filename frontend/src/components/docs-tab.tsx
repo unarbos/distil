@@ -5,29 +5,30 @@ import { formatParams } from "@/lib/utils";
 import { TEACHER } from "@/lib/subnet";
 
 interface DocsTabProps {
+  /** Composite-worst floor a challenger must clear (king.worst × 1.03). */
   scoreToBeat: number | null;
+  /** Reference: king's KL on the latest H2H. KL is one of 17 axes, not the gate. */
   kingKl: number | null;
 }
 
 export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
   return (
     <div className="max-w-3xl space-y-6">
-      {/* Score to beat */}
+      {/* Composite floor to beat */}
       <Card className="border-orange-400/30 bg-orange-400/5">
         <CardContent className="p-4 flex items-center justify-between">
           <div>
-            <p className="text-sm font-semibold text-orange-400">Score to Beat</p>
+            <p className="text-sm font-semibold text-orange-400">Composite-worst floor</p>
             <p className="text-xs text-muted-foreground">
-              Beat the king on paired KL and pass the live composite/Pareto gates.
-              Models with KL &gt; 2.0 are disqualified.
+              The king is whoever has the highest <code className="font-mono">composite.worst</code> — the lowest score across 17 axes. To dethrone, your worst-axis must clear the king&apos;s by ≥3% AND you must Pareto-dominate the king on a meaningful majority of axes.
             </p>
           </div>
           <div className="text-right">
             <p className="text-2xl font-mono font-bold text-orange-400">
-              &lt;{scoreToBeat != null ? scoreToBeat.toFixed(4) : "—"}
+              &gt;{scoreToBeat != null ? scoreToBeat.toFixed(3) : "—"}
             </p>
             <p className="text-[10px] text-muted-foreground">
-              {kingKl != null ? `king KL: ${kingKl.toFixed(4)} · gates apply` : "target KL + gates"}
+              composite.worst floor (king × 1.03)
             </p>
           </div>
         </CardContent>
@@ -42,43 +43,49 @@ export function DocsTab({ scoreToBeat, kingKl }: DocsTabProps) {
               {TEACHER.model}
             </a>{" "}
             ({formatParams(TEACHER.totalParams)} total, {formatParams(TEACHER.activeParams)} active MoE)
-            into a smaller model. The winning model must match the teacher where
-            KL matters while also passing absolute-correctness, reasoning,
-            factuality, tool-use, long-context, and multi-turn gates.
+            into a smaller model. The winning model must match the teacher
+            <em>and</em> pass absolute-correctness, reasoning, factuality,
+            tool-use, long-context, and multi-turn gates. KL is one of 17 axes
+            in the composite — useful, never sufficient.
           </p>
         </section>
 
         <section className="space-y-2">
           <h2 className="text-base font-semibold text-foreground">Scoring</h2>
           <p>
-            The validator generates 512-token continuations with vLLM-accelerated inference (5–10× faster
-            than HF), then extracts the teacher&apos;s top-128 logprobs per position
-            (<code className="font-mono text-muted-foreground">--max-logprobs 128</code>).
-            Your model computes a full-vocab softmax over all {TEACHER.vocabSize.toLocaleString()} tokens,
-            gathers + renormalizes over the teacher&apos;s top-128 support, and is compared using{" "}
-            <strong className="text-foreground">sparse top-128 KL divergence</strong>.
-            Lower KL is necessary but no longer sufficient. (Full-vocab dense path exists for reference; disabled in prod — ~150 GB/round at vocab size.)
+            Each commitment is scored on a <strong className="text-foreground">17-axis composite</strong>.
+            The five concerns it covers:
+          </p>
+          <ul className="list-disc pl-5 space-y-1 text-xs">
+            <li><strong className="text-foreground">Distribution match</strong> — on-policy reverse-KL (35% of the relative slice), forward-KL (15% — the &ldquo;classic&rdquo; KL), capability (25%), length (10%), degeneracy (15%).</li>
+            <li><strong className="text-foreground">Capability against ground truth</strong> — nine procedural benches (math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness). All items are generated per round from a block-seed; no static answer key.</li>
+            <li><strong className="text-foreground">Conversational quality</strong> — judge-probe (15%), chat-turns probe (8%).</li>
+            <li><strong className="text-foreground">Generation discipline</strong> — <code className="font-mono">reasoning_density</code> (5%) directly punishes thinking-without-answering. Past kings have been retroactively DQ&apos;d for failing this axis.</li>
+            <li><strong className="text-foreground">Robustness to prompt rewrites</strong> — robustness axis (7%) re-asks math items under K block-rotated paraphrases + noise wrappers.</li>
+          </ul>
+          <p>
+            The king is whoever has the highest <code className="font-mono">composite.worst</code> in <code className="font-mono">composite_scores.json</code>. KL is recomputed per round as <strong className="text-foreground">sparse top-128 KL</strong> (teacher returns top-128 logprobs via vLLM, student softmaxes over all {TEACHER.vocabSize.toLocaleString()} tokens then renormalises over the shared support) — but it&apos;s 0.15 of the relative tier, never the headline.
           </p>
           <p>
-            Each eval uses 60 prompts from{" "}
+            Each eval uses 300 prompts from{" "}
             <a href="https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">
               ClimbMix-400B
             </a>
             . Prompts are seeded by on-chain block hash — unpredictable before finalization.
           </p>
           <p>
-            <strong className="text-foreground">Winner-take-all:</strong> the king gets weight 1.0. A challenger can take the crown only by beating the king on the absolute composite-worst score across 20 axes by a meaningful margin (and passing axis floor + Pareto dominance gates).
+            <strong className="text-foreground">Winner-take-all:</strong> the king gets weight 1.0. A challenger takes the crown only by beating the king on <code className="font-mono">composite.worst</code> by ≥3% (and passing axis floor + Pareto dominance gates).
+            {kingKl != null && <> Reference: the current king&apos;s KL is {kingKl.toFixed(4)} — that&apos;s the KL axis only, one of 17.</>}
           </p>
           <p className="text-xs italic text-muted-foreground/60">
-            Single-eval mode (Session 3.7, live 2026-04-25): one registration → one commitment → one eval.
-            Each commitment is scored once on its own block-seeded prompts, the absolute composite is stored, and the king is selected cross-round from the highest worst-axis. Different prompts per round are by design — composite is an absolute (not paired-relative) signal.
+            Single-eval mode (live 2026-04-25): one registration → one commitment → one eval. The composite is stored once and the king is selected cross-round from the highest worst-axis. Different prompts per round are by design — composite is an absolute (not paired-relative) signal.
           </p>
         </section>
 
         <section className="space-y-2">
           <h2 className="text-base font-semibold text-foreground">King-of-the-Hill</h2>
           <p>
-            The current best model (&quot;king&quot;) holds the crown until a new commitment ships a higher composite-worst score across 20 axes (math, code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, arc, truthful, long-context, procedural, robustness, noise-resistance, judge, chat-turns, length, degeneracy, KL).
+            The current best model (&quot;king&quot;) holds the crown until a new commitment ships a higher <code className="font-mono">composite.worst</code> across the 17 active axes (KL, on-policy RKL, capability, length, degeneracy, judge, chat-turns, reasoning-density, math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness).
           </p>
           <ul className="list-disc pl-5 space-y-1">
             <li><strong className="text-foreground">Pre-checks first</strong> — architecture, hash, integrity verified before any GPU time</li>
@@ -211,8 +218,8 @@ python miner.py --wallet-name mywallet --hotkey-name myhotkey \\
         <section id="local-eval" className="space-y-2 scroll-mt-20">
           <h2 className="text-base font-semibold text-foreground">Local Eval (Parity Recipe)</h2>
           <p className="text-xs text-muted-foreground/80">
-            Want to see your KL against the current king before you submit? Run the same prompt
-            sampling + KL math the validator does, locally, against any HF model.
+            Want to sanity-check your KL axis against the current king before you submit? Run the same prompt
+            sampling + KL math the validator does, locally, against any HF model. Note: this only checks <em>one</em> of the 17 axes — a strong local KL still has to clear math, code, IFEval, reasoning-density, and the rest before it earns the crown.
           </p>
           <div className="rounded-lg border border-border/30 p-3 text-xs font-mono space-y-1">
             <div><span className="text-muted-foreground/60"># start a teacher vLLM on port 8000 (Qwen3.5-35B-A3B)</span></div>

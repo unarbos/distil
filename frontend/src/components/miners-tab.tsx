@@ -125,12 +125,12 @@ export function MinersTab({
           <span className="text-amber-400/60 text-[11px] mt-px">ℹ️</span>
           <div className="text-[10px] font-mono text-muted-foreground/50 space-y-1">
             <p>
-              <span className="text-yellow-400/80 font-semibold">H2H Score</span>
-              {" "}— Head-to-head KL on the <em>same prompts</em> as the king. This is the fair comparison used to determine the king.
+              <span className="text-blue-400/80 font-semibold">Composite worst</span>
+              {" "}— the lowest score across all 17 axes (math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness, on-policy RKL, KL, capability, judge, chat-turns, length, degeneracy, reasoning-density). <strong className="text-amber-300/80">This is the ranking key.</strong>
             </p>
             <p>
-              <span className="text-blue-400/80 font-semibold">Composite Score</span>
-              {" "}— live worst-axis score from the latest H2H when available. This is now the miner-facing objective; KL remains necessary but not sufficient.
+              <span className="text-yellow-400/80 font-semibold">H2H KL</span>
+              {" "}— forward-KL on teacher continuations under the same prompts. <em>One axis among 17</em>; useful for sanity-checking distillation, never the gate. A model that wins KL but loses on grade-school math cannot take the crown.
             </p>
           </div>
         </div>

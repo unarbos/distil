@@ -10,7 +10,7 @@ import {
 } from "@/lib/api";
 import { AutoRefresh } from "@/components/auto-refresh";
 import { DashboardTabs } from "@/components/dashboard-tabs";
-import { SCORE_TO_BEAT_FACTOR } from "@/lib/subnet";
+import { compositeFloorToBeat } from "@/lib/subnet";
 
 export const dynamic = "force-dynamic";
 
@@ -36,7 +36,12 @@ export default async function HomePage() {
 
   const king = miners.find((m) => m.isWinner);
   const kingH2hKl = h2hLatest?.king_h2h_kl ?? king?.klScore ?? null;
-  const scoreToBeat = kingH2hKl != null ? kingH2hKl * SCORE_TO_BEAT_FACTOR : null;
+  // Composite-worst is the production ranking key (since v27); KL is one
+  // of 17 axes. Use the king's composite-worst from the latest H2H if
+  // available, fall back to displaying nothing rather than a misleading
+  // KL-floor pill.
+  const kingWorst = king?.compositeWorst ?? null;
+  const compositeFloor = compositeFloorToBeat(kingWorst);
 
   return (
     <div className="relative min-h-[calc(100vh-3rem)]">
@@ -57,9 +62,12 @@ export default async function HomePage() {
             {currentBlock > 0 && <span>#{currentBlock.toLocaleString()}</span>}
             <span>{miners.length} models</span>
             {king && <span className="text-yellow-400/80">👑 UID {king.uid}</span>}
-            {scoreToBeat != null && (
-              <span className="rounded-full bg-orange-400/10 border border-orange-400/20 px-2 py-0.5 text-orange-400">
-                Beat: &lt;{scoreToBeat.toFixed(4)} KL
+            {compositeFloor != null && (
+              <span
+                className="rounded-full bg-orange-400/10 border border-orange-400/20 px-2 py-0.5 text-orange-400"
+                title="composite.worst is the ranking key — the king's lowest axis score (after dropping reference-broken axes). Beat this by ≥3% to dethrone."
+              >
+                Beat: &gt;{compositeFloor.toFixed(3)} worst-axis
               </span>
             )}
           </div>

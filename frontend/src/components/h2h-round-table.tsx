@@ -255,7 +255,7 @@ function RoundRow({ round, defaultOpen, isLatest }: { round: H2hLatestResponse; 
           <div className="hidden sm:grid grid-cols-[2rem_1fr_7rem_10rem] gap-4 px-5 py-2 text-[10px] text-muted-foreground/40 font-mono uppercase tracking-wider border-y border-border/10">
             <span>#</span>
             <span>Model</span>
-            <span className="text-right" title="Head-to-head KL score — all models scored on identical prompts">H2H KL Score</span>
+            <span className="text-right" title="KL axis on the H2H prompt set. KL is one of 17 composite axes; ranking key is composite.worst.">KL axis (1/17)</span>
             <span className="text-right">vs King</span>
           </div>
 
