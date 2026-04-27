@@ -149,6 +149,8 @@ function HeadRow({ title, meta }: { title: string; meta: string }) {
 }
 
 function BoutCard({ round }: { round: H2hRound }) {
+  const [expanded, setExpanded] = useState(false);
+
   // Two interesting sides per round: the king and the top challenger
   // (the new king if dethroned, otherwise the closest challenger).
   const king = round.results.find((r) => r.is_king);
@@ -171,29 +173,166 @@ function BoutCard({ round }: { round: H2hRound }) {
   return (
     <div
       className={[
-        "py-3.5 border-b border-border grid grid-cols-[1fr_28px_1fr] gap-2.5 items-center",
+        "py-3.5 border-b border-border",
         dethroned ? "border-l-2 border-l-foreground pl-3 -ml-3" : "",
       ].join(" ")}
     >
-      <Side
-        side="left"
-        loser={dethroned}
-        winner={!dethroned}
-        result={king}
-        showAnnotation={!dethroned}
-        annotation="defends"
-        margin={null}
-      />
-      <span className="serif text-meta text-[13px] text-center">vs</span>
-      <Side
-        side="right"
-        loser={!dethroned}
-        winner={dethroned}
-        result={challenger}
-        showAnnotation={dethroned}
-        annotation={dethroned ? "dethrone" : "challenger"}
-        margin={dethroned ? margin : null}
-      />
+      <button
+        className="grid grid-cols-[1fr_28px_1fr_18px] gap-2.5 items-center w-full text-left hover:bg-white/40 -mx-2 px-2 py-1 transition-colors"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+      >
+        <Side
+          side="left"
+          loser={dethroned}
+          winner={!dethroned}
+          result={king}
+          showAnnotation={!dethroned}
+          annotation="defends"
+          margin={null}
+        />
+        <span className="serif text-meta text-[13px] text-center">vs</span>
+        <Side
+          side="right"
+          loser={!dethroned}
+          winner={dethroned}
+          result={challenger}
+          showAnnotation={dethroned}
+          annotation={dethroned ? "dethrone" : "challenger"}
+          margin={dethroned ? margin : null}
+        />
+        <span
+          className="text-meta text-[12px] num"
+          aria-hidden
+          title={expanded ? "collapse" : "expand round detail"}
+        >
+          {expanded ? "−" : "+"}
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="mt-3 -mx-1 px-2 py-3 border-t border-border bg-[var(--surface-soft)]/60">
+          <div className="text-[10px] uppercase tracking-[0.18em] text-meta mb-2">
+            Round detail · block #{round.block} ·{" "}
+            {round.results.filter((r) => !r.disqualified).length} live ·{" "}
+            {round.results.filter((r) => r.disqualified).length} dq
+          </div>
+          <RoundAxisGrid round={round} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-round per-axis grid. Rows = miners (king first, then by worst
+ * desc, then DQ at bottom). Columns = the headline 12 axes (we don't
+ * show all 17 here — too wide; the full 17 lives on /miner/[uid] and
+ * the Axes tab). Cell = score, colour-coded.
+ */
+const ROUND_AXIS_COLS: { key: string; label: string }[] = [
+  { key: "kl", label: "kl" },
+  { key: "on_policy_rkl", label: "rkl" },
+  { key: "capability", label: "cap" },
+  { key: "math_bench", label: "math" },
+  { key: "code_bench", label: "code" },
+  { key: "reasoning_bench", label: "reas" },
+  { key: "ifeval_bench", label: "ifev" },
+  { key: "aime_bench", label: "aime" },
+  { key: "judge_probe", label: "judg" },
+  { key: "chat_turns_probe", label: "chat" },
+  { key: "length", label: "len" },
+  { key: "degeneracy", label: "deg" },
+];
+
+function RoundAxisGrid({ round }: { round: H2hRound }) {
+  const sorted = [...round.results].sort((a, b) => {
+    if (a.is_king && !b.is_king) return -1;
+    if (!a.is_king && b.is_king) return 1;
+    if (a.disqualified && !b.disqualified) return 1;
+    if (!a.disqualified && b.disqualified) return -1;
+    const aw = a.composite?.worst ?? -Infinity;
+    const bw = b.composite?.worst ?? -Infinity;
+    return bw - aw;
+  });
+  return (
+    <div className="overflow-x-auto -mx-2">
+      <table className="text-[11px] num border-collapse w-full">
+        <thead>
+          <tr>
+            <th className="text-left text-meta font-medium px-2 py-1.5 sticky left-0 bg-[var(--surface-soft)]/80">
+              UID
+            </th>
+            <th className="text-right text-meta font-medium px-2 py-1.5">worst</th>
+            <th className="text-right text-meta font-medium px-2 py-1.5">wgt</th>
+            {ROUND_AXIS_COLS.map((c) => (
+              <th
+                key={c.key}
+                className="text-right text-meta font-medium px-2 py-1.5"
+                title={c.key}
+              >
+                {c.label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((r) => {
+            const ax = r.composite?.axes ?? {};
+            return (
+              <tr
+                key={`${r.uid}-${r.model}`}
+                className={[
+                  "border-t border-border",
+                  r.disqualified ? "opacity-50" : "",
+                  r.is_king ? "bg-white" : "",
+                ].join(" ")}
+              >
+                <td className="text-left px-2 py-1.5 sticky left-0 bg-inherit whitespace-nowrap">
+                  {r.is_king && "♛ "}
+                  {r.uid != null ? `#${r.uid}` : "—"}
+                  {r.disqualified && (
+                    <span className="text-danger ml-1.5 text-[9px] uppercase">dq</span>
+                  )}
+                </td>
+                <td className="text-right px-2 py-1.5 font-medium">
+                  {r.composite?.worst != null ? r.composite.worst.toFixed(3) : "—"}
+                </td>
+                <td className="text-right px-2 py-1.5 text-meta">
+                  {r.composite?.weighted != null ? r.composite.weighted.toFixed(3) : "—"}
+                </td>
+                {ROUND_AXIS_COLS.map((c) => {
+                  const v = ax[c.key];
+                  if (typeof v !== "number" || !Number.isFinite(v)) {
+                    return (
+                      <td key={c.key} className="text-right px-2 py-1.5 text-meta">
+                        —
+                      </td>
+                    );
+                  }
+                  // Heat: <0.3 red, 0.3-0.6 amber, 0.6-0.85 fg, ≥0.85 strong
+                  const color =
+                    v < 0.3
+                      ? "text-danger"
+                      : v < 0.6
+                        ? "text-warning"
+                        : v < 0.85
+                          ? "text-foreground"
+                          : "text-foreground font-medium";
+                  return (
+                    <td
+                      key={c.key}
+                      className={["text-right px-2 py-1.5", color].join(" ")}
+                    >
+                      {v.toFixed(2)}
+                    </td>
+                  );
+                })}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }

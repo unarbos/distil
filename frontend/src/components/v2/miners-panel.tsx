@@ -5,6 +5,14 @@ import Link from "next/link";
 import type { MinerEntry, ModelInfo } from "@/lib/api";
 import { shortRevision } from "@/lib/utils";
 
+/**
+ * MinersPanelProps still receives `taoUsd` and `minersTaoDay` from the
+ * SSR layer — the leaderboard table itself no longer renders the τ/day
+ * or incentive columns (per user feedback 2026-04-27: those columns
+ * were noise; you can read them from the wallet UI). We keep the
+ * props so the SSR layer doesn't have to be rewired, and so a future
+ * "show emissions" toggle can opt-in.
+ */
 export interface MinersPanelProps {
   miners: MinerEntry[];
   modelInfoMap: Record<string, ModelInfo>;
@@ -30,8 +38,6 @@ type FilterMode = "all" | "scored" | "queued" | "dq";
 export function MinersPanel({
   miners,
   modelInfoMap,
-  taoUsd,
-  minersTaoDay,
 }: MinersPanelProps) {
   const [filter, setFilter] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
@@ -143,10 +149,11 @@ export function MinersPanel({
             <Th>#</Th>
             <Th>UID</Th>
             <Th>Model · revision</Th>
-            <Th align="right">τ/day</Th>
-            <Th align="right">Incent</Th>
             <Th align="right" title="composite.worst — the ranking key (lowest of 17 axes)">
               Worst
+            </Th>
+            <Th align="right" title="composite.weighted — the soft tiebreaker (Σ wᵢ·axisᵢ / Σ wᵢ)">
+              Weighted
             </Th>
             <Th title="The single axis bottlenecking this miner's composite.worst. Train data here to push it up.">
               Limiting axis
@@ -160,14 +167,12 @@ export function MinersPanel({
         <tbody>
           {filtered.length === 0 && (
             <tr>
-              <td colSpan={9} className="text-center text-meta py-8">
+              <td colSpan={8} className="text-center text-meta py-8">
                 no rows
               </td>
             </tr>
           )}
           {filtered.map((m, i) => {
-            const dailyTao = minersTaoDay * m.incentive;
-            const dailyUsd = dailyTao * taoUsd;
             const info = modelInfoMap[m.model];
             const params =
               typeof info?.params_b === "number"
@@ -222,19 +227,13 @@ export function MinersPanel({
                     </div>
                   )}
                 </Td>
-                <Td align="right" className="num">
-                  {dailyTao > 0 ? `${dailyTao.toFixed(1)}` : "—"}
-                  {dailyUsd > 0 && (
-                    <div className="text-[10px] text-meta">
-                      ${dailyUsd.toFixed(0)}
-                    </div>
-                  )}
-                </Td>
-                <Td align="right" className="num">
-                  {(m.incentive * 100).toFixed(1)}%
-                </Td>
                 <Td align="right" className="num font-medium">
                   {m.compositeWorst != null ? m.compositeWorst.toFixed(3) : "—"}
+                </Td>
+                <Td align="right" className="num text-meta">
+                  {m.compositeWeighted != null
+                    ? m.compositeWeighted.toFixed(3)
+                    : "—"}
                 </Td>
                 <Td className="text-[12px]">
                   {m.limitingAxis ? (

@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
 
+const BENCH_CACHE_KEY = "distil:v2:bench:cache:v1";
+const BENCH_CACHE_TTL_MS = 5 * 60 * 1000;
+
 interface BenchmarkPayload {
   uid?: number | null;
   model: string;
@@ -87,7 +90,24 @@ function pickScoreAndCount(
  * a model that's actually better, or just better at the composite?"
  */
 export function BenchPanel() {
-  const [data, setData] = useState<BenchmarksResponse | null>(null);
+  // Hydrate from localStorage so the second visit is instant. The
+  // /api/benchmarks fetch ran in 140ms in our measurements but the
+  // user reported "stopped working / takes a long time to load" on
+  // 2026-04-27 — the cache + skeleton makes the first paint look
+  // instant either way.
+  const [data, setData] = useState<BenchmarksResponse | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = window.localStorage.getItem(BENCH_CACHE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { ts: number; data: BenchmarksResponse };
+      if (Date.now() - parsed.ts > BENCH_CACHE_TTL_MS) return null;
+      return parsed.data;
+    } catch {
+      return null;
+    }
+  });
+  const [stale, setStale] = useState<boolean>(data != null);
 
   useEffect(() => {
     let cancel = false;
@@ -97,7 +117,15 @@ export function BenchPanel() {
           cache: "no-store",
         });
         if (res.ok && !cancel) {
-          setData((await res.json()) as BenchmarksResponse);
+          const json = (await res.json()) as BenchmarksResponse;
+          setData(json);
+          setStale(false);
+          try {
+            window.localStorage.setItem(
+              BENCH_CACHE_KEY,
+              JSON.stringify({ ts: Date.now(), data: json }),
+            );
+          } catch {}
         }
       } catch {}
     };
@@ -151,8 +179,19 @@ export function BenchPanel() {
       ? king.limit
       : null;
 
+  // First visit / cache miss → render a skeleton so the user doesn't
+  // stare at an empty grid while the API resolves.
+  if (data == null) {
+    return <BenchSkeleton />;
+  }
+
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
+    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)] relative">
+      {stale && (
+        <span className="absolute top-3 right-4 text-[10px] uppercase tracking-[0.18em] text-meta">
+          refreshing…
+        </span>
+      )}
       {HEADLINE.map((b, i) => {
         const k = pickScoreAndCount(
           kingFilled?.benchmarks,
@@ -343,6 +382,58 @@ function BenchRow({
       >
         {measured ? (entry.score! * 100).toFixed(1) : "n/a"}
       </span>
+    </div>
+  );
+}
+
+/**
+ * Skeleton state for the bench tab. 6 placeholder cards in the same
+ * grid as the real layout, with subtle pulse on the score-bar slots.
+ * Showing structure (not just a spinner) cuts the perceived load
+ * time because the user can read the layout while data resolves.
+ */
+function BenchSkeleton() {
+  const placeholders = [
+    "GSM8K",
+    "HumanEval",
+    "IFEval",
+    "BBH",
+    "MMLU-Pro",
+    "ARC",
+  ];
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
+      {placeholders.map((label, i) => {
+        const isLastCol = (i + 1) % 3 === 0;
+        const isLastRow = i >= placeholders.length - 3;
+        return (
+          <div
+            key={label}
+            className={[
+              "px-6 sm:px-7 py-6 flex flex-col",
+              isLastCol ? "" : "border-r border-border",
+              isLastRow ? "" : "border-b border-border",
+            ].join(" ")}
+          >
+            <h5 className="text-[22px] font-medium tracking-[-0.025em] opacity-30">
+              {label}
+            </h5>
+            <div className="text-[10px] text-meta uppercase tracking-[0.18em] mt-0.5 mb-4 opacity-30">
+              loading…
+            </div>
+            {[0, 1, 2].map((row) => (
+              <div
+                key={row}
+                className="grid grid-cols-[60px_1fr_44px] gap-3 items-center text-[11px] mb-2.5"
+              >
+                <span className="h-2 bg-[#f1f1f1] rounded-sm" />
+                <div className="h-1.5 bg-[#f1f1f1]" />
+                <span className="h-2 bg-[#f1f1f1] rounded-sm" />
+              </div>
+            ))}
+          </div>
+        );
+      })}
     </div>
   );
 }

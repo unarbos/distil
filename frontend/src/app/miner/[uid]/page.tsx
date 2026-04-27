@@ -132,12 +132,16 @@ export default async function MinerPage({
 
   return (
     <main className="mx-auto max-w-5xl px-6 sm:px-8 py-10 space-y-8">
-      <Link
+      {/* Plain <a>: hash routing is purely client-side, no need for
+          Next.js prefetch (which can RSC-prefetch the home route on
+          hover and was historically associated with a stray
+          ERR_TOO_MANY_REDIRECTS in the browser console). */}
+      <a
         href="/#miners"
         className="text-[11px] uppercase tracking-[0.18em] text-meta hover:text-foreground"
       >
         ← Back to leaderboard
-      </Link>
+      </a>
 
       {/* Identity card */}
       <section className="space-y-2">

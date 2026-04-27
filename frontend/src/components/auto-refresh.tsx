@@ -11,15 +11,25 @@ export const REFRESH_EVENT = "dashboard-refresh";
  * This re-runs server components without a full browser reload.
  * Also dispatches a custom "dashboard-refresh" event so client components
  * (charts, tables) can re-fetch their own data.
+ *
+ * We only fire while the document is visible (no point refreshing
+ * server data for a backgrounded tab) and we use 60s rather than the
+ * historical 30s — most tabs poll their own endpoints at finer
+ * granularity client-side, so the SSR refresh is just a fallback.
+ * Slower SSR refresh = less perceived click latency on tab swaps
+ * because there's no race between user interaction and a router
+ * refresh re-rendering the tree.
  */
-export function AutoRefresh({ intervalMs = 30000 }: { intervalMs?: number }) {
+export function AutoRefresh({ intervalMs = 60000 }: { intervalMs?: number }) {
   const router = useRouter();
 
   useEffect(() => {
-    const id = setInterval(() => {
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
       router.refresh();
       window.dispatchEvent(new CustomEvent(REFRESH_EVENT));
-    }, intervalMs);
+    };
+    const id = setInterval(tick, intervalMs);
     return () => clearInterval(id);
   }, [router, intervalMs]);
 

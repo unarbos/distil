@@ -342,39 +342,75 @@ python -m distil.validator --netuid 97`}</pre>
       return (
         <Article>
           <h2>API reference</h2>
-          <p>
-            Public base: <code>https://api.arbos.life</code>. Read-only ·
-            cached 60s.
+          <p className="lead">
+            Public read-only API. Cached 60s. Base:{" "}
+            <code>https://api.arbos.life</code>.
           </p>
-          <h3>Endpoints</h3>
+          <p>
+            <strong>Live OpenAPI / Swagger UI:</strong>{" "}
+            <a
+              href="https://api.arbos.life/docs"
+              target="_blank"
+              rel="noreferrer"
+              className="underline"
+            >
+              api.arbos.life/docs
+            </a>{" "}
+            — every endpoint, every parameter, runnable in the browser.
+            Bookmark it; this page is just the cheatsheet.
+          </p>
+          <h3>Endpoint cheatsheet</h3>
           <dl className="kv">
+            <dt>GET /api/health</dt>
+            <dd>service health, current king, code revision</dd>
             <dt>GET /api/metagraph</dt>
-            <dd>chain block + UID stake</dd>
+            <dd>chain block + per-UID stake / hotkey / commitment</dd>
             <dt>GET /api/scores</dt>
             <dd>latest KL per UID (one of 17 axes)</dd>
+            <dt>GET /api/leaderboard</dt>
+            <dd>top-N with composite worst + weighted breakdown</dd>
+            <dt>GET /api/miner/{`{uid}`}</dt>
+            <dd>per-UID card: model, KL, full composite axes, H2H tail</dd>
             <dt>GET /api/h2h-latest</dt>
-            <dd>king + last bout, with full composite per UID</dd>
-            <dt>GET /api/h2h-history</dt>
-            <dd>past rounds (default 50)</dd>
+            <dd>last bout, full composite per UID, king flag</dd>
+            <dt>GET /api/h2h-history?limit=N</dt>
+            <dd>past N rounds with composite per result</dd>
             <dt>GET /api/king-history</dt>
-            <dd>list of king flips with reign_blocks</dd>
+            <dd>king flips with reign_blocks</dd>
             <dt>GET /api/history</dt>
             <dd>KL axis time series</dd>
             <dt>GET /api/eval-progress</dt>
-            <dd>validator phase + progress</dd>
+            <dd>validator phase + progress (active eval)</dd>
             <dt>GET /api/eval-stream</dt>
-            <dd>SSE stream of eval events</dd>
-            <dt>GET /api/leaderboard</dt>
-            <dd>top-4 with composite breakdown</dd>
+            <dd>SSE stream of live eval events</dd>
             <dt>GET /api/benchmarks</dt>
-            <dd>held-out evalscope reports for the king</dd>
+            <dd>
+              held-out evalscope reports for the king, teacher, reference (NOT
+              the validator&apos;s composite — see Bench tab footer)
+            </dd>
+            <dt>GET /api/queue</dt>
+            <dd>pending challengers in the next eval round</dd>
             <dt>GET /api/incidents</dt>
-            <dd>recent ops events</dd>
+            <dd>recent ops events (king flips, restarts, DQ events)</dd>
             <dt>GET /api/price</dt>
             <dd>α / τ / USD</dd>
-            <dt>GET /api/health</dt>
-            <dd>service health</dd>
+            <dt>GET /api/gpu-logs?limit=N</dt>
+            <dd>recent GPU pod log lines (sanitised)</dd>
           </dl>
+          <h3>Where to ask questions</h3>
+          <p>
+            Discord <code>#ა・distil・97</code> in the Bittensor server. Open
+            issues / PRs at{" "}
+            <a
+              href="https://github.com/unarbos/distil"
+              target="_blank"
+              rel="noreferrer"
+              className="underline"
+            >
+              github.com/unarbos/distil
+            </a>
+            .
+          </p>
         </Article>
       );
     case "constants":
