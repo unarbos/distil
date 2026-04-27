@@ -95,6 +95,22 @@ def clear_chat_pod_state(*, source: str = "validator") -> None:
     write_chat_pod_state({"host": "", "ssh_port": 0, "model": ""}, source=source)
 
 
+# Tolerate host-key rotation. Lium pods sometimes get reprovisioned with the
+# same IP+port but a fresh host key; without ``UserKnownHostsFile=/dev/null``
+# the keeper hits ``REMOTE HOST IDENTIFICATION HAS CHANGED`` and refuses to
+# connect even with ``StrictHostKeyChecking=no``. The chat-tunnel already
+# ignored known_hosts; this brings probe/heal in line so chat.arbos.life
+# survives a rebuild without manual ``ssh-keygen -R``.
+_BASE_SSH_OPTS = [
+    "-o", "ConnectTimeout=10",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "GlobalKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "BatchMode=yes",
+]
+
+
 def _ssh_args(state: dict[str, Any]) -> list[str]:
     host = state.get("host") or ""
     port = int(state.get("ssh_port") or 0)
@@ -103,9 +119,7 @@ def _ssh_args(state: dict[str, Any]) -> list[str]:
         raise RuntimeError("chat pod is not configured (host/ssh_port missing)")
     return [
         "ssh",
-        "-o", "ConnectTimeout=10",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "BatchMode=yes",
+        *_BASE_SSH_OPTS,
         "-i", key,
         "-p", str(port),
         f"root@{host}",
@@ -120,9 +134,7 @@ def _scp_args(state: dict[str, Any], src: str, dst: str) -> list[str]:
         raise RuntimeError("chat pod is not configured (host/ssh_port missing)")
     return [
         "scp",
-        "-o", "ConnectTimeout=10",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "BatchMode=yes",
+        *_BASE_SSH_OPTS,
         "-i", key,
         "-P", str(port),
         src,
@@ -193,16 +205,22 @@ def heal(model_name: str | None = None, *, source: str = "cli") -> dict[str, Any
     # broad because vLLM v1 spawns a child that renames itself to
     # ``VLLM::EngineCore`` and holds the GPU; only killing chat_server.py
     # leaves the engine running and the next launch starves on memory.
+    # ``pkill -f`` matches against the *entire* command line, including its own
+    # ``bash -c`` invocation. A bare pattern like ``chat_server.py`` would
+    # match the SSH shell that's running this kill (because the pattern itself
+    # appears in argv), self-terminate, and SSH returns rc=255 with empty
+    # stderr — the chat king then never gets relaunched. Anchoring on
+    # ``^python`` filters to the actual python interpreter holding the model.
     cmd = (
         "set -e; "
-        "pkill -9 -f 'chat_server.py' 2>/dev/null || true; "
-        "pkill -9 -f 'vllm.entrypoints.openai.api_server' 2>/dev/null || true; "
-        "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null || true; "
+        "pkill -9 -f '^python.* /root/chat_server.py' 2>/dev/null || true; "
+        "pkill -9 -f '^python.* vllm.entrypoints.openai.api_server' 2>/dev/null || true; "
+        "pkill -9 -x 'VLLM::EngineCore' 2>/dev/null || true; "
         "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null || true; "
         "sleep 2; "
         f"( nohup python3 -u /root/chat_server.py {target!r} {app_port} "
         f"  >> /root/chat_server.log 2>&1 < /dev/null & ); "
-        "sleep 1; pgrep -fa chat_server.py | head -3"
+        "sleep 1; pgrep -fa '^python.* /root/chat_server.py' | head -3"
     )
     out = subprocess.run(
         _ssh_args(state) + [cmd],
