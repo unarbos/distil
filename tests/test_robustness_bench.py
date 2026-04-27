@@ -103,22 +103,26 @@ class TestRobustnessPerturbations(unittest.TestCase):
 
     def test_wrappers_strictly_extend_the_prompt(self):
         original = "What is 2 + 2?\n\nProvide a final answer."
+        # Wrapper-family entries strictly extend; paraphrase-family
+        # entries may shorten or keep the same length; noise-family
+        # entries (v28: folded in from noise_resistance_bench) mutate
+        # characters in-place and don't change length.
+        in_place = (
+            self.mod._ROBUSTNESS_PARAPHRASE_NAMES
+            | self.mod._ROBUSTNESS_NOISE_NAMES
+        )
         for name, fn in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES:
             out = fn(original)
             self.assertIsInstance(out, str, f"{name} must return str")
-            # Wrapper-family perturbations strictly extend the prompt;
-            # paraphrase-family perturbations may shorten or keep it the
-            # same length (e.g., ``Find the area of X.`` has the same
-            # character count as ``What is the area of X?``).
-            if name not in self.mod._ROBUSTNESS_PARAPHRASE_NAMES:
+            if name not in in_place:
                 self.assertGreater(
                     len(out), len(original),
                     f"{name} wrapper produced output no longer than the "
                     f"original — that's effectively a no-op",
                 )
-            # The numeric content must survive every perturbation —
-            # both wrappers (which never touch it) and paraphrases
-            # (which only swap instruction words).
+            # Numeric content must survive every perturbation. The noise
+            # family is digit-safe by construction (``_noise_safe_*`` only
+            # touches alphabetic chars).
             self.assertIn(
                 "2 + 2", out,
                 f"{name} perturbation dropped the original numeric content",
@@ -133,15 +137,22 @@ class TestRobustnessPerturbations(unittest.TestCase):
         # value of x?" which preserves semantics but not the literal
         # phrase).
         original = "If x + 5 = 12, what is x?"
+        in_place = (
+            self.mod._ROBUSTNESS_PARAPHRASE_NAMES
+            | self.mod._ROBUSTNESS_NOISE_NAMES
+        )
         for name, fn in self.mod._ROBUSTNESS_PERTURBATION_TEMPLATES:
-            if name in self.mod._ROBUSTNESS_PARAPHRASE_NAMES:
-                # For paraphrase entries we only check that the math
-                # content (``x + 5 = 12``) survives — instruction words
-                # may be swapped.
+            if name in in_place:
+                # For paraphrase + noise entries we only check that the
+                # numeric / math content (``x + 5 = 12``) survives;
+                # instruction words may be swapped (paraphrase) and
+                # whitespace / case may be perturbed (noise) but the
+                # equation is preserved by construction (digit-safe
+                # mutations only).
                 out = fn(original)
                 self.assertIn(
                     "x + 5 = 12", out,
-                    f"{name} paraphrase dropped the math content",
+                    f"{name} mutator dropped the math content",
                 )
                 continue
             out = fn(original)

@@ -58,10 +58,17 @@ mkdir -p "$RESULTS_DIR"
 echo "=== Auto-benchmark v3 (evalscope, tunnel to chat pod) for UID $KING_UID ($MODEL) ===" | tee "$LOG"
 echo "Started at $(date -u)" | tee -a "$LOG"
 
-# Use tunnel to chat pod (already has vLLM running with the king model)
-CHAT_POD_HOST="91.224.44.207"
-CHAT_POD_PORT="40070"
-VLLM_PORT=8100
+# Use tunnel to chat pod (already has vLLM running with the king model).
+# These coordinates must come from environment; hardcoding stale Lium hosts
+# caused benchmark retries to hammer a reprovisioned pod with the wrong key.
+CHAT_POD_HOST="${CHAT_POD_HOST:-${DISTIL_CHAT_POD_HOST:-}}"
+CHAT_POD_PORT="${CHAT_POD_SSH_PORT:-${DISTIL_CHAT_POD_SSH_PORT:-}}"
+VLLM_PORT="${CHAT_POD_APP_PORT:-${DISTIL_CHAT_POD_APP_PORT:-8100}}"
+
+if [ -z "$CHAT_POD_HOST" ] || [ -z "$CHAT_POD_PORT" ]; then
+    echo "Chat pod is not configured (CHAT_POD_HOST/CHAT_POD_SSH_PORT missing). Aborting." | tee -a "$LOG"
+    exit 1
+fi
 
 # Set up SSH tunnel to chat pod's vLLM
 echo "Setting up tunnel to chat pod ($CHAT_POD_HOST:$CHAT_POD_PORT)..." | tee -a "$LOG"

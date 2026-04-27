@@ -5,14 +5,23 @@ A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.5-35B-A3B*
 **Dashboard**: [distil.arbos.life](https://distil.arbos.life)  
 **API**: [api.arbos.life](https://api.arbos.life)  
 **Chat with the King**: [chat.arbos.life](https://chat.arbos.life) — try the current best distilled model  
-**Benchmarks Paper**: [KL vs Performance Analysis](paper/benchmark_kl_vs_performance.md)  
 **Subnet**: Finney netuid 97
 
 ## How It Works
 
 **Miners** distill the teacher into a smaller model (≤5.25B total params), upload to HuggingFace, and commit the repo link on-chain. **One commitment per hotkey — commitments are permanent and cannot be changed.** However, if disqualified, miners can register a new hotkey and submit a different model.
 
-**Validators** evaluate by computing top-128 sparse KL-divergence on GPU using a vLLM-accelerated pipeline (teacher returns top-128 logprobs per position; student softmaxes over the full 248,320-token vocab then gathers + renormalizes to the shared 128-token support). Lower KL = better distillation = higher rewards. **Winner-take-all** — best miner gets 100% of emissions.
+**Validators** score every committed model on a **17-axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)). The composite covers five concerns at once:
+
+- **Distribution match** — on-policy reverse-KL (35% of the relative slice, the primary distillation signal under the new framework), forward-KL on teacher continuations (15% of the relative slice), capability (25%), length (10%), degeneracy (15%).
+- **Capability against ground truth** — nine absolute benches: math, code, reasoning, IFEval, AIME, MBPP, tool use, long context, robustness. All items are **procedurally generated per round from a block-seed** so there is no static answer key for miners to memorise.
+- **Conversational quality** — judge-probe (15%), chat-turns probe (8%).
+- **Generation discipline** — `reasoning_density` axis (5%) directly punishes thinking-without-answering (the failure mode that produced the 2026-04-17 reasoning-spiral king; see [paper/off_policy_cot_collapse.md](paper/off_policy_cot_collapse.md)).
+- **Robustness to prompt rewrites** — robustness axis (7%) re-asks math items under K block-rotated paraphrases + noise wrappers.
+
+The king is whoever has the **highest worst-axis score** (with weighted-mean as tiebreaker in the saturated regime). KL is one of the 17 axes, not the gate. **Winner-take-all** — best miner gets 100% of emissions.
+
+> **Why not just KL?** Pure forward-KL on teacher continuations rewards token-level surface match. A 4B student that mimics the teacher's "wait, let me reconsider" filler can win KL while never producing a final answer. We caught this on 2026-04-17 (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench). The composite, the on-policy RKL axis, and the reasoning-density axis exist specifically to close that gap.
 
 ### King-of-the-Hill Evaluation
 
@@ -25,31 +34,32 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
    - Models that fail pre-checks are **never sent to GPU** — no wasted compute
    - `check_model.py` and `test_miner.py` run 15 validator checks — the same checks the validator uses
 
-2. **King identification** — The miner with the lowest KL score from state is the "king" (current emissions winner)
+2. **King identification** — The miner with the highest `composite.worst` in `state/composite_scores.json` is the king (current emissions winner). KL alone never crowns anyone.
 
-3. **Single-eval policy (live 2026-04-25)** — Each on-chain commitment is scored EXACTLY ONCE on its own block-seeded 300-prompt set. There is no king re-eval, no top-N rotation, and no dormant rotation. New commitments enter rounds FIFO by `commit_block`, capped at `SINGLE_EVAL_MAX_PER_ROUND` (default 10) plus the always-in reference baseline (UID -1, `Qwen/Qwen3.5-4B`). Re-evaluation triggers only when a UID re-commits a different model on-chain.
+3. **Single-eval policy (live 2026-04-25)** — Each on-chain commitment is scored EXACTLY ONCE on its own block-seeded 300-prompt set. There is no king re-eval, no top-N rotation, and no dormant rotation. New commitments enter rounds FIFO by `commit_block`, capped at `SINGLE_EVAL_MAX_PER_ROUND` (default 10) plus the always-in reference baseline (UID -1, `Qwen/Qwen3.5-4B`). Re-evaluation triggers only when a UID re-commits a different model on-chain, or when the composite schema bumps.
 
 4. **Per-UID eval on the pod** — Each student is loaded sequentially on the pod (vLLM teacher → student forward pass → bench battery). The reference baseline runs in every round so the asymmetric reference-broken-axes filter (see `composite.py::resolve_reference_broken_axes`) can drop axes the base model itself can't pass under the eval setup (token cap, etc.).
 
-5. **20-axis composite, normalized per axis** — Every student gets a 20-axis vector covering relative distillation signals (KL, on-policy RKL, capability, length, judge-probe), absolute benches (math, code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, self-consistency, arc, truthful, long-context, procedural, robustness, noise-resistance), and probes (chat-turns, reasoning-density). Each axis is in [0, 1]. The composite stores both `worst = min(axes)` (after dropping reference-broken axes) and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ` (keeps broken axes when student > 0 so beating the reference still pays).
+5. **17-axis composite, normalized per axis** — Every student gets a 17-axis vector. Axis weights live in `composite.py:AXIS_WEIGHTS` (relative tier), `BENCH_AXIS_WEIGHTS` (math/code/reasoning/IFEval), and `ARENA_V3_AXIS_WEIGHTS` (AIME/MBPP/tool-use/long-context/robustness), plus the judge-probe, chat-turns, and reasoning-density axes. Each axis is in [0, 1]. The composite stores both `worst = min(axes)` (after dropping reference-broken axes) and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ` (keeps broken axes when student > 0 so beating the reference still pays).
 
 6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. Teacher logits are precomputed and cached on GPU.
 
-7. **Cross-round dethronement gate (composite-worst, single-eval mode)** — King selection runs over `state/composite_scores.json` (records with `n_axes >= 17`, the Arena v3.7 schema floor). The king is whoever has the highest `composite.worst`. A challenger dethrones the incumbent only when `challenger.worst > incumbent.worst × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin). When both are at the saturated worst-floor (≤ 0.005), the same 3% margin applies to `composite.weighted` as a tiebreaker. The legacy paired t-test on KL is RETIRED — KL is one of 20 axes, not the ranking key. Different prompts per round are by design; the absolute composite supports cross-round comparison.
+7. **Cross-round dethronement gate (composite-worst, single-eval mode)** — King selection runs over `state/composite_scores.json` (records with `n_axes >= _KING_SELECTION_MIN_AXES`, the schema floor). The king is whoever has the highest `composite.worst`. A challenger dethrones the incumbent only when `challenger.worst > incumbent.worst × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin). When both are at the saturated worst-floor (≤ 0.005), the same 3% margin applies to `composite.weighted` as a tiebreaker. The legacy paired t-test on KL is RETIRED — KL is one of 17 axes, not the ranking key. Different prompts per round are by design; the absolute composite supports cross-round comparison.
 
-9. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
+8. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
-**Why this design beats round-local relative ranking:**
+**Why this design beats KL-alone ranking:**
 - **One eval per commitment** — miners pay for the eval once via the on-chain registration burn; no infinite re-evals
 - **Block-seeded prompts** — the 300-prompt pool for each UID is fresh, deterministic from the round's block hash, and never re-used (no leakage)
 - **Absolute multi-axis floor** — `composite.worst` is normalized per axis, so a student that gets 0.95 KL and 0.0 math fails the gate even if KL alone is "better than the king"
 - **Asymmetric broken-axes filter** — eval-setup-fragile axes (e.g. AIME under a 768-token cap, MBPP function naming) drop out of `worst()` only when the reference itself scores 0 on them. They stay in `weighted` so a student beating the broken reference still gets credit.
-- **Stable across schema changes** — `_KING_SELECTION_MIN_AXES = 17` ensures only Arena v3.7 records compete for the crown. Older records remain tracked but ineligible until the miner re-commits.
+- **Stable across schema changes** — `_KING_SELECTION_MIN_AXES` ensures only schema-current records compete for the crown. Older records remain tracked but ineligible until the miner re-commits.
 - **Revision pinning** — models evaluated at the specific committed revision; new HF commits without on-chain re-commitment = integrity DQ
+- **Anti-spiral safeguards** — `reasoning_density` axis penalises thinking-without-answering; `thinking_collapse_probe` flags models that loop indefinitely on trivial prompts (`"Hi"`, `"largest planet one word"`, `"say the word: done"`).
 
 ### Disqualification
 
-Models are disqualified (KL=∞, $0 earnings) for that commitment:
+Models are disqualified (composite.worst = 0, $0 earnings) for that commitment:
 - **COPY** — Same safetensors weights as another miner (SHA256 match). First committer owns the hash.
 - **REMOVED** — Model deleted, made private, or weights changed after commitment
 - **INVALID** — Fails architecture checks (too large, wrong tokenizer, quantized, etc.)
@@ -61,8 +71,9 @@ Disqualification reasons are shown on the dashboard and available via the API.
 ### Anti-Gaming
 
 - **SHA256 hash duplicate detection**: Model weight hashes tracked forever; copies blacklisted for that commitment
-- **Logit fingerprinting**: Even if hashes differ, models with identical KL distributions on the first 2 prompts are flagged as functional copies (cosine similarity > 0.99999 on per-position KL vectors)
+- **Logit fingerprinting**: Even if hashes differ, models with identical activation distributions on the first 2 prompts are flagged as functional copies (cosine similarity > 0.99999 on per-position vectors)
 - **Cosine similarity tool**: `scripts/cosine_similarity_check.py` provides offline near-copy detection between any two models
+- **Anti-spiral**: `reasoning_density` axis + `thinking_collapse_probe` catch the "model thinks forever, never answers" failure mode (see [paper/off_policy_cot_collapse.md](paper/off_policy_cot_collapse.md))
 - **Commitment block priority**: Earlier on-chain commitment wins hash ownership
 - **Revision-pinned integrity**: Models checked for new HF commits (git SHA comparison) — any change after commitment = DQ. Much cheaper than re-hashing weights every epoch.
 - **Continuous integrity checks**: Every epoch, all models verified public + unchanged
@@ -142,13 +153,15 @@ The miner script includes `--dry-run`/`--test-only` flags, interactive confirmat
 
 ### KL Ranges (baseline, no distillation training)
 
+KL is one of the 17 composite axes — useful for sanity-checking a fresh student before submission, but **not the ranking key**.
+
 | Model | Params | KL (nats) | Notes |
 |-------|--------|-----------|-------|
 | Qwen3.5-4B | 4.66B | ~0.10–0.15 | Strong baseline |
 | Qwen3.5-2B | 2.27B | ~0.12–0.16 | Competitive |
 | Qwen3.5-0.8B | 0.87B | ~0.17–0.21 | Moderate |
 
-These are *untrained baselines* — purpose-built distillations should do significantly better. Models with KL > 2.0 are disqualified.
+These are *untrained baselines*. Models with KL > 2.0 are disqualified, but a low-KL model can still fail the composite gate if it scores poorly on benches, on-policy RKL, reasoning-density, or any other axis. **A model that wins KL but loses on grade-school math cannot take the crown.**
 
 ## Training Guide
 

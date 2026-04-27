@@ -1,10 +1,22 @@
 import json
 import os
 import sys
+import threading
 
 from config import CACHE_TTL
 from helpers.cache import _bg_refresh, _get_cached, _get_stale, _set_cached
 from helpers.fetch import _fetch_commitments, _fetch_metagraph, _fetch_price
+
+
+# Cap concurrent HF model_info subprocesses. The dashboard fans out
+# /api/model-info/{repo} for every UID on every page load; before this cap a
+# single page render would spawn 25+ subprocess calls and saturate uvicorn's
+# thread pool, causing /api/leaderboard to 503 with "Exceeded concurrency limit".
+_MODEL_INFO_SEM = threading.Semaphore(int(os.environ.get("DISTIL_API_HF_PARALLEL", "4")))
+_MODEL_INFO_INFLIGHT_LOCK = threading.Lock()
+_MODEL_INFO_INFLIGHT: set[str] = set()
+_MODEL_INFO_TTL = 3600
+_MODEL_INFO_STALE_TTL = 7 * 24 * 3600
 
 
 def _cached(name, ttl, fetcher, fallback):
@@ -35,17 +47,7 @@ def get_price():
     return _cached("price", 30, _fetch_price, lambda exc: {"error": str(exc)})
 
 
-def get_model_info(model_path):
-    from helpers.cache import _get_cached, _set_cached
-
-    cache_key = f"model_info:{model_path}"
-    cached = _get_cached(cache_key, 3600)
-    if cached:
-        return cached
-    try:
-        import subprocess
-
-        script = """
+_MODEL_INFO_SCRIPT = """
 import json, os
 from huggingface_hub import model_info as hf_model_info, hf_hub_download
 
@@ -91,12 +93,68 @@ print(json.dumps({
     "base_model": getattr(card, "base_model", None) if card else None,
 }))
 """
-        env = os.environ.copy()
-        env["MODEL_PATH"] = model_path
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30, env=env)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr[-300:])
-        data = json.loads(result.stdout)
+
+
+def _fetch_model_info(model_path):
+    """Spawn the HF subprocess. Bounded by ``_MODEL_INFO_SEM``."""
+    import subprocess
+
+    env = os.environ.copy()
+    env["MODEL_PATH"] = model_path
+    with _MODEL_INFO_SEM:
+        result = subprocess.run(
+            [sys.executable, "-c", _MODEL_INFO_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-300:] or "hf model_info failed")
+    return json.loads(result.stdout)
+
+
+def get_model_info(model_path):
+    """Stale-while-refresh wrapper around the HF subprocess.
+
+    The dashboard fans out /api/model-info/{repo} for every miner on every page
+    render. Synchronously waiting for HF on each one used to saturate uvicorn's
+    request thread pool and stall /api/leaderboard with HTTP 503 ("Exceeded
+    concurrency limit"). Now we serve any cached/stale entry immediately and
+    schedule a single background refresh per repo so the request thread frees
+    up in microseconds.
+    """
+    cache_key = f"model_info:{model_path}"
+    fresh = _get_cached(cache_key, _MODEL_INFO_TTL)
+    if fresh:
+        return fresh
+
+    def _refresh():
+        try:
+            return _fetch_model_info(model_path)
+        except Exception as exc:
+            return {"error": str(exc), "model": model_path}
+
+    stale = _get_stale(cache_key)
+    if stale:
+        with _MODEL_INFO_INFLIGHT_LOCK:
+            already = model_path in _MODEL_INFO_INFLIGHT
+            if not already:
+                _MODEL_INFO_INFLIGHT.add(model_path)
+        if not already:
+            def _bg():
+                try:
+                    data = _refresh()
+                    if data and not data.get("error"):
+                        _set_cached(cache_key, data)
+                finally:
+                    with _MODEL_INFO_INFLIGHT_LOCK:
+                        _MODEL_INFO_INFLIGHT.discard(model_path)
+            threading.Thread(target=_bg, daemon=True).start()
+        return stale
+
+    try:
+        data = _fetch_model_info(model_path)
         _set_cached(cache_key, data)
         return data
     except Exception as exc:

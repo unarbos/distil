@@ -225,6 +225,12 @@ def main():
     else:
         out["is_king"] = True
         out_name = OUT_NAME or f"uid_{king_uid}.json"
+    # Always write with a .json extension. The dashboard's state-store
+    # reader filters by *.json (api/state_store.py::benchmarks); a file
+    # without the extension is silently ignored. Caused real bench
+    # results to vanish from /api/benchmarks until renamed.
+    if not out_name.endswith(".json"):
+        out_name += ".json"
     out_path = DASHBOARD_DIR / out_name
     out_path.write_text(json.dumps(out, indent=2))
     try:

@@ -107,6 +107,8 @@ export interface MinerEntry {
   latestH2hKl: number | null;
   /** Latest/known composite worst-axis score, higher is better */
   compositeWorst: number | null;
+  /** Latest/known composite weighted-mean score (Σ wᵢ·axisᵢ / Σ wᵢ) */
+  compositeWeighted: number | null;
   /** Axis currently limiting composite.worst */
   limitingAxis: string | null;
 }
@@ -449,6 +451,8 @@ export function buildMinerList(
     const h2hRow = uidToH2h.get(uid);
     const compAxes = h2hRow?.composite?.axes || {};
     const compositeWorst = typeof h2hRow?.composite?.worst === "number" ? h2hRow.composite.worst : null;
+    const compositeWeighted =
+      typeof h2hRow?.composite?.weighted === "number" ? h2hRow.composite.weighted : null;
     const limitingAxis = compositeWorst == null
       ? null
       : Object.entries(compAxes).reduce<string | null>((best, [axis, value]) => {
@@ -478,6 +482,7 @@ export function buildMinerList(
       totalPositions,
       latestH2hKl: typeof h2hRow?.kl === "number" ? h2hRow.kl : null,
       compositeWorst,
+      compositeWeighted,
       limitingAxis,
     });
   }

@@ -7,6 +7,10 @@
 
 ---
 
+> **⚠️ Historical document — superseded.** This paper analyses a 2026-04-12 era when SN97 scored miners on **KL alone**. It documented a positive correlation between lower KL and better held-out benchmarks at the time. That correlation **broke down** five days later: on 2026-04-17, the KL-only ranking crowned UID 107 (`gtensorapp/prime-dusk-4260`), whose 4B student looped indefinitely on `"Hi"` (4096-token cap, 102× repetition of a 6-word phrase) and was *strictly worse than the unfine-tuned 4B base on 5/5 reasoning benchmarks*. The diagnosis is in [`off_policy_cot_collapse.md`](off_policy_cot_collapse.md). The fix — a 17-axis composite where KL is 0.15 of the relative tier and `composite.worst` is the gate — is in [`mechanism_hardening.md`](mechanism_hardening.md), [`composite.py`](../scripts/validator/composite.py), and the production v28 schema. Read this paper for the historical record; do **not** read it as a guide to current SN97 mining.
+
+---
+
 ## Abstract
 
 Bittensor Subnet 97 (Distil) incentivizes miners to distill Qwen3.5-35B-A3B into compact student models (≤5.25B params), scored purely on KL divergence from the teacher. A fundamental question emerges: **does optimizing for lower KL divergence actually produce a better model, or just a more faithful token-distribution mimic?**

@@ -69,14 +69,14 @@ export function ScoreTrend({ history }: ScoreTrendProps) {
     >
       <div className="flex items-center justify-between mb-1">
         <h3 className="text-xs font-mono text-muted-foreground/70 uppercase tracking-wider">
-          Best Score Over Time
+          KL axis · best per round
         </h3>
         <span className="text-[10px] text-muted-foreground/40 font-mono">
           {history.length} eval{history.length !== 1 ? "s" : ""}
         </span>
       </div>
       <p className="text-[10px] text-muted-foreground/40 mb-3 leading-relaxed">
-        KL scores vary between evaluations due to different random prompts. Increases don&apos;t indicate worse performance — the king and challenger are always compared on the same prompts in each round.
+        This chart shows the KL axis only — <strong>one of 17 axes</strong> in the composite. KL is not the ranking key; <code>composite.worst</code> is. KL also varies between rounds due to different random prompts; increases don&apos;t indicate worse performance.
       </p>
       <div className="flex items-start gap-2 mb-3 px-2 py-1.5 rounded-md bg-amber-500/5 border border-amber-500/10">
         <span className="text-amber-500/70 text-[10px] mt-px">ℹ️</span>
@@ -113,7 +113,7 @@ export function ScoreTrend({ history }: ScoreTrendProps) {
               labelStyle={{ color: "hsl(0 0% 60%)", fontSize: "10px" }}
               formatter={(value: unknown) => [
                 typeof value === "number" ? value.toFixed(6) : String(value ?? ""),
-                "Best KL",
+                "KL axis (best)",
               ]}
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               labelFormatter={(label: any, payload: any) => {
@@ -139,7 +139,7 @@ export function ScoreTrend({ history }: ScoreTrendProps) {
             <Line
               type="monotone"
               dataKey="bestKl"
-              name="Best KL"
+              name="KL axis (best)"
               stroke={KING_COLOR}
               strokeWidth={2.5}
               dot={{ r: 3, fill: KING_COLOR }}

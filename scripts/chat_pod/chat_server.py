@@ -229,16 +229,26 @@ def write_health(status: str = "starting"):
 
 def exec_vllm():
     write_health()
+    # Chat-king coexists with the validator's eval workload on the same GPU
+    # most of the time. ``pod_eval.py`` claims ~0.90 of the H200 during
+    # rounds, so a 0.90 chat slice would OOM the second vLLM to come up
+    # (whichever loses the race). Default to a slim slice that comfortably
+    # fits a 4B model + KV cache (~18GB) and tune via env if a future king
+    # is bigger or the eval pod gets a smaller card. Same for max_model_len:
+    # chat.arbos.life rarely needs > 8K context, and the long ceiling kept
+    # forcing vLLM to pre-allocate KV cache it never used.
+    gpu_util = os.environ.get("CHAT_VLLM_GPU_UTIL", "0.15")
+    max_model_len = os.environ.get("CHAT_VLLM_MAX_MODEL_LEN", "8192")
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", str(MODEL_DIR),
         "--port", str(PORT),
         "--host", "0.0.0.0",
         "--dtype", "bfloat16",
-        "--max-model-len", "32768",
+        "--max-model-len", str(max_model_len),
         "--trust-remote-code",
         "--served-model-name", SERVED_NAME,
-        "--gpu-memory-utilization", "0.90",
+        "--gpu-memory-utilization", str(gpu_util),
         "--enforce-eager",
         "--enable-auto-tool-choice",
         "--tool-call-parser", "hermes",
@@ -246,7 +256,7 @@ def exec_vllm():
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
         "--skip-mm-profiling",
     ]
-    log("exec vLLM")
+    log(f"exec vLLM (gpu_util={gpu_util}, max_model_len={max_model_len})")
     os.execvp(cmd[0], cmd)
 
 

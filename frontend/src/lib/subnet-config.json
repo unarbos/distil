@@ -15,7 +15,7 @@
     "maxPromptTokens": 1024,
     "evalPromptsFull": 60,
     "evalPromptsH2h": 300,
-    "vllmConcurrency": 32,
+    "vllmConcurrency": 48,
     "epsilon": 0.03,
     "pairedTestAlpha": 0.03,
     "staleH2hEpochs": 50,

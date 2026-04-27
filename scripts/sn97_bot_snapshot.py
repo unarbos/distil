@@ -17,6 +17,7 @@ LIUM_ENV_FILE = "/home/distil/.secrets/distil.env"
 WORKSPACE = Path("/root/.openclaw/agents/sn97-bot/workspace")
 OUT = WORKSPACE / "LIVE_STATUS.md"
 JSON_OUT = WORKSPACE / "LIVE_STATUS.json"
+EVAL_LOG_OUT = WORKSPACE / "LIVE_EVAL_LOG.md"
 MIRROR = WORKSPACE / "mirror"
 MIRROR_STATE = MIRROR / "state"
 MIRROR_CODE = MIRROR / "code"
@@ -106,6 +107,20 @@ SECRET_PATTERNS = [
     (re.compile(r"\b(5[A-HJ-NP-Z1-9]{47,48})\b"), "SS58_ADDR"),
 ]
 
+SENSITIVE_JSON_KEYS = {
+    "hotkey",
+    "coldkey",
+    "wallet",
+    "wallet_name",
+    "wallet_path",
+    "lium_api_key",
+    "hf_token",
+    "token",
+    "secret",
+    "password",
+    "api_key",
+}
+
 
 def redact_text(text, max_hex=False):
     if not isinstance(text, str):
@@ -113,8 +128,6 @@ def redact_text(text, max_hex=False):
     out = text
     for pat, label in SECRET_PATTERNS:
         if label == "HEX_BLOB" and not max_hex:
-            continue
-        if label == "SS58_ADDR":
             continue
         if label == "ENV_SECRET":
             out = pat.sub(lambda m: f"{m.group(1)}<REDACTED_{label}>{m.group(3)}", out)
@@ -129,8 +142,28 @@ def redact_value(v, max_hex=False):
     if isinstance(v, list):
         return [redact_value(x, max_hex=max_hex) for x in v]
     if isinstance(v, dict):
-        return {k: redact_value(x, max_hex=max_hex) for k, x in v.items()}
+        clean = {}
+        for k, x in v.items():
+            key_l = str(k).lower()
+            if key_l in SENSITIVE_JSON_KEYS or any(s in key_l for s in ("token", "secret", "password", "private_key")):
+                clean[k] = "<REDACTED_FIELD>"
+            else:
+                clean[k] = redact_value(x, max_hex=max_hex)
+        return clean
     return v
+
+
+def _display_path(value):
+    """Keep pod evidence useful without exposing exact filesystem layout."""
+    if not value:
+        return "—"
+    try:
+        text = str(value).rstrip("/")
+        if not text:
+            return "—"
+        return Path(text).name or "present"
+    except Exception:
+        return "present"
 
 
 def get(path, timeout=5):
@@ -453,6 +486,149 @@ snapshot = redact_value(trimmed)
 JSON_OUT.parent.mkdir(parents=True, exist_ok=True)
 JSON_OUT.write_text(json.dumps(snapshot, indent=2, default=str)[:200000])
 
+
+def _short_json(obj, max_chars=5000):
+    try:
+        text = json.dumps(redact_value(obj), indent=2, default=str)
+    except Exception:
+        text = redact_text(str(obj))
+    return text[:max_chars]
+
+
+eval_log_lines = [
+    "# Live Eval Log (auto-updated)",
+    "",
+    f"**Generated:** {now_iso}",
+    "**Freshness:** Auto-refreshes every 60s with `sn97-bot-snapshot.timer`; if older than 3 minutes, treat as stale.",
+    "",
+    "Use this file for Discord questions about the live evaluation path, progress, stalls, and recent validator errors. It is a sanitized snapshot, not raw private infrastructure access.",
+    "",
+]
+
+cr_for_eval_log = {}
+if isinstance(overview, dict) and isinstance(overview.get("current_round"), dict):
+    cr_for_eval_log = overview["current_round"]
+
+pod_eval_meta = {}
+if isinstance(cr_for_eval_log, dict) and isinstance(cr_for_eval_log.get("pod_eval"), dict):
+    pod_eval_meta = dict(cr_for_eval_log["pod_eval"])
+
+ep_for_log = eval_progress if isinstance(eval_progress, dict) else {}
+eval_log_lines.extend([
+    "## Progress",
+    "",
+    f"- **Active:** {bool(ep_for_log.get('active'))}",
+    f"- **Phase:** `{ep_for_log.get('phase')}`",
+    f"- **Students:** {ep_for_log.get('students_done')}/{ep_for_log.get('students_total')}",
+    f"- **Current:** `{ep_for_log.get('current_student') or ((ep_for_log.get('pod') or {}).get('current') or {}).get('student_name') if isinstance((ep_for_log.get('pod') or {}).get('current'), dict) else ep_for_log.get('current_student')}`",
+    f"- **Current prompt:** {ep_for_log.get('current_prompt')}",
+    f"- **Current KL:** {ep_for_log.get('current_kl')}",
+    "",
+])
+
+completed = []
+pod_progress = ep_for_log.get("pod") if isinstance(ep_for_log.get("pod"), dict) else {}
+if isinstance(pod_progress.get("completed"), list):
+    completed = pod_progress["completed"]
+elif isinstance(ep_for_log.get("completed"), list):
+    completed = ep_for_log["completed"]
+if completed:
+    eval_log_lines.extend(["## Students Completed This Run", ""])
+    for c in completed[-12:]:
+        if not isinstance(c, dict):
+            continue
+        eval_log_lines.append(
+            f"- `{c.get('student_name')}` — status={c.get('status')} KL={c.get('kl')} prompts={c.get('prompts_scored')}/{c.get('prompts_total')}"
+        )
+    eval_log_lines.append("")
+
+eval_log_lines.extend([
+    "## Pod Eval Metadata",
+    "",
+])
+if pod_eval_meta:
+    for key in ("run_dir", "progress_remote", "results_remote", "log_remote", "done_marker_remote", "started_at"):
+        val = pod_eval_meta.get(key)
+        if val is not None:
+            if key.endswith("_remote") or key == "run_dir":
+                eval_log_lines.append(f"- **{key}:** `{_display_path(val)}`")
+            else:
+                eval_log_lines.append(f"- **{key}:** `{redact_text(str(val))}`")
+else:
+    eval_log_lines.append("- No persisted `current_round.pod_eval` metadata found.")
+eval_log_lines.append("")
+
+eval_log_lines.extend([
+    "## Direct Pod Snapshot",
+    "",
+    f"- **Reachable:** {pod_live.get('reachable')}",
+    f"- **Run dir:** `{_display_path(pod_live.get('run_dir'))}`",
+    f"- **Phase:** `{pod_live.get('phase')}`",
+    f"- **PID:** `{pod_live.get('pid_state')}`",
+    f"- **Done marker:** `{pod_live.get('done_marker')}`",
+    f"- **GPU:** `{pod_live.get('gpu')}`",
+    f"- **Disk:** `{pod_live.get('disk')}`",
+    f"- **pod_eval/vLLM procs:** {pod_live.get('procs_count')}",
+    "",
+])
+
+if pod_live.get("log_tail"):
+    eval_log_lines.extend([
+        "## Pod `eval_output.log` Tail",
+        "",
+        "```",
+        redact_text(str(pod_live["log_tail"]))[-4000:],
+        "```",
+        "",
+    ])
+else:
+    eval_log_lines.extend([
+        "## Pod `eval_output.log` Tail",
+        "",
+        "Direct pod log tail is not available in this snapshot. Use the Progress, Pod Eval Metadata, and Validator Journal sections instead; do not invent pod-log evidence.",
+        "",
+    ])
+
+if journal_validator:
+    eval_log_lines.extend([
+        "## Validator Journal Tail",
+        "",
+        "```",
+    ])
+    eval_log_lines.extend(ln[:500] for ln in journal_validator[-25:])
+    eval_log_lines.extend(["```", ""])
+
+recent_events_for_log = events.get("entries") if isinstance(events, dict) else []
+if recent_events_for_log:
+    eval_log_lines.extend(["## Recent Validator Events", ""])
+    for e in recent_events_for_log[-15:]:
+        if not isinstance(e, dict):
+            continue
+        eval_log_lines.append(f"- `{fmt_age(e.get('ts'))}` {(e.get('level') or 'info').upper()}: {redact_text(str(e.get('msg') or ''))}")
+    eval_log_lines.append("")
+
+recent_errors_for_log = errors.get("entries") if isinstance(errors, dict) else []
+if recent_errors_for_log:
+    eval_log_lines.extend(["## Recent Errors", ""])
+    for e in recent_errors_for_log[-10:]:
+        if not isinstance(e, dict):
+            continue
+        eval_log_lines.append(f"- `{fmt_age(e.get('ts'))}` {redact_text(str(e.get('msg') or ''))}")
+    eval_log_lines.append("")
+
+eval_log_lines.extend([
+    "## Answering Rules",
+    "",
+    "- For live eval questions, read this file first, then `LIVE_STATUS.md` if needed.",
+    "- If Direct Pod Snapshot is unreachable, say that explicitly and rely only on API progress / validator journal evidence.",
+    "- Do not expose raw server IPs, tokens, environment paths, or private keys. The contents here are already sanitized, but keep answers concise.",
+    "- Do not paste raw `mirror/state/*.json`; summarize the relevant fields in plain English.",
+    "- Do not claim a deployment or fix is live unless it appears in this file, `LIVE_STATUS.md`, or a verified GitHub commit.",
+    "",
+])
+
+EVAL_LOG_OUT.write_text(redact_text("\n".join(eval_log_lines)))
+
 clean_mirror()
 MIRROR_STATE.mkdir(parents=True, exist_ok=True)
 MIRROR_CODE.mkdir(parents=True, exist_ok=True)
@@ -613,7 +789,7 @@ lines.append("")
 lines.append("## Pod Live Snapshot (direct SSH)")
 lines.append("")
 lines.append(f"- **Reachable:** {pl.get('reachable')}")
-lines.append(f"- **Run dir:** `{pl.get('run_dir') or '—'}`")
+lines.append(f"- **Run dir:** `{_display_path(pl.get('run_dir'))}`")
 lines.append(f"- **Phase:** `{phase}`")
 lines.append(f"- **PID alive:** `{pl.get('pid_state')}`  |  **Done marker:** `{pl.get('done_marker')}`")
 lines.append(f"- **GPU:** `{pl.get('gpu')}`")
@@ -821,7 +997,13 @@ OUT.write_text(final_md)
 try:
     os.chmod(OUT, 0o644)
     os.chmod(JSON_OUT, 0o644)
+    os.chmod(EVAL_LOG_OUT, 0o644)
 except Exception:
     pass
 
-print(f"wrote {OUT} ({len(OUT.read_text())}B), {JSON_OUT} ({len(JSON_OUT.read_text())}B), mirror: {state_count} state + {code_count} code files")
+print(
+    f"wrote {OUT} ({len(OUT.read_text())}B), "
+    f"{JSON_OUT} ({len(JSON_OUT.read_text())}B), "
+    f"{EVAL_LOG_OUT} ({len(EVAL_LOG_OUT.read_text())}B), "
+    f"mirror: {state_count} state + {code_count} code files"
+)

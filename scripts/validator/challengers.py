@@ -5,6 +5,7 @@ from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 from scripts.validator import single_eval as single_eval_mod
+from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
 from scripts.validator.single_eval import (
     bootstrap_composite_from_h2h,
     evict_stale_evaluated_uids,
@@ -75,6 +76,43 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
     if is_single_eval_mode():
         evict_stale_evaluated_uids(state, valid_models)
         challengers = {}
+        # Force-eligible UIDs:
+        #
+        #   - The current king ALWAYS gets force-eligible (2026-04-27).
+        #     Even with procedural per-round bench items the king's
+        #     stored composite came from a different prompt sample than
+        #     this round's challengers, so worst-axis comparison is
+        #     cross-sample. SE on bench axes with n=8-12 binomial items
+        #     is ~0.14, which is bigger than the dethrone margin.
+        #     Re-evaluating the king on the same prompts as challengers
+        #     restores paired evaluation. (Discord 2026-04-27, coffieex
+        #     +crypsick: "the variance is extreme across shards".)
+        #
+        #   - Historically: also re-eval'd on schema bumps. Now
+        #     redundant because we re-eval every round, but the
+        #     code path still works as a safety net if king-in-round
+        #     ever gets disabled.
+        force_eligible: set[str] = set()
+        if king_uid is not None:
+            king_record = (state.composite_scores or {}).get(str(king_uid))
+            force_eligible.add(str(king_uid))
+            if isinstance(king_record, dict):
+                try:
+                    king_version = int(king_record.get("version") or 0)
+                except (TypeError, ValueError):
+                    king_version = 0
+                if king_version < int(COMPOSITE_SHADOW_VERSION):
+                    logger.info(
+                        f"single-eval: forcing king UID {king_uid} re-eval "
+                        f"(stored composite version {king_version} < "
+                        f"current schema {COMPOSITE_SHADOW_VERSION}); ensures "
+                        f"like-for-like comparison against challengers."
+                    )
+                else:
+                    logger.info(
+                        f"single-eval: king UID {king_uid} included in "
+                        f"this round (paired re-eval on shared prompts)."
+                    )
         for uid, info in valid_models.items():
             uid_str = str(uid)
             model_name = info["model"]
@@ -83,7 +121,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             if model_name in state.permanently_bad_models:
                 state.evaluated_uids.add(uid_str)
                 continue
-            if uid_str in state.composite_scores:
+            if uid_str in state.composite_scores and uid_str not in force_eligible:
                 continue
             # Strict no-re-eval: a UID in evaluated_uids has been through a
             # full round once already. Even if its score row got dropped
@@ -94,7 +132,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             # both ``evaluated_uids`` AND ``scores`` to be set, which let
             # historical UIDs sneak back into the queue when state was
             # partially rebuilt.
-            if uid_str in state.evaluated_uids:
+            if uid_str in state.evaluated_uids and uid_str not in force_eligible:
                 continue
             challengers[uid] = info
         # FIFO cap: oldest commitment first. Without this the planner
@@ -122,9 +160,12 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             )
             challengers = kept
         if challengers:
+            n_king = 1 if (king_uid is not None and str(king_uid) in {str(u) for u in challengers}) else 0
+            n_others = len(challengers) - n_king
             logger.info(
-                f"single-eval: {len(challengers)} new commitment(s) to evaluate "
-                f"(no king re-eval, no top-N rotation, no dormant rotation)"
+                f"single-eval: {n_others} new commitment(s) to evaluate"
+                + (" + king (paired re-eval, 2026-04-27 fairness fix)" if n_king else "")
+                + " (no top-N rotation, no dormant rotation)"
             )
         else:
             logger.info(

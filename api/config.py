@@ -38,7 +38,7 @@ Public API for [Distil]({DASHBOARD_URL}), a Bittensor subnet where miners compet
 
 ## How It Works
 
-Miners submit distilled models and a validator evaluates them head-to-head against the reigning **king** model using KL-divergence on shared prompts. Lower KL = better distillation = higher rewards.
+Miners submit distilled models and a validator scores each commitment on a **17-axis composite** (`scripts/validator/composite.py`) covering distribution match (KL, on-policy RKL, capability, length, degeneracy), absolute capability vs ground truth (math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness), conversational quality (judge-probe, chat-turns), and generation discipline (reasoning-density). The king is whoever has the highest `composite.worst` — the lowest score across the 17 axes. KL is one of the 17 axes, not the gate.
 
 ## Quick Start
 

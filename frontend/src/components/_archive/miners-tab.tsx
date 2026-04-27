@@ -67,7 +67,7 @@ export function MinersTab({
   if (sortBy === "newest") {
     filtered = [...filtered].sort((a, b) => b.commitBlock - a.commitBlock);
   }
-  // "score" sort is the default from buildMinerList (DQ last, then by KL)
+  // "score" sort is the default from buildMinerList (DQ last, then live composite, then KL)
 
   return (
     <div className="space-y-3">
@@ -125,12 +125,12 @@ export function MinersTab({
           <span className="text-amber-400/60 text-[11px] mt-px">ℹ️</span>
           <div className="text-[10px] font-mono text-muted-foreground/50 space-y-1">
             <p>
-              <span className="text-yellow-400/80 font-semibold">H2H Score</span>
-              {" "}— Head-to-head KL on the <em>same prompts</em> as the king. This is the fair comparison used to determine the king.
+              <span className="text-blue-400/80 font-semibold">Composite worst</span>
+              {" "}— the lowest score across all 17 axes (math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness, on-policy RKL, KL, capability, judge, chat-turns, length, degeneracy, reasoning-density). <strong className="text-amber-300/80">This is the ranking key.</strong>
             </p>
             <p>
-              <span className="text-blue-400/80 font-semibold">Global Score</span>
-              {" "}— KL from the last global eval using <em>different random prompts</em>. These vary between rounds and are <strong>not directly comparable</strong> across models.
+              <span className="text-yellow-400/80 font-semibold">H2H KL</span>
+              {" "}— forward-KL on teacher continuations under the same prompts. <em>One axis among 17</em>; useful for sanity-checking distillation, never the gate. A model that wins KL but loses on grade-school math cannot take the crown.
             </p>
           </div>
         </div>
@@ -287,16 +287,26 @@ export function MinersTab({
                   <div className="shrink-0 text-right">
                     {miner.isDisqualified ? (
                       <span className="font-mono text-sm text-red-400/30">—</span>
-                    ) : miner.klScore != null ? (
+                    ) : miner.compositeWorst != null || miner.klScore != null ? (
                       <div>
                         <span className={`font-mono text-base font-bold tabular-nums ${
                           miner.isWinner ? "text-yellow-400" : "text-foreground/80"
                         }`}>
-                          {miner.klScore.toFixed(4)}
+                          {miner.compositeWorst != null ? miner.compositeWorst.toFixed(3) : miner.klScore?.toFixed(4)}
                         </span>
                         <div className="text-[9px] text-blue-400/50 font-mono">
-                          Global
+                          {miner.compositeWorst != null ? "Composite" : "Global KL"}
                         </div>
+                        {miner.limitingAxis && (
+                          <div className="text-[9px] text-amber-400/50 font-mono max-w-[90px] truncate" title={`limiting axis: ${miner.limitingAxis}`}>
+                            min: {miner.limitingAxis}
+                          </div>
+                        )}
+                        {miner.latestH2hKl != null && (
+                          <div className="text-[9px] text-muted-foreground/40 font-mono">
+                            H2H KL {miner.latestH2hKl.toFixed(4)}
+                          </div>
+                        )}
                         {miner.ci95 && (
                           <div className="text-[9px] text-muted-foreground/40 font-mono">
                             [{Number.isFinite(miner.ci95[0]) ? miner.ci95[0].toFixed(3) : "?"},{Number.isFinite(miner.ci95[1]) ? miner.ci95[1].toFixed(3) : "?"}]

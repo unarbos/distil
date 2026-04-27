@@ -33,8 +33,23 @@ from state_store import (
 router = APIRouter()
 
 
+def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | None, dq: dict):
+    uid_str = str(uid)
+    commit_block = commitment.get("block") if isinstance(commitment, dict) else None
+    if commit_block is not None and hotkey:
+        reason = dq.get(f"{hotkey}:{commit_block}")
+        if reason is not None:
+            return reason
+    if commit_block is None:
+        if uid_str in dq:
+            return dq.get(uid_str)
+        if hotkey and hotkey in dq:
+            return dq.get(hotkey)
+    return None
+
+
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Returns the top-4 leaderboard - current king and contenders. Dethronement uses paired t-test (p < 0.05).")
+         description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE the king is selected cross-round from `state/composite_scores.json` by highest `composite.worst` (then `composite.weighted` as a tiebreaker at the saturated floor); a challenger dethrones only when its worst beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired.")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
@@ -55,6 +70,12 @@ def get_leaderboard():
         comp = r.get("composite")
         if uid is not None and comp:
             uid_to_composite[uid] = comp
+
+    # Cross-round composite cache (single source of truth for the king under
+    # SINGLE_EVAL_MODE, since the king is rarely a row in the latest H2H
+    # results). Surfacing it on the leaderboard answers the recurring
+    # "stop hiding wavg/axis breakdown" Discord complaint.
+    composite_scores_cache = read_state("composite_scores.json", {})
 
     def _enrich(entry):
         """Fill in model name, KL, and composite breakdown from live state."""
@@ -77,8 +98,13 @@ def get_leaderboard():
         if cum and isinstance(cum, dict):
             entry["cumulative_score"] = cum.get("cumulative_kl_diff")
             entry["cumulative_rounds"] = cum.get("rounds")
-        # Composite axes (shadow — will become canonical after T2.1).
+        # Composite axes — prefer the latest round (current prompts) and fall
+        # back to the cross-round cache so the king's panel is never empty.
         comp = uid_to_composite.get(uid)
+        if not comp:
+            cached = composite_scores_cache.get(str(uid))
+            if isinstance(cached, dict) and cached.get("axes"):
+                comp = cached
         if comp:
             entry["composite"] = {
                 "worst": comp.get("worst"),
@@ -86,6 +112,7 @@ def get_leaderboard():
                 "axes": comp.get("axes", {}),
                 "present_count": comp.get("present_count"),
                 "version": comp.get("version"),
+                "broken_axes": comp.get("broken_axes", []),
             }
         return entry
 
@@ -529,6 +556,9 @@ Statuses: king, queued, tested, stale, untested, disqualified.""")
 def get_eval_status():
     scores_data = scores()
     dq = read_state("disqualified.json", {})
+    uid_map = uid_hotkey_map()
+    commitments_data = _get_stale("commitments") or {}
+    commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
     h2h_tracker = h2h_tested_against_king()
     latest = h2h_latest()
     current_king_uid = latest.get("king_uid")
@@ -536,10 +566,14 @@ def get_eval_status():
 
     result = {}
     for uid_str in scores_data:
-        if uid_str in dq:
-            result[uid_str] = {"status": "disqualified"}
+        uid = int(uid_str)
+        hotkey = uid_map.get(uid_str)
+        commitment = commitments.get(hotkey) if hotkey else None
+        dq_reason = _dq_reason_for_commitment(uid, hotkey, commitment, dq)
+        if dq_reason is not None:
+            result[uid_str] = {"status": "disqualified", "reason": dq_reason}
             continue
-        if current_king_uid is not None and int(uid_str) == current_king_uid:
+        if current_king_uid is not None and uid == current_king_uid:
             result[uid_str] = {"status": "king"}
             continue
         tracker_entry = h2h_tracker.get(uid_str, {})

@@ -211,7 +211,7 @@ export function DashboardTabs({
 
       {scoreToBeat != null && activeTab === "miners" && (
         <p className="text-[11px] text-muted-foreground/60 px-2">
-          Score-to-beat: KL &lt; {scoreToBeat.toFixed(6)} (king × {SCORE_TO_BEAT_FACTOR}).
+          Composite-worst is the ranking key (1 of 17 axes is KL). Dethrone gate: challenger.worst &gt; king.worst × {(1 + (1 - SCORE_TO_BEAT_FACTOR)).toFixed(2)}.
         </p>
       )}
     </div>

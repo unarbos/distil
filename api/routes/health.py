@@ -84,7 +84,8 @@ def root():
 
 Response includes:
 - `status`: `ok` if the API is running
-- `king_uid` / `king_kl`: Current king and their KL score (lower = better)
+- `king_uid`: Current king (highest `composite.worst` across the 17 weighted axes)
+- `king_kl`: King's KL axis score — one of 17 axes, not the ranking key (kept for transparency)
 - `n_scored` / `n_disqualified`: Number of active vs disqualified miners
 - `last_eval_block` / `last_eval_age_min`: When the last eval happened
 - `eval_active`: Whether an evaluation round is in progress right now

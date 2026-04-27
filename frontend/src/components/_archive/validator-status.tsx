@@ -140,7 +140,12 @@ export function ValidatorStatus({
                 </span>
               )}
               {health?.king_kl != null && (
-                <span className="text-muted-foreground/40">KL {formatFixed(health.king_kl, 4)}</span>
+                <span
+                  className="text-muted-foreground/40"
+                  title="KL is one axis of 17 in the composite. Ranking key is composite.worst."
+                >
+                  KL {formatFixed(health.king_kl, 4)} <span className="opacity-60">(1/17)</span>
+                </span>
               )}
             </div>
           )}
@@ -170,8 +175,11 @@ export function ValidatorStatus({
               </span>
             )}
             {progress.current_kl != null && (
-              <span className="text-foreground/70">
-                KL {formatFixed(progress.current_kl, 4)}
+              <span
+                className="text-foreground/70"
+                title="Live KL axis — one of 17. Composite.worst is the ranking key."
+              >
+                KL axis {formatFixed(progress.current_kl, 4)}
               </span>
             )}
             {progress.current_best != null && (

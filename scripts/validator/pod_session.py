@@ -164,13 +164,65 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             #   3. fall back on nvidia-smi: if anything is still holding the GPU
             #      and it looks like a vllm/python worker, nuke it.
             pod.exec(
-                "pkill -9 -f pod_eval 2>/dev/null; "
-                "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
-                "pkill -9 -f 'VllmWorker' 2>/dev/null; "
-                "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
-                "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "  # match comm (15-char trunc)
+                # Build a deny-list of PIDs we MUST NOT kill: the chat-king
+                # vLLM (chat_server.py + vllm.entrypoints --served-model-name
+                # sn97-king on port 8100) and its descendants. Pre-2026-04-26
+                # this cleanup blanket-killed every vllm.entrypoints process,
+                # which is why chat.arbos.life went dark for ~30 minutes
+                # every round. The chat-king and the eval-teacher coexist on
+                # the same H200; eval-teacher is on port 9100 and uses
+                # served-model-name "teacher", so the deny-list is precise.
+                "preserve=''; "
+                # Only one chat-king vLLM should be alive at any time. The
+                # process that's actually bound to port 8100 is the live
+                # server; any other process matching 'served-model-name
+                # sn97-king' is a leaked duplicate (we observed 2 leaked
+                # workers holding 22.8 GB each on 2026-04-27, causing
+                # vLLM teacher startup to fall back to HF for ~80 minutes
+                # of sequential generation). Find the live PID via
+                # `ss -tlnp` and ONLY preserve its tree.
+                # ss output sample: 'users:((\"python3\",pid=107196,fd=...\")'
+                "live_chat_pid=$(ss -tlnp 'sport = :8100' 2>/dev/null "
+                "  | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2); "
+                "if [ -n \"$live_chat_pid\" ]; then "
+                "  preserve=\"$live_chat_pid\"; "
+                "  for desc in $(pgrep -P $live_chat_pid 2>/dev/null); do "
+                "    preserve=\"$preserve $desc\"; "
+                "    for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                "  done; "
+                "  # also keep the chat_server.py supervisor if any\n"
+                "  for pid in $(pgrep -f 'chat_server.py' 2>/dev/null); do "
+                "    preserve=\"$preserve $pid\"; "
+                "    for desc in $(pgrep -P $pid 2>/dev/null); do preserve=\"$preserve $desc\"; done; "
+                "  done; "
+                "fi; "
+                # If no live chat server (chat is dark), fall back to the
+                # broad include-all behaviour so we don't accidentally
+                # nuke a starting/restarting chat process.
+                "if [ -z \"$preserve\" ]; then "
+                "  for pid in $(pgrep -f 'chat_server.py' 2>/dev/null) "
+                "               $(pgrep -f 'served-model-name sn97-king' 2>/dev/null) "
+                "               $(pgrep -f 'port 8100' 2>/dev/null); do "
+                "    preserve=\"$preserve $pid\"; "
+                "    for desc in $(pgrep -P $pid 2>/dev/null); do "
+                "      preserve=\"$preserve $desc\"; "
+                "      for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                "    done; "
+                "  done; "
+                "fi; "
+                "kill_unless_chat() { "
+                "  for pid in \"$@\"; do "
+                "    case \" $preserve \" in (*\" $pid \"*) ;; (*) kill -9 $pid 2>/dev/null ;; esac; "
+                "  done; "
+                "}; "
+                "kill_unless_chat $(pgrep -f pod_eval 2>/dev/null); "
+                "kill_unless_chat $(pgrep -f 'vllm.entrypoints' 2>/dev/null); "
+                "kill_unless_chat $(pgrep -f 'VllmWorker' 2>/dev/null); "
+                "kill_unless_chat $(pgrep -f 'VLLM::EngineCore' 2>/dev/null); "
+                "kill_unless_chat $(pgrep -x 'VLLM::EngineCor' 2>/dev/null); "  # match comm (15-char trunc)
                 "sleep 2; "
                 "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+                "  case \" $preserve \" in (*\" $pid \"*) continue ;; esac; "
                 "  comm=$(cat /proc/$pid/comm 2>/dev/null); "
                 "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
                 "  case \"$cmd$comm\" in "
@@ -181,20 +233,25 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 "sleep 2; "
                 # Last-resort sweep: if GPU is still non-empty, something slipped
                 # through. Log the survivors so we can improve the patterns above.
+                # Survivors that match the preserve list are NOT killed — that
+                # would dark chat.arbos.life again.
                 "survivors=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
                 "if [ -n \"$survivors\" ]; then "
                 "  for pid in $survivors; do "
+                "    case \" $preserve \" in (*\" $pid \"*) continue ;; esac; "
                 "    echo \"[cleanup] gpu still held by pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 200)\" >&2; "
                 "    kill -9 $pid 2>/dev/null; "
                 "  done; "
                 "  sleep 2; "
                 "fi; "
-                "rm -rf /dev/shm/vllm* 2>/dev/null; "
+                # /dev/shm/vllm* is per-process; only safe to wipe when no
+                # vllm process survives. Skip if chat-king still holds a slot.
+                "if [ -z \"$preserve\" ]; then rm -rf /dev/shm/vllm* 2>/dev/null; fi; "
                 "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
                 "sleep 1",
                 timeout=40,
             )
-            logger.info("Killed existing eval/vllm processes and removed stale /home files")
+            logger.info("Killed existing eval/vllm processes (chat-king preserved) and removed stale /home files")
         except Exception as exc:
             logger.debug(f"Pre-eval cleanup: {exc}")
         try:
@@ -226,7 +283,31 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     king_flag = ""
     vllm_flag = " --no-vllm"
     if use_vllm:
-        vllm_flag = " --vllm-gpu-util 0.90"
+        # Eval shares the GPU with the chat-king vLLM. Two regimes:
+        #
+        #   1. Co-located chat-king (default today): chat-king *targets*
+        #      0.15 of GPU memory but in practice we've seen leaked
+        #      duplicate workers holding ~46 GB on a single H200
+        #      (2026-04-27 — two engine-core processes from earlier
+        #      chat-king restarts that weren't reaped). When the eval
+        #      teacher then asks for 0.78 of 139.8 GB (109 GB) it fails
+        #      with `Free memory ... is less than desired GPU memory
+        #      utilization`, falls back to HF, and the round takes 80
+        #      minutes of sequential generation instead of 5 minutes.
+        #      0.65 leaves headroom for ~50 GB of chat-king occupancy
+        #      (whether legit or leaked) without falling back.
+        #
+        #   2. Dedicated chat pod (recommended next step): use
+        #      ``scripts/provision_chat_pod.py`` to rent a small GPU
+        #      (RTX 4090 or H100) just for the chat king. Once chat is
+        #      on its own pod the eval pod has the whole GPU; bump
+        #      VLLM_EVAL_GPU_UTIL=0.92 in /home/distil/.secrets/distil.env
+        #      to unlock it. Eval rounds finish in ~30-45 min instead of
+        #      90+ min.
+        #
+        # Tune via VLLM_EVAL_GPU_UTIL.
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.65")
+        vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
     tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""
@@ -397,6 +478,15 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "POD_PER_MODEL_TIMEOUT",
         "ARENA_V3_AXES_IN_COMPOSITE",
         "REASONING_DENSITY_IN_COMPOSITE",
+        # 2026-04-26 — propagate validator-authoritative composite gates
+        # so the pod-side `pod_eval_vllm.py` reports `in_composite` /
+        # log labels that match what the validator will actually do
+        # downstream. Previously the pod read separate ``*_PROBE_IN_COMPOSITE``
+        # variables that defaulted to "0" while these axes defaulted to
+        # "1" in composite.py, so the eval log lied about whether axes
+        # were in production. See pod_eval_vllm.py JUDGE_PROBE_IN_COMPOSITE
+        # alignment patch.
+        "JUDGE_AXIS_IN_COMPOSITE",
         "CHAT_TURNS_AXIS_IN_COMPOSITE",
         "PARETO_DOMINANCE_GATE",
         "KING_REGRESSION_GATE",

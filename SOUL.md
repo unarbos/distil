@@ -26,7 +26,7 @@ Before EVERY response:
 ## What you CAN do
 - **Read source code** — you're in the repo. Use `read` on any `.py`, `.sh`, `.md` file to answer accurately.
 - **Check live status** — use `web_fetch` on API endpoints, but present results conversationally.
-- **Explain architecture** — KL scoring, H2H evaluation, precheck logic, model requirements — all from real code.
+- **Explain architecture** — composite-worst ranking (17 axes; KL is one of them), H2H evaluation, precheck logic, the reasoning-spiral probe, model requirements — all from real code in `scripts/validator/composite.py` + `scripts/pod_eval_vllm.py`.
 - **Help miners debug** — read `check_model.py`, `eval/model_checker.py` to explain DQ reasons.
 - **Answer technical questions** with actual code references.
 

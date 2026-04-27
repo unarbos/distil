@@ -229,13 +229,24 @@ class TestSession3Production(unittest.TestCase):
         self.assertEqual(comp["axes"]["truthful_bench"], 0.05)
 
     def test_truthful_bench_gates_worst_when_promoted(self):
-        """truthful_bench is in the worst-axis rule when Arena v3 is promoted."""
+        """truthful_bench gates worst when its weight is non-zero.
+
+        2026-04-26 (v28) — truthful_bench is muted to weight 0 by default
+        as part of the quality > quantity rebalance. The axis still
+        computes (so we can re-promote without a schema bump if the
+        signal turns out to matter) but it is excluded from
+        ``effective_weights`` and therefore from ``worst()``. We restore
+        a non-zero weight inside this test to verify the gating
+        machinery still works for any future re-promotion.
+        """
         import scripts.validator.composite as _c
         saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
         saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_truthful_w = _c.ARENA_V3_AXIS_WEIGHTS.get("truthful_bench", 0.0)
         try:
             _c.ARENA_V3_AXES_IN_COMPOSITE = True
             _c.BENCH_AXES_IN_COMPOSITE = True
+            _c.ARENA_V3_AXIS_WEIGHTS["truthful_bench"] = 0.03
             student = _make_student(bench={
                 "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
                 "knowledge_bench": 0.8, "ifeval_bench": 0.8,
@@ -252,6 +263,7 @@ class TestSession3Production(unittest.TestCase):
         finally:
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.ARENA_V3_AXIS_WEIGHTS["truthful_bench"] = saved_truthful_w
 
     def test_long_context_bench_is_v3_live_by_default(self):
         """long_context_bench (Session 3.5) follows live v3 semantics."""

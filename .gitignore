@@ -29,6 +29,9 @@ state/prompt_cache/
 knowledge/
 results/
 
+# Held-out evalscope reports — kept on disk for citation, not for tracking
+benchmark_results/
+
 # Next.js incremental build artifacts
 frontend/tsconfig.tsbuildinfo
 frontend/.next/
