@@ -7236,23 +7236,47 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
 
 
 def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural reasoning / multiple-choice items for reasoning_bench (v27).
+    """Procedural reasoning items for reasoning_bench (v29 — BBH rebalance).
 
-    Subtypes:
-      * ``boolean_eval``    — evaluate a small boolean expression
-      * ``ordering``        — pick the correct ordering of items by a rule
-      * ``deduction``       — small constraint-satisfaction with 3-4 entities
-      * ``sequence_next``   — guess the next term of a procedurally-generated sequence
-      * ``odd_one_out``     — pick the entry that violates a procedural rule
-      * ``analogy_letter``  — letter-arithmetic A→B :: C→? (Caesar shift)
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed
+    reasoning_bench saturating near 1.0 for trained miners while held-out
+    BBH (logical_deduction, web_of_lies, navigate, tracking_shuffled_*)
+    stays flat — same distribution-mismatch class as math/code v27→v29.
+    The v27 templates lean toward one-step lookups (sort by height,
+    sequence next term, Caesar shift). Optimising v27 teaches miners to
+    nail tiny-state arithmetic but doesn't transfer to BBH's multi-step
+    state tracking, temporal/spatial reasoning, and logical chains.
 
-    Items are emitted in BBH ``(A)/(B)/...`` MC format so the existing
-    ``_reasoning_extract_answer`` grader handles them unchanged.
+    v29 keeps the v27 templates as a difficulty floor (~30 %) and adds a
+    BBH-distribution-similar hard tier (~70 %, 4 new templates):
+
+      * ``date_arithmetic``     — date + Δdays (BBH date_understanding)
+      * ``web_of_lies``         — chained truth-teller/liar inference
+      * ``navigate_steps``      — directional path + final position query
+      * ``tracking_objects``    — N-person N-object swap state-tracking
+
+    Each hard template emits multi-step natural-language scenarios with
+    named entities and irrelevant numeric distractors so a model that
+    relies on a single key heuristic fails. All items emit the BBH
+    ``(A)/(B)/...`` MC format so ``_reasoning_extract_answer`` handles
+    them unchanged.
+
+    Procedural rotation per block_seed prevents memorisation; BBH
+    distribution similarity makes validator pass-rate predict held-out
+    BBH pass-rate (the v27 saturation gap broke that link).
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["reasoning"]) & 0xFFFFFFFF)
-    kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
-             "odd_one_out", "analogy_letter"]
+    hard_kinds = ["date_arithmetic", "web_of_lies", "navigate_steps", "tracking_objects"]
+    legacy_kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
+                    "odd_one_out", "analogy_letter"]
+    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_legacy = max(0, n_items - n_hard)
+    hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
+    legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
+    rng.shuffle(hard_pool)
+    rng.shuffle(legacy_pool)
+    kinds = hard_pool[:n_hard] + legacy_pool[:n_legacy]
     rng.shuffle(kinds)
     out: list[dict] = []
 
@@ -7413,7 +7437,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                     "Which one does not?"
                 )
             out.append(_mc(qtext, opts, gold_idx, "procedural_reasoning/odd_one_out"))
-        else:  # analogy_letter
+        elif kind == "analogy_letter":
             shift = r.randint(1, 12)
             a = r.choice("ABCDEFGHIJ")
             b = chr(((ord(a) - ord("A") + shift) % 26) + ord("A"))
@@ -7431,6 +7455,153 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             )
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/analogy_letter"))
+        # ── v29 hard tier (BBH-distribution-similar) ────────────────────
+        elif kind == "date_arithmetic":
+            from datetime import date, timedelta
+            year = r.choice([2023, 2024])
+            month = r.randint(1, 12)
+            day = r.randint(1, 28)
+            d0 = date(year, month, day)
+            direction = r.choice(["after", "before"])
+            delta = r.randint(7, 95)
+            if direction == "after":
+                target = d0 + timedelta(days=delta)
+            else:
+                target = d0 - timedelta(days=delta)
+            extra_age = r.randint(7, 73)  # noise distractor
+            extra_friend = r.choice(_PROC_NAMES) if "_PROC_NAMES" in globals() else "Sam"
+            qtext = (
+                f"Today is {d0.strftime('%B %-d, %Y')}. {extra_friend} is "
+                f"{extra_age} days old. What is the date {delta} days "
+                f"{direction} today? Answer in MM/DD/YYYY format."
+            )
+            ans = target.strftime("%m/%d/%Y")
+            distractors = []
+            for off in (-3, -1, 1, 3, 7):
+                d_alt = target + timedelta(days=off)
+                distractors.append(d_alt.strftime("%m/%d/%Y"))
+            distractors = list(dict.fromkeys(d for d in distractors if d != ans))
+            options = [ans] + distractors[:3]
+            r.shuffle(options)
+            gold_idx = options.index(ans)
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/date_arithmetic"))
+        elif kind == "web_of_lies":
+            n_chain = r.randint(3, 5)
+            people = r.sample(_PROC_NAMES if "_PROC_NAMES" in globals() else
+                              ["Alice", "Bob", "Charlie", "Dana", "Evan", "Faye", "Grace"],
+                              n_chain)
+            truth = [r.choice([True, False]) for _ in range(n_chain)]
+            statements = []
+            for i in range(1, n_chain):
+                claimed = truth[i]
+                if not truth[i - 1]:
+                    claimed = not claimed
+                verb = "tells the truth" if claimed else "lies"
+                statements.append(f"{people[i - 1]} says {people[i]} {verb}.")
+            base_truth = "tells the truth" if truth[0] else "lies"
+            preamble = f"{people[0]} {base_truth}."
+            target = people[-1]
+            target_truth = truth[-1]
+            distractor_n = r.randint(2, 9)
+            qtext = (
+                f"{preamble} {' '.join(statements)} A bystander mentions there "
+                f"are {distractor_n} people in the room (not relevant). Does "
+                f"{target} tell the truth?"
+            )
+            options = ["Yes", "No"]
+            r.shuffle(options)
+            gold_idx = options.index("Yes" if target_truth else "No")
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/web_of_lies"))
+        elif kind == "navigate_steps":
+            cardinals = ["north", "east", "south", "west"]
+            initial = r.choice(cardinals)
+            heading_idx = cardinals.index(initial)
+            x, y = 0, 0
+            steps_log = []
+            for _ in range(r.randint(3, 6)):
+                kind2 = r.choice(["walk", "turn_left", "turn_right", "turn_around"])
+                if kind2 == "walk":
+                    n = r.randint(1, 7)
+                    steps_log.append(f"walk {n} steps forward")
+                    if heading_idx == 0:
+                        y += n
+                    elif heading_idx == 1:
+                        x += n
+                    elif heading_idx == 2:
+                        y -= n
+                    else:
+                        x -= n
+                elif kind2 == "turn_left":
+                    steps_log.append("turn left")
+                    heading_idx = (heading_idx - 1) % 4
+                elif kind2 == "turn_right":
+                    steps_log.append("turn right")
+                    heading_idx = (heading_idx + 1) % 4
+                else:
+                    steps_log.append("turn around")
+                    heading_idx = (heading_idx + 2) % 4
+            qtext_query = r.choice(["start", "facing"])
+            distractor_n = r.randint(2, 13)
+            instructions = ", then ".join(steps_log)
+            if qtext_query == "start":
+                qtext = (
+                    f"You start at the origin facing {initial}. "
+                    f"There is a {distractor_n}-foot lamp at the origin (irrelevant). "
+                    f"You {instructions}. Are you back at the starting point?"
+                )
+                options = ["Yes", "No"]
+                r.shuffle(options)
+                back = (x == 0 and y == 0)
+                gold_idx = options.index("Yes" if back else "No")
+            else:
+                qtext = (
+                    f"You start at the origin facing {initial}. "
+                    f"There is a {distractor_n}-foot fence (irrelevant). "
+                    f"You {instructions}. Which direction are you facing?"
+                )
+                final = cardinals[heading_idx]
+                options = list(cardinals)
+                r.shuffle(options)
+                gold_idx = options.index(final)
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/navigate_steps"))
+        elif kind == "tracking_objects":
+            n = r.randint(3, 4)
+            people = r.sample(_PROC_NAMES if "_PROC_NAMES" in globals() else
+                              ["Alice", "Bob", "Charlie", "Dana", "Evan"], n)
+            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange"], n)
+            holds = dict(zip(people, colors))
+            n_swaps = r.randint(2, 4)
+            ops = []
+            for _ in range(n_swaps):
+                a, b = r.sample(people, 2)
+                ops.append(f"{a} swaps the ball with {b}")
+                holds[a], holds[b] = holds[b], holds[a]
+            target_person = r.choice(people)
+            ans = holds[target_person]
+            distractor_age = r.randint(20, 50)
+            preamble = ", ".join(f"{p} has the {c} ball" for p, c in zip(people, colors))
+            qtext = (
+                f"At the start: {preamble}. {target_person} is "
+                f"{distractor_age} years old (irrelevant). Then, in order: "
+                + "; then ".join(ops) + "."
+                + f" Which colour ball does {target_person} have at the end?"
+            )
+            options = list(set(colors))
+            while len(options) < 4:
+                extra = r.choice(["red", "blue", "green", "yellow", "purple", "orange",
+                                  "white", "black"])
+                if extra not in options:
+                    options.append(extra)
+            options = options[:4]
+            if ans not in options:
+                options[0] = ans
+            r.shuffle(options)
+            gold_idx = options.index(ans)
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/tracking_objects"))
     return out
 
 
@@ -7686,18 +7857,35 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
 
 
 def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural instruction-following items for ifeval_bench (v27).
+    """Procedural instruction-following items for ifeval_bench (v29 — compound rebalance).
+
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed
+    ifeval_bench saturating at high pass-rates (mean 0.85+) for trained
+    miners while held-out IFEval pass@1 stays around the Qwen 4B-base
+    baseline. Real IFEval includes a 25-30 % "compound" tail where one
+    prompt has 2-3 stacked constraints all of which must pass — the
+    v27 templates were 100 % single-constraint, so optimising v27
+    teaches the model to nail one constraint at a time but doesn't
+    transfer to compound IFEval items where a model has to balance
+    multiple format/length/keyword rules simultaneously.
+
+    v29 keeps the 13 v27 single-constraint kinds at ~70 % weight as the
+    skill floor, and adds a v29 ``compound`` tier at ~30 % that stacks
+    two non-conflicting constraints from the v27 pool (e.g. "write 30
+    words exactly AND end with 'Thank you'"). All constraints still come
+    from ``ifeval_vendor.SUPPORTED_VERIFIERS`` so the existing
+    ``evaluate_item`` grader (which already handles multi-instruction
+    items via ``all(results)``) works unchanged.
 
     Each item carries:
-      * ``prompt``         — the user-facing instruction
+      * ``prompt``         — the user-facing instruction (concatenates
+                             multiple constraints when compound)
       * ``instruction_ids`` — list of canonical constraint identifiers
                               (parallel to ``kwargs``); the existing
                               ``ifeval_vendor`` evaluator reads these
       * ``kwargs``         — list of per-instruction kwargs dicts
-      * ``src``            — telemetry tag
-
-    All constraints are drawn from ``ifeval_vendor.SUPPORTED_VERIFIERS``
-    so the existing grader works unchanged.
+      * ``src``            — telemetry tag (compound items tagged
+                             ``procedural_ifeval/compound:<a>+<b>``)
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["ifeval"]) & 0xFFFFFFFF)
@@ -7712,6 +7900,16 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
         "title_format",
         "bullet_list",
     ]
+    # v29: ~30 % compound items. We replace `compound` placeholders in
+    # the per-item loop below with two stacked constraints (chosen from
+    # a curated whitelist of non-conflicting pairs).
+    n_compound = max(0, (n_items * 30 + 50) // 100)
+    n_single = n_items - n_compound
+    single_pool = (kinds * ((n_single // len(kinds)) + 1))[:n_single]
+    rng.shuffle(single_pool)
+    item_kinds = single_pool + ["compound"] * n_compound
+    rng.shuffle(item_kinds)
+    kinds = item_kinds  # consumed below as kinds[i % len(kinds)]
     rng.shuffle(kinds)
     nouns = ["pelican", "lighthouse", "harbor", "compass", "blueprint",
              "magnolia", "obsidian", "carousel", "satellite", "sycamore"]
@@ -7827,7 +8025,7 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             )
             instruction_ids = ["detectable_format:title"]
             kwargs_list = [{}]
-        else:  # bullet_list
+        elif kind == "bullet_list":
             n = r.randint(3, 5)
             prompt = (
                 f"List {n} interesting facts about {topic}. Format the list with "
@@ -7835,6 +8033,95 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             )
             instruction_ids = ["detectable_format:number_bullet_lists"]
             kwargs_list = [{"num_bullets": n}]
+        elif kind == "compound":
+            # Curated pairs of non-conflicting constraints. Stack each pair
+            # into a single prompt — the model must satisfy BOTH for credit.
+            # Avoids combos like "all uppercase" + "exact_words=N" where N
+            # uppercase words fight the word-count count, and avoids combos
+            # that share a verifier family (e.g. min_words + max_words).
+            pair_options = [
+                ("min_words", "ends_with_phrase"),
+                ("min_words", "include_keyword"),
+                ("max_words", "no_comma"),
+                ("exact_sentences", "no_comma"),
+                ("exact_sentences", "ends_with_phrase"),
+                ("all_lowercase", "include_keyword"),
+                ("all_lowercase", "ends_with_phrase"),
+                ("bullet_list", "min_words"),
+                ("bullet_list", "include_keyword"),
+                ("title_format", "exact_sentences"),
+                ("title_format", "ends_with_phrase"),
+                ("forbid_keyword", "min_words"),
+                ("forbid_keyword", "exact_sentences"),
+            ]
+            a, b = r.choice(pair_options)
+            # Build each piece independently
+            def _build(k_local: str):
+                ii: list[str] = []
+                kk: list[dict] = []
+                pp: str = ""
+                if k_local == "min_words":
+                    n_w = r.choice([30, 40, 60])
+                    pp = f"contain at least {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at least"}]
+                elif k_local == "max_words":
+                    n_w = r.choice([20, 30, 40])
+                    pp = f"contain no more than {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at most"}]
+                elif k_local == "exact_sentences":
+                    n_s = r.choice([2, 3, 4])
+                    pp = f"contain exactly {n_s} sentences"
+                    ii = ["length_constraints:number_sentences"]
+                    kk = [{"num_sentences": n_s, "relation": "exactly"}]
+                elif k_local == "all_lowercase":
+                    pp = "use only lowercase letters"
+                    ii = ["change_case:english_lowercase"]
+                    kk = [{}]
+                elif k_local == "no_comma":
+                    pp = "contain no commas"
+                    ii = ["punctuation:no_comma"]
+                    kk = [{}]
+                elif k_local == "ends_with_phrase":
+                    phrase = r.choice([
+                        "Is there anything else I can help with?",
+                        "Thank you for reading.",
+                        "End of report.",
+                    ])
+                    pp = f"end with the exact phrase {phrase!r}"
+                    ii = ["startend:end_checker"]
+                    kk = [{"end_phrase": phrase}]
+                elif k_local == "include_keyword":
+                    n_k = r.randint(2, 4)
+                    pp = f"include the word {keyword!r} at least {n_k} times"
+                    ii = ["keywords:frequency"]
+                    kk = [{"keyword": keyword, "relation": "at least", "frequency": n_k}]
+                elif k_local == "forbid_keyword":
+                    forbidden = r.choice([n_ for n_ in nouns if n_ != keyword])
+                    pp = f"never use the word {forbidden!r}"
+                    ii = ["keywords:forbidden_words"]
+                    kk = [{"forbidden_words": [forbidden]}]
+                elif k_local == "bullet_list":
+                    n_b = r.randint(3, 5)
+                    pp = f"include exactly {n_b} markdown bullet points (lines starting with `* ` or `- `)"
+                    ii = ["detectable_format:number_bullet_lists"]
+                    kk = [{"num_bullets": n_b}]
+                elif k_local == "title_format":
+                    pp = "begin with a title wrapped in double angle brackets like ``<<Title Goes Here>>`` on the first line"
+                    ii = ["detectable_format:title"]
+                    kk = [{}]
+                return ii, kk, pp
+            ii_a, kk_a, pp_a = _build(a)
+            ii_b, kk_b, pp_b = _build(b)
+            prompt = (
+                f"Write a short response about {topic}. Your response must "
+                f"satisfy ALL of the following constraints simultaneously: "
+                f"(1) {pp_a}; (2) {pp_b}."
+            )
+            instruction_ids = ii_a + ii_b
+            kwargs_list = kk_a + kk_b
+            kind = f"compound:{a}+{b}"
         out.append({
             "src": f"procedural_ifeval/{kind}",
             "prompt": prompt,
