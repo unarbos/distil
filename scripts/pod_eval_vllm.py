@@ -2983,7 +2983,8 @@ BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
 # Number of distractor "facts" injected before + after the needle. Each
 # fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
 # needle + question ≈ 1400 tokens total input.
-BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
+# 2026-04-29 (v29.2): bumped 40 → 60 to match real long-context tests.
+BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "60"))
 # Number of confuser needles inserted alongside the real needle. Each
 # confuser uses a *different* template (different topic) with its own
 # fake 7-char code answer. With 1 confuser the 4B reference still scored
@@ -2991,7 +2992,19 @@ BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
 # the question to the right named entity rather than regex-matching any
 # all-caps code in the document. Capped at len(_LC_NEEDLE_TEMPLATES)-1
 # at runtime so we always have a real template to reserve.
-BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "3"))
+# 2026-04-29 (v29.2): saturation audit on 115 records showed long_context
+# at 93% pass-rate ≥0.95 — a dead axis. With only 3 confusers + ~14 line
+# docs every 4B-class model trivially identified the entity-matched
+# needle. Bumped 3 → 6 confusers and added MULTI-NEEDLE items below
+# (require retrieving 2-3 needles + combining via comparison/arithmetic)
+# so the axis tests genuine long-context reasoning, not just pattern
+# matching against an obvious entity.
+BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "6"))
+# 2026-04-29 (v29.2): fraction of items that are MULTI-NEEDLE — model
+# must retrieve 2-3 distinct needles and combine (sum / compare /
+# concatenate). Default 0.4 means 40 % multi-needle items per round; the
+# remaining 60 % are single-needle (legacy, kept as a difficulty floor).
+BENCH_LC_MULTI_FRACTION = float(os.environ.get("BENCH_LC_MULTI_FRACTION", "0.4"))
 # Session 3.6 (added 2026-04-25): block-seeded procedural tasks mixing
 # arithmetic reasoning, instruction following, and invented-fact retrieval.
 # This is intentionally synthetic: there is no public pool to memorize, but
@@ -3026,6 +3039,12 @@ BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2
 # twice. Kept env-addressable for emergency rollback.
 BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "0"))
 BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
+# v29.2 (2026-04-29) — debug_bench. Procedural buggy-code items, model
+# must emit a corrected function. Tests real-world coding skill
+# (debugging) which code_bench (write-from-scratch) does not measure.
+# Start at 6 items per round; ratchet based on saturation telemetry.
+BENCH_DEBUG_PER_ROUND = int(os.environ.get("BENCH_DEBUG_PER_ROUND", "6"))
+BENCH_DEBUG_MAX_TOKENS = int(os.environ.get("BENCH_DEBUG_MAX_TOKENS", "512"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -3040,7 +3059,12 @@ BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_M
 BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_TIMEOUT_S", "4.0"))
 BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
 BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"))
-BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "32"))
+# 2026-04-29 (v29.2): bumped 32 → 96 so multi-needle items have room to
+# emit "the sum is N" or "the codes are X, Y" (the new combined-answer
+# format requires more tokens than a bare 7-char code). Single-needle
+# items still pass at 32 tokens, so the budget bump is harmless for
+# legacy items; multi-needle items previously truncated.
+BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "96"))
 BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "64"))
 BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "384"))
 BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "384"))
@@ -3065,6 +3089,7 @@ _BENCH_STREAM = {
     "procedural": 0x9E71C0DE,    # Session 3.6 — procedural synthesis
     "robustness": 0x80B057E5,    # Session 3.7 — robustness_bench (math-pool reuse)
     "noise": 0x80152BE9,         # Session 3.7 — noise_resistance_bench (math-pool reuse)
+    "debug": 0xDEB8B003,         # v29.2 — debug_bench (procedural buggy-code fix)
 }
 
 _BENCH_BLOCK_SEED = None
@@ -3072,13 +3097,13 @@ _BENCH_POOLS: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [], "noise": [],
+    "robustness": [], "noise": [], "debug": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [], "noise": [],
+    "robustness": [], "noise": [], "debug": [],
 }
 
 
@@ -4398,6 +4423,10 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["noise"] = _generate_math_items(
         block_seed ^ 0x4E4F, BENCH_NOISE_PER_ROUND,
     )
+    # v29.2 — debug_bench. Procedural buggy-code items.
+    _BENCH_SAMPLES["debug"] = _generate_debug_items(
+        block_seed, BENCH_DEBUG_PER_ROUND,
+    )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -4413,7 +4442,8 @@ def set_bench_block_seed(block_seed):
         f"long_context={len(_BENCH_SAMPLES['long_context'])}, "
         f"procedural={len(_BENCH_SAMPLES['procedural'])}, "
         f"robustness={len(_BENCH_SAMPLES['robustness'])}, "
-        f"noise={len(_BENCH_SAMPLES['noise'])}",
+        f"noise={len(_BENCH_SAMPLES['noise'])}, "
+        f"debug={len(_BENCH_SAMPLES['debug'])}",
         flush=True,
     )
 
@@ -4640,6 +4670,81 @@ def code_bench_probe(model, tokenizer, device="cuda"):
                     gen, tok = _bench_generate(
                         model, tokenizer, prompt_text,
                         BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, tok, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            ok = bool(r and r.passed)
+            out["items"].append({
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def debug_bench_probe(model, tokenizer, device="cuda"):
+    """Run the debug_bench probe (v29.2 — procedural code-debugging).
+
+    Items are generated by ``_generate_debug_items`` and have the same
+    {prompt, test, entry_point, task_id} shape as ``code_bench``. The
+    prompt embeds the buggy reference (commented out) + the test cases
+    (commented out) + a fresh signature with docstring; the model
+    completes the body. The existing ``humaneval_sandbox`` grader runs
+    unchanged — its auto-indent / prose-trim / fence-strip layer all
+    apply because the prompt ends mid-``def`` block exactly like
+    ``code_bench``.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("debug") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Fix the bug in the following Python function. "
+                        "Output only the function body (no extra "
+                        "explanation, no markdown fences).\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_DEBUG_MAX_TOKENS, device, enable_thinking=False,
                     )
                     generations.append((gen, int(tok), it))
                 except Exception as e:
@@ -5531,34 +5636,49 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
     """Create ``n_items`` fresh needle-in-haystack prompts seeded by the
     round's block_seed.
 
-    Each document contains ONE real needle whose question is asked AND
+    v29.2 (2026-04-29) — multi-needle reasoning rebalance. The 2026-04-28
+    saturation audit showed long_context_bench at 93 % pass-rate ≥0.95
+    across 115 records — a dead axis with no signal at the top. Cause:
+    with only 3 confusers and ~14-line documents, every 4B-class model
+    trivially identified the entity-matched needle (archive vs vault vs
+    guild). The grader's confuser-rejection logic was sound, but the
+    items themselves did not require *long-context reasoning* — just
+    *long-context retrieval*.
+
+    v29.2 closes this with two changes:
+      * Bump confusers 3 → 6 and distractors 40 → 60 so single-needle
+        items remain non-trivial (random pick is 1/7 instead of 1/4,
+        document is ~80 lines instead of ~14).
+      * **Multi-needle items** (default 40 % of round): the model must
+        retrieve 2-3 distinct needles AND combine them via arithmetic /
+        comparison / concatenation. Multi-needle subtypes:
+          - ``sum_digits``  : sum of digits of two codes
+          - ``compare``     : which code is alphabetically first
+          - ``concatenate`` : concatenate two codes with hyphen
+          - ``count``       : count letters in three codes total
+        These force the model to read context AND reason — pure pattern
+        matching against the question's entity gets at most 1 of 2-3
+        needles and produces a wrong combined answer.
+
+    Single-needle items: the document contains ONE real needle plus
     ``BENCH_LC_N_CONFUSERS`` confuser needles drawn from different
-    templates, each with their own fake-answer 7-char code. Document
-    structure (positions chosen uniformly at random over the final doc):
+    templates. The model must return the real ANS. Grading is
+    case-insensitive substring containment of the gold AND
+    rejection of any confuser-code substring (so a model that emits
+    "the codes are X, Y, Z, W" loses even if X is correct).
 
-        distractor_1
-        confuser_needle_A   <- fake answer for "What is X?"
-        ...
-        real_needle         <- correct answer for the question we ask
-        ...
-        confuser_needle_B   <- fake answer for "What is Y?"
-        ...
+    Multi-needle items: the document contains 2-3 real needles whose
+    codes feed into a combined gold answer (computed in Python from the
+    same params, exact match required), plus 4-5 confuser needles
+    drawn from unrelated templates. The grader checks the combined
+    gold appears in the response AND no confuser code appears.
 
-    Models that just regex out any 7-character ALL-CAPS code now have to
-    discriminate among (1 real + N confusers) candidates. With 1 confuser
-    the 4B reference still scored 1.0 (Round 9 telemetry: 3/3 on every
-    student). Bumping the default to 3 confusers drops the random-match
-    pass rate from 1/2 to 1/4 and forces the model to actually match the
-    question to the right named entity (archive vs vault vs guild vs
-    professor vs treasure-chest).
+    All needle answers (real + confusers) are distinct 7-char codes so
+    a stray substring match against the wrong needle is impossible.
 
-    The model must return the real ANS. Grading: case-insensitive
-    substring containment so the model can answer "XYZ1234" or "the code
-    is XYZ1234". A response that contains *only* a confuser's answer
-    fails because the substring check is for the real ANS.
-
-    All needle answers are guaranteed to be distinct so a stray substring
-    match against the wrong needle's answer is impossible.
+    Cross-validator agreement: all generation is deterministic on
+    ``block_seed`` and per-item RNG-derived seeds, so every validator
+    materializes the same items.
     """
     import random
     out: list[dict] = []
@@ -5566,86 +5686,173 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
     alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
     n_templates = len(_LC_NEEDLE_TEMPLATES)
     n_confusers = max(0, min(BENCH_LC_N_CONFUSERS, n_templates - 1))
-    for i in range(n_items):
-        # Seed each item independently so swapping n_items doesn't change
-        # the first item's content.
+    n_multi = max(0, int(round(n_items * BENCH_LC_MULTI_FRACTION)))
+    n_single = max(0, n_items - n_multi)
+    # 2026-04-29 (v29.2): only multi-needle subtypes whose gold has a
+    # *unique* surface shape (hyphenated codes) keep the existing
+    # substring grader correct. Subtypes whose gold is a small integer
+    # or a single code can collide with code substrings or let the model
+    # "hedge" by mentioning both candidates — those are deferred to a
+    # follow-up pass with structured-output grading. Concatenation is
+    # both the cleanest gold and the most representative real long-
+    # context skill (retrieve N spans + emit them in a specified order).
+    multi_kinds = ["concatenate_two", "concatenate_three"]
+    multi_kind_seq = (multi_kinds * ((n_multi // len(multi_kinds)) + 1))[:n_multi]
+    rng.shuffle(multi_kind_seq)
+
+    def _gen_unique_codes(r: random.Random, k: int) -> list[str]:
+        codes: list[str] = []
+        seen: set[str] = set()
+        while len(codes) < k:
+            code = "".join(r.choice(alphabet) for _ in range(7))
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+        return codes
+
+    def _entity_label(template_idx: int) -> str:
+        """Short human-readable label for the question template (e.g.
+        "archive code"). Used to refer to specific needles in
+        multi-needle questions without leaking the answer."""
+        # Map question text to the entity referred to. Question is the
+        # second element of each ``_LC_NEEDLE_TEMPLATES`` tuple.
+        q = _LC_NEEDLE_TEMPLATES[template_idx][1].lower()
+        if "archive" in q: return "archive's secret access code"
+        if "treasure" in q: return "treasure-chest coordinates"
+        if "keeper" in q: return "keeper's favorite password"
+        if "vault" in q: return "lost vault combination"
+        if "professor" in q: return "professor Aldric's rare ingredient"
+        if "lottery" in q: return "last week's winning lottery number"
+        if "captain" in q: return "captain Nia's lucky charm name"
+        if "guild" in q: return "hidden guild's signal word"
+        return "value"
+
+    def _emit_layout(r: random.Random, slot_sentences: list[str], n_dist: int) -> tuple[str, list[int]]:
+        """Place needle sentences uniformly through a doc of size
+        ``n_dist + len(slot_sentences)``. Returns (rendered_doc,
+        per-needle 0-indexed positions in the same order as
+        ``slot_sentences``)."""
+        n_needles = len(slot_sentences)
+        final_n = n_dist + n_needles
+        # Distractors with replacement if pool is too small.
+        if n_dist <= len(_LC_DISTRACTORS):
+            distractors_picked = r.sample(_LC_DISTRACTORS, n_dist)
+        else:
+            distractors_picked = [r.choice(_LC_DISTRACTORS) for _ in range(n_dist)]
+        # Pick distinct positions for each needle, at least 3 apart.
+        # Real / first-real needle goes in the middle half (avoids start/end).
+        first_pos = r.randint(final_n // 4, 3 * final_n // 4)
+        positions: list[int] = [first_pos]
+        for _ in range(n_needles - 1):
+            cp = first_pos
+            attempts = 0
+            while attempts < 64 and any(abs(cp - p) < 3 for p in positions):
+                cp = r.randint(0, final_n - 1)
+                attempts += 1
+            positions.append(cp)
+        # Build the doc by walking final_n slots in order.
+        slot_map = sorted(zip(positions, slot_sentences), key=lambda x: x[0])
+        next_slot = 0
+        distract_idx = 0
+        lines: list[str] = []
+        for j in range(final_n):
+            if next_slot < len(slot_map) and j == slot_map[next_slot][0]:
+                lines.append(slot_map[next_slot][1])
+                next_slot += 1
+            else:
+                lines.append(distractors_picked[distract_idx])
+                distract_idx += 1
+        return "\n".join(lines), positions
+
+    # ── single-needle items (legacy difficulty floor) ─────────────────
+    for _ in range(n_single):
         r = random.Random(rng.randint(0, 2**31 - 1))
-        # Pick (1 + n_confusers) distinct templates — one real, the rest
-        # confusers. Fewer templates → fewer confusers; the cap above
-        # guarantees we never duplicate the real template.
         n_picked = 1 + n_confusers
         idxs = r.sample(range(n_templates), min(n_picked, n_templates))
         real_idx = idxs[0]
         confuser_idxs = idxs[1:]
         needle_tpl, question = _LC_NEEDLE_TEMPLATES[real_idx]
-        # Generate distinct 7-char codes for real + every confuser. We
-        # need n_picked unique codes; redraw any duplicates against the
-        # whole pool to avoid biasing (collision probability is tiny but
-        # non-zero with a 31^7 alphabet).
-        codes: list[str] = []
-        seen_codes: set[str] = set()
-        while len(codes) < n_picked:
-            code = "".join(r.choice(alphabet) for _ in range(7))
-            if code in seen_codes:
-                continue
-            seen_codes.add(code)
-            codes.append(code)
+        codes = _gen_unique_codes(r, n_picked)
         answer = codes[0]
         confuser_answers = codes[1:]
-        # Pick distractors without replacement; fall back to sampling
-        # with replacement if n_distractors exceeds pool size.
-        if n_distractors <= len(_LC_DISTRACTORS):
-            distractors = r.sample(_LC_DISTRACTORS, n_distractors)
-        else:
-            distractors = [r.choice(_LC_DISTRACTORS) for _ in range(n_distractors)]
-        # Build needle sentences (real + confusers).
         real_sentence = needle_tpl.format(ANS=answer)
         confuser_sentences = [
             _LC_NEEDLE_TEMPLATES[ci][0].format(ANS=ca)
             for ci, ca in zip(confuser_idxs, confuser_answers)
         ]
-        # Pick positions in the FINAL-document index space so the
-        # recorded positions match the rendered context. Real needle in
-        # the middle half (NOT at start/end); each confuser at least 3
-        # lines away from every other needle so they don't cluster.
-        final_n = n_distractors + n_picked
-        real_pos = r.randint(final_n // 4, 3 * final_n // 4)
-        chosen_positions = [real_pos]
-        confuser_positions: list[int] = []
-        for _ in confuser_sentences:
-            cp = real_pos
-            attempts = 0
-            while attempts < 32 and any(abs(cp - p) < 3 for p in chosen_positions):
-                cp = r.randint(0, final_n - 1)
-                attempts += 1
-            confuser_positions.append(cp)
-            chosen_positions.append(cp)
-        # Build the final document directly so positions are exact.
-        # Slots are reserved for the needles; the rest are distractors
-        # in order (their internal order doesn't matter for grading).
-        slot_specs: list[tuple[int, str]] = [(real_pos, real_sentence)]
-        slot_specs.extend(zip(confuser_positions, confuser_sentences))
-        slot_specs.sort(key=lambda x: x[0])
-        next_slot = 0
-        distract_idx = 0
-        lines: list[str] = []
-        for j in range(final_n):
-            if next_slot < len(slot_specs) and j == slot_specs[next_slot][0]:
-                lines.append(slot_specs[next_slot][1])
-                next_slot += 1
-            else:
-                lines.append(distractors[distract_idx])
-                distract_idx += 1
-        context = "\n".join(lines)
+        all_slots = [real_sentence] + confuser_sentences
+        context, positions = _emit_layout(r, all_slots, n_distractors)
         out.append({
-            "src": "long_context",
+            "src": "long_context/single",
             "context": context,
             "question": question,
             "answer": answer,
             "confuser_answers": confuser_answers,
-            "needle_position": real_pos,
-            "confuser_positions": confuser_positions,
+            "needle_position": positions[0],
+            "confuser_positions": positions[1:],
         })
+
+    # ── multi-needle items (combined-answer reasoning) ────────────────
+    for kind in multi_kind_seq:
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        # Pick 2-3 real needles depending on the multi-kind, plus a few
+        # confusers so the model still has to discriminate signal from
+        # noise. Cap real + confusers at template count.
+        n_real = 3 if kind == "concatenate_three" else 2
+        max_confusers = max(0, n_templates - n_real)
+        n_extra_confusers = min(max(2, n_confusers - 1), max_confusers)
+        idxs = r.sample(range(n_templates), n_real + n_extra_confusers)
+        real_idxs = idxs[:n_real]
+        confuser_idxs = idxs[n_real:]
+        codes = _gen_unique_codes(r, n_real + n_extra_confusers)
+        real_codes = codes[:n_real]
+        confuser_codes = codes[n_real:]
+        real_sentences = [
+            _LC_NEEDLE_TEMPLATES[ri][0].format(ANS=rc)
+            for ri, rc in zip(real_idxs, real_codes)
+        ]
+        confuser_sentences = [
+            _LC_NEEDLE_TEMPLATES[ci][0].format(ANS=cc)
+            for ci, cc in zip(confuser_idxs, confuser_codes)
+        ]
+        all_sentences = real_sentences + confuser_sentences
+        context, positions = _emit_layout(r, all_sentences, n_distractors)
+        # Build the question + gold. Both kinds emit a hyphenated code
+        # sequence as gold — the hyphen makes the gold's surface shape
+        # unique (no individual 7-char code contains a hyphen), so the
+        # existing substring grader stays correct.
+        entities = [_entity_label(ri) for ri in real_idxs]
+        gold = "-".join(real_codes)
+        if kind == "concatenate_two":
+            question = (
+                f"Concatenate the {entities[0]} and the {entities[1]} "
+                f"with a single hyphen between them (no spaces, no other "
+                f"text). Reply with just the concatenated codes."
+            )
+        else:  # concatenate_three
+            question = (
+                f"Concatenate (in order) the {entities[0]}, the "
+                f"{entities[1]}, and the {entities[2]} — separating each "
+                f"pair with a single hyphen (no spaces, no other text). "
+                f"Reply with just the concatenated codes."
+            )
+        out.append({
+            "src": f"long_context/multi:{kind}",
+            "context": context,
+            "question": question,
+            "answer": gold,
+            # Confusers are the UNRELATED codes only. Real codes appear
+            # in the gold and are not rejected by the grader; only the
+            # confuser codes (drawn from unrelated templates) trip the
+            # confuser-rejection check.
+            "confuser_answers": confuser_codes,
+            "real_codes": real_codes,
+            "needle_position": positions[0],
+            "confuser_positions": positions[n_real:],
+        })
+    # Shuffle so single + multi items aren't grouped at the boundary
+    # (graders see them in random order, which improves variance).
+    rng.shuffle(out)
     return out
 
 
@@ -7231,6 +7438,293 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             "prompt": prompt,
             "test": test_block,
             "entry_point": entry_point,
+        })
+    return out
+
+
+def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural code-debugging items for ``debug_bench`` (v29.2, 2026-04-29).
+
+    Why this axis exists. The 2026-04-28 capability audit identified a
+    real-world coding skill not currently scored: **fixing existing
+    code**. ``code_bench`` and ``mbpp_bench`` test the model's ability
+    to write a function from scratch given a docstring. SOTA models
+    are equally important on the *debugging* side: read an existing
+    implementation, find the bug, edit it. This is half of practical
+    coding (the other half being writing-from-scratch) and a 4B model
+    that scores well on code_bench but flat on debug_bench is
+    differentially weaker than a model strong on both.
+
+    Item shape (matches code_bench so the existing ``humaneval_sandbox``
+    grader runs unchanged):
+
+        {
+            "src":         "procedural_debug/<bug_kind>",
+            "task_id":     "debug/<kind>/NN",
+            "prompt":      "<all-comments header + entry-point signature>",
+            "test":        "def check(candidate):\\n    ...\\n",
+            "entry_point": "<function name>",
+        }
+
+    Prompt structure: every line above the entry-point ``def`` is a
+    Python comment (``# ...``) so the prompt + model body parses as
+    valid Python. The buggy reference is shown commented-out so the
+    model can read it for context, but it never executes. The prompt
+    ends with the FRESH function signature + docstring; the model
+    writes the corrected body — same shape as ``code_bench``, so the
+    existing sandbox auto-indent / format-recovery layer Just Works.
+
+    Bug kinds (block-rotated, all procedural):
+
+      * ``off_by_one_range``  — ``range(n)`` should be ``range(n+1)``
+      * ``swap_subtract``     — returns ``b - a`` instead of ``a - b``
+      * ``wrong_comparator``  — ``>`` instead of ``>=``
+      * ``wrong_init``        — accumulator init wrong (``0`` for product etc.)
+      * ``early_break``       — ``break`` after first match instead of scanning
+      * ``wrong_index``       — ``arr[-1]`` instead of ``arr[-2]``
+      * ``wrong_modulo``      — ``%`` against wrong modulus
+      * ``missing_edge_case`` — empty / None case crashes / wrong default
+
+    Each kind has parameters drawn from ``block_seed XOR
+    _BENCH_STREAM["debug"]`` so the (function, bug, tests) triple is
+    fresh every round and exists nowhere on disk — no memorisation
+    vector. Difficulty is calibrated so Qwen-4B-base scores ~0.40-0.55
+    on a smoke set (debugging is harder than write-from-scratch for
+    small models because they must first identify the bug, then fix it
+    without breaking other behaviour).
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["debug"]) & 0xFFFFFFFF)
+    bug_kinds = [
+        "off_by_one_range", "swap_subtract", "wrong_comparator",
+        "wrong_init", "early_break", "wrong_index", "wrong_modulo",
+        "missing_edge_case",
+    ]
+    pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
+    rng.shuffle(pool)
+    out: list[dict] = []
+    # Each branch builds (entry, buggy_def_source, signature_with_docstring, tests).
+    # signature_with_docstring is what the model fills in below — same shape as
+    # code_bench so the sandbox auto-indent layer applies the body indentation
+    # automatically when the model emits a bare ``return ...``.
+    for i, kind in enumerate(pool):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        if kind == "off_by_one_range":
+            entry = "sum_to"
+            buggy = (
+                "def sum_to(n: int) -> int:\n"
+                '    """Return the sum of integers from 1 to n inclusive."""\n'
+                "    total = 0\n"
+                "    for i in range(1, n):\n"
+                "        total += i\n"
+                "    return total\n"
+            )
+            sig = (
+                "def sum_to(n: int) -> int:\n"
+                '    """Return the sum of integers from 1 to n inclusive.\n'
+                "    Examples: sum_to(3) == 6 (1+2+3); sum_to(5) == 15."
+                '\n    """\n'
+            )
+            n_t = r.randint(5, 15)
+            tests = [
+                f"    assert candidate({n_t}) == {sum(range(1, n_t+1))}",
+                f"    assert candidate({n_t+1}) == {sum(range(1, n_t+2))}",
+                "    assert candidate(1) == 1",
+                "    assert candidate(2) == 3",
+            ]
+        elif kind == "swap_subtract":
+            entry = "first_minus_second"
+            buggy = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                '    """Return a minus b (i.e. a - b)."""\n'
+                "    return b - a\n"
+            )
+            sig = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                '    """Return a minus b (i.e. a - b).\n'
+                "    Examples: first_minus_second(10, 3) == 7; first_minus_second(0, 5) == -5."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate(10, 3) == 7",
+                "    assert candidate(0, 5) == -5",
+                "    assert candidate(-4, -2) == -2",
+                "    assert candidate(100, 99) == 1",
+            ]
+        elif kind == "wrong_comparator":
+            threshold = r.randint(3, 9)
+            entry = "at_least"
+            buggy = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                '    """Count elements in arr that are >= threshold."""\n'
+                "    return sum(1 for x in arr if x > threshold)\n"
+            )
+            sig = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                '    """Return the count of elements in arr that are >= threshold.\n'
+                f"    Default threshold is {threshold}.\n"
+                f"    Example: at_least([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}]) returns 3 "
+                f"(elements >= {threshold})."
+                '\n    """\n'
+            )
+            tests = [
+                f"    assert candidate([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([{threshold}, {threshold}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([0, 1, 2], threshold={threshold}) == 0",
+                "    assert candidate([], threshold=1) == 0",
+            ]
+        elif kind == "wrong_init":
+            entry = "product_of_list"
+            buggy = (
+                "def product_of_list(arr):\n"
+                '    """Return the product of integers in arr."""\n'
+                "    total = 0\n"
+                "    for x in arr:\n"
+                "        total *= x\n"
+                "    return total\n"
+            )
+            sig = (
+                "def product_of_list(arr: list[int]) -> int:\n"
+                '    """Return the product of all integers in arr.\n'
+                "    The product of an empty list is 1 (multiplicative identity).\n"
+                "    Example: product_of_list([2, 3, 4]) returns 24."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate([2, 3, 4]) == 24",
+                "    assert candidate([5]) == 5",
+                "    assert candidate([]) == 1",
+                "    assert candidate([1, 2, 3, 4, 5]) == 120",
+                "    assert candidate([2, -3, 4]) == -24",
+            ]
+        elif kind == "early_break":
+            entry = "find_largest"
+            buggy = (
+                "def find_largest(arr):\n"
+                '    """Return the largest integer in arr."""\n'
+                "    largest = arr[0]\n"
+                "    for x in arr:\n"
+                "        if x > largest:\n"
+                "            largest = x\n"
+                "            break\n"
+                "    return largest\n"
+            )
+            sig = (
+                "def find_largest(arr: list[int]) -> int:\n"
+                '    """Return the largest integer in arr. Assume arr is non-empty.\n'
+                "    Example: find_largest([3, 7, 2, 9, 4]) returns 9."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate([3, 7, 2, 9, 4]) == 9",
+                "    assert candidate([1, 2, 3, 4, 5, 6]) == 6",
+                "    assert candidate([5, 4, 3, 2, 1]) == 5",
+                "    assert candidate([-3, -1, -7, -2]) == -1",
+                "    assert candidate([42]) == 42",
+            ]
+        elif kind == "wrong_index":
+            n = r.randint(5, 9)
+            entry = "second_last"
+            buggy = (
+                "def second_last(arr):\n"
+                '    """Return the second-to-last element of arr."""\n'
+                "    return arr[-1]\n"
+            )
+            sig = (
+                "def second_last(arr: list):\n"
+                '    """Return the second-to-last element of arr.\n'
+                "    Assume arr has at least 2 elements.\n"
+                "    Example: second_last([1, 2, 3, 4]) returns 3."
+                '\n    """\n'
+            )
+            sample_arr = [r.randint(1, 99) for _ in range(n)]
+            tests = [
+                f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}",
+                "    assert candidate([1, 2]) == 1",
+                "    assert candidate(['a', 'b', 'c']) == 'b'",
+                "    assert candidate([10, 20, 30, 40, 50]) == 40",
+            ]
+        elif kind == "wrong_modulo":
+            mod = r.choice([7, 11, 13])
+            wrong_mod = mod + 1
+            entry = "mod_then_double"
+            buggy = (
+                f"def mod_then_double(n, modulus={mod}):\n"
+                '    """Return 2 * (n mod modulus)."""\n'
+                f"    return 2 * (n % {wrong_mod})\n"
+            )
+            sig = (
+                f"def mod_then_double(n: int, modulus: int = {mod}) -> int:\n"
+                '    """Return (n mod modulus) doubled, i.e. 2 * (n % modulus).\n'
+                f"    Default modulus is {mod}.\n"
+                f"    Example: mod_then_double(10, modulus={mod}) returns 2 * (10 % {mod}) = {2 * (10 % mod)}."
+                '\n    """\n'
+            )
+            tests = [
+                f"    assert candidate(10, modulus={mod}) == {2 * (10 % mod)}",
+                f"    assert candidate({mod*2 + 3}, modulus={mod}) == {2 * ((mod*2 + 3) % mod)}",
+                f"    assert candidate(0, modulus={mod}) == 0",
+                f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
+            ]
+        else:  # missing_edge_case
+            entry = "first_or_default"
+            buggy = (
+                "def first_or_default(arr, default=None):\n"
+                '    """Return arr[0] if non-empty, else default."""\n'
+                "    return arr[0]\n"
+            )
+            sig = (
+                "def first_or_default(arr: list, default=None):\n"
+                '    """Return arr[0] if arr is non-empty, else return default.\n'
+                "    Examples: first_or_default([7, 8, 9]) returns 7;\n"
+                "              first_or_default([], default=-1) returns -1."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate([7, 8, 9]) == 7",
+                "    assert candidate([]) is None",
+                "    assert candidate([], default=-1) == -1",
+                "    assert candidate(['a']) == 'a'",
+                "    assert candidate([], default=[]) == []",
+            ]
+
+        # The buggy version goes in the prompt as a comment block so it
+        # never executes but the model can still read it. The prompt
+        # ends with the corrected function's signature + docstring,
+        # ready for the model to fill in the body — same shape as
+        # code_bench, so the existing sandbox machinery (auto-indent,
+        # prose-trim, fence-strip) applies unchanged.
+        buggy_commented = "\n".join(
+            "# " + line if line else "#" for line in buggy.splitlines()
+        )
+        commented_tests = "\n".join(
+            ("# " + line.lstrip()) if line.startswith("    ") else ("# " + line)
+            for line in tests
+        )
+        prompt = (
+            "# The function below has a bug. Read the buggy version + the\n"
+            "# corrected docstring (which states the INTENDED behaviour),\n"
+            "# then write a CORRECTED implementation that passes the tests.\n"
+            "# Output only the function body (no extra explanation, no\n"
+            "# markdown fences).\n"
+            "#\n"
+            "# Buggy version (commented out — DO NOT include in your output):\n"
+            f"{buggy_commented}\n"
+            "#\n"
+            "# Tests the corrected version must pass:\n"
+            f"{commented_tests}\n"
+            "#\n"
+            "# Now complete the corrected version below.\n"
+            f"{sig}"
+        )
+        test_block_str = "\n".join(tests)
+        test_block = "def check(candidate):\n" + test_block_str + "\n"
+        out.append({
+            "src": f"procedural_debug/{kind}",
+            "task_id": f"debug/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry,
         })
     return out
 
@@ -9093,6 +9587,8 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("procedural_bench", procedural_bench_probe),
         ("robustness_bench", robustness_bench_probe),
         ("noise_resistance_bench", noise_resistance_bench_probe),
+        # v29.2 — procedural buggy-code fix probe.
+        ("debug_bench", debug_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:
