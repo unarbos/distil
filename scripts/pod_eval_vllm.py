@@ -6406,31 +6406,69 @@ def _generate_aime_items(block_seed, n_items: int) -> list[dict]:
 
 
 def _generate_code_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural code-synthesis tasks for code_bench (v27).
+    """Procedural code-synthesis tasks for code_bench (v29 — humaneval-difficulty rebalance).
 
-    Each item produces ``{prompt, test, entry_point, task_id}`` so the
-    existing ``humaneval_sandbox`` grader runs unchanged. The function
-    signatures and docstrings are generated freshly per round; the test
-    harness uses random inputs (also block-seeded) and a reference
-    implementation to derive expected outputs.
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed code_bench
+    saturating near 1.0 for most trained miners while held-out HumanEval
+    pass@1 stayed flat ~0.40. The v27 templates are humaneval-*shape* but
+    not humaneval-*difficulty* — they're one-line list comprehensions and
+    trivial string ops. Optimising v27-code teaches the model to nail
+    "double every element" but doesn't transfer to HumanEval's stack
+    machines, parsing, and DP problems. v29 keeps the v27 easy tier as
+    a difficulty floor (~30 %) and adds a new humaneval-distribution-
+    similar hard tier (~70 %) covering:
 
-    Subtypes (each tests a distinct skill cluster):
-      * ``transform_list``   — map/filter/reverse/dedupe over a list
-      * ``aggregate_list``   — sum/min/max/count with predicate
-      * ``string_predicate`` — palindrome / anagram / valid-id checks
-      * ``digit_sum``        — recurrent digit-sum / divisor checks
-      * ``window_sum``       — sliding-window aggregation
-      * ``pair_count``       — count pairs satisfying a relation
-      * ``run_length``       — encode/decode run-length pairs
-      * ``string_transform`` — case / repeat / interleave variants
+      * ``coin_change_min``       — DP, min coins to make amount
+      * ``merge_intervals``       — interval merging, sort + scan
+      * ``rolling_max``           — running max of last k elements
+      * ``nested_paren_groups``   — split balanced () groups (HE/1)
+      * ``evaluate_postfix``      — RPN evaluator with int ops
+      * ``roman_to_int``          — parse roman numerals
+      * ``binary_search_first``   — find leftmost index of target
+      * ``unique_paths_grid``     — DP grid traversal small N
+      * ``longest_no_repeat``     — longest substr w/o repeat (sliding window)
+      * ``validate_brackets``     — multi-type bracket matching ([{}])
+      * ``sliding_window_min``    — running min of window k
+      * ``most_freq_elem``        — most-frequent element with tie rule
+      * ``compress_string``       — RLE-encode unless longer than original
+      * ``two_sum_pairs``         — find unordered pair indices summing to t
+
+    Each item still produces ``{prompt, test, entry_point, task_id}`` so
+    the existing ``humaneval_sandbox`` grader runs unchanged. The hard
+    tier templates have richer test inputs (edge cases: empty, single,
+    duplicates, negatives) calibrated so Qwen3.5-4B-base scores ~0.45-0.60
+    on a private smoke set (closer to HumanEval's 0.40 than v27 code_bench
+    saturating at >0.95).
+
+    v27 legacy easy templates kept (~30 %): transform_list, aggregate_list,
+    string_predicate, digit_sum, window_sum, pair_count, run_length,
+    string_transform.
+
+    Procedural rotation per round_seed prevents memorisation; humaneval-
+    distribution similarity makes validator pass-rate predict HumanEval
+    pass-rate (the v27 saturation gap broke that link).
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
-    kinds = [
+    hard_kinds = [
+        "coin_change_min", "merge_intervals", "rolling_max",
+        "nested_paren_groups", "evaluate_postfix", "roman_to_int",
+        "binary_search_first", "unique_paths_grid", "longest_no_repeat",
+        "validate_brackets", "sliding_window_min", "most_freq_elem",
+        "compress_string", "two_sum_pairs",
+    ]
+    legacy_kinds = [
         "transform_list", "aggregate_list", "string_predicate",
         "digit_sum", "window_sum", "pair_count", "run_length",
         "string_transform",
     ]
+    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_legacy = max(0, n_items - n_hard)
+    hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
+    legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
+    rng.shuffle(hard_pool)
+    rng.shuffle(legacy_pool)
+    kinds = hard_pool[:n_hard] + legacy_pool[:n_legacy]
     rng.shuffle(kinds)
     out: list[dict] = []
     for i in range(n_items):
@@ -6730,7 +6768,7 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 s = "".join(r.choice("abcd") * r.randint(1, 3) for _ in range(r.randint(1, 4)))
                 test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
-        else:  # string_transform
+        elif kind == "string_transform":
             op = r.choice(["alternate_case", "repeat_each_char", "swap_pairs"])
             if op == "alternate_case":
                 entry_point = "alternate_case"
@@ -6784,10 +6822,412 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 s = "".join(r.choice("abcdefABCDEF12!?") for _ in range(r.randint(0, 7)))
                 test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        # ── v29 hard tier (humaneval-distribution-similar) ──────────────
+        elif kind == "coin_change_min":
+            coins = sorted(r.sample([1, 2, 5, 10, 20, 25, 50], r.randint(2, 4)))
+            entry_point = "min_coins"
+            prompt = (
+                f"def min_coins(amount):\n"
+                f"    \"\"\"Return the minimum number of coins needed to make ``amount`` "
+                f"using denominations {coins}. ``amount`` is a non-negative integer.\n"
+                f"    Each denomination may be used any number of times. If ``amount`` "
+                f"cannot be made with these coins, return -1. ``min_coins(0)`` is 0.\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_coins(amount, c=tuple(coins)):
+                if amount < 0:
+                    return -1
+                INF = 10**9
+                dp = [0] + [INF] * amount
+                for a in range(1, amount + 1):
+                    for v in c:
+                        if v <= a and dp[a - v] + 1 < dp[a]:
+                            dp[a] = dp[a - v] + 1
+                return dp[amount] if dp[amount] < INF else -1
+            ref = _ref_coins
+            test_amounts = [0, 1] + sorted({r.randint(2, 50) for _ in range(5)})
+            for a in test_amounts[:6]:
+                test_lines.append(f"    assert candidate({a!r}) == {ref(a)!r}")
+        elif kind == "merge_intervals":
+            entry_point = "merge"
+            prompt = (
+                "def merge(intervals):\n"
+                "    \"\"\"Given a list of [start, end] integer intervals (closed on both ends), "
+                "return a new list of merged, non-overlapping intervals sorted by start. "
+                "Two intervals are considered overlapping if they share at least one integer. "
+                "Empty input returns []. Singletons (start==end) are allowed.\n"
+                "    \"\"\"\n"
+            )
+            def _ref_merge(intervals):
+                if not intervals:
+                    return []
+                xs = sorted([list(iv) for iv in intervals], key=lambda p: (p[0], p[1]))
+                out_iv = [xs[0]]
+                for s, e in xs[1:]:
+                    if s <= out_iv[-1][1] + 1 - 1:
+                        out_iv[-1][1] = max(out_iv[-1][1], e)
+                    else:
+                        out_iv.append([s, e])
+                return out_iv
+            ref = _ref_merge
+            for _ in range(5):
+                k = r.randint(0, 5)
+                ivs = []
+                for _ in range(k):
+                    a = r.randint(0, 12)
+                    b = a + r.randint(0, 6)
+                    ivs.append([a, b])
+                test_lines.append(f"    assert candidate({ivs!r}) == {ref(ivs)!r}")
+        elif kind == "rolling_max":
+            k = r.randint(2, 4)
+            entry_point = "rolling_max"
+            prompt = (
+                f"def rolling_max(xs):\n"
+                f"    \"\"\"Return a list where the i-th element is the maximum of the last "
+                f"{k} elements of ``xs`` ending at index i (inclusive). For i < {k - 1}, "
+                f"use whatever elements are available (i.e. the prefix). The output has the "
+                f"same length as ``xs``. Empty input returns [].\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_rmax(xs, w=k):
+                if not xs:
+                    return []
+                return [max(xs[max(0, i - w + 1): i + 1]) for i in range(len(xs))]
+            ref = _ref_rmax
+            for _ in range(5):
+                xs = [r.randint(-9, 9) for _ in range(r.randint(0, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "nested_paren_groups":
+            entry_point = "split_paren_groups"
+            prompt = (
+                "def split_paren_groups(s):\n"
+                "    \"\"\"The input is a string containing only '(' and ')' characters and "
+                "spaces. The parentheses form one or more balanced groups concatenated "
+                "(possibly separated by spaces, which should be ignored). Return a list of "
+                "the balanced groups in order, with all spaces removed. Each output group "
+                "is itself balanced. The empty input returns [].\n\n"
+                "    >>> split_paren_groups('( ) (( ))')\n"
+                "    ['()', '(())']\n"
+                "    \"\"\"\n"
+            )
+            def _ref_spg(s):
+                s = s.replace(" ", "")
+                groups, cur, depth = [], "", 0
+                for c in s:
+                    cur += c
+                    if c == "(":
+                        depth += 1
+                    else:
+                        depth -= 1
+                    if depth == 0 and cur:
+                        groups.append(cur)
+                        cur = ""
+                return groups
+            ref = _ref_spg
+            test_strs = []
+            for _ in range(5):
+                n_grp = r.randint(0, 3)
+                groups = []
+                for _ in range(n_grp):
+                    d = r.randint(1, 3)
+                    groups.append("(" * d + ")" * d)
+                sep = r.choice([" ", "  ", ""])
+                test_strs.append(sep.join(groups))
+            for s in test_strs:
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "evaluate_postfix":
+            entry_point = "eval_rpn"
+            prompt = (
+                "def eval_rpn(tokens):\n"
+                "    \"\"\"Evaluate the expression in Reverse Polish Notation given as a "
+                "list of tokens. Each token is either an integer (Python int) or one of "
+                "the operators '+', '-', '*'. Division is not used. Return the integer "
+                "result. The expression is well-formed.\n\n"
+                "    >>> eval_rpn([2, 3, '+'])\n"
+                "    5\n"
+                "    \"\"\"\n"
+            )
+            def _ref_rpn(tokens):
+                stack = []
+                for t in tokens:
+                    if t == "+":
+                        b = stack.pop(); a = stack.pop(); stack.append(a + b)
+                    elif t == "-":
+                        b = stack.pop(); a = stack.pop(); stack.append(a - b)
+                    elif t == "*":
+                        b = stack.pop(); a = stack.pop(); stack.append(a * b)
+                    else:
+                        stack.append(t)
+                return stack[0]
+            ref = _ref_rpn
+            for _ in range(5):
+                n_terms = r.randint(2, 4)
+                vals = [r.randint(-5, 9) for _ in range(n_terms)]
+                ops_p = [r.choice(["+", "-", "*"]) for _ in range(n_terms - 1)]
+                tokens = [vals[0], vals[1], ops_p[0]]
+                for j in range(1, n_terms - 1):
+                    tokens.extend([vals[j + 1], ops_p[j]])
+                test_lines.append(f"    assert candidate({tokens!r}) == {ref(tokens)!r}")
+        elif kind == "roman_to_int":
+            entry_point = "roman_to_int"
+            prompt = (
+                "def roman_to_int(s):\n"
+                "    \"\"\"Convert a valid roman numeral string ``s`` (using I, V, X, L, "
+                "C, D, M with the standard subtractive notation IV, IX, XL, XC, CD, CM) "
+                "to its integer value. Input is in the range 1..3999. Empty string "
+                "returns 0.\n"
+                "    \"\"\"\n"
+            )
+            roman_map = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+            def _ref_roman(s):
+                total = 0
+                prev = 0
+                for c in reversed(s):
+                    v = roman_map[c]
+                    if v < prev:
+                        total -= v
+                    else:
+                        total += v
+                    prev = v
+                return total
+            ref = _ref_roman
+            def _to_roman(n):
+                table = [(1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),
+                         (90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),
+                         (5,"V"),(4,"IV"),(1,"I")]
+                out_s = ""
+                for v, sym in table:
+                    while n >= v:
+                        out_s += sym; n -= v
+                return out_s
+            test_nums = sorted({r.randint(1, 1888) for _ in range(5)})
+            for n in test_nums[:5]:
+                test_lines.append(
+                    f"    assert candidate({_to_roman(n)!r}) == {ref(_to_roman(n))!r}"
+                )
+            test_lines.append("    assert candidate('') == 0")
+        elif kind == "binary_search_first":
+            entry_point = "first_index"
+            prompt = (
+                "def first_index(xs, target):\n"
+                "    \"\"\"Given a non-decreasing list of integers ``xs`` and an integer "
+                "``target``, return the leftmost index ``i`` such that ``xs[i] == target``. "
+                "If ``target`` is not present, return -1. Run in O(log n).\n"
+                "    \"\"\"\n"
+            )
+            def _ref_fi(xs, target):
+                lo, hi = 0, len(xs)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if xs[mid] < target:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                return lo if lo < len(xs) and xs[lo] == target else -1
+            ref = _ref_fi
+            for _ in range(5):
+                xs = sorted([r.randint(0, 9) for _ in range(r.randint(0, 8))])
+                target = r.randint(0, 11)
+                test_lines.append(f"    assert candidate({xs!r}, {target!r}) == {ref(xs, target)!r}")
+        elif kind == "unique_paths_grid":
+            m = r.randint(2, 4)
+            n = r.randint(2, 4)
+            entry_point = "unique_paths"
+            prompt = (
+                f"def unique_paths(m, n):\n"
+                f"    \"\"\"Return the number of unique paths from the top-left corner to "
+                f"the bottom-right corner of an ``m × n`` grid where you can only move "
+                f"right or down at each step. ``m`` and ``n`` are positive integers.\n\n"
+                f"    >>> unique_paths(2, 2)\n"
+                f"    2\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_up(m, n):
+                dp = [[1] * n for _ in range(m)]
+                for i in range(1, m):
+                    for j in range(1, n):
+                        dp[i][j] = dp[i - 1][j] + dp[i][j - 1]
+                return dp[m - 1][n - 1]
+            ref = _ref_up
+            test_grids = [(2, 2), (3, 3), (1, 5), (4, 2), (m, n)]
+            seen = set()
+            for mm, nn in test_grids:
+                if (mm, nn) in seen:
+                    continue
+                seen.add((mm, nn))
+                test_lines.append(f"    assert candidate({mm!r}, {nn!r}) == {ref(mm, nn)!r}")
+        elif kind == "longest_no_repeat":
+            entry_point = "longest_unique"
+            prompt = (
+                "def longest_unique(s):\n"
+                "    \"\"\"Return the length of the longest contiguous substring of ``s`` "
+                "containing no repeated characters. Empty string returns 0.\n\n"
+                "    >>> longest_unique('abcabcbb')\n"
+                "    3\n"
+                "    \"\"\"\n"
+            )
+            def _ref_lu(s):
+                last = {}
+                start = 0
+                best = 0
+                for i, c in enumerate(s):
+                    if c in last and last[c] >= start:
+                        start = last[c] + 1
+                    last[c] = i
+                    if i - start + 1 > best:
+                        best = i - start + 1
+                return best
+            ref = _ref_lu
+            for _ in range(5):
+                s = "".join(r.choice("abcde") for _ in range(r.randint(0, 10)))
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "validate_brackets":
+            entry_point = "is_balanced_multi"
+            prompt = (
+                "def is_balanced_multi(s):\n"
+                "    \"\"\"Return True iff every opening bracket in ``s`` has a matching "
+                "closing bracket of the same type and they are properly nested. The bracket "
+                "types are '()', '[]', and '{}'. Other characters are ignored. Empty string "
+                "is True.\n\n"
+                "    >>> is_balanced_multi('([{}])')\n"
+                "    True\n"
+                "    \"\"\"\n"
+            )
+            pairs = {")": "(", "]": "[", "}": "{"}
+            def _ref_bm(s):
+                stack = []
+                for c in s:
+                    if c in "([{":
+                        stack.append(c)
+                    elif c in ")]}":
+                        if not stack or stack[-1] != pairs[c]:
+                            return False
+                        stack.pop()
+                return not stack
+            ref = _ref_bm
+            test_strs = []
+            for _ in range(5):
+                n_pair = r.randint(0, 4)
+                buf = []
+                if n_pair == 0:
+                    buf = ""
+                else:
+                    op = r.choice(["()", "[]", "{}"])
+                    buf = op[0] * n_pair + op[1] * n_pair
+                    if r.random() < 0.4:
+                        buf = "x" + buf + "y"
+                    if r.random() < 0.3 and buf:
+                        idx = r.randint(0, len(buf) - 1)
+                        buf = buf[:idx] + r.choice(")]}") + buf[idx + 1:]
+                test_strs.append("".join(buf) if isinstance(buf, list) else buf)
+            for s in test_strs:
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "sliding_window_min":
+            k = r.randint(2, 4)
+            entry_point = "window_min"
+            prompt = (
+                f"def window_min(xs):\n"
+                f"    \"\"\"Return a list of the minimums of every contiguous window of "
+                f"exactly {k} elements in ``xs``. If ``xs`` has fewer than {k} elements, "
+                f"return []. The output has length ``max(0, len(xs) - {k} + 1)``.\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_wm(xs, w=k):
+                if len(xs) < w:
+                    return []
+                return [min(xs[i:i + w]) for i in range(len(xs) - w + 1)]
+            ref = _ref_wm
+            for _ in range(5):
+                xs = [r.randint(-9, 9) for _ in range(r.randint(0, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "most_freq_elem":
+            entry_point = "most_frequent"
+            prompt = (
+                "def most_frequent(xs):\n"
+                "    \"\"\"Return the element that appears most often in the list ``xs``. "
+                "If multiple elements tie for highest frequency, return the smallest such "
+                "element. The list always has at least one element.\n"
+                "    \"\"\"\n"
+            )
+            def _ref_mf(xs):
+                from collections import Counter
+                c = Counter(xs)
+                best = max(c.values())
+                return min(k for k, v in c.items() if v == best)
+            ref = _ref_mf
+            for _ in range(5):
+                xs = [r.randint(0, 5) for _ in range(r.randint(1, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "compress_string":
+            entry_point = "compress"
+            prompt = (
+                "def compress(s):\n"
+                "    \"\"\"Return a run-length-encoded version of ``s`` of the form "
+                "'a3b2c4' (character followed by run length, with run length=1 also "
+                "written as 'a1'). If the encoded form is not strictly shorter than the "
+                "original, return the original string instead. Empty input returns ''.\n\n"
+                "    >>> compress('aaabbc')\n"
+                "    'a3b2c1'\n"
+                "    \"\"\"\n"
+            )
+            def _ref_cs(s):
+                if not s:
+                    return ""
+                out_parts: list[str] = []
+                cur = s[0]; cnt = 1
+                for ch in s[1:]:
+                    if ch == cur:
+                        cnt += 1
+                    else:
+                        out_parts.append(cur + str(cnt))
+                        cur = ch; cnt = 1
+                out_parts.append(cur + str(cnt))
+                enc = "".join(out_parts)
+                return enc if len(enc) < len(s) else s
+            ref = _ref_cs
+            for _ in range(5):
+                s = "".join(r.choice("abc") * r.randint(1, 4) for _ in range(r.randint(0, 4)))
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "two_sum_pairs":
+            target = r.randint(3, 12)
+            entry_point = "two_sum_indices"
+            prompt = (
+                f"def two_sum_indices(xs):\n"
+                f"    \"\"\"Return a sorted list of all unordered pairs (i, j) with i < j "
+                f"such that ``xs[i] + xs[j] == {target}``. Pairs are tuples. The output "
+                f"is sorted by (i, j). Empty result returns [].\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_ts(xs, t=target):
+                pairs = []
+                for i in range(len(xs)):
+                    for j in range(i + 1, len(xs)):
+                        if xs[i] + xs[j] == t:
+                            pairs.append((i, j))
+                return pairs
+            ref = _ref_ts
+            for _ in range(5):
+                xs = [r.randint(0, target) for _ in range(r.randint(0, 7))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        else:
+            entry_point = "noop"
+            prompt = (
+                "def noop():\n"
+                "    \"\"\"Return 0.\"\"\"\n"
+            )
+            test_lines = ["    assert candidate() == 0"]
+        # ─────────────────────────────────────────────────────────────────
         test_block = "def check(candidate):\n" + "\n".join(test_lines) + "\n"
+        version_tag = "v29" if kind in (
+            "coin_change_min", "merge_intervals", "rolling_max",
+            "nested_paren_groups", "evaluate_postfix", "roman_to_int",
+            "binary_search_first", "unique_paths_grid", "longest_no_repeat",
+            "validate_brackets", "sliding_window_min", "most_freq_elem",
+            "compress_string", "two_sum_pairs",
+        ) else "v27"
         out.append({
             "src": f"procedural_code/{kind}",
-            "task_id": f"v27/{kind}/{i:02d}",
+            "task_id": f"{version_tag}/{kind}/{i:02d}",
             "prompt": prompt,
             "test": test_block,
             "entry_point": entry_point,
