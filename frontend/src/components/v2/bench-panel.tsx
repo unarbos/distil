@@ -185,13 +185,36 @@ export function BenchPanel() {
     return <BenchSkeleton />;
   }
 
+  // Build the per-king history series for the canary trend. Each
+  // king-tagged model in `data.models` represents one snapshot of
+  // held-out scores; sort by timestamp and keep the last ~8 so the
+  // sparkline doesn't get too noisy. Reference and teacher rows
+  // are excluded.
+  const kingHistory: BenchmarkPayload[] = (() => {
+    if (!data) return [];
+    return data.models
+      .filter((m) => m.uid != null && !m.is_baseline)
+      .slice() // copy
+      .sort((a, b) => {
+        const at = typeof a.timestamp === "string"
+          ? Date.parse(a.timestamp) || 0
+          : (a.timestamp as number) || (a.fetched_at ?? 0);
+        const bt = typeof b.timestamp === "string"
+          ? Date.parse(b.timestamp) || 0
+          : (b.timestamp as number) || (b.fetched_at ?? 0);
+        return at - bt;
+      })
+      .slice(-8);
+  })();
+
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)] relative">
+    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[auto_1fr_1fr_auto] min-h-[calc(100vh-3.5rem-3rem)] relative">
       {stale && (
         <span className="absolute top-3 right-4 text-[10px] uppercase tracking-[0.18em] text-meta">
           refreshing…
         </span>
       )}
+      <CanaryStrip kings={kingHistory} reference={reference} />
       {HEADLINE.map((b, i) => {
         const k = pickScoreAndCount(
           kingFilled?.benchmarks,
@@ -247,6 +270,180 @@ export function BenchPanel() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+interface CanaryStripProps {
+  kings: BenchmarkPayload[];
+  reference: BenchmarkPayload | null;
+}
+
+/**
+ * Held-out trend strip — the open follow-up #4 from the
+ * `paper/goodhart_audit_2026-04-27.md` audit. Plots each of the
+ * last 8 kings' held-out scores per headline bench so a divergence
+ * between composite (climbing on the procedural ranking key) and
+ * held-out (which Qwen3.5-4B baseline already passes) is visible
+ * at a glance.
+ *
+ * Each cell is a 32-px-wide sparkline of the last N kings on that
+ * bench. The reference baseline is drawn as a dotted line. A red
+ * tick under the latest point marks a regression below the
+ * undistilled student.
+ */
+function CanaryStrip({ kings, reference }: CanaryStripProps) {
+  if (kings.length === 0) return null;
+  const refScores: Record<string, number | null> = {};
+  for (const b of HEADLINE) {
+    const r = pickScoreAndCount(
+      reference?.benchmarks,
+      reference?.counts,
+      b.key,
+    );
+    refScores[b.key] = r.score;
+  }
+  return (
+    <div className="col-span-2 sm:col-span-3 px-6 sm:px-9 py-4 border-b border-border">
+      <div className="flex items-baseline justify-between mb-3">
+        <div>
+          <h6 className="text-[14px] font-medium tracking-[-0.02em]">
+            Canary — last {kings.length} kings on held-out
+          </h6>
+          <div className="text-[10px] text-meta uppercase tracking-[0.16em] mt-0.5">
+            evalscope vs Qwen3.5-4B baseline · the Goodhart line
+          </div>
+        </div>
+        <div className="text-[10px] text-meta italic">
+          composite climbing while a sparkline drops below baseline
+          = the canary signal
+        </div>
+      </div>
+      <div className="grid grid-cols-3 sm:grid-cols-6 gap-x-6 gap-y-3">
+        {HEADLINE.map((b) => (
+          <CanaryCell
+            key={b.key}
+            label={b.label}
+            kings={kings}
+            benchKey={b.key}
+            baseline={refScores[b.key]}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CanaryCell({
+  label,
+  kings,
+  benchKey,
+  baseline,
+}: {
+  label: string;
+  kings: BenchmarkPayload[];
+  benchKey: string;
+  baseline: number | null;
+}) {
+  const points: { score: number | null; uid: number | null }[] = kings.map(
+    (k) => {
+      const s = pickScoreAndCount(k.benchmarks, k.counts, benchKey);
+      return { score: s.count === 0 ? null : s.score, uid: k.uid ?? null };
+    },
+  );
+  const measured = points.filter((p) => p.score != null);
+  const latest = points[points.length - 1];
+  const latestScore = latest?.score ?? null;
+  const latestVsBaseline =
+    latestScore != null && baseline != null
+      ? (latestScore - baseline) * 100
+      : null;
+  const W = 88;
+  const H = 26;
+  const PAD = 2;
+  const sx = (i: number) =>
+    PAD + (kings.length <= 1 ? 0 : (i / (kings.length - 1)) * (W - PAD * 2));
+  const sy = (v: number) => H - PAD - v * (H - PAD * 2);
+  const lineD =
+    measured.length >= 2
+      ? points
+          .map((p, i) => {
+            if (p.score == null) return null;
+            return `${i === 0 ? "M" : "L"} ${sx(i).toFixed(1)} ${sy(p.score).toFixed(1)}`;
+          })
+          .filter(Boolean)
+          .join(" ")
+      : null;
+  const baselineY = baseline != null ? sy(baseline) : null;
+  const tone =
+    latestVsBaseline == null
+      ? "text-meta"
+      : latestVsBaseline >= 0
+      ? "text-foreground"
+      : "text-warning";
+  return (
+    <div className="flex flex-col gap-1.5" title={`${label} held-out trend, last ${kings.length} kings`}>
+      <div className="flex items-baseline justify-between">
+        <span className="text-[10px] uppercase tracking-[0.18em] text-meta">
+          {label}
+        </span>
+        <span className={`num text-[11px] tabular-nums ${tone}`}>
+          {latestScore != null
+            ? `${(latestScore * 100).toFixed(1)}%`
+            : "n/a"}
+          {latestVsBaseline != null && (
+            <span className="text-meta ml-1 text-[10px]">
+              ({latestVsBaseline >= 0 ? "+" : ""}
+              {latestVsBaseline.toFixed(1)}pp)
+            </span>
+          )}
+        </span>
+      </div>
+      <svg
+        width={W}
+        height={H}
+        viewBox={`0 0 ${W} ${H}`}
+        className="block"
+        aria-label={`${label} sparkline`}
+      >
+        {/* Track */}
+        <line
+          x1={PAD}
+          x2={W - PAD}
+          y1={H - PAD}
+          y2={H - PAD}
+          stroke="var(--track)"
+          strokeWidth={0.5}
+        />
+        {/* Baseline reference (dashed) */}
+        {baselineY != null && (
+          <line
+            x1={PAD}
+            x2={W - PAD}
+            y1={baselineY}
+            y2={baselineY}
+            stroke="var(--track-fill-softer)"
+            strokeWidth={1}
+            strokeDasharray="2 2"
+          />
+        )}
+        {/* Sparkline */}
+        {lineD && (
+          <path d={lineD} fill="none" stroke="currentColor" strokeWidth={1.25} />
+        )}
+        {/* Points */}
+        {points.map((p, i) =>
+          p.score == null ? null : (
+            <circle
+              key={i}
+              cx={sx(i)}
+              cy={sy(p.score)}
+              r={i === points.length - 1 ? 1.6 : 1}
+              fill="currentColor"
+            />
+          ),
+        )}
+      </svg>
     </div>
   );
 }
@@ -410,7 +607,19 @@ function BenchSkeleton() {
     "ARC",
   ];
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
+    <div className="grid grid-cols-2 sm:grid-cols-3 grid-rows-[auto_1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
+      {/* Canary strip placeholder so the bench cards don't jump on load. */}
+      <div className="col-span-2 sm:col-span-3 px-6 sm:px-9 py-4 border-b border-border">
+        <div className="h-3 w-48 bg-[var(--track)] rounded-sm mb-3 opacity-30" />
+        <div className="grid grid-cols-3 sm:grid-cols-6 gap-x-6 gap-y-3">
+          {placeholders.map((label) => (
+            <div key={label} className="flex flex-col gap-1.5">
+              <span className="h-2 w-12 bg-[var(--track)] rounded-sm opacity-30" />
+              <span className="h-[26px] bg-[var(--track)] rounded-sm opacity-20" />
+            </div>
+          ))}
+        </div>
+      </div>
       {placeholders.map((label, i) => {
         const isLastCol = (i + 1) % 3 === 0;
         const isLastRow = i >= placeholders.length - 3;
