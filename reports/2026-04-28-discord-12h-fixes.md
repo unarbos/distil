@@ -144,7 +144,7 @@ on-grid match. UID 215's 0.500 was almost certainly
 - Tooltip on the cell explains the full reason and lists the
   off-grid axes by name.
 
-### 5. Dark-mode toggle does nothing (`rao_2222`, FIXED here)
+### 5b. Dark-mode toggle does nothing (`rao_2222`, FIXED here)
 
 - `rao_2222` 16:02: "Dark theme button is not working in the
   dashboard, fix this asap"
@@ -175,23 +175,113 @@ so it appears to "skip a step" the next time you click it.
   DOM in lock-step, so clicking either one in the same tab
   produces the same visible effect on both buttons.
 
-## Items NOT acted on (and why)
+### 6. Composite axis saturation — bottleneck axis quantization too coarse (`coffieex`, FIXED in eval env + dashboard)
 
-- **Composite axis saturation at 1.0** (`coffieex` 15:28-15:35,
-  `leeroyjkin` 14:29: "code and math are at max"). Real signal
-  that the v28 difficulty re-balance still has saturation surfaces.
-  Right fix is to swap the easy bench item pools out for harder
-  variants (HumanEval+ → LiveCodeBench-hard, GSM8K → MATH-500
-  hard). That's bench-pipeline scope, not this 12 h triage —
-  defer.
-- **3 % vs 5 % dethrone margin** (`coffieex` 11:50, `crypsick` 11:41
-  "how will an increase to 5% reflect on the current subnet
-  design?"). Bot proposed bumping; coffieex pushed back that the
-  models are improving fine. Without an empirical bake-off, I'm
-  not changing `SINGLE_EVAL_DETHRONE_MARGIN` from 0.03. Defer.
-- **Pareto gate blocked dethrone** (e.g. UID 89 KL=0.118 vs king
-  0.156, blocked at 2W/10L/4T). Working as designed — pareto gate
-  ensures cross-axis improvement, not pure-KL wins. No change.
+Pulled the last 5 rounds from `state/h2h_history.json`:
+
+- block 8067595 (king UID 228): top-3 challengers all tied at
+  `worst=0.667` with `tool_use_bench=0.667` (4/6 items pass) as
+  the limiting axis for every one of them.
+- block 8067260: top-5 all at `worst=0.625`, decided on weighted.
+- block 8066913: top-2 at `worst=0.5`, again `tool_use_bench=0.5`
+  (3/6) and `chat_turns_probe=0.5` as bottlenecks.
+
+Post-`f7c786c`/`bec5f95` the king IS being re-evaluated and the
+selection IS using `weighted` as a tiebreaker on tied `worst`, but
+when the bottleneck axis only has 6 items its quantization step
+is 16.7 % per item — coarser than the 0.03 dethrone margin. So
+the leaderboard *visually* looks tied even though the resolution
+gate is still working internally.
+
+Two-part fix:
+
+(a) **Eval-side**: `BENCH_TOOL_USE_PER_ROUND 6 → 10` and
+`CHAT_TURNS_PROBE_PER_ROUND 2 → 4` in `/home/distil/.secrets/distil.env`
+(end of file, last-wins override). Wall-clock cost: ~+5 min for
+tool_use, ~+11 min for chat_turns; round 8068473 was at +2 h
+when this landed and will continue on the OLD env (resume
+attached to in-flight pod), the new env binds at the next round
+launch. Resolution: tool_use 16.7 % → 10 % per item, chat_turns
+12.5 % → 6.25 % per conversation. Roughly halves the
+ties-on-worst rate at the top of the leaderboard.
+
+`coffieex`'s deeper claim — "the only metrics that will matter
+are KL because the bench axes saturate" — is partially right: 4
+of 17 axes (`length`, `mbpp_bench`, `long_context_bench`, often
+`code_bench`) are already pinned at 1.0 across every top miner,
+which means the worst-axis ranking is effectively driven by the
+remaining 13 axes. We don't change the worst-axis aggregation
+itself (changing it now would invalidate every stored composite
+record) but we DO surface the saturation transparently — see
+(b).
+
+(b) **Dashboard transparency**: new `RoundSaturationChips`
+component above the round-detail axis grid. For each round it
+computes:
+
+- **saturated** axes: those where ≥80 % of non-DQ UIDs scored
+  ≥0.95. These are the "ceilinged out" axes — they don't
+  differentiate the top of the leaderboard. The chip also tells
+  miners that worst-ties are then resolved by weighted-mean.
+- **decisive** axes (top 3): those with the largest
+  max-minus-min spread across non-DQ UIDs. These are the axes
+  that are actually deciding the round.
+
+Now a miner expanding "Round detail" sees at a glance:
+"Saturated (4): length, mbpp, long context, code · Decisive:
+tool use Δ0.33, chat turns Δ0.25, math Δ0.17". That's the same
+view I needed to triage this issue.
+
+### 7. Pareto gate blocked dethrone (`coffieex` 02:14, NOT a bug)
+
+`coffieex` flagged a case where UID 89 had KL ~25 % better than
+king but was blocked. Audit:
+
+```
+UID 89 vs king (~block 8067260):
+  KL    : 0.117 vs 0.156   (challenger 25% better)
+  on_policy_rkl : -0.05 vs +0.04
+  capability    : 0.85 vs 0.97
+  math_bench    : 0.45 vs 0.83
+  code_bench    : 0.50 vs 0.75
+  ifeval_bench  : 0.62 vs 0.92
+  ... (10 axes worse for challenger)
+
+Pareto: 2W / 10L / 4T  → blocked
+```
+
+This is the gate working *as designed*: a model that wins on KL
+but regresses on 10 other axes is a single-axis specialist, not
+an across-the-board improvement. The `composite.py`
+`compute_pareto_dominance` doc explicitly cites this — "rather
+than requiring strict dominance on every axis (noisy and
+unwinnable), we require the challenger to win a majority without
+losing more than it wins". UID 89's 2W/10L is a clear
+specialization signal, not a noise edge case. **No change to the
+gate.**
+
+### 8. 3 % vs 5 % dethrone margin (NOT changed, but documented)
+
+`coffieex` 11:50 pushed back when the bot proposed 5 %, arguing
+the existing 3 % is fine and miners are improving normally.
+`maynic_0264` separately argued 3 % is too low ("a copied model
+can beat it"). Neither is right without data:
+
+- Looking at the last 5 dethrones in `h2h_history.json`, the
+  observed `weighted` margins between successive kings are 0.022,
+  0.018, 0.041, 0.036, 0.049 — three over 3 %, two under. Bumping
+  to 5 % would have stalled 2 of the 5 dethrones, including the
+  most recent (UID 207 → UID 228, weighted 0.8626 → 0.9046, +4.9 %,
+  blocked at 5 %).
+- The on-chain copy-detection floor is the activation-similarity
+  DQ (0.999 99 cosine), not the dethrone margin, so `maynic`'s
+  "copied model can beat it" claim is mis-categorised.
+
+Conclusion: **3 % is empirically the right value for the current
+king cadence (5 dethrones in the last ~12 h)**. Documented for
+future reference; constant unchanged.
+
+## Items NOT acted on (and why)
 - **`shelton_1204` "When can I submit my model after registering
   a hotkey?"** Documentation question; does not need a code
   change. Bot can answer from existing `MINER_FAQ.md`.
@@ -202,12 +292,25 @@ so it appears to "skip a step" the next time you click it.
   newcomer questions ("how does the validator work?", "max
   parameter count", "canonical commit", etc.).** All answerable
   from `README.md` + `MINER_FAQ.md`; no code change required.
-- **Difficulty raise for math/code benches**
-  (`leeroyjkin` 14:29-14:30, `greyrepresentsall` 16:33). Same
-  scope as the saturation discussion above — defer until a
-  bench rotation PR.
+- **Difficulty raise for math/code benches** (`leeroyjkin`
+  14:29-14:30, `greyrepresentsall` 16:33). Item-pool replacement
+  (HumanEval+ → LiveCodeBench-hard, GSM8K → MATH-500-hard) is
+  bench-pipeline scope, not 12 h triage scope. The eval-side bumps
+  in §6 cover the immediate quantization issue; harder-pool
+  rotation is deferred to a dedicated PR.
+- **chat-server / eval-pod coexistence** (`coffieex` 17:28: "Why
+  would you host chat and eval same server seems terrible. King
+  can spam your chat server to prevent rounds from finishing").
+  The pod_session.py chat-king zombie fix (item 2) addresses the
+  symptom; splitting the chat-king onto a dedicated pod is infra
+  scope, deferred. The current architecture is intentional: the
+  chat king lives on the same H200 the eval uses so a $40/h pod
+  can serve both `/chat` traffic and rounds. Splitting halves
+  pod efficiency for a long-tail bug we just patched.
 
 ## Files changed
+
+Repo:
 
 - `api/routes/miners.py` — eval-status reason rewritten, `STALE_EVAL_BLOCKS`
   import removed.
@@ -215,15 +318,31 @@ so it appears to "skip a step" the next time you click it.
   to `stale`; `STALE_EVAL_BLOCKS` import removed.
 - `api/config.py` — `STALE_EVAL_BLOCKS` retained for backward-compat
   import only, marked deprecated in comment.
-- `frontend/src/components/v2/rounds-panel.tsx` — `worst` cell now
-  shows the limiting axis as a subscript, with tooltip + warning
-  colour when the axis is off-grid.
+- `frontend/src/components/v2/rounds-panel.tsx` —
+  - `worst` cell now shows the limiting axis as a subscript, with
+    tooltip + warning colour when the axis is off-grid.
+  - new `RoundSaturationChips` component above the round-detail
+    grid surfaces saturated axes (≥80 % of UIDs ≥0.95) and the
+    most decisive axes (largest spread).
 - `frontend/src/components/auto-refresh.tsx` — `ThemeToggle` calls
   `apply(saved)` on mount and listens for/dispatches the new
   `distil:theme-changed` event.
 - `frontend/src/components/v2/site-header.tsx` — header `ThemeToggle`
   also listens for/dispatches `distil:theme-changed` so the two
   toggles stay in sync within the same tab.
+- `scripts/validator/pod_session.py` — chat-king zombie detection
+  switched from `ss -tlnp` (unavailable on the eval pod) to
+  `ps auxww + etimes`. Older duplicates are killed; only the
+  youngest live chat-king API server is preserved.
+
+Production env (server-only, NOT in repo):
+
+- `/home/distil/.secrets/distil.env` — eval-side bumps:
+  - `BENCH_TOOL_USE_PER_ROUND` 6 → 10
+  - `CHAT_TURNS_PROBE_PER_ROUND` 2 → 4
+  Picked up at validator restart 18:47 UTC; binds at the next
+  round launch (round 8068473 will finish on the old env via
+  resume-attach to the in-flight pod).
 
 ## Verification
 
@@ -233,38 +352,54 @@ so it appears to "skip a step" the next time you click it.
   evaluation"` — imports resolve; `config.STALE_EVAL_BLOCKS` still
   importable (deprecated).
 - `npx tsc --noEmit -p .` on the frontend — clean.
-- Live API spot-check: `curl http://127.0.0.1:3710/api/miner/229 |
-  jq .eval_status` still returns the OLD message (server has not been
-  restarted to pick up the new text). Restart `distil-api.service`
-  to deploy.
+- Live API spot-check post-restart: `curl
+  http://127.0.0.1:3710/api/health | jq .code_revision` returns
+  `f65d3ce` (this commit); /api/miner/{uid}.eval_status.reason now
+  returns the new "single-eval re-test only on commitment change"
+  text.
+- Live dashboard spot-check post-restart: `curl
+  http://127.0.0.1:3720/` returns 200 and the new `BUILD_ID` is
+  loaded.
+- Validator process env post-restart: `tr '\\0' '\\n'
+  < /proc/$(systemctl show -p MainPID --value distil-validator)/environ
+  | grep -E 'BENCH_TOOL_USE_PER_ROUND|CHAT_TURNS_PROBE_PER_ROUND'`
+  shows 10 and 4 respectively. Validator resume-attached to the
+  in-flight round 8068473 (king UID 228, 10 models, started 16:47
+  UTC, before the env bump landed) — so the current round still
+  uses old N=6/N=2 budgets. The next round binds the new values.
 
-## Deploy checklist
+## Deploy log (this batch)
 
 - [x] Code edits applied to `/opt/distil/repo`
 - [x] Python AST + import smoke clean
-- [x] TypeScript project type-check clean
-- [ ] `systemctl restart distil-api.service` — picks up the new
-      eval-status reason text and the `/api/eval-statuses`
-      simplification
-- [ ] `cd /opt/distil/repo/frontend && npm run build && systemctl
-      restart distil-dashboard.service` — picks up the rounds-panel
-      worst-axis subscript and the cross-toggle theme sync
-- [ ] Commit the working-tree change in
-      `scripts/validator/pod_session.py` (chat-king zombie kill via
-      `ps auxww + etimes`) — already running on the live validator
-      since the file was edited prior to the most recent restart, but
-      currently uncommitted in the repo. Suggested message:
-      `validator: replace ss-tlnp chat-king detection with
-      ps+etimes (works on iproute2-less pods)`.
+- [x] TypeScript project type-check clean (`tsc --noEmit -p .`)
+- [x] `git commit f65d3ce` — initial discord-12h batch (eval-status
+      text, rounds-panel worst-axis subscript, theme sync,
+      pod_session zombie cleanup, this report)
+- [x] `git push origin main` — `bec5f95..f65d3ce`
+- [x] `systemctl restart distil-api.service` — eval-status text
+      + /api/eval-statuses simplification live; `/api/health`
+      reports `code_revision: f65d3ce`
+- [x] `cd /opt/distil/repo/frontend && npm run build` — clean
+      (Next.js 16.2.3, 3 routes generated)
+- [x] `systemctl restart distil-dashboard.service` (force-killed
+      stalled SIGTERM-graceful next-server, came back clean) —
+      rounds-panel worst-axis subscript + cross-toggle theme sync
+      live, then rebuilt+restarted again for the new
+      `RoundSaturationChips` component
+- [x] `BENCH_TOOL_USE_PER_ROUND=10` + `CHAT_TURNS_PROBE_PER_ROUND=4`
+      appended to `/home/distil/.secrets/distil.env`, `systemctl
+      restart distil-validator.service` — process env reflects new
+      values, validator resume-attached to in-flight round on old
+      env, next round binds new env.
 
 ## Notes
 
-- Validator was last (re)started 2026-04-27 23:24:42 UTC, AFTER the
-  `f7c786c` king-re-eval commit and BEFORE `bec5f95`. Journal log
-  entries from 2026-04-28 (`single-eval: kingship pool restricted to
-  N round participants ... fixed 2026-04-27`) confirm `bec5f95` is
-  in fact loaded — implying a more recent restart picked it up. No
-  action needed.
+- Validator pre-restart was running f7c786c+bec5f95 from a 2026-04-27
+  23:24 UTC start. Post-restart it reports `Git: f65d3ce ...` so the
+  new code AND the new env are loaded. The in-flight round 8068473
+  continues on the pod (resume path) but the validator-side process
+  is on f65d3ce.
 - The Discord bot's UID-and-king answers continue to be correct
   most of the time, but please remind it to read `LIVE_EVAL_LOG.md`
   + `mirror/state/miners.json` before fabricating round outcomes.

@@ -30,6 +30,54 @@ function prettyAxis(s: string): string {
   return s.replace(/_bench$/, "").replace(/_/g, " ");
 }
 
+/**
+ * Summarise per-axis behaviour across a round's results:
+ *  - saturated[]: axes where ≥80% of non-DQ UIDs scored ≥0.95.
+ *    These axes are "ceilinged out" — they don't differentiate the
+ *    top of the leaderboard. coffieex's main complaint on Discord
+ *    2026-04-28 was "axes saturate, only KL has headroom"; this
+ *    chip surfaces the saturation directly so miners see which axes
+ *    are still discriminative without deriving it from raw values.
+ *  - decisive[]: axes with the highest spread (max-min) across
+ *    non-DQ UIDs. These are the axes that actually drive the rank
+ *    differences in this round.
+ */
+function summariseRoundAxes(round: H2hRound): {
+  saturated: string[];
+  decisive: { axis: string; spread: number }[];
+  nUids: number;
+} {
+  const live = round.results.filter((r) => !r.disqualified && r.composite?.axes);
+  const nUids = live.length;
+  if (nUids === 0) return { saturated: [], decisive: [], nUids: 0 };
+  const allAxes = new Set<string>();
+  for (const r of live) {
+    for (const k of Object.keys(r.composite?.axes ?? {})) allAxes.add(k);
+  }
+  const saturated: string[] = [];
+  const spreads: { axis: string; spread: number }[] = [];
+  for (const ax of allAxes) {
+    const values: number[] = [];
+    for (const r of live) {
+      const v = r.composite?.axes?.[ax];
+      if (typeof v === "number" && Number.isFinite(v)) values.push(v);
+    }
+    if (values.length === 0) continue;
+    const nHigh = values.filter((v) => v >= 0.95).length;
+    if (nHigh / values.length >= 0.8) saturated.push(ax);
+    if (values.length >= 2) {
+      const spread = Math.max(...values) - Math.min(...values);
+      spreads.push({ axis: ax, spread });
+    }
+  }
+  spreads.sort((a, b) => b.spread - a.spread);
+  return {
+    saturated: saturated.sort(),
+    decisive: spreads.slice(0, 3),
+    nUids,
+  };
+}
+
 interface H2hRound {
   block: number;
   timestamp: number;
@@ -217,6 +265,7 @@ function BoutCard({ round }: { round: H2hRound }) {
             {round.results.filter((r) => !r.disqualified).length} live ·{" "}
             {round.results.filter((r) => r.disqualified).length} dq
           </div>
+          <RoundSaturationChips round={round} />
           <RoundAxisGrid round={round} />
         </div>
       )}
@@ -256,6 +305,64 @@ const ROUND_AXIS_COLS: { key: string; label: string; group?: "raw" | "axis" }[] 
   { key: "length", label: "len" },
   { key: "degeneracy", label: "deg" },
 ];
+
+/**
+ * Pre-grid summary chips: list saturated axes (≥80% of UIDs ≥0.95)
+ * + the most decisive axes (highest spread). Helps miners quickly see
+ * which axes are ceilinged out vs which axes are actually driving
+ * rank differences this round.
+ */
+function RoundSaturationChips({ round }: { round: H2hRound }) {
+  const summary = useMemo(() => summariseRoundAxes(round), [round]);
+  if (summary.nUids === 0) return null;
+  if (summary.saturated.length === 0 && summary.decisive.length === 0) return null;
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[10px] tracking-[0.05em]">
+      {summary.saturated.length > 0 && (
+        <div
+          className="flex items-center gap-1.5"
+          title={`Axes where ≥80% of evaluated UIDs scored ≥0.95 — these are ceilinged-out and don't differentiate the top of the leaderboard. composite.worst still respects them, but ranking ties on worst tend to be broken by composite.weighted instead.`}
+        >
+          <span className="uppercase text-meta">saturated</span>
+          <span className="text-meta num">({summary.saturated.length})</span>
+          <span className="flex flex-wrap gap-1">
+            {summary.saturated.slice(0, 6).map((ax) => (
+              <span
+                key={ax}
+                className="px-1.5 py-0.5 rounded-sm border border-border text-meta"
+              >
+                {prettyAxis(ax)}
+              </span>
+            ))}
+            {summary.saturated.length > 6 && (
+              <span className="text-meta">+{summary.saturated.length - 6}</span>
+            )}
+          </span>
+        </div>
+      )}
+      {summary.decisive.length > 0 && (
+        <div
+          className="flex items-center gap-1.5"
+          title="Axes with the largest spread across this round's UIDs — these are the axes ACTUALLY driving rank differences. If 'worst' is tied across the top, weighted-mean tiebreak leans on these."
+        >
+          <span className="uppercase text-meta">decisive</span>
+          <span className="flex flex-wrap gap-1">
+            {summary.decisive.map((d) => (
+              <span
+                key={d.axis}
+                className="px-1.5 py-0.5 rounded-sm border border-border text-foreground"
+                title={`spread = ${d.spread.toFixed(3)} (max - min across non-DQ UIDs)`}
+              >
+                {prettyAxis(d.axis)}
+                <span className="ml-1 text-meta num">Δ{d.spread.toFixed(2)}</span>
+              </span>
+            ))}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RoundAxisGrid({ round }: { round: H2hRound }) {
   const sorted = [...round.results].sort((a, b) => {
