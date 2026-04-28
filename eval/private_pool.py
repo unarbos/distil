@@ -2,6 +2,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 from pathlib import Path
@@ -12,7 +13,15 @@ PRIVATE_POOL_PATH = Path("state/private_prompt_pool.json")
 PRIVATE_USE_LOG_PATH = Path("state/private_pool_use.json")
 PRIVATE_COMMIT_PATH = Path("state/private_pool_commit.json")
 PRIVATE_REVEAL_PATH = Path("state/private_pool_reveal.json")
-DEFAULT_PRIVATE_FRACTION = 0.10
+# 2026-04-28 (v29.1): default raised from 0.10 → 0.20 to widen the KL
+# probe's exposure to held-out-skill prompts (gsm8k/humaneval/bbh/ifeval
+# distributions) added to the private pool. A model that has dropped
+# math/code/reasoning ability will diverge from the teacher more on
+# these prompts than on plain ClimbMix continuations, so KL itself now
+# rewards retaining the skills we measure on the held-out canary.
+# Override via PRIVATE_PROMPT_FRACTION env if a downstream issue forces
+# rollback to the legacy 0.10 mix.
+DEFAULT_PRIVATE_FRACTION = float(os.environ.get("PRIVATE_PROMPT_FRACTION", "0.20"))
 DP_NOISE_SCALE_PER_USE = 0.002
 PRIVATE_POOL_MIN_HEALTHY = 50
 

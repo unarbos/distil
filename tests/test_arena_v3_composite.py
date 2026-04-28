@@ -862,13 +862,22 @@ class TestKingHealth(unittest.TestCase):
 
     def test_worse_than_base_only(self):
         from scripts.validator.composite import annotate_h2h_with_composite
+        # 2026-04-28 (v29.1): the per-axis baseline-relative penalty
+        # docks bench axes by ``alpha * gap`` when the king regresses
+        # below the same-round Qwen-4B-base. A 20pp gap with alpha=1.5
+        # would dock the axis by 30pp, pushing it below the floor — a
+        # *correct* outcome for a heavily-regressed king. To still
+        # exercise the "worse_than_base without below_floor" branch we
+        # use a SMALL regression: 5pp gap → dock 7.5pp → adjusted axis
+        # stays above the 0.20 floor while ``king_worst`` is still
+        # below ``base_worst``, so worse_than_base fires alone.
         h2h, sd = self._build_h2h(
-            king_bench={"math_bench": 0.35, "code_bench": 0.30,
-                        "reasoning_bench": 0.32, "knowledge_bench": 0.28,
-                        "ifeval_bench": 0.30},
-            base_bench={"math_bench": 0.55, "code_bench": 0.50,
-                        "reasoning_bench": 0.52, "knowledge_bench": 0.48,
-                        "ifeval_bench": 0.50},
+            king_bench={"math_bench": 0.45, "code_bench": 0.42,
+                        "reasoning_bench": 0.43, "knowledge_bench": 0.40,
+                        "ifeval_bench": 0.41},
+            base_bench={"math_bench": 0.50, "code_bench": 0.47,
+                        "reasoning_bench": 0.48, "knowledge_bench": 0.45,
+                        "ifeval_bench": 0.46},
         )
         annotate_h2h_with_composite(h2h, king_kl=0.2, students_data=sd,
             reference_model="base/m", reference_uid=-1)
@@ -1138,6 +1147,212 @@ class TestChatTurnsProbe(unittest.TestCase):
                 "promoted chat_turns axis must be able to set worst")
         finally:
             _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved
+
+
+class TestBaselineRelativePenalty(unittest.TestCase):
+    """Per-axis baseline-relative penalty (v29.1, 2026-04-28).
+
+    Verifies that bench axes get docked when a student regresses below
+    the same-round Qwen-4B-base reference, while parity / above-base
+    students are unaffected. This is the structural fix for the
+    Goodhart pathology where every king from 2026-04-17 → 2026-04-28
+    climbed validator composite while regressing on held-out canary.
+    """
+
+    def setUp(self):
+        import scripts.validator.composite as _c
+        self._saved = (
+            _c.BASELINE_RELATIVE_PENALTY_ENABLED,
+            _c.BASELINE_RELATIVE_PENALTY_ALPHA,
+        )
+        _c.BASELINE_RELATIVE_PENALTY_ENABLED = True
+        _c.BASELINE_RELATIVE_PENALTY_ALPHA = 1.5
+
+    def tearDown(self):
+        import scripts.validator.composite as _c
+        (
+            _c.BASELINE_RELATIVE_PENALTY_ENABLED,
+            _c.BASELINE_RELATIVE_PENALTY_ALPHA,
+        ) = self._saved
+
+    def test_helper_returns_unchanged_when_disabled(self):
+        import scripts.validator.composite as _c
+        _c.BASELINE_RELATIVE_PENALTY_ENABLED = False
+        v = _c._apply_baseline_relative_penalty("math_bench", 0.30, 0.50)
+        self.assertEqual(v, 0.30)
+
+    def test_helper_returns_unchanged_for_non_listed_axis(self):
+        import scripts.validator.composite as _c
+        # judge_probe is intentionally NOT in BASELINE_RELATIVE_PENALTY_AXES.
+        v = _c._apply_baseline_relative_penalty("judge_probe", 0.30, 0.50)
+        self.assertEqual(v, 0.30)
+
+    def test_helper_returns_unchanged_when_at_or_above_reference(self):
+        import scripts.validator.composite as _c
+        self.assertEqual(_c._apply_baseline_relative_penalty("math_bench", 0.50, 0.50), 0.50)
+        self.assertEqual(_c._apply_baseline_relative_penalty("math_bench", 0.80, 0.50), 0.80)
+
+    def test_helper_docks_when_below_reference(self):
+        import scripts.validator.composite as _c
+        v = _c._apply_baseline_relative_penalty("math_bench", 0.40, 0.50)
+        self.assertAlmostEqual(v, 0.40 - 1.5 * 0.10, places=4)
+
+    def test_helper_clips_to_zero_on_heavy_regression(self):
+        import scripts.validator.composite as _c
+        v = _c._apply_baseline_relative_penalty("math_bench", 0.10, 0.80)
+        self.assertEqual(v, 0.0)
+
+    def test_helper_handles_none_inputs(self):
+        import scripts.validator.composite as _c
+        self.assertIsNone(_c._apply_baseline_relative_penalty("math_bench", None, 0.50))
+        self.assertEqual(_c._apply_baseline_relative_penalty("math_bench", 0.50, None), 0.50)
+
+    def test_compute_composite_docks_below_base_student(self):
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_rd = _c.REASONING_DENSITY_IN_COMPOSITE
+        saved_chat = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = False
+            _c.BENCH_AXES_IN_COMPOSITE = True
+            _c.REASONING_DENSITY_IN_COMPOSITE = False
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = False
+            student = _make_student(
+                kl=0.10, rkl=0.10, cap_frac=0.85,
+                bench={
+                    "math_bench": 0.40,  # 10pp below base
+                    "code_bench": 0.40,
+                    "reasoning_bench": 0.40,
+                    "knowledge_bench": 0.40,
+                    "ifeval_bench": 0.40,
+                },
+            )
+            ref_axes = {
+                "math_bench": 0.50, "code_bench": 0.50,
+                "reasoning_bench": 0.50, "knowledge_bench": 0.50,
+                "ifeval_bench": 0.50,
+            }
+            comp = _c.compute_composite(
+                student, king_kl=0.10, king_rkl=0.10,
+                reference_axes=ref_axes,
+            )
+            adj_math = comp["axes"]["math_bench"]
+            raw_math = comp["axes_raw"]["math_bench"]
+            self.assertEqual(raw_math, 0.40)
+            self.assertAlmostEqual(adj_math, 0.25, places=4,
+                msg="alpha=1.5 × 10pp gap ⇒ 15pp dock ⇒ 0.40-0.15=0.25")
+            # knowledge_bench is intentionally NOT penalized (weight 0
+            # since v28 audit), so only math/code/reasoning/ifeval get
+            # docked here — 4 axes, not 5.
+            self.assertEqual(comp["baseline_penalty"]["n_docked"], 4)
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
+
+    def test_compute_composite_no_dock_for_above_base_student(self):
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_rd = _c.REASONING_DENSITY_IN_COMPOSITE
+        saved_chat = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = False
+            _c.BENCH_AXES_IN_COMPOSITE = True
+            _c.REASONING_DENSITY_IN_COMPOSITE = False
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = False
+            student = _make_student(
+                kl=0.10, rkl=0.10, cap_frac=0.85,
+                bench={
+                    "math_bench": 0.70, "code_bench": 0.70,
+                    "reasoning_bench": 0.70, "knowledge_bench": 0.70,
+                    "ifeval_bench": 0.70,
+                },
+            )
+            ref_axes = {
+                "math_bench": 0.50, "code_bench": 0.50,
+                "reasoning_bench": 0.50, "knowledge_bench": 0.50,
+                "ifeval_bench": 0.50,
+            }
+            comp = _c.compute_composite(
+                student, king_kl=0.10, king_rkl=0.10,
+                reference_axes=ref_axes,
+            )
+            self.assertEqual(comp["axes"]["math_bench"], 0.70)
+            self.assertEqual(comp["baseline_penalty"]["n_docked"], 0)
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
+
+    def test_above_base_challenger_outranks_below_base_king(self):
+        """End-to-end: a challenger that is 5pp ABOVE base on every axis
+        outranks a king that is 5pp BELOW base on every axis. Without
+        the per-axis penalty the king might still outrank because of
+        relative-axis advantages; with the penalty its bench axes get
+        docked enough that worst() picks up the gap."""
+        from scripts.validator.composite import annotate_h2h_with_composite
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_rd = _c.REASONING_DENSITY_IN_COMPOSITE
+        saved_chat = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = False
+            _c.BENCH_AXES_IN_COMPOSITE = True
+            _c.REASONING_DENSITY_IN_COMPOSITE = False
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = False
+            # Both competitors have IDENTICAL relative axes so the test
+            # isolates the bench dock effect. Only difference is bench:
+            # king regresses 10pp below base, challenger is 5pp above.
+            students_data = {
+                "king/below_base": _make_student(
+                    kl=0.10, rkl=0.10, cap_frac=0.85,
+                    bench={
+                        "math_bench": 0.40, "code_bench": 0.40,
+                        "reasoning_bench": 0.40, "knowledge_bench": 0.40,
+                        "ifeval_bench": 0.40,
+                    },
+                ),
+                "chall/above_base": _make_student(
+                    kl=0.10, rkl=0.10, cap_frac=0.85,
+                    bench={
+                        "math_bench": 0.55, "code_bench": 0.55,
+                        "reasoning_bench": 0.55, "knowledge_bench": 0.55,
+                        "ifeval_bench": 0.55,
+                    },
+                ),
+                "base/m": _make_student(
+                    kl=0.10, rkl=0.10, cap_frac=0.85,
+                    bench={
+                        "math_bench": 0.50, "code_bench": 0.50,
+                        "reasoning_bench": 0.50, "knowledge_bench": 0.50,
+                        "ifeval_bench": 0.50,
+                    },
+                ),
+            }
+            h2h = [
+                {"uid": 10, "model": "king/below_base", "is_king": True, "kl": 0.10},
+                {"uid": 11, "model": "chall/above_base", "is_king": False, "kl": 0.10},
+                {"uid": -1, "model": "base/m", "is_king": False, "kl": 0.10},
+            ]
+            annotate_h2h_with_composite(
+                h2h, king_kl=0.10, students_data=students_data,
+                reference_model="base/m", reference_uid=-1,
+            )
+            king = next(r for r in h2h if r["uid"] == 10)["composite"]
+            chall = next(r for r in h2h if r["uid"] == 11)["composite"]
+            self.assertGreater(chall["worst"], king["worst"],
+                "above-base challenger must outrank below-base king "
+                "after per-axis penalty")
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
 
 
 if __name__ == "__main__":

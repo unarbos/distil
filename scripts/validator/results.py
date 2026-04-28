@@ -4,6 +4,7 @@ import math
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
@@ -1174,11 +1175,38 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     except Exception:
         king_rkl_ref = None
 
+    # 2026-04-28 (v29.1): resolve same-round reference axis values once
+    # so the dethroner ranking applies the same per-axis baseline-relative
+    # penalty that ``annotate_h2h_with_composite`` will use later. Without
+    # this the early ranking key (composite.worst) and the later
+    # display-time composite would disagree for kings/challengers that
+    # regress below Qwen-4B-base on a bench axis. Fail open to None when
+    # the reference is missing or compute_axes throws — penalty silently
+    # disables that round and ranking degrades to the pre-v29.1 behavior.
+    _ref_axes_for_ranking: dict | None = None
+    _ref_uid_for_ranking: Any = None
+    try:
+        from eval.runtime import REFERENCE_MODEL as _REF_MODEL_RANK, REFERENCE_UID as _REF_UID_RANK
+        from scripts.validator.composite import compute_axes as _compute_axes_rank
+        _ref_uid_for_ranking = _REF_UID_RANK
+        _ref_row = students_data.get(_REF_MODEL_RANK) if _REF_MODEL_RANK else None
+        if _ref_row is not None:
+            _ref_axes_for_ranking = _compute_axes_rank(
+                _ref_row, king_h2h_kl, king_rkl_ref,
+            )
+    except Exception:
+        _ref_axes_for_ranking = None
+
     def _composite_for(uid):
         model = uid_to_model.get(uid)
         data = students_data.get(model) or {}
+        # Reference itself is the anchor: don't dock it against itself.
+        ref_axes = None if uid == _ref_uid_for_ranking else _ref_axes_for_ranking
         try:
-            return compute_composite(data, king_h2h_kl, king_rkl_ref)
+            return compute_composite(
+                data, king_h2h_kl, king_rkl_ref,
+                reference_axes=ref_axes,
+            )
         except Exception:
             return {"worst": None, "weighted": None, "axes": {}, "present_count": 0}
 

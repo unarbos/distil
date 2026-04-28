@@ -373,6 +373,66 @@ KING_CANARY_GATE = os.environ.get("KING_CANARY_GATE", "1") != "0"
 KING_CANARY_AXES = ("gsm8k", "humaneval", "bbh", "ifeval")
 KING_CANARY_BASELINE_FILE = os.environ.get("KING_CANARY_BASELINE_FILE", "baseline_qwen35_4b.json")
 
+# ── Per-axis baseline-relative penalty (2026-04-28, v29.1) ────────────
+# The 2026-04-28 audit confirmed every king from 2026-04-17 → today
+# regressed below Qwen3.5-4B base on the held-out canary (-7.4pp gsm8k,
+# -10pp ifeval, -16pp bbh, -12pp humaneval typical). The pre-existing
+# defenses — ``_baseline_floor_dethrone_veto`` (10pp absolute floor) and
+# ``king_canary_streak`` (2-round held-out streak) — both fire AT
+# crowning / streak time, not during scoring. So a model can climb
+# composite.worst and stay there indefinitely while regressing on real
+# capability versus the un-distilled control.
+#
+# The fix is to make the per-axis composite directly reflect "stay
+# above Qwen-4B-base". For each enabled bench axis, we compare each
+# student's pass_frac to the *same-round* reference (REFERENCE_UID = -1,
+# Qwen3.5-4B) score on the SAME block-seeded items. If the student is
+# below the reference, the axis value gets docked by
+# ``alpha * (ref - student)`` clipped to 0, where ``alpha`` is the
+# regression weight.
+#
+# Why this works:
+#   * Same-round paired comparison: both models see identical procedural
+#     items (block_seed-deterministic), so the comparison is sample-
+#     paired and free of cross-round prompt drift.
+#   * Reward parity, punish regression: a student that BEATS base on
+#     math gets full credit. A student that ties gets full credit. A
+#     student that regresses is docked proportionally.
+#   * No artificial ceiling: students who legitimately exceed base on
+#     an axis are unaffected — overfitting in the *good* direction
+#     (genuine skill > base) is encouraged.
+#   * Compatible with worst-axis aggregation: the docked axis flows
+#     into worst() so the dethrone gate naturally favors balanced-and-
+#     above-base students over below-base specialists.
+#
+# Calibration:
+#   * ``BASELINE_RELATIVE_PENALTY_ALPHA = 1.5`` — a 10pp regression below
+#     base docks the axis by 15pp. This makes "stay at parity" the
+#     dominant strategy: it costs the same as a 6.7pp axis-specific
+#     improvement to drop 10pp on another axis. Aligned with the pre-
+#     existing ``BASELINE_FLOOR_MARGIN = 0.10`` veto threshold.
+#   * Penalty applied to bench axes only. Relative axes (kl, on_policy_rkl,
+#     capability, length, degeneracy) are normalized differently and
+#     would double-penalize. The judge_probe / chat_turns_probe axes
+#     are absolute correctness but reference-model-flat (small dynamic
+#     range), so we exclude them too.
+#   * ``BASELINE_RELATIVE_PENALTY_AXES`` is the explicit allow-list of
+#     axes that get the penalty.
+BASELINE_RELATIVE_PENALTY_ENABLED = (
+    os.environ.get("BASELINE_RELATIVE_PENALTY_ENABLED", "1") != "0"
+)
+BASELINE_RELATIVE_PENALTY_ALPHA = float(
+    os.environ.get("BASELINE_RELATIVE_PENALTY_ALPHA", "1.5")
+)
+# Bench axes where regression below same-round reference docks the axis.
+# All Session-2 + Session-3 bench axes that have a real ground truth and
+# are scored by absolute pass_frac. Do NOT include relative axes.
+BASELINE_RELATIVE_PENALTY_AXES = frozenset({
+    "math_bench", "code_bench", "reasoning_bench", "ifeval_bench",
+    "aime_bench", "mbpp_bench", "tool_use_bench",
+    "long_context_bench", "robustness_bench",
+})
+
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
 # For each ranking axis we can optionally compute the axis value for the
 # teacher itself (scored as if it were a student). If the teacher's axis
@@ -872,9 +932,52 @@ def resolve_teacher_broken_axes(teacher_student_row: dict | None,
     return broken
 
 
+def _apply_baseline_relative_penalty(
+    axis_name: str,
+    axis_value: float | None,
+    reference_value: float | None,
+) -> float | None:
+    """Dock a bench axis when the student regresses below the same-round
+    reference (Qwen-4B-base) on that axis.
+
+    Returns ``axis_value`` unchanged when:
+      * the penalty system is disabled
+      * the axis is not in ``BASELINE_RELATIVE_PENALTY_AXES``
+      * either value is None
+      * the student is at parity or above the reference
+
+    Otherwise returns ``max(0, axis_value - alpha * (ref - axis_value))``.
+    The clip-to-zero matches the [0, 1] domain of bench axes; the
+    composite ``worst`` aggregation already treats 0 as the lower
+    bound, so a heavily-docked axis surfaces immediately as the
+    worst-axis penalty.
+
+    Same-round paired semantics are guaranteed by the caller: both
+    models see identical block-seeded items, so the regression measure
+    isolates real capability gap from prompt-mix drift.
+    """
+    if not BASELINE_RELATIVE_PENALTY_ENABLED:
+        return axis_value
+    if axis_name not in BASELINE_RELATIVE_PENALTY_AXES:
+        return axis_value
+    if axis_value is None or reference_value is None:
+        return axis_value
+    try:
+        a = float(axis_value)
+        r = float(reference_value)
+    except (TypeError, ValueError):
+        return axis_value
+    if a >= r:
+        return axis_value
+    gap = r - a
+    docked = a - BASELINE_RELATIVE_PENALTY_ALPHA * gap
+    return max(0.0, docked)
+
+
 def compute_composite(student: dict, king_kl: float | None = None,
                       king_rkl: float | None = None,
-                      broken_axes: set[str] | None = None) -> dict:
+                      broken_axes: set[str] | None = None,
+                      reference_axes: dict[str, float | None] | None = None) -> dict:
     """Return per-axis and composite (worst-case + weighted mean) scores.
 
     We emit *both* aggregations so the validator can A/B them offline
@@ -909,8 +1012,23 @@ def compute_composite(student: dict, king_kl: float | None = None,
 
     Caller is responsible for passing the union of teacher-broken and
     reference-broken sets via ``broken_axes``.
+
+    ``reference_axes`` (2026-04-28, v29.1): per-axis values of the
+    same-round Qwen-4B-base reference. When provided, each bench axis in
+    ``BASELINE_RELATIVE_PENALTY_AXES`` is docked by
+    ``BASELINE_RELATIVE_PENALTY_ALPHA × (ref - student)`` if the student
+    regresses below the reference. The raw axis values are preserved in
+    ``axes_raw`` for telemetry; ``axes`` reflects the docked values that
+    flow into ``worst`` / ``weighted`` and downstream gates.
     """
-    axes = compute_axes(student, king_kl, king_rkl)
+    raw_axes = compute_axes(student, king_kl, king_rkl)
+    if reference_axes:
+        axes = {
+            k: _apply_baseline_relative_penalty(k, v, reference_axes.get(k))
+            for k, v in raw_axes.items()
+        }
+    else:
+        axes = dict(raw_axes)
     # Build effective weights. Shadow-only axes flip in when their
     # respective gates are set (``JUDGE_AXIS_IN_COMPOSITE`` /
     # ``BENCH_AXES_IN_COMPOSITE`` / ``ARENA_V3_AXES_IN_COMPOSITE``).
@@ -949,6 +1067,11 @@ def compute_composite(student: dict, king_kl: float | None = None,
     }
     if not ranked:
         return {"version": COMPOSITE_SHADOW_VERSION, "axes": axes,
+                "axes_raw": (
+                    {k: (round(v, 4) if v is not None else None) for k, v in raw_axes.items()}
+                    if reference_axes else None
+                ),
+                "baseline_penalty": None,
                 "worst": None, "weighted": None, "present_count": 0,
                 "broken_axes": sorted(broken_axes) if broken_axes else [],
                 "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
@@ -995,9 +1118,46 @@ def compute_composite(student: dict, king_kl: float | None = None,
     if len(rel_vals) >= 2 and len(bench_vals) >= 2:
         bench_vs_rel_gap = (sum(bench_vals) / len(bench_vals)) - (sum(rel_vals) / len(rel_vals))
 
+    # 2026-04-28 (v29.1): when the baseline-relative penalty is in
+    # effect, ``axes`` reflects the *post-penalty* values that drive
+    # ranking. We also surface ``axes_raw`` (pre-penalty) and a
+    # ``baseline_penalty`` summary so the dashboard can show both the
+    # raw bench score and the regression dock without losing signal.
+    baseline_penalty_summary = None
+    if reference_axes:
+        deltas: dict[str, dict[str, float]] = {}
+        for axis in BASELINE_RELATIVE_PENALTY_AXES:
+            raw_v = raw_axes.get(axis)
+            adj_v = axes.get(axis)
+            ref_v = reference_axes.get(axis)
+            if raw_v is None or ref_v is None:
+                continue
+            if adj_v is None:
+                continue
+            if abs(raw_v - adj_v) < 1e-6 and raw_v >= ref_v:
+                continue
+            deltas[axis] = {
+                "raw": round(float(raw_v), 4),
+                "adjusted": round(float(adj_v), 4),
+                "reference": round(float(ref_v), 4),
+                "gap": round(float(ref_v - raw_v), 4),
+                "dock": round(float(raw_v - adj_v), 4),
+            }
+        baseline_penalty_summary = {
+            "enabled": BASELINE_RELATIVE_PENALTY_ENABLED,
+            "alpha": BASELINE_RELATIVE_PENALTY_ALPHA,
+            "applied": deltas,
+            "n_docked": len(deltas),
+        }
+
     return {
         "version": COMPOSITE_SHADOW_VERSION,
         "axes": {k: (round(v, 4) if v is not None else None) for k, v in axes.items()},
+        "axes_raw": (
+            {k: (round(v, 4) if v is not None else None) for k, v in raw_axes.items()}
+            if reference_axes else None
+        ),
+        "baseline_penalty": baseline_penalty_summary,
         "worst": round(worst, 4),
         "weighted": round(weighted, 4) if weighted is not None else None,
         "axis_spread": round(axis_spread, 4) if axis_spread is not None else None,
@@ -1321,6 +1481,24 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             pass
     broken = (broken or set()) | reference_broken
 
+    # 2026-04-28 (v29.1): same-round reference axes for the per-axis
+    # baseline-relative penalty. We compute the Qwen-4B-base axis values
+    # once here and pass them to every compute_composite call so each
+    # student's bench axes get docked when they regress below the same
+    # block-seeded reference. Reference NOT being in the round (legacy
+    # rounds before INCLUDE_REFERENCE_IN_ROUND=1) ⇒ reference_axes=None
+    # ⇒ penalty silently fails open and scoring is unchanged.
+    reference_axes_raw: dict[str, float | None] | None = None
+    if reference_row is not None:
+        try:
+            reference_axes_raw = compute_axes(reference_row, king_kl, king_rkl)
+        except Exception as exc:
+            logger.warning(
+                f"composite: failed to compute reference axes: {exc} "
+                "— per-axis baseline penalty will fail open this round."
+            )
+            reference_axes_raw = None
+
     king_model = None
     king_entry = next((r for r in h2h_results if r.get("is_king")), None)
     if king_entry:
@@ -1333,7 +1511,15 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         model = entry.get("model")
         if not model or model not in students_data:
             continue
-        comp = compute_composite(students_data[model], king_kl, king_rkl, broken)
+        # The reference itself is NOT penalized against itself — pass
+        # ``reference_axes=None`` for that one row so its composite
+        # reflects raw axis values (it's the anchor by definition).
+        is_reference_row = (reference_model is not None and model == reference_model)
+        ref_axes_for_call = None if is_reference_row else reference_axes_raw
+        comp = compute_composite(
+            students_data[model], king_kl, king_rkl,
+            broken, ref_axes_for_call,
+        )
         if entry.get("disqualified") and not entry.get("is_king"):
             comp = {**comp, "worst": 0.0, "weighted": 0.0,
                     "disqualified": True, "dq_reason": entry.get("dq_reason")}
