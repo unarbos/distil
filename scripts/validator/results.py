@@ -656,7 +656,16 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 for u, info in models_to_eval.items()
                 if info.get("commit_block") is not None
             }
+            uid_to_round_model = {
+                u: info.get("model") for u, info in models_to_eval.items()
+                if info.get("model")
+            }
+            uid_to_round_revision = {
+                u: info.get("revision", "main") for u, info in models_to_eval.items()
+                if info.get("model")
+            }
             this_commit_block = models_to_eval.get(uid, {}).get("commit_block")
+            this_revision = models_to_eval.get(uid, {}).get("revision", "main")
             is_copy, copy_uid, copy_model, orig_uid, orig_model, sim = check_activation_fingerprint(
                 model_name, uid, fingerprint, state.state_dir,
                 commit_block=this_commit_block,
@@ -664,6 +673,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 uid_to_coldkey=uid_to_coldkey,
                 evaluated_uids=state.evaluated_uids,
                 composite_scores=state.composite_scores,
+                revision=this_revision,
+                uid_to_model=uid_to_round_model,
+                uid_to_revision=uid_to_round_revision,
             )
             if is_copy:
                 if copy_uid == uid:
