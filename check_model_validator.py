@@ -586,6 +586,7 @@ def main(
 
         block_seed_for_gen = 12345
         eval_bundle_meta: dict[str, Any] = {}
+        eval_items: list[dict[str, Any]] = []
 
         if offline_eval:
             n_local = prompts if prompts > 0 else 20
@@ -600,6 +601,11 @@ def main(
                 formatted = format_prompt(text)
                 if formatted:
                     eval_prompts.append(formatted)
+                    eval_items.append({
+                        "prompt": formatted,
+                        "row_index": len(eval_items),
+                        "continuation": None,
+                    })
                 if len(eval_prompts) >= n_local:
                     break
             print(
@@ -620,31 +626,57 @@ def main(
                 "max_new_tokens": eval_bundle.get("max_new_tokens"),
                 "block_seed": eval_bundle.get("block_seed"),
                 "n_prompts": eval_bundle.get("n_prompts"),
+                "private_redacted": eval_bundle.get("private_redacted"),
             }
             rows = eval_bundle.get("data") or []
             if not rows:
                 check_fail("eval-data", "Empty data[] in eval-data response")
                 sys.exit(1)
 
-            eval_prompts = []
-            for row in rows:
+            skipped_private = 0
+            skipped_invalid = 0
+            for row_idx, row in enumerate(rows):
                 if not isinstance(row, dict):
+                    skipped_invalid += 1
+                    continue
+                if row.get("is_private"):
+                    skipped_private += 1
                     continue
                 raw = row.get("prompt", "")
+                continuation = row.get("continuation")
+                if raw == "[PRIVATE]" or continuation == "[PRIVATE]":
+                    skipped_private += 1
+                    continue
                 formatted = format_prompt(raw) if raw else ""
                 if formatted:
-                    eval_prompts.append(formatted)
+                    eval_items.append({
+                        "prompt": formatted,
+                        "row_index": row_idx,
+                        "continuation": continuation if isinstance(continuation, str) and continuation else None,
+                        "continuation_tokens": row.get("continuation_tokens"),
+                    })
+                else:
+                    skipped_invalid += 1
 
             if prompts and prompts > 0:
-                eval_prompts = eval_prompts[: prompts]
+                eval_items = eval_items[: prompts]
+
+            eval_prompts = [item["prompt"] for item in eval_items]
 
             block_seed_for_gen = int(eval_bundle.get("block_seed") or 12345)
             MAX_NEW_TOKENS = int(eval_bundle.get("max_new_tokens") or 8192)
 
             print(
-                f"  Validator eval-data: {len(eval_prompts)} prompts, "
+                f"  Validator eval-data: {len(eval_prompts)} public prompts, "
                 f"max_new_tokens={MAX_NEW_TOKENS}, block_seed={block_seed_for_gen}"
             )
+            if eval_bundle_meta.get("private_redacted") or skipped_private:
+                print(
+                    f"  Skipped {skipped_private} private/redacted rows "
+                    f"(private_redacted={eval_bundle_meta.get('private_redacted')})"
+                )
+            if skipped_invalid:
+                print(f"  Skipped {skipped_invalid} invalid/non-dict rows")
             if eval_bundle_meta.get("teacher") and eval_bundle_meta["teacher"] != TEACHER_MODEL:
                 check_warn(
                     "Teacher id",
@@ -655,9 +687,24 @@ def main(
             check_fail("Prompt sampling", "No valid prompts after filtering")
             sys.exit(1)
 
+        eval_prompt_indices = [int(item.get("row_index", i)) for i, item in enumerate(eval_items)]
+        use_published_continuations = (
+            not offline_eval
+            and len(eval_items) == len(eval_prompts)
+            and all(isinstance(item.get("continuation"), str) and item.get("continuation") for item in eval_items)
+        )
+        if use_published_continuations:
+            check_info("Online continuations", "Using public continuations from eval-data")
+
         print(f"  King comparison target: {king_repo or '(none)'}")
         if h2h_meta.get("king_kl") is not None:
-            check_info("h2h-latest reference king_kl", f"{h2h_meta.get('king_kl')}")
+            if use_published_continuations:
+                check_info(
+                    "h2h-latest reference king_kl",
+                    f"{h2h_meta.get('king_kl')} (full private+public set; not used for comparison)",
+                )
+            else:
+                check_info("h2h-latest reference king_kl", f"{h2h_meta.get('king_kl')}")
         if h2h_meta.get("paired_test_alpha") is not None:
             check_info("h2h-latest paired_test_alpha", f"{h2h_meta.get('paired_test_alpha')}")
 
@@ -666,7 +713,9 @@ def main(
         full_sequences = []       # full token sequences (prompt + continuation)
         prompt_lens_list = []     # prompt token length per prompt
 
-        if teacher_cache and Path(teacher_cache).exists():
+        if teacher_cache and use_published_continuations:
+            print("  Ignoring teacher cache for online eval-data continuations")
+        elif teacher_cache and Path(teacher_cache).exists():
             print(f"  Loading cached teacher data from {teacher_cache}...")
             try:
                 cache_data = torch.load(teacher_cache, map_location="cpu", weights_only=False)
@@ -700,36 +749,38 @@ def main(
             # ── Generate teacher continuations & extract logits ────────
             # Matches production: generate continuation, then forward pass
             # to get logits, extract continuation-only positions.
-            banner("Generating Teacher Continuations + Logits")
+            if use_published_continuations:
+                banner("Preparing Published Continuations + Teacher Logits")
+            else:
+                banner("Generating Teacher Continuations + Logits")
             with torch.no_grad():
                 for i, prompt_text in enumerate(eval_prompts):
                     prompt_ids = teacher_tok(prompt_text, return_tensors="pt", truncation=False).input_ids.to(teacher.device)
                     prompt_len = prompt_ids.shape[1]
-                    prompt_seed = int(block_seed_for_gen) + i
-                    teacher_device = teacher.device
+                    if use_published_continuations:
+                        continuation_text = eval_items[i]["continuation"]
+                        continuation_ids = teacher_tok(
+                            continuation_text,
+                            return_tensors="pt",
+                            truncation=False,
+                            add_special_tokens=False,
+                        ).input_ids.to(teacher.device)
+                        output_ids = torch.cat([prompt_ids, continuation_ids], dim=1)
+                        gen_len = continuation_ids.shape[1]
+                        expected_gen_len = eval_items[i].get("continuation_tokens")
+                        if expected_gen_len is not None and int(expected_gen_len) != gen_len:
+                            check_warn(
+                                "Continuation token count",
+                                f"row {eval_prompt_indices[i]} API={expected_gen_len}, tokenizer={gen_len}",
+                            )
+                    else:
+                        prompt_seed = int(block_seed_for_gen) + eval_prompt_indices[i]
+                        teacher_device = teacher.device
 
-                    # Generate continuation (validator: seeded sampling per prompt)
-                    try:
-                        gen = torch.Generator(device=teacher_device)
-                        gen.manual_seed(prompt_seed)
-                        output_ids = teacher.generate(
-                            prompt_ids,
-                            max_new_tokens=MAX_NEW_TOKENS,
-                            do_sample=True,
-                            temperature=0.7,
-                            top_p=0.9,
-                            use_cache=True,
-                            generator=gen,
-                        )
-                    except ValueError as e:
-                        if "not used by the model: ['generator']" not in str(e):
-                            raise
-                        device_idx = teacher_device.index if teacher_device.type == "cuda" else None
-                        devices = [device_idx] if device_idx is not None else []
-                        with torch.random.fork_rng(devices=devices):
-                            torch.manual_seed(prompt_seed)
-                            if torch.cuda.is_available():
-                                torch.cuda.manual_seed_all(prompt_seed)
+                        # Generate continuation (validator: seeded sampling per original prompt row)
+                        try:
+                            gen = torch.Generator(device=teacher_device)
+                            gen.manual_seed(prompt_seed)
                             output_ids = teacher.generate(
                                 prompt_ids,
                                 max_new_tokens=MAX_NEW_TOKENS,
@@ -737,8 +788,26 @@ def main(
                                 temperature=0.7,
                                 top_p=0.9,
                                 use_cache=True,
+                                generator=gen,
                             )
-                    gen_len = output_ids.shape[1] - prompt_len
+                        except ValueError as e:
+                            if "not used by the model: ['generator']" not in str(e):
+                                raise
+                            device_idx = teacher_device.index if teacher_device.type == "cuda" else None
+                            devices = [device_idx] if device_idx is not None else []
+                            with torch.random.fork_rng(devices=devices):
+                                torch.manual_seed(prompt_seed)
+                                if torch.cuda.is_available():
+                                    torch.cuda.manual_seed_all(prompt_seed)
+                                output_ids = teacher.generate(
+                                    prompt_ids,
+                                    max_new_tokens=MAX_NEW_TOKENS,
+                                    do_sample=True,
+                                    temperature=0.7,
+                                    top_p=0.9,
+                                    use_cache=True,
+                                )
+                        gen_len = output_ids.shape[1] - prompt_len
 
                     # Forward pass to get logits for the full sequence
                     logits = teacher(output_ids).logits.float()
@@ -882,6 +951,12 @@ def main(
         # ── Compare against king ──────────────────────────────────────
         if king_repo:
             banner("KING COMPARISON")
+            if use_published_continuations:
+                print(
+                    f"  Evaluating king on the same {len(eval_prompts)} public "
+                    "eval-data prompt/continuation pairs."
+                )
+                print("  h2h-latest king_kl is not used because it includes private prompts.")
             print(f"  Loading king: {king_repo}...")
             del student
             torch.cuda.empty_cache()
@@ -948,6 +1023,12 @@ def main(
                     "  ⚠️  Paired mean favors you, but p may not meet validator alpha — "
                     "use full prompt set or reduce variance."
                 )
+        elif not king_repo and use_published_continuations:
+            check_warn(
+                "King comparison",
+                "No king model resolved; pass --king-repo to evaluate a fair public-only comparison",
+            )
+            warnings.append(("king_comparison", "No king model resolved for public-only comparison"))
         elif not king_repo:
             try:
                 h2h_file = Path("state/h2h_latest.json")
