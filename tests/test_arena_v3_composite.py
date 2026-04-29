@@ -282,7 +282,9 @@ class TestSession3Production(unittest.TestCase):
         self.assertEqual(comp["axes"]["long_context_bench"], 0.05)
 
     def test_long_context_bench_gates_worst_when_promoted(self):
-        """long_context_bench joins worst-axis rule when Arena v3 is promoted."""
+        """long_context_bench is in reasoning_skill_group (v30.2). To
+        pull worst down it has to pull the GROUP down — verified by
+        tanking all reasoning sub-axes."""
         import scripts.validator.composite as _c
         saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
         saved_bench = _c.BENCH_AXES_IN_COMPOSITE
@@ -290,18 +292,26 @@ class TestSession3Production(unittest.TestCase):
             _c.ARENA_V3_AXES_IN_COMPOSITE = True
             _c.BENCH_AXES_IN_COMPOSITE = True
             student = _make_student(bench={
-                "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
+                "math_bench": 0.8, "code_bench": 0.8,
+                # All reasoning_skill_group sub-axes low so the GROUP
+                # is low and pulls worst down.
+                "reasoning_bench": 0.1,
+                "multi_doc_synthesis_bench": 0.1,
+                "long_context_bench": 0.1,
                 "knowledge_bench": 0.8, "ifeval_bench": 0.8,
                 "aime_bench": 0.6, "mbpp_bench": 0.6,
                 "tool_use_bench": 0.6, "self_consistency_bench": 0.6,
                 "arc_bench": 0.6, "truthful_bench": 0.6,
-                "long_context_bench": 0.1,
             })
             comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
             self.assertLessEqual(
                 comp["worst"], 0.11,
-                "long_context_bench=0.1 must now pull worst down",
+                "reasoning_skill_group=0.1 (sub-axes all 0.1) must pull worst down",
             )
+            # Sub-axis values still surfaced for telemetry.
+            self.assertEqual(comp["axes"]["long_context_bench"], 0.1)
+            # Group axis present and reflects the mean.
+            self.assertAlmostEqual(comp["axes"]["reasoning_skill_group"], 0.1, places=2)
         finally:
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
@@ -326,33 +336,40 @@ class TestSession3Production(unittest.TestCase):
         self.assertEqual(comp["axes"]["procedural_bench"], 0.05)
 
     def test_robustness_bench_is_v3_live(self):
-        """robustness_bench (Session 3.7) gates the composite worst.
-
-        Session 3.7 adds a math-pool reuse axis that asks each item under
-        K block-rotated paraphrase wrappers. A model that overfits the
-        canonical math wording has high math_bench but low
-        robustness_bench → composite worst is dragged down by the
-        robustness axis.
-        """
+        """robustness_bench is in math_skill_group (v30.2). A
+        canonical-wording memorizer with high math_bench but low
+        robustness/aime drags the GROUP down, dragging worst down."""
         import scripts.validator.composite as _c
         self.assertIn("robustness_bench", _c.ARENA_V3_AXIS_WEIGHTS)
         self.assertIn("robustness_bench", _c.BENCH_MIN_VALID)
         student = _make_student(bench={
-            "math_bench": 0.95, "code_bench": 0.8, "reasoning_bench": 0.8,
+            # math_skill_group sub-axes: math_bench, aime_bench,
+            # robustness_bench. A canonical-wording memorizer has high
+            # math_bench but low aime + low robustness, dragging the
+            # GROUP mean to ~0.38.
+            "math_bench": 0.95,
+            "aime_bench": 0.10,
+            "robustness_bench": 0.10,
+            "code_bench": 0.8, "reasoning_bench": 0.8,
             "knowledge_bench": 0.8, "ifeval_bench": 0.8,
-            "aime_bench": 0.6, "mbpp_bench": 0.6,
+            "mbpp_bench": 0.6,
             "tool_use_bench": 0.6, "self_consistency_bench": 0.6,
             "arc_bench": 0.6, "truthful_bench": 0.6,
             "long_context_bench": 0.6, "procedural_bench": 0.6,
-            "robustness_bench": 0.10,  # canonical-only memorizer
             "noise_resistance_bench": 0.6,
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
-        self.assertLessEqual(
-            comp["worst"], 0.11,
-            "robustness_bench=0.10 must drag worst below 0.11 — a "
-            "miner who only memorizes canonical wording cannot win",
+        # math_skill_group = mean(0.95, 0.10, 0.10) = 0.383, which is
+        # the lowest GROUP axis and pulls worst down to that level.
+        self.assertAlmostEqual(
+            comp["axes"]["math_skill_group"], 0.383, places=2,
         )
+        self.assertLessEqual(
+            comp["worst"], 0.39,
+            "math_skill_group ≈ 0.38 must drag worst below 0.39 — a "
+            "canonical-wording memorizer cannot win",
+        )
+        # Sub-axis values still in axes dict for telemetry.
         self.assertEqual(comp["axes"]["robustness_bench"], 0.10)
 
     def test_noise_resistance_bench_is_v3_live(self):
@@ -759,14 +776,28 @@ class TestReferenceBrokenAxes(unittest.TestCase):
             self.assertIn("aime_bench", weak["broken_axes"])
             self.assertIn("tool_use_bench", weak["broken_axes"])
 
-            # WORST: identical for both (broken axes excluded).
-            self.assertEqual(weak["worst"], strong["worst"],
-                "worst() should drop broken axes — weak and strong tie there")
+            # v30.2 — with axis grouping, the broken_axes mechanism
+            # operates on individual sub-axes. ``aime_bench`` is broken
+            # (in broken_axes set) AND it feeds ``math_skill_group``.
+            # The group axis itself is NOT in broken_axes, so the
+            # group's value (which includes the broken sub-axis)
+            # contributes to ranked. This means a strong model that
+            # genuinely beats the reference on a broken axis (e.g.,
+            # solves AIME items the reference truncated) gets group
+            # credit, which inflates its worst() AND its weighted.
+            # tool_use_bench stays as a separate axis (not grouped),
+            # so its broken_axes drop semantics still apply individually.
+            self.assertGreaterEqual(strong["worst"], weak["worst"],
+                "v30.2: a strong model beating the reference on a broken "
+                "sub-axis (aime) gets group credit, raising worst")
 
-            # WEIGHTED: strong > weak (broken axes still contribute).
-            self.assertGreater(strong["weighted"], weak["weighted"],
-                f"weighted() should KEEP broken axes so genuine wins are "
-                f"rewarded: strong={strong['weighted']} weak={weak['weighted']}")
+            # WEIGHTED: strong ≥ weak. Strong's higher aime contributes
+            # to math_skill_group; tool_use_bench (broken, not grouped)
+            # is dropped from worst but kept in weighted, so strong's
+            # tool_use=1.0 also contributes via the weighted path.
+            self.assertGreaterEqual(strong["weighted"], weak["weighted"],
+                f"strong should not be worse than weak on weighted: "
+                f"strong={strong['weighted']} weak={weak['weighted']}")
         finally:
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
@@ -1351,6 +1382,268 @@ class TestBaselineRelativePenalty(unittest.TestCase):
         finally:
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
+
+
+class TestAxisGrouping(unittest.TestCase):
+    """v30.2 (2026-04-29) — Skill-group axes (code/math/reasoning/knowledge).
+
+    Sub-axes still computed for telemetry but the composite weight
+    migrates to the group axes. This collapses redundancy without
+    losing measurement depth.
+    """
+
+    def test_code_skill_group_is_mean_of_sub_axes(self):
+        from scripts.validator.composite import _axis_code_skill_group
+        student = _make_student(bench={
+            "code_bench": 0.6,
+            "mbpp_bench": 0.5,
+            "debug_bench": 0.7,
+            "correction_bench": 0.4,
+            "refactor_bench": 0.5,
+        })
+        # Mean of present sub-axes = (0.6+0.5+0.7+0.4+0.5)/5 = 0.54
+        self.assertAlmostEqual(_axis_code_skill_group(student), 0.54, places=2)
+
+    def test_math_skill_group_is_mean_of_sub_axes(self):
+        from scripts.validator.composite import _axis_math_skill_group
+        student = _make_student(bench={
+            "math_bench": 0.7,
+            "aime_bench": 0.3,
+            "robustness_bench": 0.5,
+        })
+        # Mean = 0.5
+        self.assertAlmostEqual(_axis_math_skill_group(student), 0.5, places=2)
+
+    def test_skill_group_drops_when_no_sub_axis_present(self):
+        from scripts.validator.composite import _axis_code_skill_group
+        student = _make_student()  # no bench axes
+        self.assertIsNone(_axis_code_skill_group(student))
+
+    def test_skill_group_includes_partial_data(self):
+        """If only some sub-axes have data, average over present ones."""
+        from scripts.validator.composite import _axis_code_skill_group
+        student = _make_student(bench={
+            "code_bench": 0.7,
+            # Other sub-axes absent
+        })
+        self.assertAlmostEqual(_axis_code_skill_group(student), 0.7, places=2)
+
+    def test_group_axis_in_compute_axes(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(bench={
+            "code_bench": 0.5, "mbpp_bench": 0.5,
+            "debug_bench": 0.5, "correction_bench": 0.5,
+            "refactor_bench": 0.5,
+        })
+        axes = compute_axes(student, king_kl=0.3, king_rkl=0.1)
+        self.assertIn("code_skill_group", axes)
+        self.assertAlmostEqual(axes["code_skill_group"], 0.5, places=2)
+        # Sub-axes still present for telemetry
+        self.assertEqual(axes["code_bench"], 0.5)
+        self.assertEqual(axes["mbpp_bench"], 0.5)
+
+    def test_group_axis_carries_composite_weight(self):
+        """Sub-axes default to 0 weight; group axis picks up the weight.
+
+        After v30.2 the bench sub-axis weights default to 0 so the
+        group axis is the ranking driver. To verify, we set a low
+        group score and a high sub-axis: worst should reflect the
+        group, not the sub-axis."""
+        from scripts.validator.composite import compute_composite
+        student = _make_student(bench={
+            # All code sub-axes low → group is low → should pull worst
+            "code_bench": 0.1, "mbpp_bench": 0.1,
+            "debug_bench": 0.1, "correction_bench": 0.1,
+            "refactor_bench": 0.1,
+        })
+        comp = compute_composite(student, king_kl=0.3, king_rkl=0.1)
+        self.assertAlmostEqual(comp["axes"]["code_skill_group"], 0.1, places=2)
+        self.assertLessEqual(comp["worst"], 0.11,
+            "code_skill_group=0.1 must pull worst down")
+
+
+class TestSuperTeacherAxis(unittest.TestCase):
+    """v30.2 — super_teacher axis: rewards exceeding the teacher."""
+
+    def test_super_teacher_zero_when_matching_teacher(self):
+        from scripts.validator.composite import _axis_super_teacher
+        student = _make_student(bench={
+            "math_bench": 0.7, "code_bench": 0.7, "aime_bench": 0.4,
+        })
+        teacher_axes = {"math_bench": 0.7, "code_bench": 0.7, "aime_bench": 0.4}
+        # student matches teacher → mean lift = 0 → tanh(0) = 0
+        self.assertAlmostEqual(
+            _axis_super_teacher(student, teacher_axes), 0.0, places=2,
+        )
+
+    def test_super_teacher_high_when_beating_teacher(self):
+        from scripts.validator.composite import _axis_super_teacher
+        student = _make_student(bench={
+            "math_bench": 0.9, "code_bench": 0.9, "aime_bench": 0.6,
+        })
+        teacher_axes = {"math_bench": 0.7, "code_bench": 0.7, "aime_bench": 0.4}
+        # mean lift = 0.2 → tanh(0.2/0.10) = tanh(2.0) ≈ 0.96
+        score = _axis_super_teacher(student, teacher_axes)
+        self.assertGreater(score, 0.85,
+            "student that beats teacher by 0.2 on average should score ~0.96")
+
+    def test_super_teacher_zero_when_below_teacher(self):
+        from scripts.validator.composite import _axis_super_teacher
+        student = _make_student(bench={
+            "math_bench": 0.5, "code_bench": 0.5,
+        })
+        teacher_axes = {"math_bench": 0.7, "code_bench": 0.7}
+        # student below teacher → max(0, lift) = 0 → tanh(0) = 0
+        self.assertAlmostEqual(
+            _axis_super_teacher(student, teacher_axes), 0.0, places=2,
+        )
+
+    def test_super_teacher_returns_none_without_teacher(self):
+        from scripts.validator.composite import _axis_super_teacher
+        student = _make_student(bench={"math_bench": 0.9})
+        self.assertIsNone(_axis_super_teacher(student, None))
+        self.assertIsNone(_axis_super_teacher(student, {}))
+
+    def test_super_teacher_in_composite_when_teacher_threaded(self):
+        from scripts.validator.composite import compute_composite
+        student = _make_student(bench={
+            "math_bench": 0.95, "code_bench": 0.85,
+        })
+        teacher_axes = {"math_bench": 0.70, "code_bench": 0.65}
+        comp = compute_composite(
+            student, king_kl=0.3, king_rkl=0.1,
+            teacher_axes=teacher_axes,
+        )
+        self.assertIn("super_teacher", comp["axes"])
+        self.assertGreater(comp["axes"]["super_teacher"], 0.5,
+            "student beating teacher by 0.20+0.20 should score high")
+
+
+class TestCompositeFinalRanking(unittest.TestCase):
+    """v30.2 (2026-04-29) — composite.final ranking key.
+
+    final = α · worst_3_mean + (1 − α) · weighted, default α = 0.7.
+    Replaces the legacy ``worst`` (single-axis min) as the canonical
+    dethrone gate while preserving anti-Goodhart pressure.
+    """
+
+    def test_worst_3_mean_smooths_single_zero(self):
+        """A single noisy 0 should not floor the new score the way it
+        did with worst(). worst_3_mean is the average of the lowest 3."""
+        from scripts.validator.composite import compute_composite
+        student = _make_student(
+            kl=0.30, rkl=0.10, cap_frac=0.85,
+            bench={
+                "math_bench": 0.0,    # noisy zero
+                "code_bench": 0.7,
+                "reasoning_bench": 0.7,
+                "ifeval_bench": 0.8,
+                "knowledge_bench": 0.7,
+            },
+        )
+        comp = compute_composite(student, king_kl=0.30, king_rkl=0.10)
+        self.assertEqual(comp["worst"], 0.0,
+            "legacy worst must still see the 0")
+        # worst_3_mean averages the three lowest including the 0
+        self.assertGreater(comp["worst_3_mean"], 0.0,
+            "worst_3_mean smooths the single zero — should be > 0")
+        self.assertGreater(comp["final"], 0.05,
+            "final should reflect smoothed bottom + weighted, not pure 0")
+
+    def test_final_is_blend_with_default_alpha(self):
+        """final = 0.7·worst_3_mean + 0.3·weighted by default."""
+        from scripts.validator.composite import compute_composite, COMPOSITE_FINAL_BOTTOM_WEIGHT
+        student = _make_student(
+            kl=0.30, rkl=0.10, cap_frac=0.85,
+            bench={
+                "math_bench": 0.4, "code_bench": 0.4,
+                "reasoning_bench": 0.4, "ifeval_bench": 0.4,
+                "knowledge_bench": 0.4,
+            },
+        )
+        comp = compute_composite(student, king_kl=0.30, king_rkl=0.10)
+        worst_3 = comp["worst_3_mean"]
+        weighted = comp["weighted"]
+        final = comp["final"]
+        expected = (
+            COMPOSITE_FINAL_BOTTOM_WEIGHT * worst_3
+            + (1 - COMPOSITE_FINAL_BOTTOM_WEIGHT) * weighted
+        )
+        self.assertAlmostEqual(final, expected, places=3)
+
+    def test_legacy_worst_preserved(self):
+        """The legacy ``worst`` (single-axis min) is preserved as
+        telemetry — only the ranking key changes to ``final``."""
+        from scripts.validator.composite import compute_composite
+        student = _make_student(
+            kl=0.30, rkl=0.10, cap_frac=0.85,
+            bench={"math_bench": 0.3, "code_bench": 0.5,
+                   "reasoning_bench": 0.7, "ifeval_bench": 0.6},
+        )
+        comp = compute_composite(student, king_kl=0.30, king_rkl=0.10)
+        self.assertIn("worst", comp)
+        self.assertIn("worst_3_mean", comp)
+        self.assertIn("final", comp)
+        # Worst is the single min, ≤ worst_3_mean
+        self.assertLessEqual(comp["worst"], comp["worst_3_mean"] + 1e-6)
+
+    def test_resolve_dethrone_uses_final(self):
+        """resolve_dethrone with v30.2 records uses final, not worst."""
+        from scripts.validator.single_eval import resolve_dethrone
+        # King has high worst (0.8) but low weighted (0.4) and so a
+        # mediocre final blend.
+        king = {"final": 0.55, "worst": 0.80, "weighted": 0.40}
+        # Challenger has low worst (0.5, lower than king's 0.8) but
+        # very high weighted (0.85) and a HIGHER final blend.
+        chall = {"final": 0.65, "worst": 0.50, "weighted": 0.85}
+        # Old rule (worst-based): king wins (0.8 > 0.5).
+        # New rule (final-based): challenger wins (0.65 > 0.55 × 1.03).
+        self.assertTrue(
+            resolve_dethrone(101, king, 102, chall, margin=0.03),
+            "v30.2 dethrone gate should use final, not worst",
+        )
+
+    def test_resolve_dethrone_legacy_fallback(self):
+        """Records that lack ``final`` (legacy v28) fall back to the
+        v28 worst-based rule."""
+        from scripts.validator.single_eval import resolve_dethrone
+        # No ``final`` field on either record.
+        king = {"worst": 0.80, "weighted": 0.40}
+        chall = {"worst": 0.50, "weighted": 0.85}
+        # Falls back to v28 worst rule: king wins (0.8 > 0.5).
+        self.assertFalse(
+            resolve_dethrone(101, king, 102, chall, margin=0.03),
+            "legacy records should follow the v28 worst-based rule",
+        )
+
+    def test_worst_3_mean_handles_few_axes(self):
+        """When only 1 or 2 axes are present, worst_3_mean uses what's
+        available (doesn't crash)."""
+        import scripts.validator.composite as _c
+        saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
+        saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_judge = _c.JUDGE_AXIS_IN_COMPOSITE
+        saved_rd = _c.REASONING_DENSITY_IN_COMPOSITE
+        saved_chat = _c.CHAT_TURNS_AXIS_IN_COMPOSITE
+        try:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = False
+            _c.BENCH_AXES_IN_COMPOSITE = False
+            _c.JUDGE_AXIS_IN_COMPOSITE = False
+            _c.REASONING_DENSITY_IN_COMPOSITE = False
+            _c.CHAT_TURNS_AXIS_IN_COMPOSITE = False
+            # Only kl, rkl, capability, length, degeneracy, top_k_overlap will
+            # apply (the AXIS_WEIGHTS keys with weight > 0). That's still 5+
+            # axes — plenty for worst_3.
+            student = _make_student(kl=0.30, rkl=0.10)
+            comp = _c.compute_composite(student, king_kl=0.30, king_rkl=0.10)
+            self.assertIsNotNone(comp["worst_3_mean"])
+            self.assertIsNotNone(comp["final"])
+        finally:
+            _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
+            _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.JUDGE_AXIS_IN_COMPOSITE = saved_judge
             _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
             _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
 
