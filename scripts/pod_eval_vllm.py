@@ -6211,9 +6211,10 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
     """Run the pragmatic_bench probe (v30 — theory-of-mind / scalar /
     indirect-request items). Open-ended generation, regex match on
     each item's ``accept`` patterns. Per-subtype pass-fraction
-    surfaced for telemetry."""
+    surfaced for telemetry under both ``per_subtype`` (legacy) and
+    ``per_src`` (v30.3 unified schema for the saturation audit)."""
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": [],
-           "per_subtype": {}}
+           "per_subtype": {}, "per_src": {}}
     samples = _BENCH_SAMPLES.get("pragmatic") or []
     if not samples or model is None or tokenizer is None:
         return out
@@ -6236,6 +6237,16 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
                     )
                     sub["n"] += 1
                     sub["correct"] += int(ok)
+                    # v30.3 — also record under per_src so the saturation
+                    # audit (which iterates composite.per_src) sees this
+                    # axis. ``src`` is the full ``pragmatic/<subtype>``
+                    # tag from the generator.
+                    src_key = str(it.get("src", f"pragmatic/{subtype}"))
+                    src = out["per_src"].setdefault(
+                        src_key, {"n": 0, "correct": 0}
+                    )
+                    src["n"] += 1
+                    src["correct"] += int(ok)
                     out["items"].append({
                         "src": it.get("src", ""),
                         "category": subtype,
@@ -6255,6 +6266,11 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
             sub_stats["pass_frac"] = (
                 sub_stats["correct"] / sub_stats["n"]
                 if sub_stats["n"] else 0.0
+            )
+        for src_name, src_stats in out["per_src"].items():
+            src_stats["pass_frac"] = (
+                src_stats["correct"] / src_stats["n"]
+                if src_stats["n"] else 0.0
             )
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -13557,6 +13573,111 @@ def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
     return kl_per_pos
 
 
+def compute_tail_decoupled_kl_from_sparse(
+    teacher_indices, teacher_values, student_logits,
+    values_are_logprobs=False, head_k_split: int | None = None,
+):
+    """Tail-decoupled KL estimator (synthesis §3.9 / §4.2 #3).
+
+    Splits the available top-K teacher cache into HEAD (top-K_head, the
+    most confident teacher predictions) and TAIL (positions K_head+1
+    through K, the long tail of the teacher distribution). For each
+    half, computes the KL contribution to full-vocab KL using the
+    same un-renormalised math as ``compute_kl_is_from_sparse``.
+
+    Why this matters. A model can match the teacher on top-K (so its
+    ``kl`` and ``kl_is`` look fine) while FLATTENING the tail —
+    over-concentrating mass on the head and missing the broad
+    coverage that the teacher places on rarer tokens. The
+    "Tail-Aware Distillation (TAD)" paper shows this is a real
+    failure mode for SFT-only students; the head/tail split lets
+    us detect it as a SHADOW eval signal.
+
+    Default ``head_k_split = K // 4`` (top-32 of top-128 cache).
+    The tail is the remaining 96 positions (K_head+1 .. K).
+
+    Returns a dict of [seq_len] (or [B, seq_len]) tensors:
+      * ``kl_head``  — IS-corrected KL contribution from head positions.
+      * ``kl_tail``  — IS-corrected KL contribution from tail positions.
+      * ``head_mass`` — teacher's probability mass on head positions.
+      * ``tail_mass`` — teacher's probability mass on tail positions.
+    """
+    device = student_logits.device
+    t_idx = teacher_indices.to(device)
+    t_vals = teacher_values.to(device).float()
+
+    if values_are_logprobs:
+        t_log_p_raw = t_vals
+    else:
+        t_log_p_raw = F.log_softmax(t_vals, dim=-1)
+
+    K_total = t_log_p_raw.shape[-1]
+    if head_k_split is None:
+        head_k_split = max(1, K_total // 4)
+    head_k_split = min(K_total - 1, max(1, head_k_split))
+
+    t_p_raw = t_log_p_raw.exp()
+
+    s_log_p_full = F.log_softmax(student_logits.float(), dim=-1)
+    s_log_p_k = s_log_p_full.gather(-1, t_idx)
+    del s_log_p_full
+
+    is_3d = (t_log_p_raw.dim() >= 3)
+    n_pos = t_log_p_raw.shape[1] if is_3d else t_log_p_raw.shape[0]
+    out_shape = (t_log_p_raw.shape[0], n_pos) if is_3d else (n_pos,)
+    kl_head_per_pos = torch.empty(out_shape, device=device)
+    kl_tail_per_pos = torch.empty(out_shape, device=device)
+    head_mass_per_pos = torch.empty(out_shape, device=device)
+    tail_mass_per_pos = torch.empty(out_shape, device=device)
+
+    for i in range(0, n_pos, KL_CHUNK_SIZE):
+        j = min(i + KL_CHUNK_SIZE, n_pos)
+        if is_3d:
+            tp = t_p_raw[:, i:j, :]
+            tlp = t_log_p_raw[:, i:j, :]
+            slp = s_log_p_k[:, i:j, :]
+        else:
+            tp = t_p_raw[i:j, :]
+            tlp = t_log_p_raw[i:j, :]
+            slp = s_log_p_k[i:j, :]
+
+        # Slice into head (first head_k_split positions) and tail (rest).
+        # The vLLM cache is sorted descending by logprob, so position 0
+        # is the most-likely token and position K-1 is the K'th. Head
+        # = top-most-likely subset; tail = the rest.
+        if is_3d:
+            tp_head, tp_tail = tp[..., :head_k_split], tp[..., head_k_split:]
+            tlp_head, tlp_tail = tlp[..., :head_k_split], tlp[..., head_k_split:]
+            slp_head, slp_tail = slp[..., :head_k_split], slp[..., head_k_split:]
+        else:
+            tp_head, tp_tail = tp[:, :head_k_split], tp[:, head_k_split:]
+            tlp_head, tlp_tail = tlp[:, :head_k_split], tlp[:, head_k_split:]
+            slp_head, slp_tail = slp[:, :head_k_split], slp[:, head_k_split:]
+
+        kl_head = (tp_head * (tlp_head - slp_head)).sum(dim=-1)
+        kl_tail = (tp_tail * (tlp_tail - slp_tail)).sum(dim=-1)
+        h_mass = tp_head.sum(dim=-1)
+        t_mass = tp_tail.sum(dim=-1)
+
+        if is_3d:
+            kl_head_per_pos[:, i:j] = kl_head
+            kl_tail_per_pos[:, i:j] = kl_tail
+            head_mass_per_pos[:, i:j] = h_mass
+            tail_mass_per_pos[:, i:j] = t_mass
+        else:
+            kl_head_per_pos[i:j] = kl_head
+            kl_tail_per_pos[i:j] = kl_tail
+            head_mass_per_pos[i:j] = h_mass
+            tail_mass_per_pos[i:j] = t_mass
+
+    return {
+        "kl_head": kl_head_per_pos,
+        "kl_tail": kl_tail_per_pos,
+        "head_mass": head_mass_per_pos,
+        "tail_mass": tail_mass_per_pos,
+    }
+
+
 def compute_kl_is_from_sparse(teacher_indices, teacher_values, student_logits,
                                values_are_logprobs=False):
     """Importance-sampling-corrected sparse KL estimator (Anshumann et al.,
@@ -14774,7 +14895,36 @@ def main():
             f"workers × {per_worker} GPU(s) each "
             f"(total visible: {total_gpus}). Note: this is currently "
             f"a configuration knob — the actual worker-pool dispatch "
-            f"will land in v30.3 once a multi-GPU pod is provisioned.",
+            f"will land in v30.4 once a multi-GPU pod is provisioned.",
+            flush=True,
+        )
+
+    # v30.3 — Student-prompt-batch size. When > 1 (and a multi-GPU pod
+    # is available), N consecutive prompts are padded together and run
+    # through the student in a single forward pass. Significantly
+    # speeds up Phase B at the cost of padding overhead. Default 1
+    # preserves existing single-prompt behaviour.
+    #
+    # Implementation note: enabling batched forward requires careful
+    # handling of (a) variable prompt + continuation lengths via
+    # attention masks, (b) per-prompt logits slicing for KL/EOPD/IS-KL
+    # /forking-RKL/trace computation, and (c) memory budget (B prompts
+    # × max_seq_len × vocab_size float32). Default kept at 1 in v30.3;
+    # full implementation lands in v30.4 alongside the worker-pool
+    # dispatch.
+    student_batch = os.environ.get("DISTIL_STUDENT_BATCH_SIZE")
+    if student_batch:
+        try:
+            args.student_batch_size = max(1, int(student_batch))
+        except ValueError:
+            args.student_batch_size = 1
+    else:
+        args.student_batch_size = 1
+    if args.student_batch_size > 1:
+        print(
+            f"[eval] Student batch size: {args.student_batch_size}. "
+            f"Note: this knob is reserved for v30.4 — the "
+            f"per-prompt loop is still single-prompt today.",
             flush=True,
         )
 
@@ -15881,6 +16031,9 @@ def main():
                     kl_is_mean = None
                     topk_mass_mean = None
                     teacher_trace_nll_mean = None
+                    kl_head_mean = None
+                    kl_tail_mean = None
+                    tail_mass_mean = None
                     if is_sparse:
                         # ── Sparse teacher logits path (top-k from vLLM or HF) ──
                         t_indices = tl_entry["indices"]  # [1, seq_len, k]
@@ -15964,8 +16117,6 @@ def main():
                             # KL on shared support. Also exposes the
                             # teacher's top-K mass coverage (typically
                             # 0.95-0.99) as a telemetry signal.
-                            kl_is_mean = None
-                            topk_mass_mean = None
                             try:
                                 is_metrics = compute_kl_is_from_sparse(
                                     t_indices[:, :min_len, :],
@@ -15976,6 +16127,27 @@ def main():
                                 kl_is_mean = is_metrics["kl_is"].mean().item()
                                 topk_mass_mean = is_metrics["topk_mass"].mean().item()
                                 del is_metrics
+                            except Exception:
+                                pass
+
+                            # ── v30.3 — Tail-decoupled KL (synthesis
+                            # §3.9 / §4.2 #3). Splits the top-K cache
+                            # into head (top-K_head) and tail (rest)
+                            # halves and computes KL contribution from
+                            # each. Detects "match teacher head but
+                            # flatten tail" pathology — common SFT-only
+                            # over-confidence failure mode.
+                            try:
+                                td_metrics = compute_tail_decoupled_kl_from_sparse(
+                                    t_indices[:, :min_len, :],
+                                    t_values[:, :min_len, :],
+                                    s_cont_slice,
+                                    values_are_logprobs=are_logprobs,
+                                )
+                                kl_head_mean = td_metrics["kl_head"].mean().item()
+                                kl_tail_mean = td_metrics["kl_tail"].mean().item()
+                                tail_mass_mean = td_metrics["tail_mass"].mean().item()
+                                del td_metrics
                             except Exception:
                                 pass
 
@@ -16143,6 +16315,10 @@ def main():
                         ("kl_is", kl_is_mean),
                         ("topk_mass", topk_mass_mean),
                         ("teacher_trace_nll", teacher_trace_nll_mean),
+                        # v30.3 — tail-decoupled KL components.
+                        ("kl_head", kl_head_mean),
+                        ("kl_tail", kl_tail_mean),
+                        ("tail_mass", tail_mass_mean),
                     ):
                         if shadow_val is not None and not (
                             math.isnan(shadow_val) or math.isinf(shadow_val)
@@ -16322,6 +16498,10 @@ def main():
                 ("kl_is", "kl_is_mean", "kl_is_n"),
                 ("topk_mass", "topk_mass_mean", "topk_mass_n"),
                 ("teacher_trace_nll", "teacher_trace_nll_mean", "teacher_trace_nll_n"),
+                # v30.3 — tail-decoupled KL aggregates.
+                ("kl_head", "kl_head_mean", "kl_head_n"),
+                ("kl_tail", "kl_tail_mean", "kl_tail_n"),
+                ("tail_mass", "tail_mass_mean", "tail_mass_n"),
             ):
                 vals = [
                     d.get(shadow_key) for d in kl_per_prompt

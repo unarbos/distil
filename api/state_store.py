@@ -140,12 +140,40 @@ def benchmarks():
         if isinstance(uid, int) or (isinstance(uid, str) and uid.isdigit()):
             comp = composite_scores_data.get(str(uid))
             if isinstance(comp, dict):
-                worst = comp.get("composite", {}).get("worst") if isinstance(comp.get("composite"), dict) else comp.get("worst")
-                weighted = comp.get("composite", {}).get("weighted") if isinstance(comp.get("composite"), dict) else comp.get("weighted")
+                # The composite record can be either a flat dict (post-
+                # 2026-04-26 schema) or nested under "composite" (legacy).
+                inner = comp.get("composite") if isinstance(comp.get("composite"), dict) else comp
+                worst = inner.get("worst")
+                weighted = inner.get("weighted")
+                # v30.2 — surface the new ranking key + worst_3_mean.
+                final_score = inner.get("final")
+                worst_3_mean = inner.get("worst_3_mean")
+                axes = inner.get("axes") or {}
                 if isinstance(worst, (int, float)):
                     data["composite_worst"] = worst
                 if isinstance(weighted, (int, float)):
                     data["composite_weighted"] = weighted
+                if isinstance(final_score, (int, float)):
+                    data["composite_final"] = final_score
+                if isinstance(worst_3_mean, (int, float)):
+                    data["composite_worst_3_mean"] = worst_3_mean
+                # v30.2 — surface group + super_teacher + shadow axes.
+                for axis_name, payload_key in (
+                    ("code_skill_group", "axis_code_skill_group"),
+                    ("math_skill_group", "axis_math_skill_group"),
+                    ("reasoning_skill_group", "axis_reasoning_skill_group"),
+                    ("knowledge_skill_group", "axis_knowledge_skill_group"),
+                    ("super_teacher", "axis_super_teacher"),
+                    ("top_k_overlap", "axis_top_k_overlap"),
+                    ("kl_is", "axis_kl_is"),
+                    ("forking_rkl", "axis_forking_rkl"),
+                    ("teacher_trace_plausibility", "axis_teacher_trace_plausibility"),
+                    ("entropy_aware_kl", "axis_entropy_aware_kl"),
+                    ("tail_decoupled_kl", "axis_tail_decoupled_kl"),
+                ):
+                    v = axes.get(axis_name)
+                    if isinstance(v, (int, float)):
+                        data[payload_key] = v
         if data.get("is_baseline"):
             if baseline is None:
                 baseline = data

@@ -43,7 +43,24 @@ Public API for [Distil]({DASHBOARD_URL}), a Bittensor subnet where miners compet
 
 ## How It Works
 
-Miners submit distilled models and a validator scores each commitment on a **17-axis composite** (`scripts/validator/composite.py`) covering distribution match (KL, on-policy RKL, capability, length, degeneracy), absolute capability vs ground truth (math, code, reasoning, IFEval, AIME, MBPP, tool-use, long-context, robustness), conversational quality (judge-probe, chat-turns), and generation discipline (reasoning-density). The king is whoever has the highest `composite.worst` — the lowest score across the 17 axes. KL is one of the 17 axes, not the gate.
+Miners submit distilled models and a validator scores each commitment on a **multi-axis composite** (`scripts/validator/composite.py`) covering:
+
+- **Teacher-similarity axes**: KL, on-policy RKL, top-K overlap, IS-KL (unbiased), forking-RKL, teacher-trace plausibility, entropy-aware KL, tail-decoupled KL
+- **Skill-group axes** (v30.2 — collapse without losing depth):
+  - `code_skill_group` = mean of {code_bench, mbpp_bench, debug_bench, correction_bench, refactor_bench}
+  - `math_skill_group` = mean of {math_bench, aime_bench, robustness_bench}
+  - `reasoning_skill_group` = mean of {reasoning_bench, multi_doc_synthesis_bench, long_context_bench}
+  - `knowledge_skill_group` = mean of {knowledge_bench, pragmatic_bench}
+- **Stand-alone capability axes**: tool_use_bench, ifeval_bench, calibration_bench
+- **Quality axes**: judge_probe (short answers), long_form_judge (300-500 word essays), chat_turns_probe (3-turn coherence)
+- **Discipline axes**: length, degeneracy, capability, reasoning_density
+- **Super-teacher axis** (v30.2): rewards exceeding the teacher on verifiable benches (incentivises GRPO + post-distillation SFT)
+
+**Ranking key** (v30.2+): `composite.final = 0.7 × worst_3_mean + 0.3 × weighted` where:
+- `worst_3_mean` = equal-weighted mean of the 3 lowest non-broken axes (smooths single-axis noise while preserving anti-Goodhart pressure)
+- `weighted` = standard weighted convex combination of all axes
+
+The king is whoever has the highest `composite.final`. A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy `composite.worst` (single-axis min) is retained as telemetry but is no longer the dethrone gate.
 
 ## Quick Start
 
