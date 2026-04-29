@@ -12850,9 +12850,35 @@ def _align_prompt_boundary(full_text, prompt_text, full_ids, tokenizer):
         return len(ids_list)
 
 
+# 2026-04-29 (v29.7): vLLM-died-mid-eval signal. When a worker thread sees a
+# connection-refused / remote-disconnected error, it marks this Event so
+# concurrent peers stop wasting time on the dead server and fail fast. Reset
+# at the top of every ``generate_via_vllm`` call.
+_VLLM_DEAD_EVENT = None  # populated lazily as a threading.Event
+
+
+def _vllm_dead_event():
+    """Lazy-init a process-wide Event used to short-circuit the worker
+    pool when vLLM dies mid-eval. Per-call reset by ``generate_via_vllm``."""
+    global _VLLM_DEAD_EVENT
+    if _VLLM_DEAD_EVENT is None:
+        import threading as _th
+        _VLLM_DEAD_EVENT = _th.Event()
+    return _VLLM_DEAD_EVENT
+
+
 def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
                             logprobs_k, tokenizer, token_to_id):
-    """Generate a single prompt via vLLM. Used by both sequential and concurrent paths."""
+    """Generate a single prompt via vLLM. Used by both sequential and concurrent paths.
+
+    v29.7 (2026-04-29): added the ``_vllm_dead_event()`` short-circuit so
+    that when one worker hits a hard connection failure (the vLLM server
+    crashed / hung), every other in-flight worker bails out within one
+    retry attempt instead of grinding through the full backoff loop. Cuts
+    "vLLM dies at prompt 200 of 300" recovery time from ~10 min of
+    flailing requests to ~5 s of fast-fail, then the caller falls back to
+    HF for the remaining prompts cleanly.
+    """
     import requests
 
     payload = {
@@ -12869,7 +12895,14 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
         payload["logprobs"] = logprobs_k
         payload["prompt_logprobs"] = 0
 
+    dead = _vllm_dead_event()
     for attempt in range(3):
+        # Fast-fail: another worker already determined vLLM is dead. Don't
+        # waste time on the same dead server.
+        if dead.is_set() and attempt > 0:
+            raise RuntimeError(
+                f"vLLM dead (peer worker detected); skipping prompt {idx}"
+            )
         try:
             resp = requests.post(
                 f"{VLLM_URL}/v1/completions",
@@ -12899,6 +12932,19 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
                     )
             return idx, result
         except Exception as e:
+            # Detect a fatal vLLM-server failure pattern (connection
+            # refused, peer reset). On these, set the global dead event
+            # so the rest of the worker pool fails fast.
+            err_str = (str(e) or "").lower()
+            err_name = type(e).__name__
+            is_fatal = (
+                "connection refused" in err_str
+                or "remote end closed" in err_str
+                or err_name == "ConnectionError"
+                or "max retries exceeded" in err_str
+            )
+            if is_fatal:
+                dead.set()
             if attempt < 2:
                 print(
                     f"  [vllm] Prompt {idx} attempt {attempt + 1} failed: "
@@ -12950,6 +12996,9 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
 
     # Concurrent generation
     print(f"  [vllm] Concurrent generation: {concurrency} parallel requests", flush=True)
+    # 2026-04-29 (v29.7): reset the dead-event so a previous round's
+    # vLLM crash doesn't poison this round's first attempt.
+    _vllm_dead_event().clear()
     result_slots = [None] * len(prompts)
     completed = 0
     last_log = 0
@@ -12982,9 +13031,29 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
                     progress_cb(completed, len(prompts))
             except Exception as e:
                 failed.append((orig_idx, str(e)))
-                print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
+                # If vLLM is dead, every still-pending future in this
+                # pool is going to fail. We don't bother logging each
+                # one — print once and bail loud.
+                if _vllm_dead_event().is_set():
+                    pass
+                else:
+                    print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
 
-    # Retry failed prompts sequentially
+    # 2026-04-29 (v29.7): if the dead-event fired, the vLLM server crashed
+    # mid-eval. Bail loud and fast so the caller falls back to HF for the
+    # whole eval rather than thrashing on a dead server. Without this we
+    # spent ~45 min last round retrying connection-refused before giving up.
+    if _vllm_dead_event().is_set():
+        n_done = sum(1 for r in result_slots if r is not None)
+        n_failed = len(prompts) - n_done
+        raise RuntimeError(
+            f"vLLM crashed mid-eval after {n_done}/{len(prompts)} prompts "
+            f"({n_failed} failed). Caller should fall back to HF generation."
+        )
+
+    # Retry failed prompts sequentially. We only get here if the dead-event
+    # never fired (i.e. failures were transient per-prompt errors, not a
+    # server-side crash).
     if failed:
         print(f"  [vllm] Retrying {len(failed)} failed prompts sequentially...", flush=True)
         for idx, err in failed:
@@ -13420,9 +13489,15 @@ def main():
                     progress_cb=_vllm_progress, concurrency=args.concurrency,
                 )
                 timings["vllm_generation"] = time.time() - t0
+                # 2026-04-29 (v29.7): explicit path tag so snapshot tools can
+                # distinguish "ran on vLLM" from "fell back to HF". The bot's
+                # 40-line tail snapshot needs this to answer "is the eval
+                # using HF again?" correctly.
+                print(f"[teacher_path] vllm  prompts_done={len(sequences_data)}/{len(prompts)}", flush=True)
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
+                print(f"[teacher_path] hf-fallback-after-vllm-crash  reason={type(e).__name__}", flush=True)
 
             # Probe-ref collection while vLLM is still hot (cheap: ~15 prompts).
             # Populates _TEACHER_PROBE_SAMPLES so the MAD-z degeneracy branch
@@ -13450,6 +13525,7 @@ def main():
             stop_vllm_server()
         else:
             print(f"[eval] vLLM failed to start — falling back to HF", flush=True)
+            print(f"[teacher_path] hf-fallback-vllm-failed-to-start", flush=True)
 
         if sequences_data:
             # Check if vLLM returned logprobs for all prompts
@@ -13579,6 +13655,9 @@ def main():
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1 FALLBACK: HF teacher generation + logit extraction", flush=True)
         print(f"{'='*60}", flush=True)
+        # 2026-04-29 (v29.7): visible path tag so the bot's snapshot can
+        # see we're on HF generation now (not vLLM).
+        print(f"[teacher_path] hf-generation-active", flush=True)
 
         ensure_disk_space(args.teacher, threshold=70)
 

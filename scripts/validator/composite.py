@@ -97,11 +97,14 @@ AXIS_WEIGHTS = {
     # 2026-04-19. Kept at the same relative weighting; the weights
     # below are only used by the ``weighted`` aggregation, which is
     # auxiliary — the production ranking key is ``worst``.
-    "on_policy_rkl": 0.35,
-    "kl": 0.15,
-    "capability": 0.25,
-    "length": 0.10,
-    "degeneracy": 0.15,
+    # 2026-04-29 (v29.7): all relative weights are now env-overridable
+    # so the v30 audit rebalance (drop saturated kl/capability/length)
+    # can land via distil.env without a code change.
+    "on_policy_rkl": float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.35")),
+    "kl":            float(os.environ.get("BENCH_KL_WEIGHT", "0.15")),
+    "capability":    float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
+    "length":        float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.10")),
+    "degeneracy":    float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.15")),
 }
 
 # 2026-04-23 — judge axis weight. When promoted, the other axes retain
