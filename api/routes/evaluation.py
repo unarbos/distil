@@ -49,7 +49,7 @@ def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | N
 
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE the king is selected cross-round from `state/composite_scores.json` by highest `composite.worst` (then `composite.weighted` as a tiebreaker at the saturated floor); a challenger dethrones only when its worst beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired.")
+         description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE (v30.2+) the king is selected cross-round from `state/composite_scores.json` by highest `composite.final` (= 0.7·worst_3_mean + 0.3·weighted; v28-and-earlier records still ranked by `composite.worst`). A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired. The composite axis surface includes group axes (code/math/reasoning/knowledge skill groups), super_teacher (incentivizes exceeding teacher on verifiable benches), and shadow axes (top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl).")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
@@ -107,12 +107,23 @@ def get_leaderboard():
                 comp = cached
         if comp:
             entry["composite"] = {
+                # v30.2 — ``final`` is the canonical ranking key.
+                "final": comp.get("final"),
+                "worst_3_mean": comp.get("worst_3_mean"),
+                "final_alpha": comp.get("final_alpha"),
+                # Legacy fields kept for back-compat with old miner
+                # dashboards that scrape /api/leaderboard.
                 "worst": comp.get("worst"),
                 "weighted": comp.get("weighted"),
                 "axes": comp.get("axes", {}),
                 "present_count": comp.get("present_count"),
                 "version": comp.get("version"),
                 "broken_axes": comp.get("broken_axes", []),
+                # v30.2 — surface the per-axis super_teacher lift +
+                # baseline_penalty so miners can see exactly why a
+                # given axis was docked or boosted.
+                "baseline_penalty": comp.get("baseline_penalty"),
+                "axes_raw": comp.get("axes_raw"),
             }
         return entry
 

@@ -310,12 +310,22 @@ def get_miner(uid: int):
                 break
     if composite_entry:
         result["composite"] = {
+            # v30.2 — ``final`` is the canonical ranking key.
+            "final": composite_entry.get("final"),
+            "worst_3_mean": composite_entry.get("worst_3_mean"),
+            "final_alpha": composite_entry.get("final_alpha"),
+            # Legacy fields for back-compat with miner scrapers.
             "worst": composite_entry.get("worst"),
             "weighted": composite_entry.get("weighted"),
             "axes": composite_entry.get("axes", {}),
             "broken_axes": composite_entry.get("broken_axes", []),
             "present_count": composite_entry.get("present_count"),
             "version": composite_entry.get("version"),
+            # v30.2 — surface baseline penalty + raw axes pre-penalty
+            # so miners can see exactly which axes were docked and by
+            # how much.
+            "baseline_penalty": composite_entry.get("baseline_penalty"),
+            "axes_raw": composite_entry.get("axes_raw"),
             "round_block": composite_block,
             "is_latest_round": composite_block == latest.get("block"),
         }
@@ -363,6 +373,99 @@ def get_evaluated_uids():
     result.sort(key=lambda x: x.get("kl_score") or 999)
     return JSONResponse(
         content=_sanitize_floats({"uids": result, "count": len(result)}),
+        headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
+    )
+
+
+@router.get("/api/composite-scores", tags=["Miners"],
+         summary="All composite scores (v30.2+)",
+         description="""Returns the full ``state/composite_scores.json``
+ranked by ``composite.final`` (the v30.2 ranking key), with ALL fields
+exposed so miners can scrape ranking-relevant signals from a single
+endpoint without dashboards.
+
+Response per UID:
+  - ``final`` (the v30.2 ranking key — replaces ``worst`` as the dethrone gate)
+  - ``worst_3_mean`` (mean of the 3 lowest non-broken axes, the bottom-heavy component)
+  - ``worst`` (legacy single-axis min — still in the record for back-compat)
+  - ``weighted`` (weighted mean of axes)
+  - ``axes`` — full per-axis breakdown including:
+    * v30.2 group axes: code_skill_group, math_skill_group, reasoning_skill_group, knowledge_skill_group
+    * super_teacher: rewards beating teacher on verifiable benches
+    * shadow axes: top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl
+    * sub-axes: math_bench, code_bench, ... (still in axes for telemetry, weight 0 for ranking)
+    * relative axes: kl, on_policy_rkl, capability, length, degeneracy
+    * judge axes: judge_probe, long_form_judge, chat_turns_probe
+  - ``baseline_penalty`` — per-axis dock when the student regresses below Qwen-4B-base
+  - ``axes_raw`` — pre-penalty axis values (only present when penalty was applied)
+  - ``broken_axes`` — axes where the reference 4B scored 0 (eval-setup, not skill)
+  - ``version`` — composite_shadow_version (v29 = v30.2, v28 = pre-v30.2)
+  - ``model``, ``revision``, ``block``, ``ts``
+
+Sorting: by ``final`` desc (v30.2 records), with v28-and-earlier
+records sorted by ``worst`` desc and slotted below all v30.2 records.
+
+Cache: 10s (matches the validator round cadence).
+""")
+def get_composite_scores():
+    composite = _safe_json_load(os.path.join(STATE_DIR, "composite_scores.json"), {})
+    uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_hotkey_map.json"), {})
+    commitments_data = _get_stale("commitments") or {}
+    commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
+    result = []
+    for uid_str, record in (composite.items() if isinstance(composite, dict) else []):
+        if not isinstance(record, dict):
+            continue
+        try:
+            uid = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        hotkey = uid_map.get(uid_str)
+        model = None
+        if hotkey and hotkey in commitments:
+            c = commitments[hotkey]
+            model = c.get("model") or c.get("repo")
+        result.append({
+            "uid": uid,
+            "hotkey": hotkey,
+            "model": model or record.get("model"),
+            "revision": record.get("revision"),
+            "block": record.get("block"),
+            "ts": record.get("ts"),
+            "version": record.get("version"),
+            # v30.2 ranking key
+            "final": record.get("final"),
+            "worst_3_mean": record.get("worst_3_mean"),
+            "final_alpha": record.get("final_alpha"),
+            # Legacy fields
+            "worst": record.get("worst"),
+            "weighted": record.get("weighted"),
+            # Axis breakdown
+            "axes": record.get("axes", {}),
+            "axes_raw": record.get("axes_raw"),
+            "baseline_penalty": record.get("baseline_penalty"),
+            "broken_axes": record.get("broken_axes", []),
+            "n_axes": record.get("n_axes"),
+            "axis_spread": record.get("axis_spread"),
+            "bench_vs_rel_gap": record.get("bench_vs_rel_gap"),
+        })
+    # Sort: v30.2 records (with ``final``) first by final desc, then
+    # legacy records by worst desc.
+    def _sort_key(r):
+        f = r.get("final")
+        if f is not None:
+            return (0, -float(f))
+        w = r.get("worst")
+        return (1, -(float(w) if w is not None else 0.0))
+    result.sort(key=_sort_key)
+    return JSONResponse(
+        content=_sanitize_floats({
+            "scores": result,
+            "count": len(result),
+            "v30_2_count": sum(1 for r in result if r.get("final") is not None),
+            "schema_version": "v30.2",
+            "ranking_key": "composite.final = 0.7 * worst_3_mean + 0.3 * weighted",
+        }),
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
     )
 
@@ -552,7 +655,13 @@ def compare_miners(uids: str):
 # ── New compact endpoints (Phase 3) ───────────────────────────────────────────
 
 @router.get("/api/miners/batch", tags=["Miners"], summary="Compact cards for a batch of UIDs",
-         description=f"""Returns compact cards (`uid`, `model`, `kl_score`, `is_king`, `disqualified`) for each requested UID.
+         description=f"""Returns compact cards (`uid`, `model`, `kl_score`, `composite`, `is_king`, `disqualified`) for each requested UID.
+
+v30.2: each miner card now includes ``composite`` with the
+v30.2 ranking key (``final``), the legacy ``worst``, ``weighted``,
+the new ``worst_3_mean``, and per-axis values (groups,
+super_teacher, shadow axes). Lets miner scrapers track all
+ranking-relevant signals from a single endpoint.
 
 Example: `/api/miners/batch?uids=1,2,3`. Limit: {MAX_BATCH_UIDS} UIDs per call.
 """)
@@ -567,6 +676,11 @@ def miners_batch(uids: str):
     commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
     latest = h2h_latest()
     dq = disqualified()
+    # v30.2 — surface composite scores on the batch card too so
+    # miner-side scrapers don't need a second round-trip.
+    composite_scores_data = read_state("composite_scores.json", {})
+    if not isinstance(composite_scores_data, dict):
+        composite_scores_data = {}
 
     miners = []
     for uid in uid_list:
@@ -575,11 +689,23 @@ def miners_batch(uids: str):
         if hotkey and hotkey in commitments:
             c = commitments[hotkey]
             model = c.get("model") or c.get("repo")
+        composite_summary = None
+        comp_record = composite_scores_data.get(str(uid))
+        if isinstance(comp_record, dict):
+            composite_summary = {
+                "final": comp_record.get("final"),
+                "worst_3_mean": comp_record.get("worst_3_mean"),
+                "worst": comp_record.get("worst"),
+                "weighted": comp_record.get("weighted"),
+                "version": comp_record.get("version"),
+                "axes": comp_record.get("axes", {}),
+            }
         miners.append({
             "uid": uid,
             "hotkey": hotkey,
             "model": model,
             "kl_score": scores.get(str(uid)),
+            "composite": composite_summary,
             "is_king": latest.get("king_uid") == uid,
             "disqualified": _dq_reason_for_commitment(
                 uid, hotkey, commitments.get(hotkey) if hotkey else None, dq

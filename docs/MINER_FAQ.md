@@ -38,24 +38,107 @@ Submit your HuggingFace model repo via the commitment mechanism on-chain.
 
 ---
 
-## How Evaluation Works (Arena v3, live as of 2026-04-24)
+## How Evaluation Works (v30.2 / v30.3, live as of 2026-04-29)
 
-Every round the validator pulls the set of new on-chain commitments and evaluates each one on a single GPU pod. The eval policy is **one registration → one commitment → one eval**: your commitment is scored exactly once, the absolute composite is stored, and the king is decided cross-round from those stored scores. There are no re-evals, no king re-runs, no top-N rotations, and no dormant-rotation refreshes. Each student is scored on many **independent axes**; the leaderboard is ordered by the **worst** of those axes, so gaming any single one will pull your overall rank down. The design goal is simple: **if you overfit our eval, you will accidentally produce a SOTA small model**. Every axis points at a real, held-out capability.
+Every round the validator pulls the set of new on-chain commitments and evaluates each one on a single GPU pod. The eval policy is:
+
+- **One eval per commitment** for non-king miners — your commitment is scored exactly once after you commit, the absolute composite is stored.
+- **King is re-evaluated every round** so the king's score reflects the SAME procedural items as challengers (paired-fairness; v30.2).
+- The king is decided cross-round from stored scores.
+
+Each student is scored on many **independent axes**; the leaderboard is ordered by the new **`composite.final`** ranking key, which blends the bottom-3-axis mean with the weighted-axis mean. Gaming any single axis pulls your rank down, but a single noisy 0 doesn't floor your entire score (v30.2 fix). The design goal is simple: **if you overfit our eval, you will accidentally produce a SOTA small model**. Every axis points at a real, held-out capability.
 
 **The round itself:**
 
-1. **300 prompts** per round sampled from [ClimbMix-400B](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle), seeded by the current block. The teacher generates continuations through vLLM (`temperature=0.7, top_p=0.9`, per-prompt seed = `block_seed + prompt_idx`; deterministic per round, rotating across rounds). Teacher logprobs are stored as sparse top-k logprobs when vLLM provides them, with HF teacher forward as fallback.
-2. **KL divergence** is computed on those teacher continuations by running each student through an HF forward pass and comparing the student's distribution against the teacher's stored logits/logprobs.
-3. **One eval per commitment.** Your model is scored exactly once after you commit. The validator stores `composite.worst`, every axis, and the commit signature in `composite_scores.json`. The eval is not repeated unless you submit a new commitment (different model / revision / block) on the same hotkey.
-4. **Cross-round king.** The king is the UID with the highest stored `composite.worst` across all non-DQ scored UIDs. A new commitment can dethrone the king by clearing `worst > king.worst × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin) on its single eval. There is no paired-t-test re-run because the king is not re-evaluated.
-5. **Reference baseline.** Undistilled `Qwen/Qwen3.5-4B` is included in every round as UID `-1` for axis-floor anchoring and dashboard visibility — it is not a contender.
-6. **Winner takes all** — the king gets 100% of emissions.
+1. **~300 KL prompts** per round sampled from [ClimbMix-400B](https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle) + a private skill-targeted prompt pool (math/code/reasoning, ~20% mix), seeded by the current block. The teacher generates continuations through vLLM (`temperature=0.7, top_p=0.9`); top-128 logprobs are cached for sparse KL.
+2. **Procedural bench items** generated fresh per round from `block_seed`: math (20), code (14), reasoning (14), aime (12), mbpp (14), ifeval (14), debug (10), knowledge_v2 (12), pragmatic (12), long_context (10), tool_use (10), robustness (10), calibration (10), correction (10), multi_doc (10), refactor (8). Plus judge prompts (16 short + 6 long-form essay) and chat-turns conversations (6 × 3-turn).
+3. **One eval per commitment** for non-king miners — the validator stores `composite.final`, all axes, and the commit signature in `composite_scores.json`.
+4. **King paired re-eval each round** (v30.2 fix): the king is forced into the round's eval set so its score is on the same procedural items as challengers. Their `composite_scores.json` record overwrites each round.
+5. **Cross-round dethrone gate**: a new commitment dethrones the king when its `composite.final` exceeds the king's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%).
+6. **Reference baseline.** Undistilled `Qwen/Qwen3.5-4B` is included in every round as UID `-1` for the per-axis baseline-relative penalty + axis-floor anchoring. Not a contender.
+7. **Winner takes all** — the king gets 100% of emissions on chain.
 
-**Implication for miners.** Pick your weights carefully before you commit. The on-chain registration burn is the price of an evaluation: there is no "re-roll the same commitment until variance lands well." A model that scores 0.42 worst-axis stays at 0.42 forever (until you push a new commitment to the same hotkey, which fully overwrites the previous record).
+**Implication for miners.** Pick your weights carefully before you commit. The on-chain registration burn is the price of an evaluation: there is no "re-roll the same commitment until variance lands well." A model that scores 0.42 final stays at 0.42 forever (until you push a new commitment to the same hotkey, which fully overwrites the previous record).
 
-### The axes (ranking key = `composite.worst` = min of every axis below)
+### The ranking key — `composite.final` (v30.2)
+
+```
+composite.final = α × worst_3_mean + (1 - α) × weighted
+```
+
+Default `α = 0.7`. So 70% of your score comes from the **mean of your 3 lowest non-broken axes**, and 30% comes from the **standard weighted mean of every axis**. This:
+
+- **Smooths single-axis noise** — one fluky 0 averaged with your other low axes still gives meaningful score, vs the legacy `worst()` (single-axis min) that floored you to 0.
+- **Preserves anti-Goodhart pressure** — 70% of the score is still "your worst axes", so you can't camp specialists.
+- **Rewards all-around competence** — the 30% weighted contribution stops you being penalised by a single quirky sub-axis floor.
+
+The legacy `composite.worst` (single-axis min) is still **emitted as telemetry** in the API + dashboard, but it's no longer the dethrone gate.
+
+### The axes (organised by ranking-relevance)
 
 All axes are in `[0, 1]`, higher-is-better. Missing axes (e.g. probe outage) are dropped and the weighted mean renormalizes over surviving axes. Each axis drops if the teacher itself fails a sanity floor (so a miscalibrated probe can't corrupt rankings).
+
+#### Skill-group axes (v30.2 — collapse without losing depth)
+
+These are the primary ranking drivers for the bench-correctness side of the composite. Each group is the **mean of its sub-axes** (excluding broken ones); sub-axes still run for telemetry but no longer directly carry weight.
+
+| Group axis              | Weight | Sub-axes (still computed, weight 0)                                                |
+|------------------------|--------|------------------------------------------------------------------------------------|
+| `code_skill_group`      | 0.20   | code_bench, mbpp_bench, debug_bench, correction_bench, refactor_bench               |
+| `math_skill_group`      | 0.18   | math_bench, aime_bench, robustness_bench                                            |
+| `reasoning_skill_group` | 0.12   | reasoning_bench, multi_doc_synthesis_bench, long_context_bench                      |
+| `knowledge_skill_group` | 0.07   | knowledge_bench (v2 procedural fact reasoning), pragmatic_bench (theory-of-mind / scalar) |
+
+#### Beyond-teacher axis (v30.2)
+
+| Axis            | Weight | What it rewards                                                                         |
+|-----------------|--------|-----------------------------------------------------------------------------------------|
+| `super_teacher` | 0.10   | `tanh(mean(max(0, student_pass - teacher_pass)) / 0.10)` over 16 verifiable benches.   |
+
+A student that exactly matches the teacher scores 0; one that beats teacher by ~0.20 scores ~0.96. **This is your incentive to apply Stage-4 GRPO and post-distillation SFT** — pure distillation cannot exceed teacher capability.
+
+#### Teacher-similarity axes (production)
+
+| Axis              | Weight | What it measures                                                                        |
+|-------------------|--------|-----------------------------------------------------------------------------------------|
+| `on_policy_rkl`   | 0.35   | Reverse-KL under YOUR sampling. The single-largest weight. Stage-3 OPD dependent.       |
+| `kl`              | 0.05   | Forward-KL on teacher continuations, top-128 sparse renormalised. Saturated; demoted.   |
+| `top_k_overlap`   | 0.10   | `\|top_K_t ∩ top_K_s\| / K` averaged over generated positions. v30 research-validated.   |
+| `capability`      | 0.10   | Verifiable arithmetic / yes-no / one-word factual probes vs teacher.                    |
+
+#### Shadow distillation axes (v30/v30.1/v30.3 — research-validated, low weight)
+
+| Axis                            | Weight | What it measures                                                                  |
+|---------------------------------|--------|-----------------------------------------------------------------------------------|
+| `kl_is`                         | 0.05   | Anshumann ACL 2025 **importance-sampled** KL (unbiased full-vocab from top-K).    |
+| `forking_rkl`                   | 0.05   | Reverse-KL only at top-quartile-teacher-entropy positions (Wang et al. 2025).    |
+| `teacher_trace_plausibility`    | 0.05   | Mean NLL student assigns to teacher's emitted tokens. Catches LIMO/s1 failures.  |
+| `entropy_aware_kl`              | 0.05   | EOPD adaptive RKL/FKL blend (arXiv 2510.27485, +1.37 to +5.05 Pass@8).            |
+| `tail_decoupled_kl`             | 0      | (SHADOW) Tail-mass KL contribution. Catches "match head, flatten tail" pathology. |
+
+#### Quality axes
+
+| Axis                | Weight | What it measures                                                                |
+|---------------------|--------|---------------------------------------------------------------------------------|
+| `judge_probe`       | 0.15   | Teacher rubric on 16 short prompts (1-5 → [0,1]).                                |
+| `long_form_judge`   | 0.05   | Teacher rubric on 6 long-form essay prompts (300-500 word, structure/depth).    |
+| `chat_turns_probe`  | 0.08   | 3-turn dialogue coherence; teacher rubric on full transcript.                   |
+
+#### Stand-alone capability (kept separate from groups)
+
+| Axis                | Weight | Why it's separate                                                                  |
+|---------------------|--------|------------------------------------------------------------------------------------|
+| `tool_use_bench`    | 0.06   | Agentic Python (model emits `<python>...</python>`, stdout spliced back).         |
+| `ifeval_bench`      | 0.07   | Instruction-following with structural constraints; orthogonal to content skill.   |
+| `calibration_bench` | 0.06   | Solvable + unsolvable mix; rewards correct refusal. Catches confabulation.        |
+
+#### Discipline
+
+| Axis                | Weight | What it measures                                                              |
+|---------------------|--------|-------------------------------------------------------------------------------|
+| `length`            | 0.05   | Generation length ratio vs teacher. Rambling models lose here.                |
+| `degeneracy`        | 0.15   | Termination + non-degenerate + self-BLEU. 1.0 = teacher-like.                |
+| `reasoning_density` | 0.05   | `pass_frac × length_bonus` averaged across benches. Penalises both over-think AND wrong-but-short. |
 
 **Teacher-similarity axes** (normalized against the king/teacher, weight 0.60 total):
 
@@ -134,13 +217,10 @@ All bench pools rotate per-round via `block_seed`, so every validator picks the 
 
 ### Dethrone gates (all must pass)
 
-Single-eval mode replaces the round-local paired-t-test with a cross-round absolute-composite comparison. The composite-floor and Pareto gates remain in place as anti-gaming defenses.
-
-1. **Composite-worst margin.** Your single eval's `composite.worst` must exceed the king's stored `composite.worst` by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). 0.50 → 0.515 is not enough; 0.50 → 0.52 is.
-2. **Worst-axis floor.** If `composite.worst < COMPOSITE_DETHRONE_FLOOR = 0.20`, the dethrone is **vetoed** even if the margin passes. The axis that triggered the veto is logged and surfaced in telemetry.
-3. **Pareto-dominance gate.** A challenger that wins on `composite.worst` but loses to the king on a majority of comparable axes is blocked. Pareto semantics are *soft*: majority win AND `n_wins ≥ n_losses`, with a 2% noise margin. Insufficient comparable axes fails open.
-
-When `SINGLE_EVAL_MODE` is OFF (development / fallback), the legacy KL paired t-test (p < 0.03 + 3% epsilon vs the sitting king) is used instead of #1 above. The other gates are identical.
+1. **Final-score margin (v30.2).** Your single eval's `composite.final` must exceed the king's stored `composite.final` by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). 0.50 → 0.515 is not enough; 0.50 → 0.52 is. (Legacy v28-and-earlier records that lack `final` fall back to the old `composite.worst`-based rule.)
+2. **Worst-axis floor.** If `composite.worst < COMPOSITE_DETHRONE_FLOOR = 0.20`, the dethrone is **vetoed** even if the margin passes — unless the king-canary streak is active (king regressed on held-out gsm8k/humaneval/bbh/ifeval for 2+ consecutive rounds), in which case the floor is waived.
+3. **Per-axis baseline-relative penalty (v29.1).** Each bench axis where you regress below the same-round Qwen3.5-4B-base reference is docked by `1.5 × (ref - your_score)`. So a 10pp regression below base costs you 25pp on that axis (10pp raw + 15pp dock). This makes "stay above base on every axis" the dominant strategy.
+4. **Pareto-dominance gate.** A challenger that wins on `composite.final` but loses to the king on a majority of comparable axes is blocked. Soft Pareto: majority win AND `n_wins ≥ n_losses`, with a 2% noise margin. Insufficient comparable axes fails open.
 
 ---
 

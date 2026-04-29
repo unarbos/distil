@@ -28,9 +28,20 @@ import { CLIENT_API_BASE } from "@/lib/subnet";
  * which is what most users actually want.
  */
 interface CompositePayload {
+  // v30.2 ranking key (replaces ``worst`` as the dethrone gate).
+  final?: number | null;
+  worst_3_mean?: number | null;
+  final_alpha?: number | null;
   worst?: number | null;
   weighted?: number | null;
   axes?: Record<string, number | null | undefined>;
+  axes_raw?: Record<string, number | null | undefined>;
+  baseline_penalty?: {
+    enabled?: boolean;
+    alpha?: number;
+    n_docked?: number;
+    applied?: Record<string, { raw: number; adjusted: number; reference: number; gap: number; dock: number }>;
+  } | null;
   broken_axes?: string[];
   present_count?: number;
   version?: number;
@@ -65,47 +76,92 @@ interface LeaderboardResponse {
   contenders?: MinerSummary[];
 }
 
+/**
+ * v30.2/v30.3 macro axis groups for the radial chart. These reflect
+ * the new composite where:
+ *  - Five SKILL GROUPS replace per-bench-axis weights (sub-axes still
+ *    computed for telemetry but the GROUP is the ranking driver).
+ *  - super_teacher: rewards exceeding the teacher on verifiable benches.
+ *  - DISTILL: teacher-similarity cluster (KL, RKL, top_k_overlap, etc.)
+ *  - QUALITY: judge_probe + long_form_judge + chat_turns_probe.
+ *  - DISCIPLINE: length, degeneracy, capability, reasoning_density.
+ */
 const MACRO_AXES: { label: string; members: string[]; description: string }[] = [
   {
     label: "DISTILL",
-    members: ["kl", "on_policy_rkl", "capability"],
+    members: [
+      "on_policy_rkl",
+      "kl",
+      "top_k_overlap",
+      "kl_is",
+      "forking_rkl",
+      "teacher_trace_plausibility",
+      "entropy_aware_kl",
+      "tail_decoupled_kl",
+      "capability",
+    ],
     description:
-      "How closely the student matches the teacher's output distribution. Combines KL, on-policy RKL, and a static capability probe.",
+      "How closely the student matches the teacher's distribution. Includes the canonical KL/RKL signals + v30/v30.3 research-backed shadow signals (top_k_overlap, IS-KL, forking-RKL, teacher-trace plausibility, entropy-aware KL, tail-decoupled KL).",
+  },
+  {
+    label: "MATH",
+    members: ["math_skill_group", "math_bench", "aime_bench", "robustness_bench"],
+    description:
+      "v30.2 math_skill_group = mean of {math_bench, aime_bench, robustness_bench}. Sub-axes shown for transparency. The GROUP is what gates ranking.",
+  },
+  {
+    label: "CODE",
+    members: [
+      "code_skill_group",
+      "code_bench",
+      "mbpp_bench",
+      "debug_bench",
+      "correction_bench",
+      "refactor_bench",
+    ],
+    description:
+      "v30.2 code_skill_group = mean of {code_bench, mbpp_bench, debug_bench, correction_bench, refactor_bench}. Covers write-from-scratch + bug fixing + behavior-preserving refactor.",
   },
   {
     label: "REASONING",
-    members: ["math_bench", "reasoning_bench", "aime_bench"],
+    members: [
+      "reasoning_skill_group",
+      "reasoning_bench",
+      "multi_doc_synthesis_bench",
+      "long_context_bench",
+    ],
     description:
-      "Multi-step math and reasoning. Procedurally generated each round (math), BBH-style logic, AIME olympiad math.",
+      "v30.2 reasoning_skill_group = mean of {reasoning_bench, multi_doc_synthesis_bench, long_context_bench}. Multi-step deduction + cross-document synthesis + needle-in-haystack.",
   },
   {
-    label: "CODING",
-    members: ["code_bench", "mbpp_bench"],
+    label: "KNOWLEDGE",
+    members: ["knowledge_skill_group", "knowledge_bench", "pragmatic_bench"],
     description:
-      "Programming. HumanEval-style + MBPP+. Items are paraphrased/regenerated per round so a memoriser can't beat genuine code skill.",
+      "v30.2 knowledge_skill_group = mean of {knowledge_bench v2 (procedural fact-like reasoning), pragmatic_bench (theory-of-mind / scalar implicature / indirect-request)}.",
+  },
+  {
+    label: "EXCEEDS-TEACHER",
+    members: ["super_teacher"],
+    description:
+      "v30.2 super_teacher (weight 0.10): rewards exceeding the teacher on verifiable benches via tanh(mean(max(0, student - teacher)) / 0.10). Incentivises Stage-4 GRPO + post-distillation SFT — the only paths to producing models that exceed teacher capability.",
+  },
+  {
+    label: "QUALITY",
+    members: ["judge_probe", "long_form_judge", "chat_turns_probe"],
+    description:
+      "Conversational quality. judge_probe: short-answer rubric (1-5 → [0,1]). long_form_judge: 300-500 word essay rubric (structure / depth / coherence / length). chat_turns_probe: 3-turn coherence.",
+  },
+  {
+    label: "STAND-ALONE",
+    members: ["tool_use_bench", "ifeval_bench", "calibration_bench"],
+    description:
+      "Capabilities kept separate from groups because they measure orthogonal skills: agentic Python (tool_use), instruction-following with structural constraints (ifeval), honest refusal under unsolvable items (calibration).",
   },
   {
     label: "DISCIPLINE",
     members: ["length", "degeneracy", "reasoning_density"],
     description:
-      "Generation discipline. Penalises verbose output, reasoning loops, and pass-rate-vs-length inefficiency.",
-  },
-  {
-    label: "DIALOGUE",
-    members: ["judge_probe", "chat_turns_probe"],
-    description:
-      "Conversational quality. Teacher-rubric grading on single-turn + multi-turn chat with paraphrased prompts.",
-  },
-  {
-    label: "ROBUSTNESS",
-    members: [
-      "ifeval_bench",
-      "tool_use_bench",
-      "long_context_bench",
-      "robustness_bench",
-    ],
-    description:
-      "Instruction-following + adversarial inputs. IFEval, tool-use Python, long-context needle-in-haystack, paraphrase + noise robustness.",
+      "Generation discipline. length: ramble-vs-hard-stop ratio. degeneracy: self-BLEU + termination + non-degeneracy. reasoning_density: pass_frac × length_bonus.",
   },
 ];
 
@@ -321,39 +377,50 @@ function RadialView({
   isKing: boolean;
 }) {
   const limiting = findLimitingAxis(primary);
+  const finalScore = primary.composite?.final ?? null;
+  const worst3 = primary.composite?.worst_3_mean ?? null;
   const worst = primary.composite?.worst ?? null;
   const weighted = primary.composite?.weighted ?? null;
   const presentCount = primary.composite?.present_count ?? null;
+  const finalAlpha = primary.composite?.final_alpha ?? 0.7;
 
   return (
     <>
       {/* Inline explainer */}
       <div className="mb-6 px-4 py-3 border border-border bg-[var(--surface-soft)] text-[12px] leading-relaxed max-w-3xl">
         <div className="text-[10px] uppercase tracking-[0.18em] text-meta mb-1">
-          How to read this
+          How to read this — v30.2 scoring
         </div>
         <div className="text-foreground">
-          Each spoke is a <strong>macro-axis</strong> rolling up 2-4 of the
-          17 raw composite axes. Outer ring = 1.0 (best), centre = 0
-          (worst). The amber polygon is{" "}
+          Each spoke is a <strong>macro-axis</strong> rolling up the v30.2
+          composite (skill groups + super_teacher + shadow axes). Outer
+          ring = 1.0 (best), centre = 0 (worst). The amber polygon is{" "}
           {isKing ? <strong>the current king</strong> : "the selected miner"} (
           ♛ #{primary.uid}). The grey dashed polygon is the
           {compare ? " comparison miner" : " compare-target (pick one above to overlay)"}.
         </div>
         <div className="text-meta mt-2">
-          The ranking key is{" "}
-          <strong className="text-foreground num">composite.worst</strong> —
-          the single lowest non-broken axis after dropping reference-broken
-          ones. It&apos;s {worst != null ? <strong className="text-foreground num">{worst.toFixed(3)}</strong> : "—"}{" "}
-          here, capped at the limiting axis{" "}
-          {limiting && (
-            <strong className="text-foreground num">
-              ({prettyAxis(limiting.axis)} = {limiting.value.toFixed(3)})
-            </strong>
-          )}
-          . Look at where the polygon dips — that&apos;s where this miner
-          loses the crown.
+          The v30.2 ranking key is{" "}
+          <strong className="text-foreground num">composite.final</strong>{" "}
+          = {finalAlpha.toFixed(2)} × <code>worst_3_mean</code> +{" "}
+          {(1 - finalAlpha).toFixed(2)} × <code>weighted</code>. For this
+          miner: final = {finalScore != null ? <strong className="text-foreground num">{finalScore.toFixed(3)}</strong> : "—"}{" "}
+          (worst_3_mean = {worst3 != null ? <span className="num">{worst3.toFixed(3)}</span> : "—"},{" "}
+          weighted = {weighted != null ? <span className="num">{weighted.toFixed(3)}</span> : "—"}).
+          Legacy <code>worst</code> (single-axis min) ={" "}
+          {worst != null ? <span className="num">{worst.toFixed(3)}</span> : "—"}{" "}
+          (kept for back-compat — no longer the gate).
         </div>
+        {limiting && (
+          <div className="text-meta mt-2">
+            Lowest axis:{" "}
+            <strong className="text-foreground num">
+              {prettyAxis(limiting.axis)} = {limiting.value.toFixed(3)}
+            </strong>
+            . Look at where the polygon dips — that&apos;s where this
+            miner needs the most work.
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-10 items-start">
@@ -566,6 +633,10 @@ function RadialLegend({
   presentCount: number | null;
   limitingAxis: string | null;
 }) {
+  const finalScore = primary.composite?.final ?? null;
+  const worst3 = primary.composite?.worst_3_mean ?? null;
+  const compFinal = compare?.composite?.final ?? null;
+  const compWorst3 = compare?.composite?.worst_3_mean ?? null;
   const compWorst = compare?.composite?.worst ?? null;
   const compWeighted = compare?.composite?.weighted ?? null;
   return (
@@ -584,24 +655,38 @@ function RadialLegend({
             {primary.model}
           </span>
         </div>
-        <dl className="grid grid-cols-[80px_1fr] gap-x-3 gap-y-1 text-[12px] num">
+        <dl className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1 text-[12px] num">
           <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
-            worst
+            final
           </dt>
           <dd className="font-medium">
-            {worst != null ? worst.toFixed(3) : "—"}{" "}
-            <span className="text-meta text-[10px]">ranking key</span>
+            {finalScore != null ? finalScore.toFixed(3) : "—"}{" "}
+            <span className="text-meta text-[10px]">v30.2 ranking key</span>
+          </dd>
+          <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
+            worst_3
+          </dt>
+          <dd>
+            {worst3 != null ? worst3.toFixed(3) : "—"}{" "}
+            <span className="text-meta text-[10px]">mean of 3 lowest</span>
           </dd>
           <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
             weighted
           </dt>
           <dd>{weighted != null ? weighted.toFixed(3) : "—"}</dd>
           <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
+            worst
+          </dt>
+          <dd className="text-meta">
+            {worst != null ? worst.toFixed(3) : "—"}{" "}
+            <span className="text-[10px]">legacy single-min</span>
+          </dd>
+          <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
             limit
           </dt>
           <dd>
             {limitingAxis ? (
-              <span title={`limiting axis: ${limitingAxis}`}>
+              <span title={`lowest axis: ${limitingAxis}`}>
                 {prettyAxis(limitingAxis)}
               </span>
             ) : (
@@ -628,26 +713,36 @@ function RadialLegend({
               {compare.model}
             </span>
           </div>
-          <dl className="grid grid-cols-[80px_1fr] gap-x-3 gap-y-1 text-[12px] num">
+          <dl className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1 text-[12px] num">
             <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
-              worst
+              final
             </dt>
             <dd className="font-medium">
-              {compWorst != null ? compWorst.toFixed(3) : "—"}
+              {compFinal != null ? compFinal.toFixed(3) : "—"}
             </dd>
+            <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
+              worst_3
+            </dt>
+            <dd>{compWorst3 != null ? compWorst3.toFixed(3) : "—"}</dd>
             <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
               weighted
             </dt>
             <dd>{compWeighted != null ? compWeighted.toFixed(3) : "—"}</dd>
+            <dt className="text-meta uppercase tracking-[0.14em] text-[10px]">
+              worst
+            </dt>
+            <dd className="text-meta">
+              {compWorst != null ? compWorst.toFixed(3) : "—"}
+            </dd>
           </dl>
         </div>
       )}
 
       <p className="text-[10px] text-meta leading-relaxed pt-3 border-t border-border">
         Macro-axis values are <strong className="text-foreground">means</strong>{" "}
-        of their constituent v28 axes. The ranker uses the raw axes
-        (Scores tab), not these macros — but for &ldquo;is this miner round
-        or spiky?&rdquo; the macro view is faster.
+        of their constituent v30.2 sub-axes. The v30.2 ranker uses{" "}
+        <code>composite.final</code> = α·worst_3_mean + (1−α)·weighted
+        — see Scores tab for per-axis breakdown.
       </p>
     </div>
   );
@@ -657,24 +752,62 @@ function RadialLegend({
 //  Scores sub-tab — full 17-axis breakdown
 // ────────────────────────────────────────────────────────────────────
 
+/**
+ * v30.2/v30.3 full axis breakdown organised by ranking-relevance:
+ * - SKILL GROUPS (the v30.2 ranking drivers — sub-axes feed these but
+ *   don't directly drive ranking)
+ * - SUPER-TEACHER (v30.2 — incentivises beyond-teacher capability)
+ * - TEACHER-SIMILARITY (production + research-paper shadow signals)
+ * - QUALITY (judge probes, chat coherence)
+ * - DISCIPLINE (length/degeneracy/density)
+ * - STAND-ALONE CAPABILITY (kept separate from groups)
+ * - SUB-AXES (still computed for telemetry — no direct ranking weight)
+ */
 const ALL_AXES: { key: string; group: string }[] = [
-  { key: "kl", group: "Distribution" },
-  { key: "on_policy_rkl", group: "Distribution" },
-  { key: "capability", group: "Distribution" },
+  // Skill groups (v30.2)
+  { key: "code_skill_group", group: "Skill Groups" },
+  { key: "math_skill_group", group: "Skill Groups" },
+  { key: "reasoning_skill_group", group: "Skill Groups" },
+  { key: "knowledge_skill_group", group: "Skill Groups" },
+  // Super-teacher
+  { key: "super_teacher", group: "Beyond Teacher" },
+  // Teacher-similarity (live ranking axes)
+  { key: "on_policy_rkl", group: "Teacher-Similarity" },
+  { key: "kl", group: "Teacher-Similarity" },
+  { key: "top_k_overlap", group: "Teacher-Similarity" },
+  { key: "capability", group: "Teacher-Similarity" },
+  // Teacher-similarity (shadow axes — research-validated)
+  { key: "kl_is", group: "Shadow Distillation Axes" },
+  { key: "forking_rkl", group: "Shadow Distillation Axes" },
+  { key: "teacher_trace_plausibility", group: "Shadow Distillation Axes" },
+  { key: "entropy_aware_kl", group: "Shadow Distillation Axes" },
+  { key: "tail_decoupled_kl", group: "Shadow Distillation Axes" },
+  // Quality
+  { key: "judge_probe", group: "Quality" },
+  { key: "long_form_judge", group: "Quality" },
+  { key: "chat_turns_probe", group: "Quality" },
+  // Discipline
   { key: "length", group: "Discipline" },
   { key: "degeneracy", group: "Discipline" },
   { key: "reasoning_density", group: "Discipline" },
-  { key: "judge_probe", group: "Dialogue" },
-  { key: "chat_turns_probe", group: "Dialogue" },
-  { key: "math_bench", group: "Capability" },
-  { key: "code_bench", group: "Capability" },
-  { key: "reasoning_bench", group: "Capability" },
-  { key: "ifeval_bench", group: "Capability" },
-  { key: "aime_bench", group: "Capability" },
-  { key: "mbpp_bench", group: "Capability" },
-  { key: "tool_use_bench", group: "Capability" },
-  { key: "long_context_bench", group: "Capability" },
-  { key: "robustness_bench", group: "Capability" },
+  // Stand-alone capability
+  { key: "tool_use_bench", group: "Capability (Stand-Alone)" },
+  { key: "ifeval_bench", group: "Capability (Stand-Alone)" },
+  { key: "calibration_bench", group: "Capability (Stand-Alone)" },
+  // Sub-axes (telemetry — fold into groups for ranking)
+  { key: "math_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "aime_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "robustness_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "code_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "mbpp_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "debug_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "correction_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "refactor_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "reasoning_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "multi_doc_synthesis_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "long_context_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "knowledge_bench", group: "Sub-Axes (Telemetry)" },
+  { key: "pragmatic_bench", group: "Sub-Axes (Telemetry)" },
 ];
 
 function ScoresView({
@@ -693,13 +826,16 @@ function ScoresView({
   return (
     <>
       <div className="mb-6 max-w-3xl text-[12px] text-meta leading-relaxed">
-        Full 17 v28 composite axes for{" "}
+        Full v30.2/v30.3 composite axis breakdown for{" "}
         <strong className="text-foreground">
           {isKing && "♛ "}#{primary.uid}
         </strong>
-        . The amber bar = primary; the grey marker = compare. The single
-        lowest non-broken axis (the <em>limiting axis</em>) sets{" "}
-        <code>composite.worst</code> — that&apos;s the gate.
+        . The amber bar = primary; the grey marker = compare. The
+        ranking key is{" "}
+        <code>composite.final = 0.7 × worst_3_mean + 0.3 × weighted</code>{" "}
+        — see the <strong>Skill Groups</strong> section first (those
+        are the ranking-relevant axes), then{" "}
+        <strong>Beyond Teacher</strong> (super_teacher), then the rest.
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-12 gap-y-6">
         {Array.from(new Set(ALL_AXES.map((a) => a.group))).map((grp) => (
@@ -756,7 +892,7 @@ function ScoreRow({
         isBroken
           ? "axis dropped this round (eval-broken)"
           : isLimiting
-            ? "limiting axis — this determines composite.worst"
+            ? "single lowest axis — counts in worst_3_mean (and legacy composite.worst)"
             : undefined
       }
     >

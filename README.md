@@ -1,25 +1,37 @@
 # Distil — SN97
 
-A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.5-35B-A3B** (35B total, 3B active MoE).
+A Bittensor subnet for competitive model distillation of **Qwen/Qwen3.6-35B-A3B** (35B total, ~3B active MoE).
 
 **Dashboard**: [distil.arbos.life](https://distil.arbos.life)  
 **API**: [api.arbos.life](https://api.arbos.life)  
 **Chat with the King**: [chat.arbos.life](https://chat.arbos.life) — try the current best distilled model  
 **Subnet**: Finney netuid 97
 
-## How It Works
+## How It Works (v30.2 / v30.3, 2026-04-29)
 
-**Miners** distill the teacher into a smaller model (≤5.25B total params), upload to HuggingFace, and commit the repo link on-chain. **One commitment per hotkey — commitments are permanent and cannot be changed.** However, if disqualified, miners can register a new hotkey and submit a different model.
+**Miners** distill the teacher into a smaller model (≤7B total params), upload to HuggingFace, and commit the repo link on-chain. **One commitment per hotkey — commitments are permanent and cannot be changed.** However, if disqualified, miners can register a new hotkey and submit a different model.
 
-**Validators** score every committed model on a **17-axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)). The composite covers five concerns at once:
+**Validators** score every committed model on a **multi-axis composite** ([`scripts/validator/composite.py`](scripts/validator/composite.py)) covering teacher-similarity, capability against ground truth (procedural — no static answer key), conversational quality, generation discipline, and "exceeds the teacher" capability. See [`docs/MINER_FAQ.md`](docs/MINER_FAQ.md) for the full axis-by-axis playbook.
 
-- **Distribution match** — on-policy reverse-KL (35% of the relative slice, the primary distillation signal under the new framework), forward-KL on teacher continuations (15% of the relative slice), capability (25%), length (10%), degeneracy (15%).
-- **Capability against ground truth** — nine absolute benches: math, code, reasoning, IFEval, AIME, MBPP, tool use, long context, robustness. All items are **procedurally generated per round from a block-seed** so there is no static answer key for miners to memorise.
-- **Conversational quality** — judge-probe (15%), chat-turns probe (8%).
-- **Generation discipline** — `reasoning_density` axis (5%) directly punishes thinking-without-answering (the failure mode that produced the 2026-04-17 reasoning-spiral king; see [paper/off_policy_cot_collapse.md](paper/off_policy_cot_collapse.md)).
-- **Robustness to prompt rewrites** — robustness axis (7%) re-asks math items under K block-rotated paraphrases + noise wrappers.
+### Ranking key — `composite.final` (v30.2)
 
-The king is whoever has the **highest worst-axis score** (with weighted-mean as tiebreaker in the saturated regime). KL is one of the 17 axes, not the gate. **Winner-take-all** — best miner gets 100% of emissions.
+```
+composite.final = α × worst_3_mean + (1 - α) × weighted
+```
+
+Default `α = 0.7`. So 70% of your score comes from the **mean of your 3 lowest non-broken axes**, and 30% from the **weighted mean of every axis**. This smooths single-axis noise (the legacy `worst()` floored 22% of the leaderboard at 0) while preserving anti-Goodhart pressure (you still can't camp specialists). The legacy `composite.worst` (single-axis min) is retained as telemetry — see API + dashboard.
+
+### Axis structure (v30.2 collapsed without losing depth)
+
+- **Skill groups** (the new ranking drivers): `code_skill_group` (0.20) = mean of {code, mbpp, debug, correction, refactor}; `math_skill_group` (0.18) = mean of {math, aime, robustness}; `reasoning_skill_group` (0.12) = mean of {reasoning, multi_doc, long_context}; `knowledge_skill_group` (0.07) = mean of {knowledge_v2, pragmatic}.
+- **Beyond-teacher** (v30.2 — incentivises exceeding teacher): `super_teacher` (0.10) = `tanh(mean(max(0, student - teacher)) / 0.10)` over 16 verifiable benches. Pure distillation can't exceed teacher; this rewards Stage-4 GRPO + post-distillation SFT.
+- **Teacher-similarity**: `on_policy_rkl` (0.35), `kl` (0.05), `top_k_overlap` (0.10), `capability` (0.10).
+- **Shadow distillation axes** (research-validated, low weight 0-0.05): `kl_is`, `forking_rkl`, `teacher_trace_plausibility`, `entropy_aware_kl`, `tail_decoupled_kl`.
+- **Quality**: `judge_probe` (0.15), `long_form_judge` (0.05), `chat_turns_probe` (0.08).
+- **Stand-alone capability**: `tool_use_bench` (0.06), `ifeval_bench` (0.07), `calibration_bench` (0.06).
+- **Discipline**: `length` (0.05), `degeneracy` (0.15), `reasoning_density` (0.05).
+
+The king is whoever has the **highest `composite.final`**. **Winner-take-all** — best miner gets 100% of emissions on chain.
 
 > **Why not just KL?** Pure forward-KL on teacher continuations rewards token-level surface match. A 4B student that mimics the teacher's "wait, let me reconsider" filler can win KL while never producing a final answer. We caught this on 2026-04-17 (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench). The composite, the on-policy RKL axis, and the reasoning-density axis exist specifically to close that gap.
 
@@ -34,17 +46,17 @@ The validator uses a **king-of-the-hill** architecture for efficient, high-confi
    - Models that fail pre-checks are **never sent to GPU** — no wasted compute
    - `check_model.py` and `test_miner.py` run 15 validator checks — the same checks the validator uses
 
-2. **King identification** — The miner with the highest `composite.worst` in `state/composite_scores.json` is the king (current emissions winner). KL alone never crowns anyone.
+2. **King identification** — The miner with the highest `composite.final` in `state/composite_scores.json` is the king (current emissions winner). KL alone never crowns anyone.
 
-3. **Single-eval policy (live 2026-04-25)** — Each on-chain commitment is scored EXACTLY ONCE on its own block-seeded 300-prompt set. There is no king re-eval, no top-N rotation, and no dormant rotation. New commitments enter rounds FIFO by `commit_block`, capped at `SINGLE_EVAL_MAX_PER_ROUND` (default 10) plus the always-in reference baseline (UID -1, `Qwen/Qwen3.5-4B`). Re-evaluation triggers only when a UID re-commits a different model on-chain, or when the composite schema bumps.
+3. **Single-eval-per-commitment + paired king re-eval (live 2026-04-29, v30.2)** — Each on-chain commitment is scored EXACTLY ONCE for non-king miners. The **king is re-evaluated EVERY round** so its score is on the same procedural items as challengers (paired-fairness fix). New commitments enter rounds FIFO by `commit_block`, capped at `SINGLE_EVAL_MAX_PER_ROUND` (default 10) plus the always-in reference baseline (UID -1, `Qwen/Qwen3.5-4B`). Re-evaluation for non-king triggers only when a UID re-commits a different model on-chain, or when the composite schema bumps.
 
 4. **Per-UID eval on the pod** — Each student is loaded sequentially on the pod (vLLM teacher → student forward pass → bench battery). The reference baseline runs in every round so the asymmetric reference-broken-axes filter (see `composite.py::resolve_reference_broken_axes`) can drop axes the base model itself can't pass under the eval setup (token cap, etc.).
 
-5. **17-axis composite, normalized per axis** — Every student gets a 17-axis vector. Axis weights live in `composite.py:AXIS_WEIGHTS` (relative tier), `BENCH_AXIS_WEIGHTS` (math/code/reasoning/IFEval), and `ARENA_V3_AXIS_WEIGHTS` (AIME/MBPP/tool-use/long-context/robustness), plus the judge-probe, chat-turns, and reasoning-density axes. Each axis is in [0, 1]. The composite stores both `worst = min(axes)` (after dropping reference-broken axes) and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ` (keeps broken axes when student > 0 so beating the reference still pays).
+5. **Multi-axis composite, normalized per axis** — Every student gets a vector covering skill-group axes, beyond-teacher, teacher-similarity, shadow distillation, quality, capability, and discipline. Axis weights live in `composite.py:AXIS_WEIGHTS` (relative tier), `BENCH_AXIS_WEIGHTS` (legacy sub-axes — most weight 0 in v30.2), `BENCH_GROUP_AXIS_WEIGHTS` (the v30.2 skill groups + super_teacher), and `ARENA_V3_AXIS_WEIGHTS` (kept-separate capability axes). Each axis is in [0, 1]. The composite stores `final = 0.7·worst_3_mean + 0.3·weighted` (the ranking key), `worst_3_mean = mean(bottom 3 non-broken axes)`, `worst = min(axes)` (legacy telemetry), and `weighted = Σ wᵢ · axisᵢ / Σ wᵢ`.
 
-6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. Teacher logits are precomputed and cached on GPU.
+6. **vLLM-accelerated evaluation** — vLLM generates teacher continuations 5–10× faster than pure HuggingFace inference. Teacher logits are precomputed and cached on GPU. Multi-GPU pod scaffolding (`DISTIL_TP_SIZE`, `DISTIL_STUDENT_PARALLELISM`) supports 4× / 8× H100 migration for Kimi K2.6 / batched student forward (v30.4).
 
-7. **Cross-round dethronement gate (composite-worst, single-eval mode)** — King selection runs over `state/composite_scores.json` (records with `n_axes >= _KING_SELECTION_MIN_AXES`, the schema floor). The king is whoever has the highest `composite.worst`. A challenger dethrones the incumbent only when `challenger.worst > incumbent.worst × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin). When both are at the saturated worst-floor (≤ 0.005), the same 3% margin applies to `composite.weighted` as a tiebreaker. The legacy paired t-test on KL is RETIRED — KL is one of 17 axes, not the ranking key. Different prompts per round are by design; the absolute composite supports cross-round comparison.
+7. **Cross-round dethronement gate (v30.2)** — King selection runs over `state/composite_scores.json`. The king is whoever has the highest `composite.final`. A challenger dethrones the incumbent only when `challenger.final > incumbent.final × (1 + SINGLE_EVAL_DETHRONE_MARGIN)` (default 3% margin). When both are at the saturated floor, the same 3% margin applies to `composite.weighted` as a tiebreaker. Legacy v28 records (lacking `final`) fall back to the v28 `worst`-based rule.
 
 8. **Weight setting** — King gets weight=1.0, everyone else gets 0.0. Raw scores, no EMA smoothing. Weights are set on-chain immediately after each evaluation.
 
