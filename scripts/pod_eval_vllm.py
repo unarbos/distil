@@ -12537,6 +12537,85 @@ def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
 # §6  vLLM Server Management
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _stub_missing_preprocessor_config(model_name, revision=None):
+    """Write a minimal ``preprocessor_config.json`` into the snapshot
+    cache if one isn't published in the upstream repo.
+
+    Background (2026-04-29): Qwen3.6-35B-A3B's HF repo declares
+    ``vision_config`` in config.json (the model is described as a
+    multimodal MoE) but the repo does NOT publish a
+    ``preprocessor_config.json``. vLLM's engine init calls
+    ``transformers.AutoProcessor.from_pretrained`` which then calls
+    ``ImageProcessingMixin.get_image_processor_dict`` and crashes with
+    ``OSError: Can't load image processor`` because the file is
+    missing. ``--limit-mm-per-prompt`` and ``--skip-mm-profiling``
+    don't fix this — they only skip the profiling pass, not the
+    processor build at engine init.
+
+    This helper writes a minimal Qwen2-VL-shape stub (the same
+    image_processor_type Qwen multimodal models use) so the
+    AutoProcessor load succeeds. The ``--limit-mm-per-prompt {"image": 0,
+    "video": 0}`` flag then guarantees we never exercise the vision
+    path at inference, so the stub's actual values are never read.
+    No-op if the file already exists upstream (most multimodal repos
+    do publish it).
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        return
+    try:
+        snap_root = snapshot_download(
+            model_name,
+            revision=revision if (revision and revision != "main") else None,
+            allow_patterns=["config.json"],
+            local_files_only=True,
+        )
+    except Exception:
+        return
+    snap_path = Path(snap_root)
+    if not snap_path.exists():
+        return
+    pp_path = snap_path / "preprocessor_config.json"
+    if pp_path.exists():
+        return  # nothing to stub
+    cfg_path = snap_path / "config.json"
+    if not cfg_path.exists():
+        return
+    try:
+        import json as _json
+        cfg = _json.loads(cfg_path.read_text())
+    except Exception:
+        return
+    # Only stub if the model declares vision capability; non-multimodal
+    # configs don't need a preprocessor_config and nothing tries to load
+    # one for them.
+    if "vision_config" not in cfg:
+        return
+    # Minimal Qwen2-VL-shape image processor config. Values aren't used
+    # at inference because mm is disabled via --limit-mm-per-prompt.
+    stub = {
+        "image_processor_type": "Qwen2VLImageProcessor",
+        "min_pixels": 3136,
+        "max_pixels": 12845056,
+        "patch_size": 14,
+        "merge_size": 2,
+        "temporal_patch_size": 2,
+        "do_rescale": True,
+        "rescale_factor": 0.00392156862745098,
+        "do_normalize": True,
+        "image_mean": [0.48145466, 0.4578275, 0.40821073],
+        "image_std": [0.26862954, 0.26130258, 0.27577711],
+        "do_convert_rgb": True,
+        "do_resize": True,
+    }
+    try:
+        pp_path.write_text(_json.dumps(stub, indent=2))
+        print(f"[vllm] Stubbed missing preprocessor_config.json at {pp_path}", flush=True)
+    except Exception as e:
+        print(f"[vllm] Failed to write preprocessor stub: {e}", flush=True)
+
+
 def _teacher_cache_complete(model_name, revision=None):
     """Return True if HF cache has all the weight files vLLM needs.
 
@@ -12548,18 +12627,56 @@ def _teacher_cache_complete(model_name, revision=None):
     This check lets us skip that remote call by confirming locally that the
     safetensors shards are already on disk — if they are, we start vLLM with
     HF_HUB_OFFLINE=1 and it reads straight from cache.
+
+    2026-04-29 (v29.7): the previous version called
+    ``snapshot_download(local_files_only=True)`` which just checks the
+    snapshot DIRECTORY exists — it does NOT verify the .safetensors
+    shards are actually present. A partial prefetch (config.json +
+    tokenizer downloaded, weights failed) made this check wrongly
+    return True, then vLLM started with ``HF_HUB_OFFLINE=1`` and crashed
+    because the weights weren't there. Now we explicitly verify at
+    least one ``.safetensors`` file resolved by ``hf_hub_download(
+    local_files_only=True)`` exists, AND verify the model config /
+    tokenizer files exist, AND (for multimodal models) verify the
+    preprocessor_config.json is also present.
     """
     try:
-        from huggingface_hub import snapshot_download
-        snapshot_download(
+        from huggingface_hub import snapshot_download, hf_hub_download
+    except Exception:
+        return False
+    try:
+        snap_root = snapshot_download(
             model_name,
             revision=revision if (revision and revision != "main") else None,
             allow_patterns=["*.safetensors", "*.json", "tokenizer*", "*.txt"],
             local_files_only=True,
         )
-        return True
     except Exception:
         return False
+    # Verify at least one .safetensors weight file is locally cached.
+    import glob
+    snap_path = Path(snap_root)
+    if not snap_path.exists():
+        return False
+    has_weights = any(snap_path.glob("*.safetensors"))
+    if not has_weights:
+        # Maybe it's stored as a single .bin / consolidated. Check.
+        has_weights = (
+            any(snap_path.glob("*.bin"))
+            or any(snap_path.glob("model.safetensors.index.json"))
+        )
+    if not has_weights:
+        return False
+    # Verify the config / tokenizer + (if multimodal) preprocessor are present.
+    has_config = (snap_path / "config.json").exists()
+    if not has_config:
+        return False
+    # Note (v29.7): we used to require preprocessor_config.json for
+    # multimodal teachers here, but ``_stub_missing_preprocessor_config``
+    # below now writes a minimal stub on demand. So this check no
+    # longer needs to fail-back to online for that one file. If the
+    # weights + config + tokenizer are present, we can go offline.
+    return True
 
 
 def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384, revision=None, tensor_parallel_size=1, _attempt=1):
@@ -12584,6 +12701,20 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         except Exception as e:
             print(f"[vllm] prefetch raised {type(e).__name__}: {e} — continuing with online vLLM start", flush=True)
         offline_ok = _teacher_cache_complete(model_name, revision)
+    # 2026-04-29 (v29.7): handle multimodal teachers whose HF repo is
+    # missing ``preprocessor_config.json`` (Qwen3.6-35B-A3B's repo is
+    # this case as of April 2026 — config.json declares vision_config
+    # but no preprocessor_config.json is published, so vLLM crashes when
+    # ``transformers.AutoProcessor.from_pretrained`` tries to load the
+    # image processor). Even with ``--limit-mm-per-prompt``  +
+    # ``--skip-mm-profiling`` vLLM still attempts the processor load
+    # at engine init. Stub a minimal preprocessor_config.json into the
+    # local cache so the load succeeds; ``--limit-mm-per-prompt`` then
+    # ensures we never actually exercise the vision path at inference.
+    try:
+        _stub_missing_preprocessor_config(model_name, revision)
+    except Exception as e:
+        print(f"[vllm] preprocessor stub failed (non-fatal): {e}", flush=True)
 
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
