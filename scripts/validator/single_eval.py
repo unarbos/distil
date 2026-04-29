@@ -32,7 +32,10 @@ import os
 import time
 from typing import Any
 
-from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
+from scripts.validator.composite import (
+    COMPOSITE_FINAL_BOTTOM_WEIGHT,
+    COMPOSITE_SHADOW_VERSION,
+)
 
 logger = logging.getLogger("distillation.remote_validator")
 
@@ -212,6 +215,14 @@ def merge_composite_scores(
         info = models_to_eval.get(uid, {}) or {}
         record = {
             "worst": float(worst),
+            # v30.2 — final ranking key + worst_3_mean.
+            "final": (
+                float(comp["final"]) if comp.get("final") is not None else None
+            ),
+            "worst_3_mean": (
+                float(comp["worst_3_mean"]) if comp.get("worst_3_mean") is not None else None
+            ),
+            "final_alpha": comp.get("final_alpha"),
             "weighted": (
                 float(comp["weighted"]) if comp.get("weighted") is not None else None
             ),
@@ -613,14 +624,34 @@ def select_king_by_composite(
                 n_axes_i = 0
             if n_axes_i < min_axes:
                 continue
-            worst = rec.get("worst")
-            if worst is None:
-                continue
-            try:
-                worst_f = float(worst)
-            except (TypeError, ValueError):
-                continue
-            if math.isnan(worst_f) or math.isinf(worst_f):
+            # v30.2 — primary sort key is ``final`` (blended worst_3_mean
+            # + weighted), with ``worst`` and ``weighted`` as fallbacks
+            # for legacy v28-and-earlier records that lack ``final``.
+            final_v = rec.get("final")
+            if final_v is None:
+                # Legacy record: synthesize a final from worst+weighted
+                # using the current alpha so the comparison is consistent.
+                worst_v = rec.get("worst")
+                weighted_v = rec.get("weighted")
+                if worst_v is None and weighted_v is None:
+                    continue
+                try:
+                    w_f = float(worst_v) if worst_v is not None else 0.0
+                    wt_f = float(weighted_v) if weighted_v is not None else 0.0
+                except (TypeError, ValueError):
+                    continue
+                # Use ``worst`` as a proxy for worst_3_mean (legacy single
+                # axis), then blend with weighted using current alpha.
+                final_f = (
+                    COMPOSITE_FINAL_BOTTOM_WEIGHT * w_f
+                    + (1.0 - COMPOSITE_FINAL_BOTTOM_WEIGHT) * wt_f
+                )
+            else:
+                try:
+                    final_f = float(final_v)
+                except (TypeError, ValueError):
+                    continue
+            if math.isnan(final_f) or math.isinf(final_f):
                 continue
             weighted = rec.get("weighted")
             try:
@@ -628,18 +659,11 @@ def select_king_by_composite(
             except (TypeError, ValueError):
                 weighted_f = 0.0
             prior_bonus = 1 if uid == prior_king_uid else 0
-            # Sort tuple ordering matters here:
-            #   (worst desc, weighted desc, prior_bonus desc, uid desc)
-            # Why weighted before prior_bonus: in the current state ~45% of
-            # composite records have worst=0.0 (any axis at 0.0 floors the
-            # min). With prior_bonus higher in the tuple than weighted, the
-            # prior king *always* wins among the worst=0.0 group regardless
-            # of how poorly they rank on the 19 other axes — even if a
-            # never-king UID has weighted=0.78 vs the prior king's 0.50.
-            # Putting weighted first means prior_bonus only matters when two
-            # UIDs are *also* tied on weighted (essentially a coin flip
-            # stabilizer, not a sticky-king bias).
-            out.append((worst_f, weighted_f, prior_bonus, uid))
+            # Sort tuple: (final desc, weighted desc, prior_bonus desc, uid desc).
+            # ``final`` is the canonical ranker; ``weighted`` is the
+            # tiebreaker; ``prior_bonus`` only matters on exact ties to
+            # avoid coin-flip churn.
+            out.append((final_f, weighted_f, prior_bonus, uid))
         return out
 
     # Tier 1 — schema-current AND grader-current records. These were graded
@@ -709,25 +733,87 @@ def resolve_dethrone(
 ) -> bool:
     """Return True iff challenger should take the crown from incumbent.
 
-    Three-stage decision:
+    v30.2 (2026-04-29): the canonical dethrone key is now ``final``
+    (a 0.7·worst_3_mean + 0.3·weighted blend) rather than ``worst``
+    (single-axis min). The blend smooths the single-axis-min noise
+    pathology while preserving anti-Goodhart pressure (~70% of the
+    score is still bottom-3-axis driven).
 
-    1. **Clear win on worst** — ``ch_worst > inc_worst * (1 + margin)``.
-       Challenger dominates on its worst axis. Take the crown.
-    2. **Clear regression on worst** — ``ch_worst < inc_worst * (1 - margin)``.
-       Challenger is meaningfully WORSE on at least one axis than the
-       king. Reject. This protects the "no-axis-can-be-broken"
-       guarantee that ``worst`` exists to enforce.
-    3. **Worst is effectively tied** (between the two thresholds) — fall
-       back to ``weighted`` with the same relative margin. Covers the
-       saturated-floor case (both ≤ ε, ~45% of records) AND the more
-       common low-resolution-quantum case (e.g. both at 1/3 because n=3
-       on the worst axis and each model missed exactly one sample).
-       Without this fallback the king is preserved by default whenever
-       ``worst`` quantizes to the same value, even when the challenger
-       is unambiguously better on every other axis (Round 9: UID 93
-       weighted=0.6833 lost to UID 89 weighted=0.6567 on a worst tie of
-       0.333; that's a 4% improvement getting silently rejected).
+    Decision rule:
+      1. Clear win on ``final``: ``ch_final > inc_final × (1 + margin)``.
+         Challenger dominates on the blended ranking. Take the crown.
+      2. Clear regression on ``final``: ``ch_final < inc_final × (1 − margin)``.
+         Reject. Protects against single-eval noise dethroning a
+         genuinely-better king.
+      3. Tied region (within ±margin): fall back to a strict ``weighted``
+         comparison. Covers saturated-floor cases and exact-tie quantum
+         cases the old ``worst``-based dethrone had to special-case.
+
+    Backward compat: if the records lack ``final`` (legacy v28 records
+    pre-bump), fall back to the v28 worst+weighted decision rule.
     """
+    ch_final = (challenger_record or {}).get("final")
+    inc_final = (incumbent_record or {}).get("final") if incumbent_record else None
+
+    if ch_final is None:
+        # Backward-compat path: legacy v28 record without ``final``.
+        # Fall through to the v28 worst-based decision rule.
+        return _resolve_dethrone_legacy_worst(
+            incumbent_uid, incumbent_record,
+            challenger_uid, challenger_record, margin,
+        )
+
+    if incumbent_uid is None or not incumbent_record:
+        return float(ch_final) > 0.0
+    if challenger_uid == incumbent_uid:
+        return True
+    if inc_final is None:
+        return float(ch_final) > 0.0
+
+    inc_final_f = float(inc_final)
+    ch_final_f = float(ch_final)
+    rel_margin = max(0.0, float(margin))
+
+    # Saturated-floor handling: if both are at the floor (~0), neither
+    # axis-blend is informative; defer to weighted directly.
+    both_saturated = (
+        inc_final_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+        and ch_final_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
+    )
+    if not both_saturated:
+        win_threshold = inc_final_f * (1.0 + rel_margin)
+        if ch_final_f > win_threshold:
+            return True
+        regress_threshold = inc_final_f * (1.0 - rel_margin)
+        if ch_final_f < regress_threshold:
+            return False
+
+    # Tied region: fall back to ``weighted`` with the same relative margin.
+    ch_w = (challenger_record or {}).get("weighted")
+    inc_w = incumbent_record.get("weighted")
+    if ch_w is None or inc_w is None:
+        return False
+    try:
+        ch_w_f = float(ch_w)
+        inc_w_f = float(inc_w)
+    except (TypeError, ValueError):
+        return False
+    if inc_w_f <= 0.0:
+        return ch_w_f > 0.0
+    weighted_threshold = inc_w_f * (1.0 + rel_margin)
+    return ch_w_f > weighted_threshold
+
+
+def _resolve_dethrone_legacy_worst(
+    incumbent_uid: int | None,
+    incumbent_record: dict | None,
+    challenger_uid: int,
+    challenger_record: dict,
+    margin: float = SINGLE_EVAL_DETHRONE_MARGIN,
+) -> bool:
+    """v28-and-earlier dethrone rule using ``worst`` (single-axis min) +
+    ``weighted`` fallback. Kept for backward compatibility on legacy
+    records that pre-date the v30.2 schema bump."""
     ch_worst = (challenger_record or {}).get("worst")
     if ch_worst is None:
         return False
@@ -741,10 +827,6 @@ def resolve_dethrone(
     inc_worst_f = float(inc_worst)
     ch_worst_f = float(ch_worst)
     rel_margin = max(0.0, float(margin))
-    # If both are at the saturated floor, skip the worst-thresholds
-    # entirely (they multiply to 0 and any positive ch_worst wins by
-    # default, which leaks past the saturation guard) and go straight to
-    # the weighted tiebreaker.
     both_saturated = (
         inc_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
         and ch_worst_f <= SINGLE_EVAL_WORST_FLOOR_EPSILON
@@ -753,13 +835,9 @@ def resolve_dethrone(
         win_threshold = inc_worst_f * (1.0 + rel_margin)
         if ch_worst_f > win_threshold:
             return True
-        # If challenger regressed on worst by more than the margin,
-        # reject. Protects the "no-axis-can-be-broken" guarantee.
         regress_threshold = inc_worst_f * (1.0 - rel_margin)
         if ch_worst_f < regress_threshold:
             return False
-    # Tied region (within ±margin of inc_worst, or both saturated).
-    # Fall back to weighted with the same relative margin.
     ch_w = (challenger_record or {}).get("weighted")
     inc_w = incumbent_record.get("weighted")
     if ch_w is None or inc_w is None:
@@ -799,6 +877,15 @@ def _seed_one_h2h_round(state, latest: dict) -> int:
             continue
         state.composite_scores[uid_str] = {
             "worst": float(worst),
+            # v30.2 — also seed final/worst_3_mean from the bootstrap
+            # h2h record so legacy seedings carry the new ranking key.
+            "final": (
+                float(comp["final"]) if comp.get("final") is not None else None
+            ),
+            "worst_3_mean": (
+                float(comp["worst_3_mean"]) if comp.get("worst_3_mean") is not None else None
+            ),
+            "final_alpha": comp.get("final_alpha"),
             "weighted": (
                 float(comp["weighted"]) if comp.get("weighted") is not None else None
             ),

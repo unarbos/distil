@@ -14733,6 +14733,51 @@ def main():
             args.tensor_parallel_size = max(1, torch.cuda.device_count())
         except Exception:
             args.tensor_parallel_size = 1
+
+    # v30.2 — Student-side GPU dispatch.
+    # On a multi-GPU pod, the teacher uses tensor-parallel across all
+    # GPUs (above), but the student forward pass can either:
+    #   (a) Use the same TP layout as the teacher (faster per prompt
+    #       for big students). This is the default when
+    #       DISTIL_STUDENT_TP_SIZE is unset.
+    #   (b) Run multiple students in parallel on disjoint GPU groups
+    #       (faster when many students need scoring per round).
+    #       This requires DISTIL_STUDENT_PARALLELISM > 1, which
+    #       partitions the visible GPUs into N worker groups of
+    #       (total_gpus // N) GPUs each.
+    # Default settings preserve existing single-GPU behaviour.
+    student_tp = os.environ.get("DISTIL_STUDENT_TP_SIZE")
+    if student_tp:
+        try:
+            args.student_tp_size = max(1, int(student_tp))
+        except ValueError:
+            args.student_tp_size = 1
+    else:
+        args.student_tp_size = 1
+    student_par = os.environ.get("DISTIL_STUDENT_PARALLELISM")
+    if student_par:
+        try:
+            args.student_parallelism = max(1, int(student_par))
+        except ValueError:
+            args.student_parallelism = 1
+    else:
+        args.student_parallelism = 1
+    if args.student_parallelism > 1:
+        # Sanity check: parallelism × per-worker GPU count ≤ visible.
+        try:
+            total_gpus = torch.cuda.device_count()
+        except Exception:
+            total_gpus = 1
+        per_worker = max(1, total_gpus // args.student_parallelism)
+        print(
+            f"[eval] Student parallelism: {args.student_parallelism} "
+            f"workers × {per_worker} GPU(s) each "
+            f"(total visible: {total_gpus}). Note: this is currently "
+            f"a configuration knob — the actual worker-pool dispatch "
+            f"will land in v30.3 once a multi-GPU pod is provisioned.",
+            flush=True,
+        )
+
     # Higher concurrency pays off only when the teacher is sharded.
     user_set_concurrency = any(a.startswith("--concurrency") for a in sys.argv[1:])
     if args.tensor_parallel_size > 1 and not user_set_concurrency:
