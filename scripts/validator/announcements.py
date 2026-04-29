@@ -52,17 +52,18 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
                       state: ValidatorState, paired_prompts=None, total_prompts=None,
                       p_value=None, *, new_composite_worst=None,
                       new_composite_weighted=None, new_limiting_axis=None,
-                      old_composite_worst=None, old_composite_weighted=None):
+                      old_composite_worst=None, old_composite_weighted=None,
+                      new_composite_final=None, old_composite_final=None,
+                      new_composite_worst_3_mean=None,
+                      old_composite_worst_3_mean=None):
     """Write a pending announcement to state for async Discord posting.
 
-    Composite-worst is the production ranking key (since v27). When the
-    caller passes ``new_composite_worst``, the Discord post leads with the
-    composite scores and demotes KL to a parenthetical "axis component"
-    line so the public framing matches the eval mechanism. KL-only
-    framing was the headline through 2026-04-26 and contributed to the
-    reasoning-spiral failure mode (see paper/off_policy_cot_collapse.md);
-    this signature keeps backward compatibility for callers that don't
-    know the composite yet (the headline falls back to KL in that case).
+    v30.2 (2026-04-29): the canonical ranking key is ``composite.final``
+    (= 0.7 × worst_3_mean + 0.3 × weighted), not ``composite.worst``
+    (single-axis min). When ``new_composite_final`` is provided, the
+    headline leads with ``Composite final`` and demotes ``worst`` to
+    a "limiting axis" telemetry line. Falls back to the legacy
+    ``Composite worst`` headline for callers that haven't migrated yet.
     """
     import os as _os
     single_eval_active = bool(int(_os.environ.get("SINGLE_EVAL_MODE", "0") or 0))
@@ -94,12 +95,12 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
         n_axes, axis_list = _active_axis_summary()
         gate_explainer = (
-            f"Dethronement uses an absolute composite across {n_axes} weighted axes "
-            f"({axis_list}). 3-stage gate: clear win on `worst` (>3% margin) → take "
-            f"crown; clear regression on `worst` (<-3%) → reject; tied region → "
-            f"fall back to `weighted` with the same 3% margin. KL shown above is "
-            f"the global distillation distance, not the ranking key. One eval per "
-            f"commitment; no re-evals. (composite schema v{COMPOSITE_SHADOW_VERSION})"
+            f"Dethronement uses `composite.final = 0.7 × worst_3_mean + 0.3 × weighted` "
+            f"across {n_axes} axes ({axis_list}). Challenger must clear the king on "
+            f"`final` by >3%. KL shown above is one of N axes — not the ranking key. "
+            f"One eval per commitment; the king is paired-re-evaluated every round "
+            f"on the same procedural items as challengers (composite schema "
+            f"v{COMPOSITE_SHADOW_VERSION})."
         )
     else:
         prompt_line = f"🧪 Compared on {prompt_count} paired prompts"
@@ -110,12 +111,39 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         )
     p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""
 
-    # Build the headline. Composite-worst is the production ranking key
-    # under v28 (see ``select_king_by_composite``); KL is one of 17 axes,
-    # never the gate. Fall back to the KL-only line only when the caller
-    # didn't pass composite payloads (legacy callers, dev mode).
-    if new_composite_worst is not None:
-        worst_line = f"📊 **Composite worst: {new_composite_worst:.3f}**"
+    # Build the headline. v30.2 (2026-04-29) made ``composite.final`` the
+    # ranking key (= 0.7 × worst_3_mean + 0.3 × weighted). When ``final``
+    # is available, lead with it and surface ``worst_3_mean``, ``worst``
+    # (as the limiting-axis telemetry line), ``weighted``, and KL.
+    # Falls back to the legacy worst-led headline for legacy callers.
+    if new_composite_final is not None:
+        final_line = f"📊 **Composite final: {new_composite_final:.3f}** (ranking key)"
+        if old_composite_final is not None:
+            final_line += f" — previous king: {old_composite_final:.3f}"
+        breakdown_parts = []
+        if new_composite_worst_3_mean is not None:
+            w3 = f"worst-3 mean: {new_composite_worst_3_mean:.3f}"
+            if old_composite_worst_3_mean is not None:
+                w3 += f" (was {old_composite_worst_3_mean:.3f})"
+            breakdown_parts.append(w3)
+        if new_composite_weighted is not None:
+            ww = f"weighted: {new_composite_weighted:.3f}"
+            if old_composite_weighted is not None:
+                ww += f" (was {old_composite_weighted:.3f})"
+            breakdown_parts.append(ww)
+        breakdown_line = ""
+        if breakdown_parts:
+            breakdown_line = "\n📐 " + " · ".join(breakdown_parts)
+        worst_telemetry = ""
+        if new_composite_worst is not None:
+            worst_telemetry = f"\n└ Worst-axis floor: {new_composite_worst:.3f}"
+            if new_limiting_axis:
+                axis_pretty = new_limiting_axis.replace("_bench", "").replace("_", " ")
+                worst_telemetry += f" ({axis_pretty})"
+        kl_part = f"\n└ KL component: {new_kl:.6f} (one of N axes — not the ranking key)"
+        headline = final_line + breakdown_line + worst_telemetry + kl_part
+    elif new_composite_worst is not None:
+        worst_line = f"📊 **Composite worst: {new_composite_worst:.3f}** (legacy ranking)"
         if new_limiting_axis:
             axis_pretty = new_limiting_axis.replace("_bench", "").replace("_", " ")
             worst_line += f" (limiting axis: {axis_pretty})"
@@ -126,13 +154,13 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             weighted_part = f"\n📐 Weighted mean: {new_composite_weighted:.3f}"
             if old_composite_weighted is not None:
                 weighted_part += f" (was {old_composite_weighted:.3f})"
-        kl_part = f"\n└ KL component: {new_kl:.6f} (1 of 17 axes — not the ranking key)"
+        kl_part = f"\n└ KL component: {new_kl:.6f} (one of N axes — not the ranking key)"
         headline = worst_line + weighted_part + kl_part
     else:
         # Backward-compat path. Lead with KL but explicitly note it's
         # one of N axes so the framing isn't misleading even here.
         headline = (
-            f"📊 **KL: {new_kl:.6f}** (one of 17 axes; previous king's KL: {old_kl:.6f})"
+            f"📊 **KL: {new_kl:.6f}** (one of N axes; previous king's KL: {old_kl:.6f})"
         )
 
     announcement = {
@@ -155,6 +183,10 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
         "data": {
             "new_uid": new_uid, "new_model": new_model, "new_kl": new_kl,
             "old_uid": old_uid, "old_model": old_model, "old_kl": old_kl,
+            "new_composite_final": new_composite_final,
+            "old_composite_final": old_composite_final,
+            "new_composite_worst_3_mean": new_composite_worst_3_mean,
+            "old_composite_worst_3_mean": old_composite_worst_3_mean,
             "new_composite_worst": new_composite_worst,
             "new_composite_weighted": new_composite_weighted,
             "new_limiting_axis": new_limiting_axis,

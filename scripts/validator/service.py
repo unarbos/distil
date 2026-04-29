@@ -949,6 +949,10 @@ def post_round(
                 new_limiting_axis=limiting_axis,
                 old_composite_worst=old_king_comp.get("worst"),
                 old_composite_weighted=old_king_comp.get("weighted"),
+                new_composite_final=winner_comp.get("final"),
+                old_composite_final=old_king_comp.get("final"),
+                new_composite_worst_3_mean=winner_comp.get("worst_3_mean"),
+                old_composite_worst_3_mean=old_king_comp.get("worst_3_mean"),
             )
         except Exception as exc:
             logger.warning(f"Announcement failed: {exc}")

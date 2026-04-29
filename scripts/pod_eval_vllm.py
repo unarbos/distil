@@ -16008,6 +16008,70 @@ def main():
         ):
             effective_total = king_prompts_done
 
+        # v30.4 — Batched student forward pass.
+        # When ``DISTIL_STUDENT_BATCH_SIZE > 1``, we pad K consecutive
+        # prompts together and run a single forward pass on the batch,
+        # then slice each prompt's logits back out for the existing
+        # per-prompt sub-computations. The padding overhead (right-pad
+        # to max length) is small for similar-length prompts and large
+        # for very-uneven prompts, but the wall-time win on a multi-GPU
+        # pod is typically 2-3x for B=4.
+        student_batch_size = max(1, int(os.environ.get(
+            "DISTIL_STUDENT_BATCH_SIZE", "1"
+        )))
+        s_logits_cache: list[torch.Tensor] = []
+        cache_start = -1
+        # Resolve a pad_id for batched forward — required when seqs have
+        # different lengths. Falls back to eos_id if pad_token is None.
+        pad_id_batched = (
+            getattr(tokenizer, "pad_token_id", None)
+            if tokenizer is not None else None
+        )
+        if pad_id_batched is None and tokenizer is not None:
+            pad_id_batched = getattr(tokenizer, "eos_token_id", 0) or 0
+        if pad_id_batched is None:
+            pad_id_batched = 0
+
+        def _refill_cache(i: int) -> None:
+            """Refill ``s_logits_cache`` with the next K prompts'
+            student logits via a single batched forward pass."""
+            nonlocal s_logits_cache, cache_start
+            cache_start = i
+            B = min(student_batch_size, effective_total - i)
+            if B == 1:
+                # Single-prompt path: keep the existing semantics
+                # (no padding overhead).
+                full_seq = full_sequences[i]
+                s_logits = student(full_seq).logits.float()
+                s_logits_cache = [s_logits]
+                return
+            batch_seqs = full_sequences[i:i + B]
+            seq_lens = [int(s.shape[1]) for s in batch_seqs]
+            max_len = max(seq_lens)
+            padded = torch.full(
+                (B, max_len), pad_id_batched,
+                dtype=torch.long, device=device,
+            )
+            attn_mask = torch.zeros(
+                (B, max_len), dtype=torch.long, device=device,
+            )
+            for j, (s, ln) in enumerate(zip(batch_seqs, seq_lens)):
+                padded[j, :ln] = s.to(device).flatten()[:ln]
+                attn_mask[j, :ln] = 1
+            try:
+                batch_out = student(padded, attention_mask=attn_mask)
+                batch_logits = batch_out.logits.float()
+            except TypeError:
+                # Some causal LMs don't accept attention_mask kwarg —
+                # fall back to no-mask forward (causal mask still
+                # applies internally).
+                batch_logits = student(padded).logits.float()
+            # Slice per-prompt logits back to [1, seq_len, vocab].
+            s_logits_cache = [
+                batch_logits[j:j + 1, :seq_lens[j], :]
+                for j in range(B)
+            ]
+
         t0 = time.time()
         with torch.no_grad():
             for i in range(effective_total):
@@ -16017,8 +16081,10 @@ def main():
                     tl_entry = teacher_logits_list[i]
                     is_sparse = _is_sparse_logits(tl_entry)
 
-                    # Student forward pass
-                    s_logits = student(full_seq).logits.float()
+                    # Student forward pass (batched if BATCH_SIZE > 1).
+                    if i >= cache_start + len(s_logits_cache):
+                        _refill_cache(i)
+                    s_logits = s_logits_cache[i - cache_start]
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
 
                     topk_shadow = {}

@@ -130,7 +130,7 @@ def health():
         "status": "ok",
         "netuid": NETUID,
         "dethrone_method": (
-            "single_eval_composite_worst"
+            "single_eval_composite_final"
             if int(os.environ.get("SINGLE_EVAL_MODE", "0") or 0)
             else "paired_t_test"
         ),
