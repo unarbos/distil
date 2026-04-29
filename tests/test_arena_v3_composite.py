@@ -1355,5 +1355,411 @@ class TestBaselineRelativePenalty(unittest.TestCase):
             _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
 
 
+class TestImportanceSampledKLAxis(unittest.TestCase):
+    """v30 (2026-04-29) — importance-sampled KL axis (SHADOW).
+
+    Per Anshumann et al. ACL 2025, this is the unbiased full-vocab KL
+    contribution from the top-K support, replacing the biased
+    renormalised KL on shared support.
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_kl_is
+        student = {"kl_is_mean": 0.20}
+        self.assertAlmostEqual(_axis_kl_is(student, 0.10), 0.5)
+        self.assertAlmostEqual(_axis_kl_is(student, 0.20), 1.0)
+        self.assertAlmostEqual(_axis_kl_is(student, 0.40), 1.0)  # clipped
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_kl_is
+        self.assertIsNone(_axis_kl_is({}, 0.10))
+        self.assertIsNone(_axis_kl_is({"kl_is_mean": None}, 0.10))
+        self.assertIsNone(_axis_kl_is({"kl_is_mean": 0.10}, None))
+        self.assertIsNone(_axis_kl_is({"kl_is_mean": 0.10}, 0.0))
+
+    def test_compute_axes_includes_kl_is(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(kl=0.30, rkl=0.10)
+        student["kl_is_mean"] = 0.18
+        axes = compute_axes(
+            student, king_kl=0.30, king_rkl=0.10, king_kl_is=0.09,
+        )
+        self.assertIn("kl_is", axes)
+        self.assertAlmostEqual(axes["kl_is"], 0.5)
+
+
+class TestForkingRKLAxis(unittest.TestCase):
+    """v30 (2026-04-29) — forking-token RKL axis (SHADOW).
+
+    Per Wang et al. 2025 / synthesis §4.2 #5, RKL averaged only at
+    positions in the top quartile of teacher entropy is a stronger
+    predictor than mean RKL.
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_forking_rkl
+        student = {"forking_rkl_mean": 0.40}
+        self.assertAlmostEqual(_axis_forking_rkl(student, 0.20), 0.5)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_forking_rkl
+        self.assertIsNone(_axis_forking_rkl({}, 0.20))
+        self.assertIsNone(_axis_forking_rkl({"forking_rkl_mean": None}, 0.20))
+
+
+class TestTeacherTracePlausibilityAxis(unittest.TestCase):
+    """v30 (2026-04-29) — teacher-trace plausibility axis (SHADOW).
+
+    Captures "support coverage" — does the student place mass on the
+    teacher's actually-emitted tokens? Distinct from FKL (which weights
+    full distributions) and RKL (which weights student rollouts).
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_teacher_trace_plausibility
+        student = {"teacher_trace_nll_mean": 1.0}
+        # student NLL = king NLL → 1.0
+        self.assertAlmostEqual(_axis_teacher_trace_plausibility(student, 1.0), 1.0)
+        # student NLL = 2× king → 0.5 (worse plausibility = lower score)
+        self.assertAlmostEqual(_axis_teacher_trace_plausibility(student, 0.5), 0.5)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_teacher_trace_plausibility
+        self.assertIsNone(_axis_teacher_trace_plausibility({}, 1.0))
+        self.assertIsNone(
+            _axis_teacher_trace_plausibility({"teacher_trace_nll_mean": None}, 1.0)
+        )
+
+
+class TestResolveKingMetricMin(unittest.TestCase):
+    """v30 (2026-04-29) — generic king-min resolver for shadow metrics."""
+
+    def test_picks_minimum(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {
+            "alice": {"kl_is_mean": 0.25},
+            "bob": {"kl_is_mean": 0.10},   # min
+            "carol": {"kl_is_mean": 0.40},
+        }
+        self.assertAlmostEqual(_resolve_king_metric_min(students, "kl_is_mean"), 0.10)
+
+    def test_skips_teacher_near_zero(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {
+            "Qwen/teacher": {"kl_is_mean": 1e-12},  # below the 1e-4 floor
+            "alice": {"kl_is_mean": 0.10},
+        }
+        self.assertAlmostEqual(_resolve_king_metric_min(students, "kl_is_mean"), 0.10)
+
+    def test_returns_none_when_no_data(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {"alice": {}, "bob": {"kl_is_mean": None}}
+        self.assertIsNone(_resolve_king_metric_min(students, "kl_is_mean"))
+
+    def test_handles_invalid_types(self):
+        from scripts.validator.composite import _resolve_king_metric_min
+        students = {
+            "alice": {"kl_is_mean": "not a number"},
+            "bob": {"kl_is_mean": float("nan")},
+            "carol": {"kl_is_mean": 0.20},
+        }
+        self.assertAlmostEqual(_resolve_king_metric_min(students, "kl_is_mean"), 0.20)
+
+
+class TestEntropyAwareKLAxis(unittest.TestCase):
+    """v30 (2026-04-29) — entropy-aware adaptive KL axis (SHADOW).
+
+    Tests that:
+      * The axis function reads ``eopd_adaptive_mean`` and normalises
+        against ``king_eopd`` (king/student form, like _axis_kl).
+      * Missing field → None (axis drops).
+      * Non-positive king_eopd → None.
+      * compute_axes propagates king_eopd correctly.
+      * The axis is in AXIS_WEIGHTS but defaults to weight 0 (shadow).
+      * The zero-weight filter in compute_composite drops shadow axes
+        from effective_weights so they don't gate ``worst()``.
+      * _resolve_king_eopd picks the round-wide minimum and skips the
+        teacher's near-zero adaptive-KL.
+    """
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_entropy_aware_kl
+        student = {"eopd_adaptive_mean": 0.10}
+        # student matches king → 1.0
+        self.assertAlmostEqual(_axis_entropy_aware_kl(student, 0.10), 1.0)
+        # student worse than king (higher KL) → fraction
+        self.assertAlmostEqual(_axis_entropy_aware_kl(student, 0.05), 0.5)
+        # student better than king → clipped to 1.0
+        self.assertAlmostEqual(_axis_entropy_aware_kl(student, 0.20), 1.0)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_entropy_aware_kl
+        self.assertIsNone(_axis_entropy_aware_kl({}, 0.10))
+        self.assertIsNone(_axis_entropy_aware_kl({"eopd_adaptive_mean": None}, 0.10))
+        self.assertIsNone(_axis_entropy_aware_kl({"eopd_adaptive_mean": 0.0}, 0.10))
+        self.assertIsNone(_axis_entropy_aware_kl({"eopd_adaptive_mean": -0.5}, 0.10))
+
+    def test_axis_function_returns_none_for_zero_king(self):
+        from scripts.validator.composite import _axis_entropy_aware_kl
+        student = {"eopd_adaptive_mean": 0.10}
+        self.assertIsNone(_axis_entropy_aware_kl(student, None))
+        self.assertIsNone(_axis_entropy_aware_kl(student, 0.0))
+        self.assertIsNone(_axis_entropy_aware_kl(student, -0.5))
+
+    def test_compute_axes_includes_entropy_aware_kl_when_king_eopd_provided(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(kl=0.30, rkl=0.10)
+        student["eopd_adaptive_mean"] = 0.20
+        axes = compute_axes(student, king_kl=0.30, king_rkl=0.10, king_eopd=0.10)
+        self.assertIn("entropy_aware_kl", axes)
+        self.assertAlmostEqual(axes["entropy_aware_kl"], 0.5)
+
+    def test_zero_weight_axis_does_not_gate_worst(self):
+        """``ENTROPY_AWARE_KL_WEIGHT=0`` (default) → axis is computed but
+        DROPPED from effective_weights so it never sets the worst score."""
+        import scripts.validator.composite as _c
+        student = _make_student(kl=0.30, rkl=0.10)
+        student["eopd_adaptive_mean"] = 1.0  # very high (= bad)
+        comp = _c.compute_composite(
+            student, king_kl=0.30, king_rkl=0.10, king_eopd=0.05,
+        )
+        # The axis VALUE is exposed in axes for telemetry.
+        self.assertIn("entropy_aware_kl", comp["axes"])
+        self.assertAlmostEqual(comp["axes"]["entropy_aware_kl"], 0.05, places=3)
+        # But it must NOT pull worst down — the existing axes (math, etc.)
+        # should still set worst.
+        self.assertGreater(comp["worst"], 0.05,
+            "shadow axis with weight 0 must not gate worst")
+
+    def test_promoted_weight_axis_does_gate_worst(self):
+        """Operators promote by setting the weight > 0; the axis then
+        takes effect on worst() as a normal axis would."""
+        import scripts.validator.composite as _c
+        saved = _c.AXIS_WEIGHTS.get("entropy_aware_kl", 0.0)
+        try:
+            _c.AXIS_WEIGHTS["entropy_aware_kl"] = 0.05
+            student = _make_student(kl=0.30, rkl=0.10)
+            student["eopd_adaptive_mean"] = 1.0  # = 5% of king's 0.05
+            comp = _c.compute_composite(
+                student, king_kl=0.30, king_rkl=0.10, king_eopd=0.05,
+            )
+            self.assertLessEqual(comp["worst"], 0.05 + 1e-6)
+        finally:
+            _c.AXIS_WEIGHTS["entropy_aware_kl"] = saved
+
+    def test_resolve_king_eopd_picks_minimum(self):
+        from scripts.validator.composite import _resolve_king_eopd
+        students_data = {
+            "alice/m1": {"eopd_adaptive_mean": 0.20},
+            "bob/m2": {"eopd_adaptive_mean": 0.05},   # king
+            "carol/m3": {"eopd_adaptive_mean": 0.40},
+        }
+        h2h = [
+            {"model": "bob/m2", "is_king": True},
+            {"model": "alice/m1", "is_king": False},
+            {"model": "carol/m3", "is_king": False},
+        ]
+        self.assertAlmostEqual(_resolve_king_eopd(students_data, h2h), 0.05)
+
+    def test_resolve_king_eopd_skips_teacher_zero(self):
+        """Teacher-vs-itself gives adaptive KL ≈ 0 by construction. The
+        floor at 1e-4 must skip it so we don't pin king_eopd to 0 and
+        crash every challenger's axis."""
+        from scripts.validator.composite import _resolve_king_eopd
+        students_data = {
+            "Qwen/teacher": {"eopd_adaptive_mean": 1e-12},  # teacher self
+            "alice/m1": {"eopd_adaptive_mean": 0.10},
+            "bob/m2": {"eopd_adaptive_mean": 0.20},
+        }
+        result = _resolve_king_eopd(students_data, [])
+        self.assertAlmostEqual(result, 0.10,
+            "must skip teacher near-zero and pick the next-best student")
+
+
+class TestLongFormJudgeAxis(unittest.TestCase):
+    """v30 (2026-04-29) — long-form judge axis.
+
+    Tests that:
+      * The axis function reads ``long_form_judge_probe.normalized``.
+      * Missing probe / missing normalized → None.
+      * n_valid below LONG_FORM_JUDGE_MIN_VALID → axis drops out
+        (matches the short-form judge probe convention so a noisy
+        rubric / teacher-drift round doesn't corrupt the composite).
+      * compute_axes includes the new key with the right value.
+      * compute_composite respects the LONG_FORM_JUDGE_AXIS_IN_COMPOSITE
+        gate.
+      * The new axis is classified as a relative axis (alongside
+        judge_probe / chat_turns_probe / kl) for telemetry.
+    """
+
+    def test_axis_function_reads_normalized(self):
+        from scripts.validator.composite import _axis_long_form_judge
+        student = {"long_form_judge_probe": {
+            "normalized": 0.65, "n_valid": 4, "n": 4,
+        }}
+        self.assertEqual(_axis_long_form_judge(student), 0.65)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_long_form_judge
+        self.assertIsNone(_axis_long_form_judge({}))
+        self.assertIsNone(_axis_long_form_judge({"long_form_judge_probe": {}}))
+        self.assertIsNone(_axis_long_form_judge({
+            "long_form_judge_probe": {"n_valid": 4, "normalized": None}
+        }))
+
+    def test_axis_function_drops_below_min_valid(self):
+        import scripts.validator.composite as _c
+        saved = _c.LONG_FORM_JUDGE_MIN_VALID
+        try:
+            _c.LONG_FORM_JUDGE_MIN_VALID = 2
+            student = {"long_form_judge_probe": {
+                "normalized": 0.7, "n_valid": 1, "n": 4,
+            }}
+            self.assertIsNone(_c._axis_long_form_judge(student))
+            student["long_form_judge_probe"]["n_valid"] = 2
+            self.assertEqual(_c._axis_long_form_judge(student), 0.7)
+        finally:
+            _c.LONG_FORM_JUDGE_MIN_VALID = saved
+
+    def test_compute_axes_includes_long_form_judge(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(kl=0.30, rkl=0.10)
+        student["long_form_judge_probe"] = {
+            "normalized": 0.5, "n_valid": 3, "n": 4,
+        }
+        axes = compute_axes(student, king_kl=0.30, king_rkl=0.10)
+        self.assertIn("long_form_judge", axes)
+        self.assertEqual(axes["long_form_judge"], 0.5)
+
+    def test_gate_off_excludes_from_composite_weights(self):
+        import scripts.validator.composite as _c
+        saved = _c.LONG_FORM_JUDGE_AXIS_IN_COMPOSITE
+        try:
+            _c.LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = False
+            student = _make_student(kl=0.30, rkl=0.10)
+            student["long_form_judge_probe"] = {
+                "normalized": 0.10, "n_valid": 3, "n": 4,
+            }
+            comp = _c.compute_composite(student, king_kl=0.30, king_rkl=0.10)
+            self.assertGreater(comp["worst"], 0.10,
+                "gate=off must not let long_form_judge floor the worst score")
+            self.assertFalse(comp["long_form_judge_in_composite"])
+        finally:
+            _c.LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = saved
+
+
+class TestTopKOverlapAxis(unittest.TestCase):
+    """v30 (2026-04-29) — Top-K token overlap axis.
+
+    Tests that:
+      * The axis function reads ``top_k_overlap_mean`` from the student row
+        and clamps to [0, 1].
+      * Missing / NaN / Inf values return None (axis drops out).
+      * compute_axes includes the new key with the right value.
+      * compute_composite respects the TOP_K_OVERLAP_AXIS_IN_COMPOSITE gate.
+      * The new axis is classified as a ``relative`` axis for the
+        ``bench_vs_rel_gap`` telemetry, not a bench axis.
+    """
+
+    def test_axis_function_reads_field(self):
+        from scripts.validator.composite import _axis_top_k_overlap
+        self.assertEqual(_axis_top_k_overlap({"top_k_overlap_mean": 0.85}), 0.85)
+        self.assertEqual(_axis_top_k_overlap({"top_k_overlap_mean": 0.0}), 0.0)
+        self.assertEqual(_axis_top_k_overlap({"top_k_overlap_mean": 1.0}), 1.0)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_top_k_overlap
+        self.assertIsNone(_axis_top_k_overlap({}))
+        self.assertIsNone(_axis_top_k_overlap({"top_k_overlap_mean": None}))
+
+    def test_axis_function_clamps_out_of_range_inputs(self):
+        from scripts.validator.composite import _axis_top_k_overlap
+        self.assertEqual(_axis_top_k_overlap({"top_k_overlap_mean": 1.5}), 1.0)
+        self.assertEqual(_axis_top_k_overlap({"top_k_overlap_mean": -0.5}), 0.0)
+
+    def test_axis_function_handles_invalid_types(self):
+        from scripts.validator.composite import _axis_top_k_overlap
+        self.assertIsNone(_axis_top_k_overlap({"top_k_overlap_mean": "nope"}))
+        self.assertIsNone(_axis_top_k_overlap({"top_k_overlap_mean": float("nan")}))
+        self.assertIsNone(_axis_top_k_overlap({"top_k_overlap_mean": float("inf")}))
+
+    def test_compute_axes_includes_top_k_overlap(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(kl=0.30, rkl=0.10)
+        student["top_k_overlap_mean"] = 0.92
+        axes = compute_axes(student, king_kl=0.30, king_rkl=0.10)
+        self.assertIn("top_k_overlap", axes)
+        self.assertEqual(axes["top_k_overlap"], 0.92)
+
+    def test_compute_axes_drops_when_missing(self):
+        from scripts.validator.composite import compute_axes
+        student = _make_student(kl=0.30, rkl=0.10)
+        axes = compute_axes(student, king_kl=0.30, king_rkl=0.10)
+        self.assertIn("top_k_overlap", axes)
+        self.assertIsNone(axes["top_k_overlap"])
+
+    def test_gate_off_excludes_from_composite_weights(self):
+        import scripts.validator.composite as _c
+        saved = _c.TOP_K_OVERLAP_AXIS_IN_COMPOSITE
+        try:
+            _c.TOP_K_OVERLAP_AXIS_IN_COMPOSITE = False
+            student = _make_student(kl=0.30, rkl=0.10)
+            student["top_k_overlap_mean"] = 0.05  # very low
+            student_high = _make_student(kl=0.30, rkl=0.10)
+            student_high["top_k_overlap_mean"] = 0.99  # very high
+            comp_low = _c.compute_composite(student, king_kl=0.30, king_rkl=0.10)
+            comp_high = _c.compute_composite(student_high, king_kl=0.30, king_rkl=0.10)
+            # When gate off, the axis value is still computed/exposed on
+            # ``axes`` for telemetry but the worst aggregator should NOT
+            # be pulled to ~0.05 just because of the new axis.
+            self.assertGreater(comp_low["worst"], 0.05,
+                "gate=off must not let top_k_overlap floor the worst score")
+            # Both students should have the same worst (since the axis
+            # is dropped), modulo the bench/judge axes which differ
+            # only via the synthetic data we passed (identical).
+            self.assertEqual(comp_low["worst"], comp_high["worst"])
+            self.assertFalse(comp_low["top_k_overlap_in_composite"])
+        finally:
+            _c.TOP_K_OVERLAP_AXIS_IN_COMPOSITE = saved
+
+    def test_gate_on_axis_does_floor_the_worst(self):
+        import scripts.validator.composite as _c
+        saved = _c.TOP_K_OVERLAP_AXIS_IN_COMPOSITE
+        try:
+            _c.TOP_K_OVERLAP_AXIS_IN_COMPOSITE = True
+            student = _make_student(kl=0.30, rkl=0.10)
+            student["top_k_overlap_mean"] = 0.05
+            comp = _c.compute_composite(student, king_kl=0.30, king_rkl=0.10)
+            self.assertEqual(comp["axes"]["top_k_overlap"], 0.05)
+            # When gate on, a low overlap should drag the worst score down.
+            self.assertLessEqual(comp["worst"], 0.05 + 1e-6)
+            self.assertTrue(comp["top_k_overlap_in_composite"])
+        finally:
+            _c.TOP_K_OVERLAP_AXIS_IN_COMPOSITE = saved
+
+    def test_classified_as_relative_axis_for_telemetry(self):
+        """top_k_overlap counts as a 'relative' axis (alongside KL/RKL)
+        for the bench_vs_rel_gap telemetry, not a bench axis. This
+        is important: a perfectly-distilled student with 99% top-K
+        overlap and 90% bench accuracy should have a SMALL
+        bench_vs_rel_gap (not a large positive one indicating
+        memorisation pathology)."""
+        import scripts.validator.composite as _c
+        student = _make_student(
+            kl=0.10, rkl=0.10, cap_frac=0.90,
+            bench={"math_bench": 0.85, "code_bench": 0.85},
+        )
+        student["top_k_overlap_mean"] = 0.90
+        comp = _c.compute_composite(student, king_kl=0.10, king_rkl=0.10)
+        # Both rel and bench averages should be ~0.85-0.90 so the gap
+        # stays close to 0. If top_k_overlap had been classified as a
+        # bench axis the rel side would be lower and the gap larger.
+        if comp.get("bench_vs_rel_gap") is not None:
+            self.assertLess(abs(comp["bench_vs_rel_gap"]), 0.10,
+                "top_k_overlap must count as relative (it's a "
+                "teacher-similarity axis); a gap > 10pp here means "
+                "the axis classification regressed.")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

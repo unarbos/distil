@@ -100,12 +100,57 @@ AXIS_WEIGHTS = {
     # 2026-04-29 (v29.7): all relative weights are now env-overridable
     # so the v30 audit rebalance (drop saturated kl/capability/length)
     # can land via distil.env without a code change.
-    "on_policy_rkl": float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.35")),
-    "kl":            float(os.environ.get("BENCH_KL_WEIGHT", "0.15")),
-    "capability":    float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
-    "length":        float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.10")),
-    "degeneracy":    float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.15")),
+    "on_policy_rkl":  float(os.environ.get("ON_POLICY_RKL_WEIGHT", "0.35")),
+    "kl":             float(os.environ.get("BENCH_KL_WEIGHT", "0.15")),
+    # 2026-04-29 (v30): top-K overlap axis. Per the 2026 'Rethinking OPD'
+    # paper, this is the most predictive single signal of downstream
+    # OPD success. Conservative initial weight 0.10 — same magnitude
+    # as a single bench axis. Already in [0, 1] from per-prompt
+    # |top_K_t ∩ top_K_s| / K averaged. Add to the weighted
+    # aggregation by default; gated env-overridable while we collect
+    # 48h of telemetry (see TOP_K_OVERLAP_AXIS_IN_COMPOSITE below).
+    "top_k_overlap":  float(os.environ.get("TOP_K_OVERLAP_AXIS_WEIGHT", "0.10")),
+    # 2026-04-29 (v30) — entropy-aware adaptive KL axis. Per the EOPD
+    # paper (arXiv 2510.27485), per-token RKL/FKL weighting based on
+    # teacher entropy is +1.37 to +5.05 Pass@8 on small-model math
+    # benchmarks. Defaults to 0 (SHADOW) — we collect 48h of correlation
+    # telemetry against the held-out canary before promoting to ranking.
+    # Operators can flip in via ``ENTROPY_AWARE_KL_WEIGHT=0.05`` once
+    # the shadow window concludes.
+    "entropy_aware_kl": float(os.environ.get("ENTROPY_AWARE_KL_WEIGHT", "0.0")),
+    # 2026-04-29 (v30) — three additional research-paper shadow axes,
+    # all default weight 0 until 48h of correlation telemetry against
+    # the held-out canary validates them. Computed from the existing
+    # top-128 sparse cache so wall-time impact is negligible.
+    #
+    #   * kl_is — Anshumann ACL 2025 importance-sampled KL. Unbiased
+    #     full-vocab KL contribution from top-K support, replacing the
+    #     biased renormalised KL on shared support. See
+    #     ``compute_kl_is_from_sparse``.
+    #   * forking_rkl — Wang et al. 2025 forking-token RKL. Average
+    #     reverse-KL at positions in the top quartile of teacher
+    #     entropy ("decision points" with most informative teacher
+    #     feedback).
+    #   * teacher_trace_plausibility — average NLL the student
+    #     assigns to the teacher's actually-emitted tokens. Distinct
+    #     from FKL (full-distribution match) and RKL (student-policy
+    #     match); catches LIMO/s1 SFT-only "place mass everywhere
+    #     except where the teacher goes" failure modes.
+    "kl_is":          float(os.environ.get("KL_IS_AXIS_WEIGHT", "0.0")),
+    "forking_rkl":    float(os.environ.get("FORKING_RKL_AXIS_WEIGHT", "0.0")),
+    "teacher_trace_plausibility": float(
+        os.environ.get("TEACHER_TRACE_PLAUSIBILITY_WEIGHT", "0.0")
+    ),
+    "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
+    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.10")),
+    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.15")),
 }
+
+# v30 — top-K overlap axis gate. Defaults ON; env-flippable for fast
+# rollback if the 48h shadow window flags any issue with the new axis.
+TOP_K_OVERLAP_AXIS_IN_COMPOSITE = (
+    os.environ.get("TOP_K_OVERLAP_AXIS_IN_COMPOSITE", "1") != "0"
+)
 
 # 2026-04-23 — judge axis weight. When promoted, the other axes retain
 # their relative weighting and the judge weight is added on top before
@@ -232,6 +277,13 @@ ARENA_V3_AXIS_WEIGHTS = {
     "calibration_bench":         float(os.environ.get("BENCH_CALIBRATION_WEIGHT", "0.06")),
     # refactor_bench: preserve behavior under a style constraint.
     "refactor_bench":            float(os.environ.get("BENCH_REFACTOR_WEIGHT", "0.04")),
+    # v30 (2026-04-29) — pragmatic_bench. Theory-of-mind / scalar
+    # implicature / indirect-request recognition. Procedural items
+    # rotated per round, open-ended regex match. Conservative initial
+    # weight 0.04 (same as refactor_bench) — pragmatic reasoning is
+    # under-represented in current SOTA evals so this axis fills a
+    # meaningful capability gap without dominating the composite.
+    "pragmatic_bench":           float(os.environ.get("BENCH_PRAGMATIC_WEIGHT", "0.04")),
 }
 
 ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
@@ -285,6 +337,10 @@ REASONING_DENSITY_TARGET_TOKENS = {
     "multi_doc_synthesis_bench": float(os.environ.get("RD_MULTI_DOC_TARGET", "60")),
     "calibration_bench":     float(os.environ.get("RD_CALIBRATION_TARGET", "60")),
     "refactor_bench":        float(os.environ.get("RD_REFACTOR_TARGET", "300")),
+    # v30 — pragmatic_bench. Items request short answers ("Reply with
+    # the container name only" / "Reply with 'yes' or 'no'"). 60-token
+    # target catches the median; longer wraps still get partial credit.
+    "pragmatic_bench":       float(os.environ.get("RD_PRAGMATIC_TARGET", "60")),
 }
 REASONING_DENSITY_WEIGHT = float(os.environ.get("REASONING_DENSITY_WEIGHT", "0.05"))
 REASONING_DENSITY_IN_COMPOSITE = (
@@ -312,6 +368,16 @@ CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "2"))
 # hardcoded 8 was higher than the configured budget, so judge_probe
 # was always None in production.
 JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
+
+# v30 — long-form judge axis. Default per-round budget is 4 prompts so
+# the floor is set at 2 (half the budget) — matches the JUDGE_PROBE
+# floor convention. Operators bumping ``LONG_FORM_JUDGE_PER_ROUND`` on
+# the eval side can raise this floor accordingly.
+LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2"))
+LONG_FORM_JUDGE_AXIS_WEIGHT = float(os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.05"))
+LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = (
+    os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
+)
 
 # Per-axis minimum valid-item count below which the axis drops as
 # "insufficient sample". Small pools (code_bench samples only 4 items
@@ -356,6 +422,9 @@ BENCH_MIN_VALID = {
     "multi_doc_synthesis_bench": 3,
     "calibration_bench": 4,
     "refactor_bench": 2,
+    # v30 — pragmatic_bench. 8 items per round; floor at 4 so a few
+    # parse failures don't drop the axis but a sandbox outage does.
+    "pragmatic_bench": 4,
 }
 
 COMPOSITE_SHADOW_VERSION = 28  # Session 3.21 — quality > quantity rebalance. Six axes muted to weight 0 (knowledge_bench, arc_bench, truthful_bench, procedural_bench, self_consistency_bench, noise_resistance_bench) because they were either eval-setup-fragile (random-pick floors near the king's signal), redundant with the post-v27 procedural rewrite (procedural_bench duplicates capability + math_bench), or the same item pool re-graded under a different aggregator (self_consistency reuses math_bench). Cut weight 0.20 redirected to harder axes the user explicitly asked us to make more binding (aime_bench +0.04, mbpp_bench +0.02, tool_use_bench +0.02, long_context_bench +0.01, robustness_bench +0.03) and to the relative-axis cluster (math_bench +0.02, code_bench +0.02, reasoning_bench +0.02, ifeval_bench +0.02). Per-round item budgets shrunk on the muted axes (knowledge: 10→0, arc: 8→0, truthful: 6→0, procedural: 6→0, self_consistency: 6→0, noise_resistance: 4→0) and bumped on the high-value ones (math: 10→12, aime: 6→8, code: 6→8, mbpp: 6→8). Net effect: ~24 fewer items per round (~9 min wall-time saved) with sharper composite ranking. Mixing v27 and v28 records is unsafe because v27 records carry six axes the v28 ranker now ignores — the king filter (``_KING_SELECTION_MIN_VERSION = 28``) quarantines old records until regraded under v28 so the dethrone gate never compares v27-axes-passed-on-luck to v28-honest-ranking. Session 3.20 — full procedural switch for math_bench / code_bench / reasoning_bench / knowledge_bench / ifeval_bench / aime_bench / mbpp_bench / tool_use_bench / self_consistency_bench / arc_bench / truthful_bench / robustness_bench / noise_resistance_bench. Pre-v27 every benchmark axis sampled from public datasets (GSM8K + MATH-500 + HumanEval + MBPP + BBH + MMLU-Pro + IFEval + AIME + ARC + TruthfulQA). v18-v26 paraphrase / option-shuffle / prompt-rotation hardening rotated the surface form of public items but the (problem, gold) pair on disk was unchanged, so a miner with a {paraphrased_question → answer} lookup over the public corpus could still saturate the axis. v27 generates the bench items per round directly from ``block_seed`` via 6 new procedural generators in ``pod_eval_vllm.py`` (_generate_math_items / _generate_aime_items / _generate_code_items / _generate_reasoning_items / _generate_mc_items / _generate_ifeval_items). The (parameters, gold) pair is fresh every round and exists nowhere on disk — there is no dataset to memorise. The public datasets remain available for ``scripts/eval_pod/auto_benchmark.sh`` post-hoc evalscope verification against the king on a separate Lium pod, but the validator never trains-or-evals against the public items. Round duration unchanged because per-item generation is microseconds. Mixing v26 and v27 records would let a v26 memoriser keep their inflated public-pool floor under the old grading while honest miners regrade against fresh procedural items every round — the king filter (``_KING_SELECTION_MIN_VERSION = 27``) quarantines old records until regraded under v27. Session 3.19 — on_policy_rkl per-round chat-domain prompt paraphrase. After v25 closed the judge_probe / chat_turns_probe surfaces, ``on_policy_rkl`` (composite weight 0.35 — the SINGLE-LARGEST axis weight in the entire composite, larger than the next two combined) was the largest remaining un-rotated public-prompt-pool axis. The 80-prompt ``ON_POLICY_RKL_POOL`` is fully baked into the open-source ``pod_eval_vllm.py``; pre-v17 the per-round 16-of-80 sample was deterministic on ``block_seed`` but the rollout-sampling seed was a constant ``42``, so a miner could pre-compute their student's exact deterministic rollout per pool entry and surgically train weights to align with the teacher's high-prob tokens at every position of that exact trajectory. v17 (Session 3.10) defeated *that specific* attack by rotating the rollout-sampling seed per ``block_seed`` (XOR with ``ON_POLICY_RKL_SEED``) — but it did NOT defeat the more fundamental Goodhart vector that prompt rotation alone defeats: a miner who pre-distils their student onto ``teacher_logprobs(prompt)`` for the canonical wording of all 80 pool entries can saturate ``on_policy_rkl`` regardless of sampling-seed rotation, because the student has been trained to place teacher-likely tokens at every position the teacher would. Rotating the *surface form* of the prompt every round forces a student that wants to keep its low-KL floor to actually generalise across phrasings — which is the entire point of distillation. v26 wires the v25 ``_paraphrase_chat_prompt`` helper into ``_pick_on_policy_rkl_prompts`` so each of the 16 sampled prompts gets a chat-domain synonym swap (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline, give/provide/offer, list/enumerate, briefly/concisely, etc.) keyed on ``(block_seed, sha(prompt))``. The helper is region-aware so translation answer keys ("Translate to French: The cat sat on the mat.") are PROTECTED — only conversational PROSE rotates, the quoted source text and the language tag survive byte-identical so the gold output of a translation prompt is unchanged. JSON-output specs ("Output a JSON object with keys 'name' and 'age'..."), function-signature requests, and bash one-liner prompts likewise survive because their format constraints sit inside protected single-quoted regions. The math-domain default synonym table is *not* layered in (the helper uses ``_apply_chat_synonyms``) so verbs like ``find``/``calculate``/``determine`` in the on_policy_rkl reasoning sub-pool ("Is 97 prime? Answer with reasoning.") read naturally because they are NOT rewritten — only chat-domain prose rotates. Mixing v25 and v26 records would let an on_policy_rkl wording-memoriser keep their inflated low-KL floor under the old grading while honest miners regrade against rotated phrasings — the king filter quarantines old records until regraded under v26. Session 3.18 — judge_probe / chat_turns_probe canonical-response paraphrase. After v18-v24 closed every benchmark-axis canonical-wording attack vector, the two largest remaining un-rotated public-prompt-pool axes were ``judge_probe`` (composite weight 0.15, drawn from a 65-prompt static pool baked into ``pod_eval_vllm.py``) and ``chat_turns_probe`` (composite weight 0.08, drawn from a ~25-conversation static pool of 3-turn dialogues). Combined attack surface = 0.23 weight, larger than ``code_bench`` + ``reasoning_bench`` combined (0.20). Both axes are graded by the teacher rubric on a 1-5 scale of "correct + clear + addresses the question + appropriate length" — a miner who pre-trains on canonical 5/5-quality responses to all ~90 prompts can saturate both axes from a ``{prompt_text → canonical_response}`` lookup without doing any genuine chat work, the same canonical-wording memorisation Goodhart vector closed for math / code / BBH in v18-v24, just on a smaller surface. v25 introduces ``_paraphrase_chat_prompt`` which is region-aware: it splits each prompt into alternating PROSE / PROTECTED chunks (anything inside triple-backtick fences, single-backtick code, single or double quoted strings, or inline ``{...}`` JSON-like blocks is PROTECTED) and applies a chat-domain synonym swap (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline, give/provide/offer, show/demonstrate/illustrate, list/enumerate, briefly/concisely, suggest/recommend, etc.) ONLY to PROSE chunks. Code identifiers (``range(5)`` / ``list(...)``), function names (``is_palindrome``), format specifiers (``'PROS: <a, b>; CONS: <c, d>'``), regex literals (``\\d{5}``), inline JSON (``{"name": "Ada", "langs": ["py", "go"]}``), and tight format constraints ("no other text" / "only the JSON" / "exactly N words") are all preserved verbatim — so the rubric-graded format adherence is unchanged and the answer key implicit in code-output prompts (``print(list(range(3, 10, 2)))``) still matches. The math-domain default synonym table is *not* layered in for chat (the helper uses ``_apply_chat_synonyms`` which bypasses the math defaults) because English homonyms (``"find a movie"`` / ``"calculate the cost"``) make indiscriminate ``find/calculate/determine`` rewrites read awkward in conversational prose. Per-prompt seed is mixed via ``_stable_seed_from_text`` so cross-validator agreement is preserved while the swap rotates per ``block_seed``. Each turn of a chat_turns_probe conversation is paraphrased independently so a memoriser keyed on "Give me a simple recipe for chocolate chip cookies." → "Provide a simple recipe..." on round N → "Offer a simple recipe..." on round N+1 sees a different surface every round across all three turns. Mixing v24 and v25 records would let a chat-prompt memoriser keep their inflated ``judge_probe=0.95`` / ``chat_turns_probe=0.95`` floor while honest miners regrade against rotated phrasings — the king filter quarantines old records until regraded under v25. Session 3.17 — reasoning_bench (BBH) inline-MC option shuffle per round. After v23 closed the code surface, ``reasoning_bench`` (0.08 weight, 21 BBH subtasks) was the largest remaining un-rotated MC public-pool axis. ~12 of the 21 BBH subtasks (logical_deduction_*, tracking_shuffled_objects_*, disambiguation_qa, geometric_shapes, hyperbaton, movie_recommendation, penguins_in_a_table, ruin_names, snarks, temporal_sequences) ship with a fixed correct-letter per item, encoded INLINE in the question text as ``Options:\\n(A) ...\\n(B) ...``. The round-20 ``_shuffle_mc_options_for_round`` helper couldn't be reused because BBH stores options inline rather than as a separate ``options`` field. Schema-version-0 records (pre any Goodhart hardening) reached ``reasoning_bench=0.88`` paired with ``capability=0.99`` / ``arc_bench=0`` / ``code_bench=0`` — the textbook saturated-on-memorisable-axis Goodhart signature. v24 introduces ``_shuffle_bbh_mc_options`` which parses the inline ``Options:\\n(A) ...`` block via a dedicated regex, shuffles option contents per ``(block_seed XOR sha256(question))`` to match v20's keying convention, and remaps the gold letter to point at where the original correct content lands. Boolean / numeric subtasks (boolean_expressions, object_counting, web_of_lies, navigate) have no inline options block and pass through unchanged so the helper degrades gracefully on the entire BBH pool. The rebuilt question keeps the canonical ``Options:\\n(A) ...\\n(B) ...`` shape so the model sees a familiar BBH format and the existing answer-extraction regex (``\\(?[A-Z]\\)?``) keeps working. Mixing v23 and v24 records would let a BBH letter-memoriser keep their inflated ``reasoning_bench=0.88`` floor while honest miners regrade against rotated letters; the king filter quarantines old records until regraded. Session 3.16 — code_bench (HumanEval) and mbpp_bench prompt paraphrase per round. After v18-v22 closed the math / multiple-choice / tool-use / self-consistency surfaces, ``code_bench`` (164 fully-public HumanEval items) and ``mbpp_bench`` (378 MBPP+ items) became the largest remaining un-rotated axis pair on the validator. ``code_bench`` carries weight 0.12 (tied with ``math_bench`` for the largest single axis weight) and the entire pool plus answer key is open-source, so a miner can build a ``{prompt → solution}`` lookup keyed on canonical docstring wording and saturate the axis without ever passing the prompt through a Python compiler. Round-18 prose-stripping closed the conversational-wrapper bypass; round 23 closes the prompt-memorisation bypass that prose-stripping could not. v23 introduces ``_paraphrase_code_problem`` which is structurally aware: it tokenises the prompt line-by-line, classifies each line as PROSE or CODE (function signatures, ``import``/``from``/``class``/``@``/``return``/``assert`` lines, ``>>>`` doctest inputs, doctest outputs, and bare triple-quote markers all classified as CODE), and applies the math-domain synonym swap PLUS a code-domain extension (``_CODE_INSTRUCTION_SYNONYMS``: "write a function" / "check if" / "given a" rotations) ONLY to PROSE lines. Function signatures, type hints, parameter names, doctest examples, and the test harness in MBPP ``assert`` blocks are preserved verbatim — a genuine solver still passes the gold tests. Cross-validator agreement: same ``(prompt, block_seed)`` → identical paraphrased prompt because the per-prompt seed is mixed via ``_stable_seed_from_text``. Mixing v22 and v23 records would let a HumanEval/MBPP wording-memoriser keep their stale code_bench=1.0 floor while honest miners regrade against rotated phrasings — the king filter requires v23+ to claim the crown so the gamed records are quarantined until regraded. Session 3.15 — math_bench / tool_use_bench / self_consistency_bench problem paraphrase per round. The round-21 paraphrase defence covered ``aime_bench`` (~90 public items) but left the much larger math-bench surface (1 319 GSM8K + 500 MATH-500 = 1 819 public items) wide open. ``math_bench`` is also the heaviest single bench weight at 0.12 (vs ``robustness_bench`` at 0.04), so a miner who memorised canonical wording could saturate it for a +0.12 weight payoff and only lose 0.04 on robustness — net +0.08 weight gain even after the round-21 audit. v22 applies the same math-domain-safe paraphrase helpers (``_apply_instruction_synonyms`` + ``_imperative_to_question``) to math_bench, tool_use_bench, and self_consistency_bench items at round-start, keyed on ``(block_seed, sha(question))``. All three axes pull from the GSM8K / MATH-500 pool, so they share the same canonical-wording attack surface — closing all three together stops the +0.20 cumulative weight payoff the previous gap allowed. Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), GSM8K ``####`` answer markers, and the ``\\n\\n`` format suffix are preserved verbatim by the helpers, so a model that genuinely understands the problem still scores; only ``{problem_text → answer}`` lookups break. Mixing v21 and v22 records would let a wording memoriser keep their math_bench=0.9 floor under the old grading while honest miners regrade against rotated phrasings — re-grounding via the king filter is required. Session 3.14 — AIME problem paraphrase per round. Pre-v21 ``aime_bench`` used the canonical AIME problem wording verbatim. The pool is ~90 public items from ``HuggingFaceH4/aime_2025`` + ``Maxwell-Jia/AIME_2024`` + ``AI-MO/aimo-validation-aime`` with integer answers 0–999. A miner who pre-trains on the public datasets can build a ``{problem_text → answer}`` lookup keyed on canonical wording. AIME isn't currently the dominant Goodhart vector (round-18 logs show top score 0.25 = 2/6, suggesting partial memorization but not full saturation) but the attack scales linearly with how much of the public pool a miner caches. v21+ wraps each AIME problem with the same math-domain-safe paraphrase helpers used by robustness_bench (``_apply_instruction_synonyms`` + ``_imperative_to_question``) keyed on ``(block_seed, sha(question))``. The synonym table only touches instruction verbs (``find``/``calculate``/``determine``) and the imperative→question rewrite only edits the closing sentence — digits, LaTeX, and boxed format are preserved so the math is unchanged. A genuine reasoner solves it; a memoriser keyed on canonical wording fails. Session 3.13 — per-round MC option shuffle for arc_bench / knowledge_bench / truthful_bench. Pre-v20 the ARC and MMLU-Pro pools shipped with a fixed correct-letter per question (the original dataset order), and ``truthful_bench`` shuffled per-question only at load time. A miner who pre-trained on the public ``allenai/ai2_arc`` and ``TIGER-Lab/MMLU-Pro`` datasets could build a ``{question_text → correct_letter}`` lookup and saturate ``arc_bench`` without parsing the options. Round 18 logs caught this in the wild: 8 distinct miners scored ``arc_bench=1.000`` while their ``knowledge_bench`` was 0.0–0.25 (uids 11/22/40/42/61/64/69/79). Rotating the option order per ``(block_seed, sha256(question))`` forces the correct letter to change every round so a memorised lookup is wrong on every refresh; the model has to actually parse the option text. Cross-validator agreement preserved (every validator with the same block_seed produces the same shuffle). Session 3.12 — capability_probe procedural rebalance. Pre-v19 the capability axis (composite weight 0.25, the second-highest after on_policy_rkl) drew 24 of its 36 items per round from a static trivia pool baked into the open-source pod_eval_vllm.py. The pool rotates 24/200 items per round but the pool is public, so a miner can pre-train answers to every entry and saturate this axis. Round 18 evidence (composite_scores.json) confirmed the attack: ``ty4321/cc`` scored capability=1.000 perfect while bombing math_bench=0.500, code_bench=0.500, aime_bench=0.000, knowledge_bench=0.500 — a textbook overfit-one-axis Goodhart signature. Several other ty4321 commitments showed the same pattern: capability ≥ 0.95 with reasoning_bench / knowledge_bench < 0.30. v19+ flips the static/procedural ratio (CAPABILITY_PROBE_N=12 down from 24, CAPABILITY_PROBE_N_PROC_MATH=24 up from 12) and broadens the procedural generator (``_procedural_capability_prompts``) beyond arithmetic to number theory, string ops (count chars / vowels), list ops (min/max/count), and comparison. All procedural items are block_seed-derived so the (operands, items) tuple is fresh every round and cannot be memorized; total per-round count stays at 36 so wall-clock cost is unchanged. Mixing v18 and v19 records would let an old static-pool memorizer keep their capability=1.0 floor while honest miners regrade against the harder mix — ranking re-grounded by the king filter. Session 3.11 — MBPP+HumanEval prose-stripping. Pre-v18 the sandbox accepted the model generation almost-verbatim: ``_strip_code_fences`` peeled markdown fences and an auto-indent path repaired bare unindented bodies, but a chatty model that wrapped a CORRECT solution in conversational prose ("Sure, here's the function:" / "Hope this helps!") tripped a SyntaxError instead of being graded on its code. Confirmed via synthetic repro on ``def is_sorted(...)`` and seen in real eval logs as IndentationError on Qwen-class HumanEval/13 outputs. That penalises coding ability on the basis of pedantic instruction-following — already measured separately in ``ifeval_bench`` — so it is a textbook Goodhart vector. v18+ adds ``_find_parseable_gen_window`` which uses ``ast.parse`` to find the largest contiguous gen line range that, concatenated to the prompt, parses cleanly. Conservative: never invents code, never re-orders lines, and the empty-prompt MBPP variant additionally requires the entry-point ``def`` to survive the trim. Mixing v17 and v18 records would let a model whose chatty wrapping was previously masked recover the earned-but-blocked passes — composite scores need to be re-grounded on a uniform sandbox. The ``_strip_code_fences`` helper was also hardened to handle paired fences with both leading and trailing prose (regex over the whole string) and to disambiguate the single-marker fallback by preferring the side that precedes the bare ``\`\`\``` marker. Session 3.10 — on_policy_rkl per-round seed rotation. Pre-v17 the student rollout-sampling seed was the constant ``ON_POLICY_RKL_SEED=42`` for every round. Combined with the prompt-pool rotation, that meant ``torch.manual_seed(42 + p_idx)`` was the SAME across rounds for every prompt position — a miner who knew the public 80-prompt pool could pre-compute their model's exact rollout (deterministic given weights + sampling seed + prompt) and surgically train weights to place teacher-high-prob tokens onto that exact sampled trajectory. That's a direct attack on the highest-weight axis (on_policy_rkl is composite-weighted higher than every benchmark axis). v17+ derives the sampling seed from ``XOR(ON_POLICY_RKL_SEED, block_seed) & 0xFFFFFFFF`` so the trajectory rotates per round (every validator agrees but per-round-rollout overfitting is impractical, requiring intra-round retraining). Mixing v16 and v17 records would let a per-round-overfitter inherit the crown via inflated on_policy_rkl. v16 robustness paraphrase, v15 prompt-injection defense, and v14 code_bench auto-indent fix carry forward unchanged.
@@ -481,6 +550,10 @@ BASELINE_RELATIVE_PENALTY_AXES = frozenset({
     # Qwen-4B-base on any of them gets docked.
     "correction_bench", "multi_doc_synthesis_bench",
     "calibration_bench", "refactor_bench",
+    # v30 — pragmatic_bench. A model regressing on theory-of-mind /
+    # scalar implicature / indirect-request recognition vs the
+    # un-distilled Qwen-4B base loses ranking accordingly.
+    "pragmatic_bench",
 })
 
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
@@ -539,6 +612,186 @@ def _axis_kl(student: dict, king_kl: float | None) -> float | None:
     if kl is None or kl <= 0 or king_kl is None or king_kl <= 0:
         return None
     return max(0.0, min(1.0, king_kl / kl))
+
+
+def _axis_kl_is(student: dict, king_kl_is: float | None) -> float | None:
+    """v30 — Importance-sampled KL axis (SHADOW until 48h telemetry).
+
+    Reads ``student.kl_is_mean`` (full-vocab KL contribution from top-K
+    support, computed via ``compute_kl_is_from_sparse``). Normalised
+    against the round's best (lowest) IS-KL using the same king/student
+    ratio shape as ``_axis_kl``.
+
+    Per the synthesis report (§4.2 #2) and Anshumann et al. ACL 2025,
+    this estimator is unbiased where the renormalised KL on shared
+    support is biased by the teacher's top-K mass coverage. Useful both
+    as a sanity-check on the existing ``kl`` axis (the ratio
+    kl_is_mean / kl_global_avg should be ~ ``topk_mass_mean``) and as
+    a SHADOW signal we can promote once 48h of correlation telemetry
+    against the canary confirms the bias matters in practice.
+    """
+    val = student.get("kl_is_mean")
+    if val is None or king_kl_is is None or king_kl_is <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_kl_is) / v))
+
+
+def _axis_forking_rkl(student: dict, king_forking_rkl: float | None) -> float | None:
+    """v30 — Forking-token RKL axis (SHADOW until 48h telemetry).
+
+    Reads ``student.forking_rkl_mean``: average reverse-KL at positions
+    in the top quartile of teacher entropy. Per Wang et al. 2025 (cited
+    in the Thinking Machines OPD blog and our synthesis report §4.2
+    #5), high-entropy positions are the "decision points" where the
+    teacher's feedback is most informative; the RKL there is a stronger
+    predictor of downstream OPD success than the mean RKL across all
+    positions.
+
+    Same king/student normalisation shape as ``_axis_kl`` and
+    ``_axis_kl_is``.
+    """
+    val = student.get("forking_rkl_mean")
+    if val is None or king_forking_rkl is None or king_forking_rkl <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_forking_rkl) / v))
+
+
+def _axis_teacher_trace_plausibility(student: dict,
+                                      king_trace_nll: float | None) -> float | None:
+    """v30 — Teacher-trace plausibility axis (SHADOW until 48h telemetry).
+
+    Reads ``student.teacher_trace_nll_mean``: average NLL the student
+    assigns to the teacher's actually-emitted tokens (greedy
+    continuation). Captures "support coverage" — does the student
+    place any mass on the teacher's chosen path? This is distinct
+    from FKL, which weights the FULL teacher distribution (not the
+    sampled tokens), and from RKL, which weights the student's own
+    rollout (not the teacher's).
+
+    Synthesis §4.2 #4: a model with high FKL but low plausibility is
+    placing mass everywhere except where the teacher actually goes —
+    a known LIMO/s1 SFT-only failure mode.
+
+    Same king/student normalisation shape as ``_axis_kl``.
+    """
+    val = student.get("teacher_trace_nll_mean")
+    if val is None or king_trace_nll is None or king_trace_nll <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_trace_nll) / v))
+
+
+def _axis_entropy_aware_kl(student: dict, king_eopd: float | None) -> float | None:
+    """v30 — Entropy-Aware adaptive KL axis (SHADOW until 48h telemetry).
+
+    Reads ``student.eopd_adaptive_mean``, the per-prompt mean of the
+    per-token quantity ``α(H_t) · RKL + (1 − α(H_t)) · FKL`` where
+    ``α = sigmoid((H₀ − H_t) / τ)`` is high when the teacher is
+    confident (low entropy) and low when the teacher is uncertain
+    (high entropy).
+
+    Per the EOPD paper (arXiv 2510.27485), this is a strictly more
+    discriminating distillation signal than vanilla per-token KL on
+    small-model math benchmarks (+1.37 to +5.05 Pass@8 on
+    Qwen3-{0.6B,1.7B,4B}).
+
+    The axis is normalised against the king's adaptive-KL the same
+    way ``_axis_kl`` is normalised against ``king_kl``: a student with
+    ``adaptive == king_adaptive`` scores 1.0; 2× king → ~0.5; etc.
+
+    Returns ``None`` when:
+      * The student lacks the field (legacy record / dense-path eval).
+      * The king lacks the field (round didn't compute EOPD).
+      * Adaptive KL is non-positive (NaN / Inf guard).
+    """
+    val = student.get("eopd_adaptive_mean")
+    if val is None or king_eopd is None or king_eopd <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_eopd) / v))
+
+
+def _axis_top_k_overlap(student: dict) -> float | None:
+    """Top-K token overlap between teacher and student distributions.
+
+    Definition: at each generated position, count how many of the
+    teacher's top-K predicted tokens also appear in the student's top-K
+    predicted tokens. Average this fraction across positions, then
+    across prompts. Returns the model-level mean, already in [0, 1],
+    higher is better.
+
+    Why this axis matters (v30, 2026-04-29):
+
+    Per the 2026 'Rethinking On-Policy Distillation' paper (arXiv
+    2604.13016), top-K agreement between teacher and student
+    distributions is the single most predictive signal of downstream
+    OPD success — more predictive than raw KL or capability pass-rate.
+    Successful OPD runs converge to 97-99% top-K overlap with the
+    teacher, while failed runs (mode collapse, teacher hacking) sit
+    at 60-80% even when KL looks acceptable.
+
+    Dynamic range:
+      * Random student: ~K/vocab_size ≈ 128/248320 ≈ 0.05% per slot,
+        with 128 slots ≈ 7% expected overlap by chance alone.
+      * Decent distillation student: 70-90%.
+      * SOTA distilled student: 97-99%.
+
+    So the axis has natural dynamic range from ~7% (random) to ~99%
+    (SOTA), which maps cleanly onto the [0, 1] composite scale without
+    further normalization.
+
+    Goodhart resistance:
+      * Cannot be gamed by per-token probability calibration (only the
+        SET of top-K matters, not the probabilities on those K tokens).
+      * Cannot be gamed by prompt-pool memorisation (top-K depends on
+        the entire generated trajectory; off-policy memorisation
+        doesn't help on-policy continuations).
+      * Cannot be gamed by length collapse (positions are evaluated
+        per-token; a 1-token early stop would only sample 1 position).
+
+    Edge cases:
+      * Returns ``None`` if no prompt had a valid overlap (e.g. all
+        cache entries were sparse-empty / continuation length 0).
+      * Returns ``None`` for rows that lack the field (teacher row,
+        legacy records).
+
+    The K used in production is 128 (matches the vLLM
+    ``--max-logprobs 128`` cap that produces the teacher's sparse
+    cache). Override via ``TOP_K_OVERLAP_K`` in the eval script for
+    research replays.
+    """
+    val = student.get("top_k_overlap_mean")
+    if val is None:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")):  # NaN/Inf guard
+        return None
+    return max(0.0, min(1.0, v))
 
 
 def _axis_capability(student: dict) -> float:
@@ -640,6 +893,35 @@ def _axis_judge_probe(student: dict) -> float | None:
     if norm is None:
         return None
     if (jp.get("n_valid") or 0) < JUDGE_PROBE_MIN_VALID:
+        return None
+    return max(0.0, min(1.0, float(norm)))
+
+
+def _axis_long_form_judge(student: dict) -> float | None:
+    """v30 — long-form judge axis.
+
+    Teacher rubric grades each student's 300-500 word essay-style
+    response on STRUCTURE / DEPTH / COHERENCE / LENGTH. Returns the
+    normalized [0, 1] score from the per-prompt mean (1-5 → (mean-1)/4).
+    Returns ``None`` if the probe didn't run, or if too few prompts
+    parsed successfully (``n_valid < LONG_FORM_JUDGE_MIN_VALID``,
+    default 2 since the per-round budget is 4).
+
+    Why this axis exists. The short-form ``judge_probe`` measures
+    response quality on 1-2 line answers; nothing else in the
+    composite measures whether the model can sustain a coherent
+    multi-paragraph response — one of the SOTA-distinct deployment
+    capabilities. A model that aces all the bench axes but cannot
+    write a 400-word coherent essay is missing a real capability,
+    and this axis penalises that gap.
+    """
+    lf = student.get("long_form_judge_probe") or {}
+    if not lf:
+        return None
+    norm = lf.get("normalized")
+    if norm is None:
+        return None
+    if (lf.get("n_valid") or 0) < LONG_FORM_JUDGE_MIN_VALID:
         return None
     return max(0.0, min(1.0, float(norm)))
 
@@ -777,6 +1059,15 @@ def _axis_refactor_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "refactor_bench")
 
 
+def _axis_pragmatic_bench(student: dict) -> float | None:
+    """v30 — pragmatic_bench (theory-of-mind / scalar implicature /
+    indirect-request recognition). Procedural items, open-ended
+    generation, regex match against per-item ``accept`` patterns.
+    Reads ``pass_frac`` from the bench probe payload like the other
+    capability axes."""
+    return _axis_bench_pass_frac(student, "pragmatic_bench")
+
+
 def _axis_reasoning_density(student: dict) -> float | None:
     """Reasoning-density axis (Session 3.2, 2026-04-25).
 
@@ -870,7 +1161,11 @@ def _axis_on_policy_rkl(student: dict, king_rkl: float | None) -> float:
 
 
 def compute_axes(student: dict, king_kl: float | None = None,
-                 king_rkl: float | None = None) -> dict[str, float | None]:
+                 king_rkl: float | None = None,
+                 king_eopd: float | None = None,
+                 king_kl_is: float | None = None,
+                 king_forking_rkl: float | None = None,
+                 king_trace_nll: float | None = None) -> dict[str, float | None]:
     """Compute the raw per-axis values for one student dict.
 
     Pulled out of ``compute_composite`` so that the teacher sanity gate
@@ -887,10 +1182,18 @@ def compute_axes(student: dict, king_kl: float | None = None,
     return {
         "on_policy_rkl": _axis_on_policy_rkl(student, king_rkl),
         "kl": _axis_kl(student, king_kl),
+        "top_k_overlap": _axis_top_k_overlap(student),
+        "entropy_aware_kl": _axis_entropy_aware_kl(student, king_eopd),
+        "kl_is": _axis_kl_is(student, king_kl_is),
+        "forking_rkl": _axis_forking_rkl(student, king_forking_rkl),
+        "teacher_trace_plausibility": _axis_teacher_trace_plausibility(
+            student, king_trace_nll
+        ),
         "capability": _axis_capability(student),
         "length": _axis_length(student),
         "degeneracy": _axis_degeneracy(student),
         "judge_probe": _axis_judge_probe(student),
+        "long_form_judge": _axis_long_form_judge(student),
         "chat_turns_probe": _axis_chat_turns_probe(student),
         "math_bench": _axis_math_bench(student),
         "code_bench": _axis_code_bench(student),
@@ -912,6 +1215,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "multi_doc_synthesis_bench": _axis_multi_doc_synthesis_bench(student),
         "calibration_bench": _axis_calibration_bench(student),
         "refactor_bench": _axis_refactor_bench(student),
+        "pragmatic_bench": _axis_pragmatic_bench(student),
         "reasoning_density": _axis_reasoning_density(student),
     }
 
@@ -962,6 +1266,10 @@ def resolve_reference_broken_axes(reference_student_row: dict | None) -> set[str
         # v29.4 — same broken-axis treatment for the new SOTA axes.
         "correction_bench", "multi_doc_synthesis_bench",
         "calibration_bench", "refactor_bench",
+        # v30 — pragmatic_bench is procedural and self-contained so a
+        # reference 0/N is a real signal of generator regression
+        # rather than skill, justifying broken-axis treatment.
+        "pragmatic_bench",
     }
     for axis in bench_axes:
         bench = reference_student_row.get(axis)
@@ -1064,7 +1372,11 @@ def _apply_baseline_relative_penalty(
 def compute_composite(student: dict, king_kl: float | None = None,
                       king_rkl: float | None = None,
                       broken_axes: set[str] | None = None,
-                      reference_axes: dict[str, float | None] | None = None) -> dict:
+                      reference_axes: dict[str, float | None] | None = None,
+                      king_eopd: float | None = None,
+                      king_kl_is: float | None = None,
+                      king_forking_rkl: float | None = None,
+                      king_trace_nll: float | None = None) -> dict:
     """Return per-axis and composite (worst-case + weighted mean) scores.
 
     We emit *both* aggregations so the validator can A/B them offline
@@ -1108,7 +1420,13 @@ def compute_composite(student: dict, king_kl: float | None = None,
     ``axes_raw`` for telemetry; ``axes`` reflects the docked values that
     flow into ``worst`` / ``weighted`` and downstream gates.
     """
-    raw_axes = compute_axes(student, king_kl, king_rkl)
+    raw_axes = compute_axes(
+        student, king_kl, king_rkl,
+        king_eopd=king_eopd,
+        king_kl_is=king_kl_is,
+        king_forking_rkl=king_forking_rkl,
+        king_trace_nll=king_trace_nll,
+    )
     if reference_axes:
         axes = {
             k: _apply_baseline_relative_penalty(k, v, reference_axes.get(k))
@@ -1122,6 +1440,14 @@ def compute_composite(student: dict, king_kl: float | None = None,
     # Keeping this local to compute_composite so a single env flip
     # flows to every caller without touching the weight dicts.
     effective_weights = dict(AXIS_WEIGHTS)
+    # Drop any zero-weight axis from effective_weights so a SHADOW axis
+    # (declared with default weight 0 — e.g. ``entropy_aware_kl`` until
+    # its 48h telemetry window concludes) cannot gate the worst-axis
+    # ranking. Operators promote a shadow axis by setting its
+    # corresponding env weight > 0.
+    effective_weights = {k: w for k, w in effective_weights.items() if w > 0}
+    if not TOP_K_OVERLAP_AXIS_IN_COMPOSITE:
+        effective_weights.pop("top_k_overlap", None)
     if JUDGE_AXIS_IN_COMPOSITE:
         effective_weights["judge_probe"] = JUDGE_AXIS_WEIGHT
     if BENCH_AXES_IN_COMPOSITE:
@@ -1136,6 +1462,8 @@ def compute_composite(student: dict, king_kl: float | None = None,
         effective_weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
     if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
         effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
+    if LONG_FORM_JUDGE_AXIS_IN_COMPOSITE and LONG_FORM_JUDGE_AXIS_WEIGHT > 0:
+        effective_weights["long_form_judge"] = LONG_FORM_JUDGE_AXIS_WEIGHT
     # ``ranked`` = axes used by ``worst()``: drops broken axes so the
     # min is not artificially floored by an axis the eval setup itself
     # can't pass (the dethrone gate degenerates to 0=0=0 otherwise).
@@ -1165,7 +1493,9 @@ def compute_composite(student: dict, king_kl: float | None = None,
                 "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
                 "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
                 "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
-                "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE}
+                "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE,
+                "top_k_overlap_in_composite": TOP_K_OVERLAP_AXIS_IN_COMPOSITE,
+                "long_form_judge_in_composite": LONG_FORM_JUDGE_AXIS_IN_COMPOSITE}
     worst = min(ranked.values())
     total_w = sum(effective_weights[k] for k in weighted_axes)
     weighted = (
@@ -1196,7 +1526,9 @@ def compute_composite(student: dict, king_kl: float | None = None,
         var = sum((v - m) ** 2 for v in all_values) / len(all_values)
         axis_spread = var ** 0.5
 
-    rel_keys = ("kl", "on_policy_rkl", "capability", "judge_probe",
+    rel_keys = ("kl", "on_policy_rkl", "top_k_overlap", "entropy_aware_kl",
+                "kl_is", "forking_rkl", "teacher_trace_plausibility",
+                "capability", "judge_probe", "long_form_judge",
                 "chat_turns_probe", "length", "degeneracy")
     bench_keys = tuple(BENCH_AXIS_WEIGHTS.keys()) + tuple(ARENA_V3_AXIS_WEIGHTS.keys())
     rel_vals = [axes[k] for k in rel_keys if axes.get(k) is not None]
@@ -1256,6 +1588,8 @@ def compute_composite(student: dict, king_kl: float | None = None,
         "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
         "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
         "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE,
+        "top_k_overlap_in_composite": TOP_K_OVERLAP_AXIS_IN_COMPOSITE,
+        "long_form_judge_in_composite": LONG_FORM_JUDGE_AXIS_IN_COMPOSITE,
     }
 
 
@@ -1385,6 +1719,69 @@ def _resolve_king_rkl(king_kl: float | None,
     if best is not None:
         return best
     return None
+
+
+def _resolve_king_metric_min(students_data: dict[Any, dict],
+                              key: str,
+                              skip_floor: float = 1e-4) -> float | None:
+    """Generic helper: round-wide MINIMUM of a numeric per-student field
+    (lower-is-better metric like KL / RKL / NLL).
+
+    Skips values <= ``skip_floor`` to avoid the teacher-vs-itself row
+    pinning the reference to ~0 (every challenger would then receive
+    None on the axis).
+
+    Returns None if no qualifying row has the field.
+    """
+    best = None
+    for _model_name, data in students_data.items():
+        v = (data or {}).get(key)
+        if v is None:
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v != v or v <= skip_floor:
+            continue
+        if best is None or v < best:
+            best = v
+    return best
+
+
+def _resolve_king_eopd(students_data: dict[Any, dict],
+                       h2h_results: list[dict]) -> float | None:
+    """v30 — round-wide reference adaptive-KL for the entropy-aware
+    (EOPD) axis normalisation. Same logic as ``_resolve_king_rkl``:
+    pick the round-wide MINIMUM ``eopd_adaptive_mean`` across all
+    students with a probe record (best), so a challenger with strictly
+    better adaptive-KL than the king can score >1 on that axis and
+    surface as a candidate dethroner.
+
+    A small floor (1e-4 nats) drops the teacher-vs-itself row when it
+    is included in ``students_data``: the teacher's adaptive-KL is 0
+    by construction (teacher logits equal teacher logits) and using
+    that as the reference would force ``_axis_entropy_aware_kl`` to
+    return None for every challenger.
+
+    Returns ``None`` if no student has the field (legacy round /
+    sparse-cache absent / EOPD computation failed).
+    """
+    best = None
+    EOPD_KING_MIN = 1e-4
+    for _model_name, data in students_data.items():
+        v = (data or {}).get("eopd_adaptive_mean")
+        if v is None:
+            continue
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v != v or v <= EOPD_KING_MIN:
+            continue
+        if best is None or v < best:
+            best = v
+    return best
 
 
 def compute_king_health(
@@ -1546,6 +1943,14 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     before promotion.
     """
     king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
+    king_eopd = _resolve_king_eopd(students_data, h2h_results)
+    # v30 — three additional research-paper shadow-axis king references.
+    # Resolved via the same min-with-floor pattern as king_eopd.
+    king_kl_is = _resolve_king_metric_min(students_data, "kl_is_mean")
+    king_forking_rkl = _resolve_king_metric_min(students_data, "forking_rkl_mean")
+    king_trace_nll = _resolve_king_metric_min(
+        students_data, "teacher_trace_nll_mean"
+    )
     broken = resolve_teacher_broken_axes(teacher_student_row, king_kl, king_rkl)
     # Layer 2 (2026-04-26): reference-broken axes. The reference base model
     # (REFERENCE_UID = -1, Qwen3.5-4B) runs the same bench probes as
@@ -1578,7 +1983,13 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     reference_axes_raw: dict[str, float | None] | None = None
     if reference_row is not None:
         try:
-            reference_axes_raw = compute_axes(reference_row, king_kl, king_rkl)
+            reference_axes_raw = compute_axes(
+                reference_row, king_kl, king_rkl,
+                king_eopd=king_eopd,
+                king_kl_is=king_kl_is,
+                king_forking_rkl=king_forking_rkl,
+                king_trace_nll=king_trace_nll,
+            )
         except Exception as exc:
             logger.warning(
                 f"composite: failed to compute reference axes: {exc} "
@@ -1592,7 +2003,13 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         king_model = king_entry.get("model")
     king_raw_axes = None
     if king_model and king_model in students_data:
-        king_raw_axes = compute_axes(students_data[king_model], king_kl, king_rkl)
+        king_raw_axes = compute_axes(
+            students_data[king_model], king_kl, king_rkl,
+            king_eopd=king_eopd,
+            king_kl_is=king_kl_is,
+            king_forking_rkl=king_forking_rkl,
+            king_trace_nll=king_trace_nll,
+        )
 
     # 2026-04-29 (v29.3): which bench axes carry per-template breakdown.
     # We surface ``composite.per_src`` so the saturation audit can attribute
@@ -1610,6 +2027,10 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         # v29.4 axes also expose per_src for saturation telemetry.
         "correction_bench", "multi_doc_synthesis_bench",
         "calibration_bench", "refactor_bench",
+        # v30 — pragmatic_bench exposes per-subtype telemetry under
+        # ``per_subtype`` (not per_src — different schema), so this
+        # axis is not in PER_SRC_AXES; the dashboard reads
+        # per_subtype directly from the bench payload.
     )
 
     for entry in h2h_results:
@@ -1624,6 +2045,10 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         comp = compute_composite(
             students_data[model], king_kl, king_rkl,
             broken, ref_axes_for_call,
+            king_eopd=king_eopd,
+            king_kl_is=king_kl_is,
+            king_forking_rkl=king_forking_rkl,
+            king_trace_nll=king_trace_nll,
         )
         if entry.get("disqualified") and not entry.get("is_king"):
             comp = {**comp, "worst": 0.0, "weighted": 0.0,
@@ -1633,6 +2058,10 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         if king_raw_axes is not None and not entry.get("is_king"):
             challenger_raw_axes = compute_axes(
                 students_data[model], king_kl, king_rkl,
+                king_eopd=king_eopd,
+                king_kl_is=king_kl_is,
+                king_forking_rkl=king_forking_rkl,
+                king_trace_nll=king_trace_nll,
             )
             comp["pareto"] = compute_pareto_dominance(
                 challenger_raw_axes, king_raw_axes, include_shadow=True,
