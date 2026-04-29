@@ -32,6 +32,29 @@ interface BenchmarkPayload {
    */
   composite_worst?: number | null;
   composite_weighted?: number | null;
+  /** v30.2 — composite.final is the new canonical ranking key
+   * (0.7·worst_3_mean + 0.3·weighted). Surfaced here so the dashboard
+   * shows ranking-relevant scores rather than the legacy worst-only.
+   */
+  composite_final?: number | null;
+  composite_worst_3_mean?: number | null;
+  /** v30.2 — group axes (bench-axis collapses) and super_teacher
+   * (incentivize beyond-teacher). All in [0, 1], higher is better.
+   */
+  axis_code_skill_group?: number | null;
+  axis_math_skill_group?: number | null;
+  axis_reasoning_skill_group?: number | null;
+  axis_knowledge_skill_group?: number | null;
+  axis_super_teacher?: number | null;
+  /** v30 / v30.1 / v30.3 shadow axes (low or zero weight by default).
+   * Surfaced for visibility into research-paper signals.
+   */
+  axis_top_k_overlap?: number | null;
+  axis_kl_is?: number | null;
+  axis_forking_rkl?: number | null;
+  axis_teacher_trace_plausibility?: number | null;
+  axis_entropy_aware_kl?: number | null;
+  axis_tail_decoupled_kl?: number | null;
 }
 
 interface BenchmarksResponse {
@@ -322,7 +345,7 @@ function CanaryStrip({ kings, reference }: CanaryStripProps) {
           </div>
         </div>
         <div className="text-[10px] text-meta italic max-w-[260px] text-right">
-          solid = held-out · dotted = composite.worst.
+          solid = held-out · dotted = composite.final (v30.2; falls back to .worst).
           ↯ flag = composite climbing while held-out drops below baseline.
         </div>
       </div>
@@ -355,10 +378,20 @@ function CanaryCell({
   const points: { score: number | null; uid: number | null; composite: number | null }[] = kings.map(
     (k) => {
       const s = pickScoreAndCount(k.benchmarks, k.counts, benchKey);
+      // v30.2 — prefer composite.final (the v30.2 ranking key) over
+      // legacy composite.worst when both are present. The Goodhart
+      // co-plot tracks the SAME score the validator uses to pick the
+      // king, so it must reflect ``final`` post-v30.2.
+      const composite =
+        typeof k.composite_final === "number"
+          ? k.composite_final
+          : typeof k.composite_worst === "number"
+          ? k.composite_worst
+          : null;
       return {
         score: s.count === 0 ? null : s.score,
         uid: k.uid ?? null,
-        composite: typeof k.composite_worst === "number" ? k.composite_worst : null,
+        composite,
       };
     },
   );
@@ -420,7 +453,7 @@ function CanaryCell({
   const titleText =
     goodhartDivergence
       ? `${label} — GOODHART DIVERGENCE: composite climbing while held-out below baseline (last ${kings.length} kings).`
-      : `${label} held-out trend (solid) vs validator composite.worst (dotted), last ${kings.length} kings`;
+      : `${label} held-out trend (solid) vs validator composite.final (dotted), last ${kings.length} kings`;
   return (
     <div className="flex flex-col gap-1.5" title={titleText}>
       <div className="flex items-baseline justify-between">

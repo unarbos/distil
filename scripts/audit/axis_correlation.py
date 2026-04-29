@@ -65,15 +65,44 @@ OUT_PATH = REPO_ROOT / "state" / "axis_correlation.json"
 # rationale). Add entries here when new bench axes have a clear evalscope
 # counterpart.
 AXIS_PAIRS: dict[str, tuple[str, str]] = {
+    # ── v28 sub-axes (still computed for telemetry, weight 0 in v30.2) ──
     "math_bench":      ("gsm8k", "GSM8K-narrative-style multi-step word problems"),
     "code_bench":      ("humaneval", "HumanEval-difficulty algorithm completion"),
     "reasoning_bench": ("bbh", "BBH-style multi-step deduction"),
     "ifeval_bench":    ("ifeval", "instruction-following with structural constraints"),
     "mbpp_bench":      ("humaneval", "closest held-out analog (no MBPP in canary)"),
     "aime_bench":      ("gsm8k", "closest held-out analog (no AIME in canary)"),
-    # debug_bench (v29.2) doesn't have a clean evalscope analog; tracked
-    # manually via post-round king benchmark runs. Add when a held-out
-    # debugging benchmark is wired into the canary set.
+    # ── v30.2 group axes (now the primary ranking signal) ──
+    # These are the most important axes to track — if a group is
+    # anti-correlated, the entire group needs design work.
+    "math_skill_group":      ("gsm8k", "v30.2 group: math + aime + robustness"),
+    "code_skill_group":      ("humaneval", "v30.2 group: code + mbpp + debug + correction + refactor"),
+    "reasoning_skill_group": ("bbh", "v30.2 group: reasoning + multi_doc + long_context"),
+    "knowledge_skill_group": ("mmlu_pro", "v30.2 group: knowledge_v2 + pragmatic"),
+    # ── v30.2 super_teacher axis ──
+    "super_teacher": ("gsm8k", "v30.2 super_teacher (mean lift on verifiable benches)"),
+    # ── v30 capability axes that map to canary ──
+    "knowledge_bench": ("mmlu_pro", "v30 procedural knowledge → MMLU-Pro analog"),
+    "long_context_bench": ("bbh", "long-context retrieval, closest analog"),
+    "robustness_bench": ("gsm8k", "math under paraphrase wrappers"),
+    "debug_bench":     ("humaneval", "buggy code fix, closest analog"),
+    "correction_bench": ("humaneval", "buggy code + error trace, closest analog"),
+    "refactor_bench":  ("humaneval", "behavior-preserving refactor, closest analog"),
+    "calibration_bench": ("ifeval", "honest refusal — instruction-following analog"),
+    # ── v30.2 final + worst_3_mean (the actual ranker) ──
+    "final": ("gsm8k", "v30.2 final composite — should correlate with all canaries"),
+    "worst_3_mean": ("gsm8k", "v30.2 worst-3 mean — anti-Goodhart signal"),
+    # ── v30 / v30.1 shadow axes (still SHADOW until proven) ──
+    # Their correlation with canary tells us whether to promote weight.
+    "top_k_overlap": ("gsm8k", "research-validated OPD-success predictor"),
+    "kl_is": ("gsm8k", "Anshumann ACL 2025 unbiased IS-KL"),
+    "forking_rkl": ("gsm8k", "Wang et al. forking-token RKL"),
+    "teacher_trace_plausibility": ("gsm8k", "support coverage — LIMO/s1 catcher"),
+    "entropy_aware_kl": ("gsm8k", "EOPD adaptive RKL/FKL blend"),
+    "tail_decoupled_kl": ("gsm8k", "v30.3 tail-flatten detector"),
+    # pragmatic_bench has no clean canary analog yet; track via post-
+    # round king benchmark runs once a held-out theory-of-mind benchmark
+    # is wired into the canary set (e.g., FANToM).
 }
 
 
@@ -137,6 +166,12 @@ def _per_uid_validator_axes(history: list[dict]) -> dict[int, dict[str, float]]:
     recent challenger row if it never appeared as king (so a UID
     that's been a top-N challenger but never crowned still gets
     paired data when it has a canary file).
+
+    v30.2: also extracts top-level composite fields (``final``,
+    ``worst_3_mean``, ``worst``, ``weighted``) and merges them into
+    the per-UID axis dict so the correlation analysis can track
+    aggregate scores against canary too — those are the actual
+    ranking keys, not just per-axis values.
     """
     by_uid_king: dict[int, dict[str, float]] = {}
     by_uid_any: dict[int, dict[str, float]] = {}
@@ -154,9 +189,19 @@ def _per_uid_validator_axes(history: list[dict]) -> dict[int, dict[str, float]]:
             axes = comp.get("axes") or {}
             if not axes:
                 continue
-            by_uid_any[uid_i] = {k: v for k, v in axes.items() if v is not None}
+            row: dict[str, float] = {
+                k: v for k, v in axes.items() if v is not None
+            }
+            # v30.2 — surface the aggregate composite scores so they can
+            # be correlated against canary too. ``final`` is the new
+            # ranking key; the others are telemetry.
+            for top_key in ("final", "worst_3_mean", "worst", "weighted"):
+                v = comp.get(top_key)
+                if v is not None:
+                    row[top_key] = float(v)
+            by_uid_any[uid_i] = row
             if r.get("is_king"):
-                by_uid_king[uid_i] = {k: v for k, v in axes.items() if v is not None}
+                by_uid_king[uid_i] = row
     # Prefer king rows; fall back to any row.
     return {uid: by_uid_king.get(uid, by_uid_any.get(uid)) for uid in by_uid_any}
 

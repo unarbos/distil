@@ -141,6 +141,14 @@ AXIS_WEIGHTS = {
     "teacher_trace_plausibility": float(
         os.environ.get("TEACHER_TRACE_PLAUSIBILITY_WEIGHT", "0.0")
     ),
+    # 2026-04-29 (v30.3) — tail-decoupled KL shadow axis. Detects
+    # "match teacher head but flatten tail" over-confidence pathology
+    # documented in the Tail-Aware Distillation paper. Default 0
+    # (SHADOW); promote once a 48h round-correlation pass against the
+    # canary confirms the signal.
+    "tail_decoupled_kl": float(
+        os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")
+    ),
     "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
     "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.10")),
     "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.15")),
@@ -713,6 +721,36 @@ def _axis_forking_rkl(student: dict, king_forking_rkl: float | None) -> float | 
     return max(0.0, min(1.0, float(king_forking_rkl) / v))
 
 
+def _axis_tail_decoupled_kl(student: dict,
+                             king_kl_tail: float | None) -> float | None:
+    """v30.3 — Tail-decoupled KL axis (SHADOW).
+
+    Reads ``student.kl_tail_mean``: the per-position mean KL
+    contribution from the TAIL of the teacher's top-K cache (positions
+    K_head+1 .. K, default top-32 .. 128). Catches the
+    "match teacher's head but flatten the tail" pathology where the
+    student concentrates probability on the most-likely tokens and
+    misses the broad coverage the teacher places on rarer tokens.
+
+    Per the synthesis report §3.9 / §4.2 #3 and the Tail-Aware
+    Distillation paper, this is a documented SFT-only over-confidence
+    failure mode.
+
+    Same king/student normalisation shape as ``_axis_kl``.
+    Returns None when missing or king ref is missing.
+    """
+    val = student.get("kl_tail_mean")
+    if val is None or king_kl_tail is None or king_kl_tail <= 0:
+        return None
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")) or v <= 0:
+        return None
+    return max(0.0, min(1.0, float(king_kl_tail) / v))
+
+
 def _axis_teacher_trace_plausibility(student: dict,
                                       king_trace_nll: float | None) -> float | None:
     """v30 — Teacher-trace plausibility axis (SHADOW until 48h telemetry).
@@ -1161,9 +1199,28 @@ KNOWLEDGE_SKILL_GROUP_SUB_AXES = (
 )
 
 
-def _axis_skill_group_mean(student: dict, sub_axes: tuple[str, ...]) -> float | None:
+def _axis_skill_group_mean(
+    student: dict,
+    sub_axes: tuple[str, ...],
+    broken_axes: set[str] | None = None,
+) -> float | None:
     """Equal-weighted mean of present (non-None) bench sub-axis
-    pass-fracs. Returns None when no sub-axis has data — graceful
+    pass-fracs.
+
+    v30.2 (2026-04-29): preserves the broken-axes invariant from the
+    pre-grouping era. When a sub-axis is in ``broken_axes`` (the
+    reference 4B scored 0 — eval-setup signal, not skill), it is
+    excluded from the group computation. This means a student who
+    just happens to score 0 on aime_bench (because the reference
+    couldn't either) doesn't get docked in math_skill_group, while
+    a student who SOLVED aime items the reference couldn't solve also
+    doesn't get an inflated lift via the broken sub-axis. The group
+    score reflects only the eval-valid sub-axes.
+
+    When broken_axes is None (legacy callers), all non-None sub-axes
+    are included — same as v30.2 release behaviour.
+
+    Returns None when no eval-valid sub-axis has data — graceful
     drop so the composite renormalises over surviving axes.
 
     We use the RAW pass_frac (``_axis_bench_pass_frac``), not the
@@ -1173,6 +1230,10 @@ def _axis_skill_group_mean(student: dict, sub_axes: tuple[str, ...]) -> float | 
     """
     vals: list[float] = []
     for ax in sub_axes:
+        if broken_axes and ax in broken_axes:
+            # Broken sub-axis: drop from group mean to preserve the
+            # "broken axes don't penalize" invariant.
+            continue
         v = _axis_bench_pass_frac(student, ax)
         if v is None:
             continue
@@ -1182,32 +1243,51 @@ def _axis_skill_group_mean(student: dict, sub_axes: tuple[str, ...]) -> float | 
     return sum(vals) / len(vals)
 
 
-def _axis_code_skill_group(student: dict) -> float | None:
+def _axis_code_skill_group(
+    student: dict, broken_axes: set[str] | None = None,
+) -> float | None:
     """Mean of {code_bench, mbpp_bench, debug_bench, correction_bench,
     refactor_bench}. Catches code competence across write-from-scratch
     (code/mbpp), bug fixing (debug/correction), and behaviour-preserving
-    refactoring."""
-    return _axis_skill_group_mean(student, CODE_SKILL_GROUP_SUB_AXES)
+    refactoring. Excludes broken sub-axes (v30.2)."""
+    return _axis_skill_group_mean(
+        student, CODE_SKILL_GROUP_SUB_AXES, broken_axes,
+    )
 
 
-def _axis_math_skill_group(student: dict) -> float | None:
+def _axis_math_skill_group(
+    student: dict, broken_axes: set[str] | None = None,
+) -> float | None:
     """Mean of {math_bench, aime_bench, robustness_bench}. Catches
     word-problem narrative (math), olympiad-level (aime), and
-    paraphrase-invariant solving (robustness)."""
-    return _axis_skill_group_mean(student, MATH_SKILL_GROUP_SUB_AXES)
+    paraphrase-invariant solving (robustness). Excludes broken
+    sub-axes (v30.2)."""
+    return _axis_skill_group_mean(
+        student, MATH_SKILL_GROUP_SUB_AXES, broken_axes,
+    )
 
 
-def _axis_reasoning_skill_group(student: dict) -> float | None:
+def _axis_reasoning_skill_group(
+    student: dict, broken_axes: set[str] | None = None,
+) -> float | None:
     """Mean of {reasoning_bench, multi_doc_synthesis_bench,
     long_context_bench}. Catches multi-step deduction (BBH-style),
-    cross-document synthesis, and needle-in-haystack retrieval."""
-    return _axis_skill_group_mean(student, REASONING_SKILL_GROUP_SUB_AXES)
+    cross-document synthesis, and needle-in-haystack retrieval.
+    Excludes broken sub-axes (v30.2)."""
+    return _axis_skill_group_mean(
+        student, REASONING_SKILL_GROUP_SUB_AXES, broken_axes,
+    )
 
 
-def _axis_knowledge_skill_group(student: dict) -> float | None:
+def _axis_knowledge_skill_group(
+    student: dict, broken_axes: set[str] | None = None,
+) -> float | None:
     """Mean of {knowledge_bench v2, pragmatic_bench}. Catches
-    factual reasoning + theory-of-mind / pragmatic competence."""
-    return _axis_skill_group_mean(student, KNOWLEDGE_SKILL_GROUP_SUB_AXES)
+    factual reasoning + theory-of-mind / pragmatic competence.
+    Excludes broken sub-axes (v30.2)."""
+    return _axis_skill_group_mean(
+        student, KNOWLEDGE_SKILL_GROUP_SUB_AXES, broken_axes,
+    )
 
 
 # v30.2 — Super-teacher axis: rewards exceeding the teacher on
@@ -1386,7 +1466,9 @@ def compute_axes(student: dict, king_kl: float | None = None,
                  king_kl_is: float | None = None,
                  king_forking_rkl: float | None = None,
                  king_trace_nll: float | None = None,
-                 teacher_axes: dict[str, float | None] | None = None) -> dict[str, float | None]:
+                 king_kl_tail: float | None = None,
+                 teacher_axes: dict[str, float | None] | None = None,
+                 broken_axes: set[str] | None = None) -> dict[str, float | None]:
     """Compute the raw per-axis values for one student dict.
 
     Pulled out of ``compute_composite`` so that the teacher sanity gate
@@ -1410,6 +1492,8 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "teacher_trace_plausibility": _axis_teacher_trace_plausibility(
             student, king_trace_nll
         ),
+        # v30.3 — tail-decoupled KL: catches over-confident tail-flatteners.
+        "tail_decoupled_kl": _axis_tail_decoupled_kl(student, king_kl_tail),
         "capability": _axis_capability(student),
         "length": _axis_length(student),
         "degeneracy": _axis_degeneracy(student),
@@ -1437,12 +1521,12 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "calibration_bench": _axis_calibration_bench(student),
         "refactor_bench": _axis_refactor_bench(student),
         "pragmatic_bench": _axis_pragmatic_bench(student),
-        # v30.2 — skill-group axes (mean of sub-axes, sub-axes still
-        # populated above for telemetry).
-        "code_skill_group": _axis_code_skill_group(student),
-        "math_skill_group": _axis_math_skill_group(student),
-        "reasoning_skill_group": _axis_reasoning_skill_group(student),
-        "knowledge_skill_group": _axis_knowledge_skill_group(student),
+        # v30.2 — skill-group axes (mean of non-broken sub-axes,
+        # sub-axes still populated above for telemetry).
+        "code_skill_group": _axis_code_skill_group(student, broken_axes),
+        "math_skill_group": _axis_math_skill_group(student, broken_axes),
+        "reasoning_skill_group": _axis_reasoning_skill_group(student, broken_axes),
+        "knowledge_skill_group": _axis_knowledge_skill_group(student, broken_axes),
         # v30.2 — incentivize exceeding the teacher on verifiable
         # benches. Reads the teacher's per-axis scores (None when
         # teacher_axes not threaded through).
@@ -1608,6 +1692,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
                       king_kl_is: float | None = None,
                       king_forking_rkl: float | None = None,
                       king_trace_nll: float | None = None,
+                      king_kl_tail: float | None = None,
                       teacher_axes: dict[str, float | None] | None = None) -> dict:
     """Return per-axis and composite (worst-case + weighted mean) scores.
 
@@ -1658,7 +1743,9 @@ def compute_composite(student: dict, king_kl: float | None = None,
         king_kl_is=king_kl_is,
         king_forking_rkl=king_forking_rkl,
         king_trace_nll=king_trace_nll,
+        king_kl_tail=king_kl_tail,
         teacher_axes=teacher_axes,
+        broken_axes=broken_axes,
     )
     if reference_axes:
         axes = {
@@ -1791,6 +1878,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
 
     rel_keys = ("kl", "on_policy_rkl", "top_k_overlap", "entropy_aware_kl",
                 "kl_is", "forking_rkl", "teacher_trace_plausibility",
+                "tail_decoupled_kl",
                 "capability", "judge_probe", "long_form_judge",
                 "chat_turns_probe", "length", "degeneracy")
     bench_keys = tuple(BENCH_AXIS_WEIGHTS.keys()) + tuple(ARENA_V3_AXIS_WEIGHTS.keys())
@@ -2220,6 +2308,8 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     king_trace_nll = _resolve_king_metric_min(
         students_data, "teacher_trace_nll_mean"
     )
+    # v30.3 — tail-decoupled KL king reference.
+    king_kl_tail = _resolve_king_metric_min(students_data, "kl_tail_mean")
     broken = resolve_teacher_broken_axes(teacher_student_row, king_kl, king_rkl)
 
     # v30.2 — Teacher axis values for the super_teacher axis.
@@ -2271,13 +2361,19 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     reference_axes_raw: dict[str, float | None] | None = None
     if reference_row is not None:
         try:
+            # Reference uses ``broken_axes=None``: it's the row that
+            # DEFINES which axes are broken (reference scored 0), so
+            # we don't drop them from the reference's own group axes —
+            # the reference is the anchor.
             reference_axes_raw = compute_axes(
                 reference_row, king_kl, king_rkl,
                 king_eopd=king_eopd,
                 king_kl_is=king_kl_is,
                 king_forking_rkl=king_forking_rkl,
                 king_trace_nll=king_trace_nll,
+                king_kl_tail=king_kl_tail,
                 teacher_axes=teacher_axes_for_super,
+                broken_axes=None,
             )
         except Exception as exc:
             logger.warning(
@@ -2298,7 +2394,9 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             king_kl_is=king_kl_is,
             king_forking_rkl=king_forking_rkl,
             king_trace_nll=king_trace_nll,
+            king_kl_tail=king_kl_tail,
             teacher_axes=teacher_axes_for_super,
+            broken_axes=broken,
         )
 
     # 2026-04-29 (v29.3): which bench axes carry per-template breakdown.
@@ -2317,10 +2415,10 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
         # v29.4 axes also expose per_src for saturation telemetry.
         "correction_bench", "multi_doc_synthesis_bench",
         "calibration_bench", "refactor_bench",
-        # v30 — pragmatic_bench exposes per-subtype telemetry under
-        # ``per_subtype`` (not per_src — different schema), so this
-        # axis is not in PER_SRC_AXES; the dashboard reads
-        # per_subtype directly from the bench payload.
+        # v30.3 — pragmatic_bench now also exposes per_src (mirrored
+        # alongside its legacy per_subtype) so the saturation audit
+        # picks it up. The dashboard can keep reading per_subtype.
+        "pragmatic_bench",
     )
 
     for entry in h2h_results:
@@ -2339,8 +2437,11 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             king_kl_is=king_kl_is,
             king_forking_rkl=king_forking_rkl,
             king_trace_nll=king_trace_nll,
+            king_kl_tail=king_kl_tail,
             teacher_axes=teacher_axes_for_super,
         )
+        # Note: compute_composite passes ``broken`` to compute_axes
+        # internally so the group axes drop broken sub-axes.
         if entry.get("disqualified") and not entry.get("is_king"):
             comp = {**comp, "worst": 0.0, "weighted": 0.0,
                     "disqualified": True, "dq_reason": entry.get("dq_reason")}
@@ -2353,7 +2454,9 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
                 king_kl_is=king_kl_is,
                 king_forking_rkl=king_forking_rkl,
                 king_trace_nll=king_trace_nll,
+                king_kl_tail=king_kl_tail,
                 teacher_axes=teacher_axes_for_super,
+                broken_axes=broken,
             )
             comp["pareto"] = compute_pareto_dominance(
                 challenger_raw_axes, king_raw_axes, include_shadow=True,

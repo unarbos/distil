@@ -1464,6 +1464,76 @@ class TestAxisGrouping(unittest.TestCase):
             "code_skill_group=0.1 must pull worst down")
 
 
+class TestGroupAxisBrokenHandling(unittest.TestCase):
+    """v30.2 fix: when a sub-axis is in broken_axes, the group axis
+    excludes it from the mean. Preserves the v28-era 'broken axes
+    don't penalize' invariant through grouping."""
+
+    def test_group_drops_broken_sub_axis(self):
+        from scripts.validator.composite import _axis_math_skill_group
+        student = _make_student(bench={
+            "math_bench": 0.7,
+            "aime_bench": 0.0,    # broken (reference scored 0)
+            "robustness_bench": 0.6,
+        })
+        # Without broken filtering: mean(0.7, 0.0, 0.6) = 0.43
+        without_broken = _axis_math_skill_group(student, broken_axes=None)
+        self.assertAlmostEqual(without_broken, 0.433, places=2)
+        # With broken filtering: mean(0.7, 0.6) = 0.65 (aime dropped)
+        with_broken = _axis_math_skill_group(student,
+                                             broken_axes={"aime_bench"})
+        self.assertAlmostEqual(with_broken, 0.65, places=2)
+
+    def test_two_students_tie_on_group_when_only_broken_differs(self):
+        """Two students that only differ on broken sub-axes should have
+        identical group scores (because broken axes are excluded)."""
+        from scripts.validator.composite import _axis_math_skill_group
+        weak = _make_student(bench={
+            "math_bench": 0.7, "aime_bench": 0.0,
+            "robustness_bench": 0.6,
+        })
+        strong = _make_student(bench={
+            "math_bench": 0.7, "aime_bench": 1.0,
+            "robustness_bench": 0.6,
+        })
+        broken = {"aime_bench"}
+        weak_group = _axis_math_skill_group(weak, broken)
+        strong_group = _axis_math_skill_group(strong, broken)
+        self.assertEqual(weak_group, strong_group,
+            "v30.2: when only the broken sub-axis differs, group "
+            "scores must be identical")
+
+    def test_group_axes_in_compute_composite_drop_broken(self):
+        """End-to-end: when broken_axes is passed through, the group
+        axis values reflect the broken-aware mean."""
+        from scripts.validator.composite import compute_composite
+        student = _make_student(bench={
+            "math_bench": 0.7, "aime_bench": 0.0,
+            "robustness_bench": 0.6,
+        })
+        broken = {"aime_bench"}
+        comp = compute_composite(
+            student, king_kl=0.3, king_rkl=0.1,
+            broken_axes=broken,
+        )
+        # Group axis should reflect broken-aware mean.
+        self.assertAlmostEqual(
+            comp["axes"]["math_skill_group"], 0.65, places=2,
+            msg="math_skill_group should drop aime_bench when broken",
+        )
+
+    def test_group_unchanged_when_no_broken(self):
+        """If broken_axes is None (legacy callers / no broken), group
+        axes use the full sub-axis set."""
+        from scripts.validator.composite import _axis_math_skill_group
+        student = _make_student(bench={
+            "math_bench": 0.7, "aime_bench": 0.0,
+            "robustness_bench": 0.6,
+        })
+        v = _axis_math_skill_group(student, broken_axes=None)
+        self.assertAlmostEqual(v, 0.433, places=2)
+
+
 class TestSuperTeacherAxis(unittest.TestCase):
     """v30.2 — super_teacher axis: rewards exceeding the teacher."""
 
@@ -1646,6 +1716,22 @@ class TestCompositeFinalRanking(unittest.TestCase):
             _c.JUDGE_AXIS_IN_COMPOSITE = saved_judge
             _c.REASONING_DENSITY_IN_COMPOSITE = saved_rd
             _c.CHAT_TURNS_AXIS_IN_COMPOSITE = saved_chat
+
+
+class TestTailDecoupledKLAxis(unittest.TestCase):
+    """v30.3 (2026-04-29) — tail-decoupled KL shadow axis."""
+
+    def test_axis_function_normalises_against_king(self):
+        from scripts.validator.composite import _axis_tail_decoupled_kl
+        student = {"kl_tail_mean": 0.20}
+        self.assertAlmostEqual(_axis_tail_decoupled_kl(student, 0.10), 0.5)
+        self.assertAlmostEqual(_axis_tail_decoupled_kl(student, 0.20), 1.0)
+
+    def test_axis_function_returns_none_when_missing(self):
+        from scripts.validator.composite import _axis_tail_decoupled_kl
+        self.assertIsNone(_axis_tail_decoupled_kl({}, 0.10))
+        self.assertIsNone(_axis_tail_decoupled_kl({"kl_tail_mean": None}, 0.10))
+        self.assertIsNone(_axis_tail_decoupled_kl({"kl_tail_mean": 0.10}, None))
 
 
 class TestImportanceSampledKLAxis(unittest.TestCase):
