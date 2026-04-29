@@ -5,7 +5,7 @@ import os
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from config import EPOCH_BLOCKS, MAX_BATCH_UIDS, MAX_COMPARE_UIDS, STALE_EVAL_BLOCKS, STATE_DIR
+from config import EPOCH_BLOCKS, MAX_BATCH_UIDS, MAX_COMPARE_UIDS, STATE_DIR
 from external import get_commitments as fetch_commitments_data, get_model_info as fetch_model_info_data
 from helpers.cache import _get_stale
 from helpers.h2h import compact_round, index_by_uid, load_history, rounds_for_uid, uid_stats
@@ -249,17 +249,24 @@ def get_miner(uid: int):
     elif tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
         last_block = tracker_entry["block"]
         epochs_since = (current_block - last_block) // EPOCH_BLOCKS if current_block > last_block else 0
-        if epochs_since < STALE_EVAL_BLOCKS:
-            eval_status["status"] = "tested"
-            eval_status["reason"] = f"Already tested against current king ({epochs_since} epochs ago, re-test after {STALE_EVAL_BLOCKS})"
-            eval_status["last_test_block"] = last_block
-            eval_status["epochs_since"] = epochs_since
-            eval_status["stale_after"] = STALE_EVAL_BLOCKS
-        else:
-            eval_status["status"] = "stale"
-            eval_status["reason"] = f"Due for re-test ({epochs_since} epochs since last H2H, threshold is {STALE_EVAL_BLOCKS})"
-            eval_status["last_test_block"] = last_block
-            eval_status["epochs_since"] = epochs_since
+        # Re-test policy in single-eval mode: a UID is re-evaluated when its
+        # on-chain commitment changes (push a new HF revision OR commit a new
+        # model_repo on-chain). There is NO time-based cooldown — the
+        # ``epochs_since`` counter is informational only. The previous text
+        # ("re-test after 50 epochs") was misleading; multiple miners
+        # (Discord 2026-04-28: crypsick UID 209 retested after 3 rounds, not 50)
+        # asked why models came back to the queue inside the supposed window.
+        # The honest answer: they re-committed, which always re-eligibles them.
+        eval_status["status"] = "tested"
+        eval_status["reason"] = (
+            f"Already tested against current king at block {last_block} "
+            f"({epochs_since} epoch(s) ago). Single-eval policy: a UID is "
+            f"re-tested when its on-chain commitment changes "
+            f"(push a new HuggingFace revision or commit a new model_repo) "
+            f"or when the king changes. There is no time-based re-test."
+        )
+        eval_status["last_test_block"] = last_block
+        eval_status["epochs_since"] = epochs_since
     else:
         eval_status["status"] = "untested"
         eval_status["reason"] = "Not yet tested against the current king - will be scheduled"

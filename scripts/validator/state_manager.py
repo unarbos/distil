@@ -326,6 +326,60 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         except Exception as exc:
             logger.warning(f"king_regression_streak update failed (non-fatal): {exc}")
 
+    # ── King canary streak (2026-04-28) ────────────────────────────────
+    # Held-out evalscope regression tracker. Sibling of king_regression_
+    # streak above; reads benchmark JSONs (out-of-band canary) instead
+    # of validator-internal composite. When both gates are active and
+    # either streak >= its min, the composite-floor veto is waived for
+    # this king (results.py::_king_regression_floor_waived).
+    if round_is_canonical and effective_king_uid is not None:
+        try:
+            from scripts.validator.composite import (
+                _compute_king_canary_regression,
+                KING_CANARY_GATE,
+                KING_CANARY_MIN_STREAK,
+            )
+            if KING_CANARY_GATE:
+                canary = _compute_king_canary_regression(
+                    effective_king_uid, state.state_dir,
+                )
+                if canary is not None:
+                    if not hasattr(state, "king_canary_streak") or not isinstance(getattr(state, "king_canary_streak", None), dict):
+                        state.king_canary_streak = {}
+                    king_key = str(effective_king_uid)
+                    at_risk = bool(canary.get("at_risk"))
+                    prev_streak = int(state.king_canary_streak.get(king_key, 0))
+                    state.king_canary_streak = {
+                        k: v for k, v in state.king_canary_streak.items()
+                        if k in (king_key, str(king_uid) if king_uid is not None else None)
+                    }
+                    if king_changed:
+                        prev_streak = 0  # fresh king, fresh slate
+                    new_streak = prev_streak + 1 if at_risk else 0
+                    state.king_canary_streak[king_key] = new_streak
+                    if at_risk:
+                        logger.warning(
+                            f"🚨 King UID {effective_king_uid} CANARY at risk: "
+                            f"held-out mean={canary.get('king_canary_mean')} "
+                            f"vs base={canary.get('base_canary_mean')} "
+                            f"(gap={canary.get('gap_pp')} > margin={canary.get('margin')}) — "
+                            f"axes={canary.get('axes_compared')} "
+                            f"streak={new_streak}/{KING_CANARY_MIN_STREAK}"
+                        )
+                    else:
+                        logger.info(
+                            f"King UID {effective_king_uid} canary healthy: "
+                            f"held-out mean={canary.get('king_canary_mean')} "
+                            f"vs base={canary.get('base_canary_mean')} — streak reset."
+                        )
+                    atomic_json_write(
+                        state._path("king_canary_streak.json"),
+                        state.king_canary_streak,
+                        indent=2,
+                    )
+        except Exception as exc:
+            logger.warning(f"king_canary_streak update failed (non-fatal): {exc}")
+
 
 _COPY_LIKE_DQ_PATTERNS = (
     "activation-space duplicate",

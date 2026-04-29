@@ -151,17 +151,6 @@ function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>("system");
   const [mounted, setMounted] = useState(false);
 
-  useEffect(() => {
-    setMounted(true);
-    let saved: Theme = "system";
-    try {
-      const v = window.localStorage.getItem("distil:theme") as Theme | null;
-      if (v === "light" || v === "dark" || v === "system") saved = v;
-    } catch {}
-    setTheme(saved);
-    apply(saved);
-  }, []);
-
   function apply(next: Theme) {
     if (typeof document === "undefined") return;
     const el = document.documentElement;
@@ -172,6 +161,29 @@ function ThemeToggle() {
     }
   }
 
+  useEffect(() => {
+    setMounted(true);
+    let saved: Theme = "system";
+    try {
+      const v = window.localStorage.getItem("distil:theme") as Theme | null;
+      if (v === "light" || v === "dark" || v === "system") saved = v;
+    } catch {}
+    setTheme(saved);
+    apply(saved);
+    // Listen for the footer toggle (or any other toggle) so the two
+    // stay in sync in the same tab. See 2026-04-28 fix in
+    // components/auto-refresh.tsx for the event contract.
+    const onChange = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ theme?: Theme }>).detail;
+      if (detail?.theme === "light" || detail?.theme === "dark" || detail?.theme === "system") {
+        setTheme(detail.theme);
+        apply(detail.theme);
+      }
+    };
+    window.addEventListener("distil:theme-changed", onChange);
+    return () => window.removeEventListener("distil:theme-changed", onChange);
+  }, []);
+
   function cycle() {
     const order: Theme[] = ["system", "dark", "light"];
     const next = order[(order.indexOf(theme) + 1) % order.length];
@@ -179,6 +191,11 @@ function ThemeToggle() {
     apply(next);
     try {
       window.localStorage.setItem("distil:theme", next);
+    } catch {}
+    try {
+      window.dispatchEvent(
+        new CustomEvent("distil:theme-changed", { detail: { theme: next } }),
+      );
     } catch {}
   }
 

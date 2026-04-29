@@ -9,7 +9,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import ANNOUNCEMENT_CLAIMS_KEEP, EPOCH_BLOCKS, STALE_EVAL_BLOCKS, STATE_DIR
+from config import ANNOUNCEMENT_CLAIMS_KEEP, EPOCH_BLOCKS, STATE_DIR
 from helpers.cache import _get_stale
 from helpers.sanitize import _sanitize_floats, _safe_json_load
 from state_store import (
@@ -580,10 +580,13 @@ def get_eval_status():
         if tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
             last_block = tracker_entry["block"]
             epochs_since = (current_block - last_block) // EPOCH_BLOCKS if current_block > last_block else 0
-            if epochs_since < STALE_EVAL_BLOCKS:
-                result[uid_str] = {"status": "tested", "epochs_ago": epochs_since}
-            else:
-                result[uid_str] = {"status": "stale", "epochs_ago": epochs_since}
+            # 2026-04-28 (Discord): single-eval mode has no time-based "stale"
+            # re-test — UIDs are re-evaluated only on commitment change. The
+            # previous "stale after 50 epochs" status was misleading; the
+            # ``epochs_ago`` field stays for clients that filter on it, but
+            # the discrete status is just ``tested`` until a new commit moves
+            # the UID back into the queue.
+            result[uid_str] = {"status": "tested", "epochs_ago": epochs_since}
         else:
             result[uid_str] = {"status": "untested"}
     return JSONResponse(

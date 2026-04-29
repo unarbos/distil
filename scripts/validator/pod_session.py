@@ -173,32 +173,63 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 # the same H200; eval-teacher is on port 9100 and uses
                 # served-model-name "teacher", so the deny-list is precise.
                 "preserve=''; "
-                # Only one chat-king vLLM should be alive at any time. The
-                # process that's actually bound to port 8100 is the live
-                # server; any other process matching 'served-model-name
-                # sn97-king' is a leaked duplicate (we observed 2 leaked
-                # workers holding 22.8 GB each on 2026-04-27, causing
-                # vLLM teacher startup to fall back to HF for ~80 minutes
-                # of sequential generation). Find the live PID via
-                # `ss -tlnp` and ONLY preserve its tree.
-                # ss output sample: 'users:((\"python3\",pid=107196,fd=...\")'
-                "live_chat_pid=$(ss -tlnp 'sport = :8100' 2>/dev/null "
-                "  | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2); "
-                "if [ -n \"$live_chat_pid\" ]; then "
-                "  preserve=\"$live_chat_pid\"; "
-                "  for desc in $(pgrep -P $live_chat_pid 2>/dev/null); do "
-                "    preserve=\"$preserve $desc\"; "
-                "    for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                # Only one chat-king vLLM should be alive at any time. We
+                # kept seeing 2-3 EngineCore processes simultaneously
+                # because the previous detection used `ss -tlnp`, which
+                # isn't installed on the eval pod (iproute2 missing) and
+                # silently returned empty — fallback then preserved ALL
+                # matching processes, leaving zombies untouched.
+                #
+                # New strategy (2026-04-28): pick the youngest
+                # `vllm.entrypoints` chat-king API server (newest start
+                # time per /proc/PID/stat field 22 or `ps -o etimes`)
+                # and preserve only that process tree. Older duplicates
+                # are leaks from prior chat-server restarts that
+                # weren't reaped — they bind to port 8100 via
+                # SO_REUSEPORT and squat on ~22 GB of VRAM each.
+                #
+                # Test history: 3 zombies observed on 2026-04-28
+                # (PIDs 681678 [8h], 758224 [4h41m], 842769 [38min] —
+                # all chat-king API servers, all alive, all
+                # SO_REUSEPORT-bound to 8100). Fix kills the two
+                # oldest, keeps the youngest (which is what
+                # chat-tunnel.path most recently rebound to).
+                #
+                # Falls back to the broad include-all behaviour only if
+                # NO chat-king is found at all (chat is genuinely
+                # dark) so we don't kill a starting/restarting one.
+                # Use `ps auxww` (not pgrep) so the pgrep command itself
+                # doesn't appear in the match. pgrep -f matches its own
+                # cmdline because the regex appears in argv. ps + grep -v
+                # grep is the bullet-proof Unix idiom.
+                "all_chat_pids=$(ps auxww 2>/dev/null | grep 'served-model-name sn97-king' | grep -v grep | awk '{print $2}' | sort -u); "
+                "if [ -n \"$all_chat_pids\" ]; then "
+                # Find the youngest by smallest etimes (elapsed seconds).
+                "  youngest=''; youngest_etimes=999999999; "
+                "  for pid in $all_chat_pids; do "
+                "    et=$(ps -p $pid -o etimes= 2>/dev/null | tr -d ' '); "
+                "    if [ -n \"$et\" ] && [ \"$et\" -lt \"$youngest_etimes\" ]; then "
+                "      youngest_etimes=$et; youngest=$pid; "
+                "    fi; "
                 "  done; "
-                "  # also keep the chat_server.py supervisor if any\n"
+                "  if [ -n \"$youngest\" ]; then "
+                "    preserve=\"$youngest\"; "
+                "    for desc in $(pgrep -P $youngest 2>/dev/null); do "
+                "      preserve=\"$preserve $desc\"; "
+                "      for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                "    done; "
+                "    echo \"[cleanup] preserving youngest chat-king PID=$youngest (etimes=$youngest_etimes); will kill any older sn97-king vllms\" >&2; "
+                "  fi; "
+                # also keep the chat_server.py supervisor if any (it's
+                # a thin wrapper that spawns the vLLM)
                 "  for pid in $(pgrep -f 'chat_server.py' 2>/dev/null); do "
                 "    preserve=\"$preserve $pid\"; "
                 "    for desc in $(pgrep -P $pid 2>/dev/null); do preserve=\"$preserve $desc\"; done; "
                 "  done; "
                 "fi; "
-                # If no live chat server (chat is dark), fall back to the
-                # broad include-all behaviour so we don't accidentally
-                # nuke a starting/restarting chat process.
+                # If no chat-king found (chat is genuinely dark), fall
+                # back to broad include-all so we don't kill a
+                # starting/restarting one mid-bootstrap.
                 "if [ -z \"$preserve\" ]; then "
                 "  for pid in $(pgrep -f 'chat_server.py' 2>/dev/null) "
                 "               $(pgrep -f 'served-model-name sn97-king' 2>/dev/null) "

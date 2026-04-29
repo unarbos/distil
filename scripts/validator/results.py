@@ -1,8 +1,10 @@
 import json
 import logging
 import math
+import os
 import time
 from pathlib import Path
+from typing import Any
 
 from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
@@ -141,6 +143,110 @@ def _pairwise_two_sided_p(a_per_prompt: list[float], b_per_prompt: list[float]) 
     mean_delta = sum(deltas) / n
     _t, _p_one, p_two = _paired_t_stats(deltas)
     return mean_delta, p_two, n
+
+
+def _baseline_floor_dethrone_veto(
+    challenger_model: str | None,
+    reference_model: str | None,
+    students_data: dict,
+) -> dict | None:
+    """Veto a dethrone if the challenger regresses below the Qwen 4B base.
+
+    Goodhart guard (2026-04-28): the held-out evalscope canary showed
+    kings regressing -7.4pp on gsm8k and -10.2pp on BBH versus the
+    Qwen3.5-4B base (state/benchmarks/baseline_qwen35_4b.json gsm8k
+    0.934 vs king 0.86; bbh 0.879 vs king 0.777). The composite gate
+    can't catch this because the validator's procedural items don't
+    reach that absolute level — a challenger gaming math_bench at 0.92
+    can still be -0.10 below where the *base* model would score on the
+    same items, which is direct evidence the model has *regressed* on
+    real capability rather than gained it.
+
+    This gate is paired-evaluation: when the reference (Qwen3.5-4B
+    base, REFERENCE_UID = -1) is included in the same round
+    (INCLUDE_REFERENCE_IN_ROUND=1), challenger and reference see the
+    *same* block-seeded items, so the comparison is sample-paired and
+    free of cross-round prompt drift. If the reference isn't in the
+    round (legacy behavior), this veto silently fails open.
+
+    Threshold: a challenger that scores below the reference by more
+    than ``BASELINE_FLOOR_MARGIN`` on any of the gsm8k-/humaneval-/bbh-
+    transfer axes (math_bench, code_bench, reasoning_bench,
+    ifeval_bench, aime_bench, mbpp_bench) is blocked from dethrone.
+    Default 0.10 = 10pp absolute margin: a small regression is allowed
+    to avoid sample-noise false positives, but a -10pp absolute drop
+    on a held-out-transfer axis vs the SAME 4B base reads as the
+    model is genuinely worse than the un-distilled control.
+
+    Returns None when:
+      * reference not in the round
+      * fewer than ``BASELINE_FLOOR_MIN_AXES_COMPARABLE`` axes are
+        comparable (insufficient sample, fail open)
+      * no axis regresses by more than the margin (challenger is at
+        least non-regressive)
+    Returns ``{"reason": str, "axis": str, "challenger": float,
+    "reference": float, "margin": float}`` to block dethrone.
+
+    Implementation note: this is in addition to the existing
+    composite-floor / Pareto vetoes. A challenger must pass ALL gates
+    to take the crown.
+    """
+    if not challenger_model or not reference_model:
+        return None
+    c_data = students_data.get(challenger_model) or {}
+    r_data = students_data.get(reference_model) or {}
+    if not c_data or not r_data:
+        return None
+    margin = float(os.environ.get("BASELINE_FLOOR_MARGIN", "0.10"))
+    min_comparable = int(os.environ.get("BASELINE_FLOOR_MIN_AXES_COMPARABLE", "2"))
+    if margin <= 0:
+        return None
+    transfer_axes = (
+        "math_bench", "code_bench", "reasoning_bench",
+        "ifeval_bench", "aime_bench", "mbpp_bench",
+    )
+    comparable: list[tuple[str, float, float]] = []
+    for axis in transfer_axes:
+        c_payload = c_data.get(axis) or {}
+        r_payload = r_data.get(axis) or {}
+        if not c_payload or not r_payload:
+            continue
+        c_pf = c_payload.get("pass_frac")
+        r_pf = r_payload.get("pass_frac")
+        if c_pf is None or r_pf is None:
+            continue
+        try:
+            c_val = float(c_pf)
+            r_val = float(r_pf)
+        except (TypeError, ValueError):
+            continue
+        comparable.append((axis, c_val, r_val))
+    if len(comparable) < min_comparable:
+        return None
+    # Block dethrone if ANY transfer axis regresses below baseline by margin.
+    worst_axis = None
+    worst_gap = 0.0  # most-negative gap seen
+    for axis, c_val, r_val in comparable:
+        gap = c_val - r_val  # negative ⇒ challenger below reference
+        if gap < worst_gap:
+            worst_gap = gap
+            worst_axis = (axis, c_val, r_val)
+    if worst_axis is None or worst_gap > -margin:
+        return None
+    axis, c_val, r_val = worst_axis
+    return {
+        "reason": (
+            f"baseline-floor regression: {axis} challenger={c_val:.3f} "
+            f"vs Qwen-4B-base={r_val:.3f} (gap={worst_gap:+.3f}, "
+            f"margin -{margin:.2f}). Model is worse than the un-distilled "
+            f"reference on a held-out-transfer axis."
+        ),
+        "axis": axis,
+        "challenger": c_val,
+        "reference": r_val,
+        "gap": worst_gap,
+        "margin": margin,
+    }
 
 
 def _composite_dethrone_veto(
@@ -293,12 +399,24 @@ def _pareto_dethrone_veto(
 def _king_regression_floor_waived(state, king_uid) -> bool:
     """Return True when a persistently at-risk king loses floor protection.
 
-    The composite floor is challenger-side: it stops a narrow KL specialist
-    from taking the crown. Once the king itself has been at-risk for
-    ``KING_REGRESSION_MIN_STREAK`` canonical rounds, keeping that same floor
-    asymmetrically protects a weak king. In that case we still require the
-    challenger to pass KL significance and Pareto, but we waive only the
-    composite-floor veto.
+    Two independent at-risk signals trigger a waiver:
+
+      (1) Internal composite at-risk: the king's ``composite.worst`` has
+          been below ``KING_COMPOSITE_FLOOR`` (or below the base model)
+          for ``KING_REGRESSION_MIN_STREAK`` consecutive canonical
+          rounds. Tracked via ``state.king_regression_streak``.
+
+      (2) Held-out canary at-risk (2026-04-28): the king's mean
+          held-out evalscope score across ``KING_CANARY_AXES`` has
+          been > ``KING_CANARY_MARGIN`` pp below the Qwen 4B base for
+          ``KING_CANARY_MIN_STREAK`` consecutive canonical rounds.
+          Tracked via ``state.king_canary_streak``.
+
+    The composite floor is challenger-side: it stops a narrow KL
+    specialist from taking the crown. Once EITHER at-risk signal fires,
+    keeping that same floor asymmetrically protects a weak king. We
+    still require the challenger to pass KL significance and Pareto,
+    but we waive only the composite-floor veto.
     """
     if king_uid is None:
         return False
@@ -306,11 +424,18 @@ def _king_regression_floor_waived(state, king_uid) -> bool:
         from scripts.validator.composite import (
             KING_REGRESSION_GATE as _KRG,
             KING_REGRESSION_MIN_STREAK as _KRMS,
+            KING_CANARY_GATE as _KCG,
+            KING_CANARY_MIN_STREAK as _KCMS,
         )
-        if not _KRG:
-            return False
-        streak = int((getattr(state, "king_regression_streak", {}) or {}).get(str(king_uid), 0))
-        return streak >= int(_KRMS)
+        if _KRG:
+            streak = int((getattr(state, "king_regression_streak", {}) or {}).get(str(king_uid), 0))
+            if streak >= int(_KRMS):
+                return True
+        if _KCG:
+            canary_streak = int((getattr(state, "king_canary_streak", {}) or {}).get(str(king_uid), 0))
+            if canary_streak >= int(_KCMS):
+                return True
+        return False
     except Exception:
         return False
 
@@ -532,12 +657,26 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 for u, info in models_to_eval.items()
                 if info.get("commit_block") is not None
             }
+            uid_to_round_model = {
+                u: info.get("model") for u, info in models_to_eval.items()
+                if info.get("model")
+            }
+            uid_to_round_revision = {
+                u: info.get("revision", "main") for u, info in models_to_eval.items()
+                if info.get("model")
+            }
             this_commit_block = models_to_eval.get(uid, {}).get("commit_block")
+            this_revision = models_to_eval.get(uid, {}).get("revision", "main")
             is_copy, copy_uid, copy_model, orig_uid, orig_model, sim = check_activation_fingerprint(
                 model_name, uid, fingerprint, state.state_dir,
                 commit_block=this_commit_block,
                 uid_to_commit_block=uid_to_commit_block,
                 uid_to_coldkey=uid_to_coldkey,
+                evaluated_uids=state.evaluated_uids,
+                composite_scores=state.composite_scores,
+                revision=this_revision,
+                uid_to_model=uid_to_round_model,
+                uid_to_revision=uid_to_round_revision,
             )
             if is_copy:
                 if copy_uid == uid:
@@ -715,6 +854,16 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         king_rkl_ref_early = _resolve_king_rkl(king_h2h_kl, students_data_early, _early_h2h_stub)
     except Exception:
         king_rkl_ref_early = None
+    # Reference (Qwen 4B base) model name for the baseline-floor veto.
+    # When INCLUDE_REFERENCE_IN_ROUND=1 the reference is in models_to_eval
+    # at REFERENCE_UID, so we resolve its model name once here. If the
+    # reference isn't seated this round, _ref_model_name stays None and
+    # the baseline-floor veto silently fails open.
+    try:
+        from eval.runtime import REFERENCE_UID as _REF_UID
+        _ref_model_name = uid_to_model.get(_REF_UID)
+    except Exception:
+        _ref_model_name = None
 
     round_info = getattr(state, "current_round", {}) or {}
     prompt_texts_for_dp = round_info.get("prompts") or []
@@ -779,6 +928,28 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                                 f"UID {uid}: composite floor would block ({comp_veto['reason']}), "
                                 "but king regression gate waived the floor"
                             )
+                        # Baseline-floor gate (2026-04-28): block dethrone
+                        # when challenger regresses below the Qwen 4B base
+                        # on a held-out-transfer axis. Requires reference
+                        # to be in the round (INCLUDE_REFERENCE_IN_ROUND=1).
+                        baseline_veto = _baseline_floor_dethrone_veto(
+                            challenger_model, _ref_model_name, students_data_early,
+                        )
+                        if baseline_veto is not None:
+                            logger.info(
+                                f"UID {uid}: BLOCKED DETHRONE by baseline floor — "
+                                f"{baseline_veto['reason']} (KL passed: p={p_value:.4f}, "
+                                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
+                            )
+                            log_event(
+                                f"Baseline floor blocked dethrone: UID {uid} "
+                                f"axis {baseline_veto['axis']} "
+                                f"challenger={baseline_veto['challenger']:.3f} "
+                                f"vs reference={baseline_veto['reference']:.3f} "
+                                f"(gap={baseline_veto['gap']:+.3f})",
+                                level="warning", state_dir=str(state.state_dir),
+                            )
+                            continue
                         # Pareto-dominance gate (SHADOW until +48h notice).
                         pareto_veto = _pareto_dethrone_veto(
                             challenger_model, king_model_name,
@@ -839,6 +1010,24 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                             f"UID {uid}: composite floor would block ({comp_veto['reason']}) "
                             "[legacy path], but king regression gate waived the floor"
                         )
+                    # Baseline-floor gate (legacy path)
+                    baseline_veto = _baseline_floor_dethrone_veto(
+                        challenger_model, _ref_model_name, students_data_early,
+                    )
+                    if baseline_veto is not None:
+                        logger.info(
+                            f"UID {uid}: BLOCKED DETHRONE by baseline floor — "
+                            f"{baseline_veto['reason']} [legacy epsilon path, KL={challenger_kl:.6f}]"
+                        )
+                        log_event(
+                            f"Baseline floor blocked dethrone: UID {uid} "
+                            f"axis {baseline_veto['axis']} "
+                            f"challenger={baseline_veto['challenger']:.3f} "
+                            f"vs reference={baseline_veto['reference']:.3f} "
+                            f"(gap={baseline_veto['gap']:+.3f}) [legacy path]",
+                            level="warning", state_dir=str(state.state_dir),
+                        )
+                        continue
                     pareto_veto = _pareto_dethrone_veto(
                         challenger_model, king_model_name,
                         students_data_early, king_h2h_kl, king_rkl_ref_early,
@@ -986,11 +1175,38 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     except Exception:
         king_rkl_ref = None
 
+    # 2026-04-28 (v29.1): resolve same-round reference axis values once
+    # so the dethroner ranking applies the same per-axis baseline-relative
+    # penalty that ``annotate_h2h_with_composite`` will use later. Without
+    # this the early ranking key (composite.worst) and the later
+    # display-time composite would disagree for kings/challengers that
+    # regress below Qwen-4B-base on a bench axis. Fail open to None when
+    # the reference is missing or compute_axes throws — penalty silently
+    # disables that round and ranking degrades to the pre-v29.1 behavior.
+    _ref_axes_for_ranking: dict | None = None
+    _ref_uid_for_ranking: Any = None
+    try:
+        from eval.runtime import REFERENCE_MODEL as _REF_MODEL_RANK, REFERENCE_UID as _REF_UID_RANK
+        from scripts.validator.composite import compute_axes as _compute_axes_rank
+        _ref_uid_for_ranking = _REF_UID_RANK
+        _ref_row = students_data.get(_REF_MODEL_RANK) if _REF_MODEL_RANK else None
+        if _ref_row is not None:
+            _ref_axes_for_ranking = _compute_axes_rank(
+                _ref_row, king_h2h_kl, king_rkl_ref,
+            )
+    except Exception:
+        _ref_axes_for_ranking = None
+
     def _composite_for(uid):
         model = uid_to_model.get(uid)
         data = students_data.get(model) or {}
+        # Reference itself is the anchor: don't dock it against itself.
+        ref_axes = None if uid == _ref_uid_for_ranking else _ref_axes_for_ranking
         try:
-            return compute_composite(data, king_h2h_kl, king_rkl_ref)
+            return compute_composite(
+                data, king_h2h_kl, king_rkl_ref,
+                reference_axes=ref_axes,
+            )
         except Exception:
             return {"worst": None, "weighted": None, "axes": {}, "present_count": 0}
 

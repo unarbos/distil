@@ -84,10 +84,16 @@ MIN_COMPLETION_TOKENS = 10  # Skip prompts producing fewer continuation tokens
 KL_CHUNK_SIZE = 128
 
 # -- Activation fingerprinting (functional copy detection) --
+# 2026-04-29: vocab size is teacher-tokenizer-specific (Qwen=248320,
+# Kimi/GLM/etc would differ on swap). Read from env so the planned
+# teacher swap doesn't require a code change here. Default still
+# matches Qwen3.5 for backward compatibility.
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
-ACTIVATION_FP_VOCAB_SIZE = 248320  # Qwen tokenizer vocab
+ACTIVATION_FP_VOCAB_SIZE = int(
+    os.environ.get("ACTIVATION_FP_VOCAB_SIZE", "248320")
+)  # default matches Qwen3.5; override on teacher swap
 
 # -- vLLM server --
 VLLM_PORT = 9100
@@ -183,7 +189,19 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     When revision is set, pins to that exact HF commit hash.
     """
     from transformers import AutoModelForCausalLM
-    is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
+    # 2026-04-29: teacher-detection heuristic generalised so the planned
+    # swap to Kimi/GLM/Qwen3.6 doesn't require a code change here. We
+    # match the configured TEACHER_MODEL name (read from subnet-config)
+    # rather than hardcoding "Qwen3.5". Falls back to the legacy
+    # Qwen-substring check if the import fails (e.g. running the script
+    # outside the validator venv).
+    try:
+        from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
+        is_teacher = (name == _TEACHER_NAME) or (
+            "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
+        )
+    except Exception:
+        is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
     kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
     if revision and revision != "main":
         kwargs["revision"] = revision
@@ -818,18 +836,24 @@ def _pick_on_policy_rkl_prompts(block_seed):
     requests survive byte-identical — only conversational PROSE
     rotates.
     """
+    # 2026-04-29 (v29.6): replace pool sampling + paraphrase with fully
+    # procedural synthesis. Each call yields a fresh batch of chat-style
+    # prompts via ``_synthetic_chat_prompt``; combinatorial space ⇒
+    # uncacheable. Falls back to legacy pool only when block_seed is
+    # None (local dev / replay) so the dev path stays deterministic
+    # against the file-baked content.
     import random
     if block_seed is None:
+        # Local dev path: keep deterministic legacy behaviour to support
+        # replay. Production always supplies a real block_seed.
         return list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
     try:
-        rng = random.Random(int(block_seed))
+        rng = random.Random(int(block_seed) ^ ON_POLICY_RKL_SEED)
     except (TypeError, ValueError):
         return list(ON_POLICY_RKL_POOL[:ON_POLICY_RKL_PER_ROUND])
-    pool = list(ON_POLICY_RKL_POOL)
-    rng.shuffle(pool)
-    k = min(ON_POLICY_RKL_PER_ROUND, len(pool))
-    picked = pool[:k]
-    return [_paraphrase_chat_prompt(p, block_seed) for p in picked]
+    return [
+        _synthetic_chat_prompt(rng) for _ in range(ON_POLICY_RKL_PER_ROUND)
+    ]
 
 
 # Backward-compatibility alias so the rest of the file (and any caller
@@ -971,6 +995,141 @@ JUDGE_PROBE_POOL = (
     "Why do we typically indent code? One sentence.",
     "What is the benefit of writing a docstring on a function? One sentence.",
     "Explain in one sentence why running database migrations in transactions is usually a good idea.",
+    # === v29 expansion 2026-04-28 — open follow-up #1 from
+    # paper/goodhart_audit_2026-04-27.md. The pool was 82 prompts;
+    # `JUDGE_PROBE_PER_ROUND` is 16 and the per-round paraphrase
+    # forces fresh wording each time, but a 82-prompt surface is small
+    # enough that distributional rubric-passing was within reach. The
+    # 120 additions below triple the surface to ~200, with even
+    # coverage across the existing categories so per-round sampling
+    # stays balanced. Keep prompts <=2 sentences and answers
+    # rubric-friendly so the grading pipeline doesn't need changes.
+    # --- Chat / factual-helpful ---
+    "Briefly: why do skyscrapers sway slightly in the wind?",
+    "In two sentences, explain what a hash function is to a curious 14-year-old.",
+    "What are two reasons software projects miss deadlines? Two short bullet points.",
+    "Why does a vinyl record sound different from a digital file? One short paragraph.",
+    "Explain in 2-3 sentences how a bicycle stays upright while moving.",
+    "What is the role of a load balancer? Single short paragraph.",
+    "Briefly: why does cooking food make it easier to digest?",
+    "Explain in one sentence what 'eventual consistency' means in distributed systems.",
+    "What's the difference between RAM and disk storage? One short paragraph.",
+    "In 2 sentences, explain what a CDN does and why it speeds up websites.",
+    "Why is hand-washing effective at preventing illness? One short paragraph.",
+    "Briefly explain what a P-value means in statistics, in plain language.",
+    "In one short paragraph: why do phone batteries degrade over time?",
+    "Two reasons unit tests are not the same as integration tests, one sentence each.",
+    "What does it mean for an algorithm to be O(log n)? One short sentence.",
+    "Briefly: why is north-south travel faster than east-west on Earth's surface?",
+    "Explain what 'idempotent' means in API design, in one sentence.",
+    "Two reasons why too much sleep can leave you feeling tired. One sentence each.",
+    "What is a vaccine adjuvant? One sentence.",
+    "Briefly: why do some bridges hum or sing in the wind?",
+    # --- Reasoning ---
+    "A pizza is cut into 8 equal slices. If 3 slices have only cheese, 2 have only pepperoni, and 3 have both, how many slices have pepperoni? Show one step.",
+    "A clock loses 4 minutes per day. If it shows the correct time at noon today, what time will it show 6 days later at noon? Show your work.",
+    "Three friends split a $144 bill, but Alice paid 50% more than each of the other two. How much did Alice pay? Show the calculation.",
+    "I have 24 socks: 8 black, 10 white, and 6 grey, all in a drawer. What is the minimum number I must pull out in the dark to guarantee a matching pair? Justify briefly.",
+    "If today is Wednesday, what day will it be in 100 days? Show your work.",
+    "A pool fills in 6 hours via tap A, or 9 hours via tap B. With both running, how long does it take to fill? Show the calculation.",
+    "A square garden has a perimeter of 36 m. What is its area? Show one step.",
+    "A bag has 4 red and 6 blue balls. Two are drawn without replacement. What is the probability the second is red given the first was blue? Show one step.",
+    "If 5 machines make 5 widgets in 5 minutes, how long do 100 machines take to make 100 widgets? One-line justification.",
+    "A pyramid scheme starts with 1 person, who recruits 3, who each recruit 3, etc. How many people are in the scheme after 4 levels of recruitment? Show your work.",
+    "If A is twice as old as B, and 5 years ago A was 3 times as old as B, how old is A now? Show your work.",
+    "A car drives 60 km north, then 80 km east. How far is it from its starting point in a straight line? Show one step.",
+    "A 200-page book is open. The sum of the two visible page numbers is 145. What are the page numbers? Justify briefly.",
+    "A line passes through (1, 2) and (4, 11). What is its slope? One-line answer.",
+    "If you flip a fair coin 4 times, what is the probability of getting at least one heads? Show one step.",
+    "An auditorium has 8 rows, each with 12 seats. If 23 seats are broken, how many seats are usable? One-line answer.",
+    "A jar contains coins totaling $4.30, made up of 5 dimes and the rest nickels and quarters. If there are 18 coins total, how many are quarters? Show your work.",
+    "Two trains 200 km apart approach each other at 60 km/h and 90 km/h respectively. After how many minutes do they meet? Show your work.",
+    "A photo of a man's reflection in a mirror is described as 'his right hand holding a pen'. Which hand is actually holding the pen in real life? One-line justification.",
+    "A 10x10 grid contains 100 squares of size 1x1, plus larger ones. How many 2x2 squares are in the 10x10 grid? Show one step.",
+    # --- Instruction-following ---
+    "Reply with exactly four words separated by spaces, all starting with the letter 'B'.",
+    "Provide a Python dict literal mapping the strings 'one' through 'three' to the integers 1, 2, 3. Just the dict, no comment.",
+    "Output the words 'red', 'green', 'blue' separated by hyphens, all uppercase, no other characters.",
+    "Compose a single sentence that contains the word 'ephemeral' and ends with a period.",
+    "Reply with five short bullet points, each line beginning with a single dash and a space.",
+    "Output exactly two lines: the first containing 'A', the second containing 'B'. No other characters.",
+    "Write a haiku (5-7-5 syllables) about a coffee mug. Output only the three lines.",
+    "Respond with a JSON array of three integers: [first prime above 10, first composite above 10, first square above 10]. Just the array.",
+    "Write three rhyming couplets about a cat. Output the six lines and nothing else.",
+    "Output the alphabet from 'a' to 'g' with each letter on its own line, lowercase.",
+    "Write a sentence that is exactly 12 words long and ends with a question mark.",
+    "Reply in YAML with two keys: 'season' set to 'spring', and 'colors' set to a list of three flower colors. Just the YAML.",
+    "Provide a Markdown table with two columns ('language', 'year') and two rows for Python and JavaScript. Just the table.",
+    "Output the string 'hello' translated into Spanish, French, and Italian, separated by '|'. Just the line.",
+    "Write a one-line shell command that prints today's date in YYYY-MM-DD format. Just the command.",
+    "Output a single sentence that uses the words 'spring', 'pivot', and 'wheel'. No other constraints.",
+    "Reply with a numbered list of three sentences. Each sentence must contain the word 'morning'.",
+    "Provide three CSS color names that begin with 'sea', separated by commas. Just the line.",
+    "Write a sentence containing exactly two semicolons. Just the sentence.",
+    "Output the squared values 1^2 through 5^2 as integers separated by spaces. Just the values.",
+    # --- Coding / code output ---
+    "Write a Python function `count_vowels(s: str) -> int` that returns the number of vowels in `s`. Just the function.",
+    "Write a SQL query that returns customer names with more than 5 orders from `orders(customer_id, order_id)` and `customers(id, name)`. Just the query.",
+    "Write a Python one-liner using `enumerate` that prints index and value for the list `['a','b','c']`. Just the one-liner.",
+    "Write a regex that matches a valid IPv4 address. Just the regex.",
+    "Provide a Python dict comprehension that maps `i: i*i` for `i` in 1..5. Just the comprehension.",
+    "Write a Python function `merge_dicts(a, b)` that returns a new dict with keys from both. Just the function.",
+    "Write a Bash one-liner that finds and prints the largest file (size and path) in the current directory. Just the command.",
+    "Translate this JavaScript expression into Python: `arr.filter(x => x > 0).map(x => x * 2)`. Just the Python.",
+    "Write a Python function `is_prime(n: int) -> bool` that returns whether n is prime, for n>=2. Just the function.",
+    "Write a SQL query that calculates the average `salary` per `department` from a table `employees(salary, department)`. Just the query.",
+    "Provide a Python `dataclass` with two fields: `name: str` and `age: int`. Just the dataclass.",
+    "Write a one-line shell command that counts the number of unique IPs in a file `access.log`. Just the command.",
+    "Write a Python function `flatten(nested)` that returns a flat list from a list of lists, using only one comprehension. Just the function.",
+    "Provide a regex that matches Markdown link syntax `[text](url)`. Just the regex.",
+    "Write a Python `with` block that opens 'data.txt' for reading, reads all lines, and prints the count. Just the block.",
+    "Write a SQL query that finds duplicate `email` values in a table `users(id, email)`. Just the query.",
+    "Provide a Python function that returns the second-largest element of a list, or None if there isn't one. Just the function.",
+    "Write a SQL `LEFT JOIN` between `posts(id, author_id)` and `users(id, name)` returning post id and author name. Just the query.",
+    "Write a TypeScript type alias `Pair<T>` that represents a tuple of two T values. Just the type alias.",
+    "Provide a Python class `Stack` with `push`, `pop`, and `peek` methods. Just the class definition.",
+    # --- Creative / writing ---
+    "Write a single sentence describing the smell of rain on hot asphalt without using the word 'rain'.",
+    "In one sentence, describe the moment you successfully fix a long-standing bug.",
+    "Provide an opening sentence for a short story that takes place inside an abandoned subway station.",
+    "Write a two-line slogan for a fictional time-management app called 'Hourly'.",
+    "Compose a one-sentence epigraph for a book about long-distance friendship.",
+    "Write a single tweet (<= 280 chars) describing the experience of seeing the ocean for the first time.",
+    "Provide one creative metaphor comparing debugging to a real-world activity.",
+    "Write a one-sentence newspaper headline announcing a fictional cure for the common cold.",
+    "Describe the sound of an old typewriter in one sentence, without using the word 'click' or 'clack'.",
+    "Compose two lines of dialogue between a barista and a hesitant first-time customer.",
+    "Write a 3-line concrete poem in the shape of a triangle (decreasing word counts: 4, 2, 1).",
+    "Provide a one-sentence definition of 'home' that does not mention buildings or rooms.",
+    "Write a single tweet (<= 280 chars) thanking a reviewer who left thoughtful feedback on a PR.",
+    "Compose a one-line tagline for a podcast about overlooked open-source maintainers.",
+    "Write a single sentence describing the silence of a library before opening hour.",
+    "Provide a one-sentence pitch for a children's book about a friendly server room.",
+    "Write a one-line proverb about the value of incremental progress.",
+    "Compose a one-sentence elevator pitch for a service that turns shell sessions into shareable, reproducible scripts.",
+    "Write a single rhyming couplet about a paper coffee cup.",
+    "Provide a 2-line review of imaginary 'productivity socks'.",
+    # --- Misc — world model / common sense / ambiguity ---
+    "If a friend asks you to keep a secret that turns out to involve their own safety, what should you do? One short paragraph.",
+    "Explain in one sentence why you should not lift heavy objects with a rounded back.",
+    "Briefly: why does a banana brown more quickly after it's been peeled?",
+    "Explain in one sentence why staring directly at the sun is dangerous, even briefly.",
+    "What's the difference between empathy and sympathy? Two short sentences.",
+    "Why do most people find a public-speaking situation more stressful than the actual talk itself? One paragraph.",
+    "If a colleague keeps interrupting you in meetings, what's a respectful way to address it? One short paragraph.",
+    "Briefly: why does soap remove grease from a dish?",
+    "What's a common reason people miss obvious mistakes when proofreading their own writing? One sentence.",
+    "Why does a small leak in a tire eventually flatten it even if it seals quickly? One short sentence.",
+    "Explain why honest negative feedback is harder to give than positive feedback. One short paragraph.",
+    "What does 'fail-fast' mean in software design? One sentence.",
+    "Briefly: why might a self-driving car struggle in heavy snow?",
+    "What is one practical way to recover focus after an interruption while coding? One sentence.",
+    "Why do many people sleep poorly the night before a big event, even when relaxed? One short paragraph.",
+    "Explain in one sentence why a strict dependency upper bound can be just as risky as no upper bound at all.",
+    "What does 'principle of least surprise' mean in API design? One sentence.",
+    "Briefly: why do flames mostly point upward, even on Earth's surface?",
+    "What's a respectful way to disagree with a senior colleague's design choice? One short paragraph.",
+    "Why is over-fitting in machine learning analogous to a student memorizing past exams? One short sentence.",
 )
 JUDGE_PROBE_PER_ROUND = int(os.environ.get("JUDGE_PROBE_PER_ROUND", "16"))
 JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
@@ -1003,16 +1162,17 @@ JUDGE_PROBE_IN_COMPOSITE = os.environ.get(
 
 
 def _pick_judge_probe_prompts(block_seed):
-    """Deterministically sample JUDGE_PROBE_PER_ROUND prompts per round.
+    """Per-round chat prompts for the judge_probe (teacher-rubric grade).
 
-    Round 25 Goodhart hardening: each picked prompt is rewritten via
-    ``_paraphrase_chat_prompt`` so a miner who memorised canonical
-    5/5-quality responses to the static pool sees the prompt arrive
-    wrapped in a different verb / adverb pair every round. The
-    paraphrase is region-aware (preserves code, JSON, format specs,
-    quoted strings) and deterministic per ``(prompt, block_seed)``,
-    so every validator agrees on the rewritten prompt while honest
-    miners still answer the same intent.
+    v29.6 (2026-04-29): replaced static-pool sampling + paraphrase with
+    procedural synthesis via ``_synthetic_chat_prompt``. Combinatorial
+    space ⇒ uncacheable; teacher's rubric grade is on response quality
+    (helpfulness / clarity / correctness), which works just as well on
+    procedurally-grounded topics as on real-world ones — the rubric
+    measures HOW the model answers, not WHAT specific facts it cites.
+
+    Falls back to the legacy static pool only on block_seed=None (local
+    dev / replay) so deterministic local replays still match.
     """
     import random
     if block_seed is None:
@@ -1021,11 +1181,10 @@ def _pick_judge_probe_prompts(block_seed):
         seed_val = int(block_seed)
     except (TypeError, ValueError):
         return list(JUDGE_PROBE_POOL[:JUDGE_PROBE_PER_ROUND])
-    rng = random.Random(seed_val ^ 0x6A09E667F3BCC908)  # distinct sub-stream vs think/rkl
-    pool = list(JUDGE_PROBE_POOL)
-    rng.shuffle(pool)
-    picked = pool[:min(JUDGE_PROBE_PER_ROUND, len(pool))]
-    return [_paraphrase_chat_prompt(p, block_seed) for p in picked]
+    rng = random.Random(seed_val ^ 0x6A09E667F3BCC908)
+    return [
+        _synthetic_chat_prompt(rng) for _ in range(JUDGE_PROBE_PER_ROUND)
+    ]
 
 
 JUDGE_PROBE_PROMPTS = _pick_judge_probe_prompts(None)
@@ -1482,9 +1641,173 @@ CHAT_TURNS_PROBE_POOL = (
         "It's a software engineering role. Does that change the advice?",
         "Walk me through how I should structure my answer to 'Tell me about yourself'.",
     ),
+    # === v29 expansion 2026-04-28 — open follow-up #2 from
+    # paper/goodhart_audit_2026-04-27.md. The pool was 24
+    # conversations; per-round sampling is up to 6 with paraphrase,
+    # but a 24-conversation surface is small enough that
+    # distributional rubric-passing is feasible. The 30 additions
+    # below bring us to ~54 conversations — still under the 100
+    # target but materially harder to memorise. Each conversation
+    # ends with a turn that depends on prior context (the coherence
+    # signal we want to grade).
+    (
+        "I'm picking out a first apartment. What should I check before signing?",
+        "It's a 4th-floor walk-up with no laundry. Does that change the priorities?",
+        "Given those concerns, what is the single most important question to ask the landlord before signing?",
+    ),
+    (
+        "Help me choose between SQLite and Postgres for a small side project.",
+        "It's a CRUD web app I'll be the only user of for now. Does that simplify the choice?",
+        "Given that, which would you pick and what is the first thing to revisit if I start sharing it?",
+    ),
+    (
+        "Suggest one stretch I can do at my desk to relieve back pain.",
+        "I have a herniated disc — does that rule any of it out?",
+        "Given the herniated disc, which version of the stretch is safe and how often should I do it?",
+    ),
+    (
+        "What are the basic rules of chess?",
+        "Now explain what 'castling' is and when it's allowed.",
+        "If a king has been moved once and returned to its original square, can it still castle? Explain why or why not.",
+    ),
+    (
+        "I want to start journaling daily. Any practical advice?",
+        "I keep skipping after 4-5 days. What's a realistic fallback?",
+        "Translate your fallback into a single sentence I can paste at the top of my journal app.",
+    ),
+    (
+        "Explain what an LRU cache is and when you'd use one.",
+        "Sketch the core data structures behind an O(1) implementation.",
+        "Given those data structures, what's the time complexity of `get` on a non-existent key, and why?",
+    ),
+    (
+        "I'd like to learn to bake bread. Where should I start?",
+        "I have only a glass loaf pan and no scale. Adjust your starter recipe.",
+        "Given those constraints, how do I tell from sight whether the dough is properly proofed?",
+    ),
+    (
+        "Briefly: how do vaccines train the immune system?",
+        "Why do some vaccines need a booster?",
+        "Based on what you said, why does the influenza vaccine specifically need to be re-formulated yearly?",
+    ),
+    (
+        "Suggest three good first contributions to an open-source repo.",
+        "I'm a junior dev with about 1 year of experience. Tailor the difficulty.",
+        "Pick the one most likely to lead to a follow-up review conversation, and explain why.",
+    ),
+    (
+        "I want to improve my listening in conversations. Any concrete tips?",
+        "I tend to plan my response while the other person is still talking. Address that.",
+        "Translate your top tip into a one-sentence cue I can repeat to myself before a hard conversation.",
+    ),
+    (
+        "Explain what big-O complexity is, in one short paragraph.",
+        "Now contrast O(n log n) and O(n^2) on a list of 10,000 items.",
+        "If my algorithm starts to take noticeably longer at 10,000 vs 1,000 items but is still fast, which complexity am I most likely in?",
+    ),
+    (
+        "Help me design a simple chore chart for two roommates.",
+        "We disagree on dishes. Build the disagreement-resolution into the chart.",
+        "Summarize the entire chart, including the dishes rule, in five short bullet points.",
+    ),
+    (
+        "I'm anxious about an upcoming flight. Any tips for managing it?",
+        "I have claustrophobia, not a fear of heights. Does that change your advice?",
+        "Based on the cause, what is the single most useful thing to do in the 5 minutes before boarding?",
+    ),
+    (
+        "Recommend an introductory book on personal finance.",
+        "I'm in my mid-20s and just started saving. Adjust your pick.",
+        "What's the one chapter or concept from that book I should apply this month?",
+    ),
+    (
+        "Explain how a CPU instruction pipeline works at a high level.",
+        "Now describe what a 'branch misprediction' is.",
+        "Given your previous answer, why are pipelines deeper in performance-CPUs but shallower in efficiency-CPUs?",
+    ),
+    (
+        "I want to read more this year. Set me a realistic plan.",
+        "I have about 30 minutes a day on the train. Adjust accordingly.",
+        "How many books per month does that translate to, given an average book length, and which format is best on a train?",
+    ),
+    (
+        "Help me write a short out-of-office reply for vacation.",
+        "I'll have no email access. Make sure that's clear.",
+        "Add a one-line escalation path for urgent issues, given that I'll be unreachable.",
+    ),
+    (
+        "Describe the difference between 'precision' and 'recall' in classification.",
+        "When would you optimize for precision over recall?",
+        "Given a spam-filter example, which would you optimize and why? Justify briefly.",
+    ),
+    (
+        "I want to start a small herb garden indoors. Where do I start?",
+        "I only have a north-facing window. Does that rule anything out?",
+        "Given that exposure, which one herb is the easiest first try and what's the one mistake to avoid?",
+    ),
+    (
+        "Explain what 'graceful degradation' means in software.",
+        "Give me a concrete example from a web app.",
+        "If we apply that pattern to a payment endpoint specifically, what is the bare minimum the user should still see when the payment provider is down?",
+    ),
+    (
+        "I'm preparing a 10-minute talk for my team. Help me outline it.",
+        "The topic is 'why we should write more design docs'. Tailor the outline.",
+        "Pick the strongest single line from the outline and turn it into a slide title.",
+    ),
+    (
+        "What are common signs of overtraining when running?",
+        "Are mood changes a sign too?",
+        "If I noticed three of the signs you listed in the same week, what's the single first action you'd advise?",
+    ),
+    (
+        "Help me draft a polite reminder email to a delinquent invoice.",
+        "It's the second reminder, 30 days overdue. Adjust the tone.",
+        "Add one line that opens the door for them to ask for an extension, without sounding weak.",
+    ),
+    (
+        "Briefly explain what zero-knowledge proofs allow.",
+        "Give a concrete (non-cryptocurrency) use case.",
+        "For your example, what specifically is being kept secret from the verifier?",
+    ),
+    (
+        "I want to be more present with my kids in the evenings. Practical ideas?",
+        "Phone use is my biggest distractor. Address that directly.",
+        "Translate your phone-related tip into a single rule I can write on a sticky note.",
+    ),
+    (
+        "Recommend three plants suitable for a forgetful plant-parent.",
+        "I keep my apartment quite cool (around 18°C). Adjust your picks.",
+        "Among the cool-tolerant ones you mentioned, which is least likely to die from a 2-week vacation absence?",
+    ),
+    (
+        "Explain at a high level what 'consistent hashing' is.",
+        "Why is it useful for a load-balanced cache?",
+        "Given that property, what specifically goes wrong with a regular `hash(key) % N` scheme when you add a node?",
+    ),
+    (
+        "I want to learn basic conversational French in 3 months. Realistic plan?",
+        "I have about 20 minutes a day, no access to a tutor.",
+        "Given those constraints, which is the most important skill to prioritize first, and why?",
+    ),
+    (
+        "Suggest a good first horror novel for someone who normally avoids the genre.",
+        "I scare easily but I love beautifully written prose.",
+        "Given that profile, why is your specific pick a better fit than 'It' by Stephen King?",
+    ),
+    (
+        "I'm trying to deliver feedback to a junior who is over-engineering. Help me phrase it.",
+        "They're sensitive to criticism. Soften the framing while keeping the message clear.",
+        "Boil your phrasing down to a single one-sentence message I can use as the opening line.",
+    ),
 )
 CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "6"))
 CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "200"))
+# v29.6 (2026-04-29): N-turn chain length for procedural synthesis.
+# Default 3 matches the historical legacy pool.
+CHAT_TURNS_PROBE_TURNS_PER_PROMPT = int(
+    os.environ.get("CHAT_TURNS_PROBE_TURNS_PER_PROMPT", "3"),
+)
 CHAT_TURNS_PROBE_ENABLED = os.environ.get("CHAT_TURNS_PROBE", "1") != "0"
 # 2026-04-26 — same alignment fix as JUDGE_PROBE_IN_COMPOSITE above.
 # composite.py (line 254-256) reads ``CHAT_TURNS_AXIS_IN_COMPOSITE`` with
@@ -1499,20 +1822,19 @@ CHAT_TURNS_PROBE_IN_COMPOSITE = os.environ.get(
 
 
 def _pick_chat_turns_prompts(block_seed):
-    """Deterministically sample 6 multi-turn conversations per round.
+    """Per-round multi-turn chat conversations for chat_turns_probe.
 
-    Uses a sub-stream distinct from judge_probe / think_probe / rkl so
-    rotations don't phase-lock.
+    v29.6 (2026-04-29): replaced static-pool sampling + paraphrase with
+    procedural synthesis via ``_synthetic_chat_turn_chain``. Each call
+    yields a fresh batch of N-turn dialogues whose content rotates per
+    block_seed; the teacher's rubric grade on the full transcript
+    (coherence + consistency + helpfulness) applies the same way it
+    would on legacy fixed-pool conversations — what the rubric measures
+    is HOW each turn references the previous, not WHAT specific topic
+    the dialogue is about.
 
-    Round 25 Goodhart hardening: each turn of each picked conversation
-    is rewritten via ``_paraphrase_chat_prompt`` so a miner who
-    memorised canonical 3-turn transcripts sees a rotated phrasing on
-    every turn every round. The paraphrase is region-aware (preserves
-    code, JSON, format specs, quoted strings) and per-turn-deterministic
-    so every validator agrees on the rewritten conversation while honest
-    miners still answer the same intent. We paraphrase at conversation-
-    pick time (not at probe time) so the phase-A student rollout and
-    the phase-B teacher rubric see byte-identical transcripts.
+    Falls back to the legacy static pool only on block_seed=None
+    (local dev / replay) so deterministic local replays still match.
     """
     import random
     if block_seed is None:
@@ -1522,12 +1844,10 @@ def _pick_chat_turns_prompts(block_seed):
     except (TypeError, ValueError):
         return list(CHAT_TURNS_PROBE_POOL[:CHAT_TURNS_PROBE_PER_ROUND])
     rng = random.Random(seed_val ^ 0xBF58476D1CE4E5B9)  # distinct mixer
-    pool = list(CHAT_TURNS_PROBE_POOL)
-    rng.shuffle(pool)
-    picked = pool[:min(CHAT_TURNS_PROBE_PER_ROUND, len(pool))]
+    n_turns = max(2, CHAT_TURNS_PROBE_TURNS_PER_PROMPT)
     return [
-        tuple(_paraphrase_chat_prompt(turn, block_seed) for turn in convo)
-        for convo in picked
+        _synthetic_chat_turn_chain(rng, n_turns)
+        for _ in range(CHAT_TURNS_PROBE_PER_ROUND)
     ]
 
 
@@ -1965,25 +2285,500 @@ CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", 
 # unmemorizable) items: 12 static (down from 24) + 24 procedural (up from
 # 12) per round, swapping the old 2:1 static-favoured ratio for a 1:2
 # procedural-favoured ratio. See COMPOSITE_SHADOW_VERSION==19 docstring.
-CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "12"))
-CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "24"))
+# 2026-04-29 (v29.5) — capability mix: full procedural switch.
+# v29.4 dropped static trivia from 12 → 4. v29.5 drops the remaining 4
+# to 0: every capability item is now procedurally synthesised (mix of
+# arithmetic, number theory, string ops, list ops, multi-step
+# reasoning kinds — see ``_procedural_capability_prompts`` for the
+# full list of kinds, and ``_synthetic_word`` for the procedural
+# pseudo-word generator that replaces the legacy static word pool).
+# Override via env if a regression in procedural calibration forces
+# rollback to the v29.4 mix.
+CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "0"))
+CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "36"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
 
-# Pool of common simple words used as random subjects for procedural
-# string-operation items (count_chars / count_vowels). Public but the
-# *combination* of (word, op) is per-round-block-seeded so a miner cannot
-# pre-cache the exact tuples.
-_PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = (
-    "apple", "banana", "cherry", "delta", "elephant", "garden",
-    "harbor", "island", "jungle", "kitten", "lemon", "morning",
-    "ocean", "puzzle", "river", "summer", "table", "umbrella",
-    "valley", "winter", "yellow", "zebra", "candle", "dinner",
-    "engine", "forest", "guitar", "hammer", "jacket", "knight",
-    "ladder", "magnet", "needle", "orange", "panda", "quilt",
-    "rabbit", "shadow", "thunder", "violet", "window", "yogurt",
-    "anchor", "basket", "circle", "diamond", "eagle", "feather",
-    "glacier", "horizon", "iguana", "journey", "kangaroo", "lighthouse",
+# ── 2026-04-29 (v29.5) — Procedural lexicon synthesisers ──────────────
+#
+# Every fixed lexicon (names, words, topic strings, distractor
+# sentences, needle entities) used to be a static tuple baked into
+# this file. That meant the SURFACE FORM of each item was a fixed
+# member of a small pool, even when the COMPOSITIONAL parameters
+# rotated per round. A determined miner could enumerate every
+# pool entry from the open-source code and pre-train against the
+# union — Goodhart vector closed with this section.
+#
+# v29.5 replaces all of those with procedural synthesisers. The
+# building blocks are CV (consonant-vowel) syllables drawn from a
+# small inventory; combining them produces effectively-infinite
+# unique pronounceable strings (90 syllable choices ⇒ ~8k 2-syllable
+# names, ~730k 3-syllable, etc.). The COMPOSITION GRAMMAR is fixed
+# (we still pick adjective + noun + org-type for topics, etc.) but
+# the resulting tokens do not appear anywhere on disk.
+#
+# Why pseudo-words instead of real words: real-word pools are
+# bounded (~50k common English words); a determined attacker can
+# train against the entire pool. Pseudo-words have unbounded
+# combinatorial space AND look natural enough that the model treats
+# them as named entities (which is what we want — the GRADING never
+# depends on real-world meaning of these tokens, only on the
+# arithmetic / structural property tested).
+#
+# All synthesisers take a ``random.Random`` parameter so they're
+# deterministic on the round's block_seed-derived RNG. Use the same
+# pattern as ``_procedural_capability_prompts``.
+
+# Phoneme inventory. Excludes ``q`` and ``x`` (rare in English so they
+# read as foreign), and excludes ``y`` as vowel to keep CV pattern
+# unambiguous. Vowels include common diphthongs to add variety
+# without confusing the model.
+_LEX_CONS = (
+    "b", "c", "d", "f", "g", "h", "j", "k", "l", "m",
+    "n", "p", "r", "s", "t", "v", "w", "z",
+    "br", "cl", "cr", "dr", "fl", "fr", "gl", "gr",
+    "pl", "pr", "sk", "sl", "sm", "sn", "sp", "st", "sw", "tr",
+    "th", "sh", "ch",
+)  # 37 onsets
+_LEX_VOWELS = ("a", "e", "i", "o", "u", "ai", "ea", "ee", "ie", "oa", "ou", "ay")  # 12 nuclei
+_LEX_CODAS = ("", "n", "r", "l", "s", "t", "ck", "rd", "rt", "ng", "st", "ld")  # 12 codas (including empty)
+
+
+def _synthetic_syllable(rng: "random.Random") -> str:
+    """Return a single CVC-pattern syllable (consonant-vowel-coda).
+
+    Coda may be empty (open syllable). Output is always 2-5 chars,
+    pronounceable, and never identical across calls except by
+    coincidence (rare given 37×12×12 ≈ 5300 distinct syllables).
+    """
+    return rng.choice(_LEX_CONS) + rng.choice(_LEX_VOWELS) + rng.choice(_LEX_CODAS)
+
+
+def _synthetic_word(rng: "random.Random", n_syll: int = 2) -> str:
+    """Return a procedural pseudo-word of ``n_syll`` syllables.
+
+    Default 2 syllables ≈ 4-8 chars, similar to the average length of
+    the legacy ``_PROC_CAPABILITY_WORD_POOL`` entries (5.4 chars). The
+    word is suitable for any operation that depends only on character
+    properties (count_chars, count_vowels) since the rules are
+    universal across pseudo and real words.
+    """
+    if n_syll < 1:
+        n_syll = 1
+    return "".join(_synthetic_syllable(rng) for _ in range(n_syll))
+
+
+def _synthetic_name(rng: "random.Random") -> str:
+    """Return a procedural Capitalised name (2-3 syllables).
+
+    Used wherever the legacy ``_PROC_NAMES`` / ``_NAMES`` tuples were:
+    procedural narrative items in math_bench, capability counterfactual
+    items, calibration_bench, etc. Per-call procedurally drawn from
+    the lex inventory ⇒ effectively-infinite unique names.
+    """
+    n_syll = rng.choice([2, 2, 3])  # mostly 2-syllable, occasional 3
+    word = _synthetic_word(rng, n_syll)
+    return word.capitalize()
+
+
+def _synthetic_names(rng: "random.Random", n: int) -> list[str]:
+    """Return ``n`` distinct procedural names (helper for callers that
+    used to do ``_synthetic_names(r, n)``)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    attempts = 0
+    while len(out) < n and attempts < n * 16:
+        attempts += 1
+        name = _synthetic_name(rng)
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _synthetic_org_topic(rng: "random.Random") -> str:
+    """Return a procedural organisation-style topic string used by
+    ``multi_doc_synthesis_bench``.
+
+    Shape: ``"the {Adj} {NounStem}{Suffix} {OrgType}"`` where every
+    slot is procedurally synthesised. The adjective is a procedural
+    pseudo-word with an English-style suffix (``-ish`` / ``-ese`` /
+    ``-ian``); the noun is two procedural syllables; the org-type
+    is drawn from a small lexicon of organisation common-nouns
+    (Society / Guild / Festival / etc.) — the only semi-static
+    component, kept because these category labels carry meaning the
+    model needs to interpret the question correctly.
+    """
+    adj = _synthetic_word(rng, 2) + rng.choice(["ish", "ese", "ian", "ese", "ic", "an"])
+    noun_stem = _synthetic_word(rng, 2)
+    suffix = rng.choice(
+        ["thorne", "wood", "field", "haven", "moor", "watch",
+         "crest", "ridge", "vale", "burn", "marsh", "spire"]
+    )
+    org_type = rng.choice([
+        "Society", "Guild", "Festival", "Workshop", "Conservancy",
+        "Foundation", "Trust", "Academy", "Collective", "Studio",
+        "Mill", "Atelier", "Hall", "Co-op", "Lodge", "Brotherhood",
+    ])
+    # Capitalise the adj + noun-suffix block.
+    return f"the {adj.capitalize()} {noun_stem.capitalize()}{suffix} {org_type}"
+
+
+def _synthetic_entity(rng: "random.Random") -> tuple[str, str, str]:
+    """Return a procedural (entity_phrase, possessive_phrase,
+    question_subject) triple for ``long_context_bench`` needle templates.
+
+    All three slots are procedurally generated from the lex inventory:
+
+      * ``entity_phrase``: ``"the {Capitalised} {role}"`` — used as
+        the noun phrase that owns the secret value
+      * ``possessive_phrase``: ``"{entity_phrase}'s"``
+      * ``question_subject``: phrase used in the question, distinct
+        enough that the model can parse "what is the X of {subject}"
+        cleanly
+
+    Using procedurally-synthesised entity names means a memoriser
+    cannot pre-cache "archive code = 7-char string" attacks because
+    the names rotate per round.
+    """
+    name = _synthetic_name(rng)
+    role = rng.choice([
+        "archivist", "vault keeper", "treasurer", "harbormaster",
+        "librarian", "warden", "alchemist", "courier", "navigator",
+        "watchsmith", "bellfounder", "tuner", "scribe", "ferryman",
+        "cartographer", "lampmaker", "lockwright",
+    ])
+    item_word = rng.choice([
+        "code", "passphrase", "tally", "manifest signature", "ledger key",
+        "cipher", "recall token", "watchword", "registration mark",
+    ])
+    entity_phrase = f"the {name} {role}"
+    poss_phrase = f"{entity_phrase}'s {item_word}"
+    return (entity_phrase, poss_phrase, item_word)
+
+
+def _synthetic_distractor_sentence(rng: "random.Random") -> str:
+    """Return a procedural neutral filler sentence for use as a
+    distractor inside ``long_context_bench`` documents.
+
+    Shape: ``"{Capitalised name} {verbed} the {object} {time-modifier}."``
+    Subject is a procedural name; verb is from a small lexicon of
+    common past-tense verbs; object is a procedural noun; time-modifier
+    rotates across a small lexicon. Each call produces a unique
+    grammatical sentence that contains no 7-char ALL-CAPS code (the
+    needle answers' surface shape) so substring grading is safe.
+    """
+    name = _synthetic_name(rng)
+    verb = rng.choice([
+        "repaired", "swept", "tidied", "polished", "watered", "mended",
+        "rolled", "carried", "rinsed", "wrapped", "stacked", "labelled",
+        "delivered", "inspected", "pressed", "trimmed", "weighed",
+        "harvested", "logged", "filed", "shelved", "hung", "rested",
+    ])
+    obj_adj = rng.choice([
+        "old", "new", "broken", "tidy", "well-worn", "spare", "long",
+        "small", "narrow", "wide", "smooth", "loose", "tight",
+    ])
+    obj_noun = rng.choice([
+        "kettle", "lantern", "bench", "ledger", "saddle", "tarp",
+        "broom", "cart", "rope", "trellis", "barrel", "wheelbarrow",
+        "hat-rack", "scales", "doormat", "saw", "fence post",
+    ])
+    when = rng.choice([
+        "before lunch", "at the morning bell", "between rain showers",
+        "during the council meeting", "near sundown", "in the late afternoon",
+        "after the market closed", "before the storm", "early on Tuesday",
+        "right after dawn", "while the bread proofed",
+    ])
+    return f"{name} {verb} the {obj_adj} {obj_noun} {when}."
+
+
+# Backwards-compat shim: a few callers still expect a TUPLE of words
+# for legacy code paths that haven't been migrated yet. We synthesise
+# a fresh pool on import using a fixed seed (so module load is
+# deterministic across validators), but the actual round-time consumers
+# use the procedural synthesisers above. This keeps any straggler
+# callers working while the per-round synthesisers do the real work.
+def _build_legacy_word_pool(n: int = 64) -> tuple[str, ...]:
+    import random as _r
+    rng = _r.Random(0xC0DE_F0CC)
+    return tuple(_synthetic_word(rng, _r.choice([2, 3])) for _ in range(n))
+
+
+_PROC_CAPABILITY_WORD_POOL: tuple[str, ...] = _build_legacy_word_pool()
+
+
+# ── 2026-04-29 (v29.6) — Procedural CHAT-PROMPT synthesiser ────────────
+#
+# Replaces the legacy ``ON_POLICY_RKL_POOL`` / ``JUDGE_PROBE_POOL`` /
+# ``CHAT_TURNS_PROBE_POOL`` static pools (88 + ~65 + ~25 entries
+# respectively) that miners could pre-train against. Each per-round
+# probe now synthesises fresh chat-style prompts from procedural
+# templates whose slots are filled by combinations of:
+#
+#   * procedural topic noun-phrases (procedural adj + noun + suffix)
+#   * procedural opener sentences (subject + verb + object + clause)
+#   * procedural character names + actions
+#   * a small REAL-WORD lexicon for slots that need semantic anchoring:
+#     audiences, aspects, languages, styles, tasks (the model needs
+#     these to interpret the prompt meaningfully — pseudo-words would
+#     break grading)
+#
+# Combinatorial space: ~12 template families × per-template slot
+# multiplicity × procedural slots ⇒ effectively unbounded surface
+# rotation. The teacher's rubric grading still applies because the
+# templates are coherent, grammatical, and call for a clear response;
+# the teacher grades on RESPONSE QUALITY (rubric-1-5) rather than
+# specific factual knowledge of the procedural topic.
+
+# Real-word lexicons. Kept fixed because the model needs these as
+# semantic anchors to interpret the prompt. Combinatorial composition
+# with procedural slots makes the prompt-LEVEL surface form effectively
+# uncacheable.
+_CHAT_AUDIENCES = (
+    "a curious child", "a beginner", "an experienced engineer",
+    "a careful student", "a busy professional", "a high-school class",
+    "a thoughtful generalist", "a sceptical reader", "a friendly stranger",
+    "a journalist", "a designer", "a small-business owner",
 )
+_CHAT_ASPECTS = (
+    "efficiency", "clarity", "cost", "safety", "robustness",
+    "ease of use", "long-term maintainability", "energy use",
+    "speed", "reliability", "accessibility", "fault tolerance",
+)
+_CHAT_LANGUAGES = (
+    "Spanish", "French", "Italian", "German", "Portuguese",
+    "Japanese", "Korean", "Mandarin Chinese", "Arabic", "Hindi",
+    "Dutch", "Swedish", "Polish", "Greek",
+)
+_CHAT_STYLES = (
+    "more concise", "more formal", "less formal", "less ambiguous",
+    "easier to skim", "more confident", "more cautious",
+)
+_CHAT_TASKS = (
+    "set up a small backyard vegetable garden",
+    "plan a four-day visit to an unfamiliar city",
+    "debug a slow database query without changing the schema",
+    "interview a candidate for a junior software role",
+    "prepare a 20-minute weeknight dinner for two",
+    "review a colleague's pull-request constructively",
+    "wind down before sleep on a stressful evening",
+    "prepare for a difficult conversation with a teammate",
+    "host a quiet weekend gathering for six guests",
+    "explain a delay to a stakeholder over email",
+    "calibrate a new espresso grinder",
+    "write a short eulogy for a colleague's mentor",
+)
+_CHAT_CATEGORIES = (
+    "common kitchen tools", "household chores", "weekend hobbies",
+    "items in a hiking pack", "useful office habits",
+    "low-effort dinner ideas", "small acts of kindness",
+    "gardening tasks for spring", "ways to reduce screen time",
+    "indoor exercises that need no equipment",
+)
+_CHAT_QUALIFIERS = (
+    "are easy to do in under ten minutes",
+    "would suit a complete beginner",
+    "save money over the long run",
+    "involve no special equipment",
+    "work well in a small apartment",
+    "you'd recommend to a friend",
+)
+_CHAT_DILEMMAS = (
+    ("buying a used car", "buying a new car"),
+    ("learning to cook at home", "ordering takeout regularly"),
+    ("pair programming", "solo deep-focus coding"),
+    ("renting a small apartment in the city", "owning a house in the suburbs"),
+    ("training a junior engineer", "hiring a senior engineer"),
+    ("commuting by bicycle", "commuting by public transit"),
+    ("studying late at night", "studying early in the morning"),
+)
+_CHAT_VERB_OBJECTS = (  # for opener sentences
+    ("found", "an old letter"), ("noticed", "a faint humming sound"),
+    ("packed", "a small leather suitcase"), ("watched", "the boats slip past"),
+    ("opened", "a faded paperback"), ("planted", "the last row of beans"),
+    ("started", "the campfire after the rain"), ("sketched", "the mountain skyline"),
+    ("repaired", "the back door's hinge"), ("read", "the local newspaper"),
+)
+_CHAT_PLACES = (
+    "the harbour", "the small kitchen", "the back garden",
+    "the morning market", "the empty library", "the frosted balcony",
+    "the steep cobbled lane", "the railway platform",
+)
+
+
+def _synthetic_topic_phrase(rng: "random.Random") -> str:
+    """Procedural topic noun-phrase used as a slot filler in
+    ``_synthetic_chat_prompt``. Returns ``"the {Adj} {Noun}"`` where
+    each slot is procedurally synthesised.
+
+    Distinct from ``_synthetic_org_topic`` (which builds full org-name
+    strings); this one yields shorter noun-phrases suitable for
+    "Explain {topic}" prompts.
+    """
+    adj = _synthetic_word(rng, 2) + rng.choice(["ish", "ical", "ese", "an", "ic"])
+    noun = _synthetic_word(rng, 2) + rng.choice(
+        ["craft", "weave", "fold", "grain", "thread", "stone"]
+    )
+    return f"the {adj} {noun}"
+
+
+def _synthetic_quote(rng: "random.Random") -> str:
+    """Procedural neutral sentence used as a translation / rewrite
+    target. Combination of subject + verb + object + place clause."""
+    name = _synthetic_name(rng)
+    verb, obj = rng.choice(_CHAT_VERB_OBJECTS)
+    place = rng.choice(_CHAT_PLACES)
+    return f"{name} {verb} {obj} near {place} that morning."
+
+
+def _synthetic_opener(rng: "random.Random") -> str:
+    """Procedural first-sentence opener for story-continuation prompts."""
+    name = _synthetic_name(rng)
+    place = rng.choice(_CHAT_PLACES)
+    verb, obj = rng.choice(_CHAT_VERB_OBJECTS)
+    return f"{name} stood at {place} and {verb} {obj}."
+
+
+def _synthetic_action(rng: "random.Random") -> str:
+    """Generic action verb-phrase for character-driven story prompts."""
+    return rng.choice([
+        "loses a familiar object", "discovers an unmarked door",
+        "must apologise to a neighbour", "decides to learn a craft",
+        "accepts an unexpected invitation", "starts a small project alone",
+        "finds an unsigned letter", "agrees to a brief errand",
+    ])
+
+
+def _synthetic_chat_prompt(rng: "random.Random") -> str:
+    """Synthesise one fresh chat-style prompt for use by the
+    ``on_policy_rkl`` / ``judge_probe`` / ``chat_turns_probe`` axes.
+
+    Picks one of ~12 template families and fills its slots from a
+    mix of procedural synthesis (topic / opener / character) and the
+    small real-word lexicons above (audiences / aspects / languages /
+    etc., needed for semantic anchoring). The resulting prompt is
+    grammatical, coherent, and calls for a clear response that the
+    teacher can grade on rubric quality.
+
+    Combinatorial expansion: ~12 templates × per-template slot
+    multiplicity × procedural slots ⇒ effectively unbounded surface
+    rotation. A miner cannot pre-cache the next round's prompts.
+    """
+    kind = rng.choice([
+        "explain", "describe", "compare", "continue_story", "define",
+        "story", "list", "opinion", "translate", "rewrite", "howto", "steps",
+    ])
+    n = rng.choice([2, 3, 4])
+    if kind == "explain":
+        topic = _synthetic_topic_phrase(rng)
+        return f"Explain {topic} in {n} sentences. Be specific."
+    if kind == "describe":
+        topic = _synthetic_topic_phrase(rng)
+        audience = rng.choice(_CHAT_AUDIENCES)
+        return f"Describe {topic} for {audience}, in {n} sentences."
+    if kind == "compare":
+        a = _synthetic_topic_phrase(rng)
+        b = _synthetic_topic_phrase(rng)
+        aspect = rng.choice(_CHAT_ASPECTS)
+        return f"Compare {a} and {b} in terms of {aspect}. Use {n} short sentences."
+    if kind == "continue_story":
+        opener = _synthetic_opener(rng)
+        return f"Continue this story in {n}-{n+1} sentences: '{opener}'"
+    if kind == "define":
+        term = _synthetic_word(rng, 2)
+        audience = rng.choice(_CHAT_AUDIENCES)
+        return f"Define '{term}' clearly for {audience}. Use one or two sentences."
+    if kind == "story":
+        char = _synthetic_name(rng)
+        action = _synthetic_action(rng)
+        return f"Write a 60-word short story about {char} who {action}."
+    if kind == "list":
+        category = rng.choice(_CHAT_CATEGORIES)
+        qualifier = rng.choice(_CHAT_QUALIFIERS)
+        return (
+            f"List {n + 2} {category} that {qualifier}. Number each item "
+            f"and add a brief one-line note."
+        )
+    if kind == "opinion":
+        choice, alt = rng.choice(_CHAT_DILEMMAS)
+        return (
+            f"What are the practical trade-offs of {choice} versus "
+            f"{alt}? Give {n} considerations on each side."
+        )
+    if kind == "translate":
+        quote = _synthetic_quote(rng)
+        lang = rng.choice(_CHAT_LANGUAGES)
+        return f"Translate the following sentence into {lang}: '{quote}'"
+    if kind == "rewrite":
+        quote = _synthetic_quote(rng)
+        style = rng.choice(_CHAT_STYLES)
+        return f"Rewrite the following sentence to be {style}: '{quote}'"
+    if kind == "howto":
+        task = rng.choice(_CHAT_TASKS)
+        return f"How would you {task}? Answer in {n} sentences."
+    # steps
+    task = rng.choice(_CHAT_TASKS)
+    return (
+        f"List the steps to {task}. Number each step on its own line; "
+        f"keep each step to one sentence."
+    )
+
+
+def _synthetic_chat_turn_chain(rng: "random.Random",
+                                n_turns: int = 3) -> tuple[str, ...]:
+    """Synthesise an N-turn chat conversation where each turn naturally
+    refines the previous, suitable for ``chat_turns_probe`` grading.
+
+    The chain picks a "scenario" (small fixed lexicon for semantic
+    anchoring) and then emits N turns whose content rotates per call
+    via procedural slot fillers. The teacher grades the FULL transcript
+    on a 1-5 rubric (coherence + consistency + helpfulness), so what
+    matters is that consecutive turns reference earlier content
+    coherently — not that any single turn is "static."
+    """
+    scenarios = [
+        # (initial, refine, constrain) triple of templates
+        (
+            "I'm planning a small dinner for {n} guests. Can you help me pick a theme?",
+            "Great — now suggest a {n}-course menu for that theme.",
+            "One guest is vegetarian; revise the menu to accommodate them and list the final menu.",
+        ),
+        (
+            "I need to write a short blog post about {topic}. What angle should I take?",
+            "Outline the post in {n} bullet points based on that angle.",
+            "Now expand the second bullet into a 60-word paragraph.",
+        ),
+        (
+            "I want to start a small home garden in {place}. What plants should I grow?",
+            "Suggest a {n}-month planting schedule for those plants.",
+            "Now adjust the schedule for an unusually dry summer.",
+        ),
+        (
+            "I'm preparing for a difficult conversation with {char} about {topic}. How should I open?",
+            "Now rewrite that opener to feel less confrontational.",
+            "Finally, list {n} key points I should be ready to address if {char} pushes back.",
+        ),
+        (
+            "I have to lead a quick team retro for {n} engineers about {topic}. What's a good agenda?",
+            "Now break the agenda into {n} 5-minute slots.",
+            "Tighten the longest slot so the whole retro fits in 25 minutes.",
+        ),
+    ]
+    initial, refine, constrain = rng.choice(scenarios)
+    n = rng.choice([3, 4, 5])
+    fillers = {
+        "n": n,
+        "topic": _synthetic_topic_phrase(rng),
+        "place": rng.choice(_CHAT_PLACES),
+        "char": _synthetic_name(rng),
+    }
+    turns = (
+        initial.format(**fillers),
+        refine.format(**fillers),
+        constrain.format(**fillers),
+    )
+    return turns[:max(1, n_turns)]
 
 
 def _procedural_capability_prompts(rng, n):
@@ -2009,12 +2804,29 @@ def _procedural_capability_prompts(rng, n):
     alias ``_procedural_math_prompts`` retained below for old callers
     that explicitly want arithmetic-only.
     """
+    # v29.4 (2026-04-29): saturation audit on 163 UIDs showed capability
+    # at 53 % saturated (mean 0.90, weight 0.25). The legacy kinds below
+    # are too easy for 4B-class models. We add 7 harder kinds (post-v29.4)
+    # that require multi-step reasoning rather than single-step lookup:
+    #   * ``multi_step_arithmetic`` — chained 3-4 ops with parens
+    #   * ``seq_next``              — pattern-recognition (Fibonacci-like / polynomial)
+    #   * ``string_chain``          — multi-step string ops (reverse + uppercase + count vowels)
+    #   * ``list_chain``            — multi-step list ops (filter even + sum + multiply by 2)
+    #   * ``counterfactual``        — "if X were Y, what would Z be"
+    #   * ``nested_logic``          — boolean evaluation with negation + parens
+    #   * ``two_step_compare``      — compare results of two computations
+    # These shift mean pass-rate from ~0.90 toward ~0.55-0.65, restoring
+    # discrimination on a 0.25-weight axis.
     kinds = (
+        # legacy easy floor (kept for diversity, ~30 % of the procedural pool)
         "add", "sub", "mul", "div", "mod",
         "power_small", "sum_digits", "even_or_odd", "divisible_by",
         "count_chars", "count_vowels",
         "list_min", "list_max", "count_evens",
         "which_larger",
+        # v29.4 hard tier (each appears ~once per round at n=24)
+        "multi_step_arithmetic", "seq_next", "string_chain",
+        "list_chain", "counterfactual", "nested_logic", "two_step_compare",
     )
     out = []
     for _ in range(n):
@@ -2062,11 +2874,14 @@ def _procedural_capability_prompts(rng, n):
             out.append({"q": f"Is {v} divisible by {div}? Answer yes or no.",
                         "a": ans, "kind": "yesno"})
         elif kind == "count_chars":
-            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            # v29.5: procedurally synthesise the test word so the
+            # surface form rotates per item — no static word pool to
+            # memorise.
+            w = _synthetic_word(rng, rng.choice([2, 3]))
             out.append({"q": f"How many characters are in the word '{w}'? Answer with only the number.",
                         "a": str(len(w)), "kind": "int"})
         elif kind == "count_vowels":
-            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            w = _synthetic_word(rng, rng.choice([2, 3]))
             n_vowels = sum(1 for c in w.lower() if c in "aeiou")
             out.append({"q": f"How many vowels are in the word '{w}'? Answer with only the number.",
                         "a": str(n_vowels), "kind": "int"})
@@ -2090,6 +2905,123 @@ def _procedural_capability_prompts(rng, n):
             ans = str(a) if a > b else str(b)
             out.append({"q": f"Which is larger: {a} or {b}? Answer with just the number.",
                         "a": ans, "kind": "int"})
+        # ── v29.4 hard tier ────────────────────────────────────────
+        elif kind == "multi_step_arithmetic":
+            a = rng.randint(5, 25)
+            b = rng.randint(3, 15)
+            c = rng.randint(2, 10)
+            d = rng.randint(2, 8)
+            ans = (a + b) * c - d
+            out.append({
+                "q": f"Compute ({a} + {b}) * {c} - {d}. Answer with only the number.",
+                "a": str(ans), "kind": "int",
+            })
+        elif kind == "seq_next":
+            # Pick a sequence type and ask for the next term.
+            seq_kind = rng.choice(["arith", "geom", "fib_like", "square"])
+            if seq_kind == "arith":
+                a0 = rng.randint(2, 20)
+                d = rng.randint(2, 12)
+                seq = [a0 + i * d for i in range(5)]
+                nxt = a0 + 5 * d
+            elif seq_kind == "geom":
+                a0 = rng.randint(2, 6)
+                r = rng.choice([2, 3])
+                seq = [a0 * (r ** i) for i in range(5)]
+                nxt = a0 * (r ** 5)
+            elif seq_kind == "fib_like":
+                a, b = rng.randint(1, 5), rng.randint(2, 6)
+                seq = [a, b]
+                for _ in range(3):
+                    seq.append(seq[-1] + seq[-2])
+                nxt = seq[-1] + seq[-2]
+            else:  # square
+                start = rng.randint(2, 6)
+                seq = [(start + i) ** 2 for i in range(5)]
+                nxt = (start + 5) ** 2
+            seq_str = ", ".join(str(s) for s in seq)
+            out.append({
+                "q": f"What is the next number in the sequence {seq_str}, ...? Answer with only the number.",
+                "a": str(nxt), "kind": "int",
+            })
+        elif kind == "string_chain":
+            w = _synthetic_word(rng, rng.choice([2, 3]))
+            # Reverse, uppercase, then count vowels in original — the
+            # answer is the count of original-vowels which doesn't
+            # change with case but the model has to track the chain.
+            n_v = sum(1 for c in w.lower() if c in "aeiou")
+            out.append({
+                "q": (
+                    f"Take the word '{w}'. Reverse it, then convert to "
+                    f"uppercase. How many vowels (A, E, I, O, U) appear "
+                    f"in the result? Answer with only the number."
+                ),
+                "a": str(n_v), "kind": "int",
+            })
+        elif kind == "list_chain":
+            vals = [rng.randint(1, 30) for _ in range(rng.randint(5, 8))]
+            evens = [v for v in vals if v % 2 == 0]
+            ans = sum(evens) * 2 if evens else 0
+            out.append({
+                "q": (
+                    f"From the list [{', '.join(str(v) for v in vals)}], "
+                    f"select the even numbers, sum them, then multiply by 2. "
+                    f"Answer with only the resulting number."
+                ),
+                "a": str(ans), "kind": "int",
+            })
+        elif kind == "counterfactual":
+            # Build a hypothetical scenario where one fact is changed.
+            real_a = rng.randint(5, 15)
+            real_b = rng.randint(20, 40)
+            # Change the original 'a' to a new value 'a2' and ask for a*b
+            a2 = rng.randint(2, 50)
+            while a2 == real_a:
+                a2 = rng.randint(2, 50)
+            ans = a2 * real_b
+            out.append({
+                "q": (
+                    f"In our world, x = {real_a} and y = {real_b}. "
+                    f"Suppose instead that x were {a2} (everything else "
+                    f"unchanged). What would the product x * y equal? "
+                    f"Answer with only the number."
+                ),
+                "a": str(ans), "kind": "int",
+            })
+        elif kind == "nested_logic":
+            # Build a boolean expression with negations and parens.
+            vals = [rng.choice([True, False]) for _ in range(3)]
+            ops = [rng.choice(["and", "or"]) for _ in range(2)]
+            negs = [rng.random() < 0.5 for _ in range(3)]
+            parts = [
+                ("not " if neg else "") + str(v)
+                for v, neg in zip(vals, negs)
+            ]
+            expr = f"({parts[0]} {ops[0]} {parts[1]}) {ops[1]} {parts[2]}"
+            ans = "yes" if eval(expr) else "no"
+            out.append({
+                "q": (
+                    f"Evaluate the boolean expression: {expr}. "
+                    f"Answer 'yes' if True, 'no' if False."
+                ),
+                "a": ans, "kind": "yesno",
+            })
+        elif kind == "two_step_compare":
+            a1 = rng.randint(5, 30)
+            b1 = rng.randint(2, 8)
+            a2 = rng.randint(10, 60)
+            b2 = rng.randint(3, 12)
+            res1 = a1 * b1
+            res2 = a2 + b2 * 5  # different shape
+            larger = "first" if res1 > res2 else ("second" if res2 > res1 else "equal")
+            out.append({
+                "q": (
+                    f"Compute these two values: (1) {a1} * {b1}; "
+                    f"(2) {a2} + {b2} * 5. Which is larger? Answer 'first', "
+                    f"'second', or 'equal'."
+                ),
+                "a": larger, "kind": "word",
+            })
     return out
 
 
@@ -2689,7 +3621,8 @@ BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
 # Number of distractor "facts" injected before + after the needle. Each
 # fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
 # needle + question ≈ 1400 tokens total input.
-BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
+# 2026-04-29 (v29.2): bumped 40 → 60 to match real long-context tests.
+BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "60"))
 # Number of confuser needles inserted alongside the real needle. Each
 # confuser uses a *different* template (different topic) with its own
 # fake 7-char code answer. With 1 confuser the 4B reference still scored
@@ -2697,7 +3630,19 @@ BENCH_LC_DISTRACTORS = int(os.environ.get("BENCH_LC_DISTRACTORS", "40"))
 # the question to the right named entity rather than regex-matching any
 # all-caps code in the document. Capped at len(_LC_NEEDLE_TEMPLATES)-1
 # at runtime so we always have a real template to reserve.
-BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "3"))
+# 2026-04-29 (v29.2): saturation audit on 115 records showed long_context
+# at 93% pass-rate ≥0.95 — a dead axis. With only 3 confusers + ~14 line
+# docs every 4B-class model trivially identified the entity-matched
+# needle. Bumped 3 → 6 confusers and added MULTI-NEEDLE items below
+# (require retrieving 2-3 needles + combining via comparison/arithmetic)
+# so the axis tests genuine long-context reasoning, not just pattern
+# matching against an obvious entity.
+BENCH_LC_N_CONFUSERS = int(os.environ.get("BENCH_LC_N_CONFUSERS", "6"))
+# 2026-04-29 (v29.2): fraction of items that are MULTI-NEEDLE — model
+# must retrieve 2-3 distinct needles and combine (sum / compare /
+# concatenate). Default 0.4 means 40 % multi-needle items per round; the
+# remaining 60 % are single-needle (legacy, kept as a difficulty floor).
+BENCH_LC_MULTI_FRACTION = float(os.environ.get("BENCH_LC_MULTI_FRACTION", "0.4"))
 # Session 3.6 (added 2026-04-25): block-seeded procedural tasks mixing
 # arithmetic reasoning, instruction following, and invented-fact retrieval.
 # This is intentionally synthetic: there is no public pool to memorize, but
@@ -2732,6 +3677,36 @@ BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2
 # twice. Kept env-addressable for emergency rollback.
 BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "0"))
 BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
+# v29.2 (2026-04-29) — debug_bench. Procedural buggy-code items, model
+# must emit a corrected function. Tests real-world coding skill
+# (debugging) which code_bench (write-from-scratch) does not measure.
+# Start at 6 items per round; ratchet based on saturation telemetry.
+BENCH_DEBUG_PER_ROUND = int(os.environ.get("BENCH_DEBUG_PER_ROUND", "6"))
+BENCH_DEBUG_MAX_TOKENS = int(os.environ.get("BENCH_DEBUG_MAX_TOKENS", "512"))
+# v29.4 (2026-04-29) — correction_bench. Procedural buggy-code +
+# explicit error trace; model emits the corrected function. Tests the
+# read→run→see-error→fix workflow specifically. Same item shape as
+# debug_bench so humaneval_sandbox runs unchanged. 6 items per round,
+# weight 0.05.
+BENCH_CORRECTION_PER_ROUND = int(os.environ.get("BENCH_CORRECTION_PER_ROUND", "6"))
+BENCH_CORRECTION_MAX_TOKENS = int(os.environ.get("BENCH_CORRECTION_MAX_TOKENS", "512"))
+# v29.4 — multi_doc_synthesis_bench. Procedural fact cards + cross-card
+# question. Tests info integration across discrete sources.
+BENCH_MULTI_DOC_PER_ROUND = int(os.environ.get("BENCH_MULTI_DOC_PER_ROUND", "6"))
+BENCH_MULTI_DOC_N_CARDS = int(os.environ.get("BENCH_MULTI_DOC_N_CARDS", "4"))
+BENCH_MULTI_DOC_MAX_TOKENS = int(os.environ.get("BENCH_MULTI_DOC_MAX_TOKENS", "64"))
+# v29.4 — calibration_bench. Mix solvable + intentionally unsolvable
+# items; reward correct answers AND correct refusals. Discourages
+# confabulation.
+BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "8"))
+BENCH_CALIBRATION_UNSOLVABLE_FRACTION = float(
+    os.environ.get("BENCH_CALIBRATION_UNSOLVABLE_FRACTION", "0.5"),
+)
+BENCH_CALIBRATION_MAX_TOKENS = int(os.environ.get("BENCH_CALIBRATION_MAX_TOKENS", "96"))
+# v29.4 — refactor_bench. Working code + style constraint, AST-graded.
+# Tests refactoring skill (preserve behavior + improve form).
+BENCH_REFACTOR_PER_ROUND = int(os.environ.get("BENCH_REFACTOR_PER_ROUND", "4"))
+BENCH_REFACTOR_MAX_TOKENS = int(os.environ.get("BENCH_REFACTOR_MAX_TOKENS", "512"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -2746,7 +3721,12 @@ BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_M
 BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_TIMEOUT_S", "4.0"))
 BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
 BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"))
-BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "32"))
+# 2026-04-29 (v29.2): bumped 32 → 96 so multi-needle items have room to
+# emit "the sum is N" or "the codes are X, Y" (the new combined-answer
+# format requires more tokens than a bare 7-char code). Single-needle
+# items still pass at 32 tokens, so the budget bump is harmless for
+# legacy items; multi-needle items previously truncated.
+BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "96"))
 BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "64"))
 BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "384"))
 BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "384"))
@@ -2771,6 +3751,11 @@ _BENCH_STREAM = {
     "procedural": 0x9E71C0DE,    # Session 3.6 — procedural synthesis
     "robustness": 0x80B057E5,    # Session 3.7 — robustness_bench (math-pool reuse)
     "noise": 0x80152BE9,         # Session 3.7 — noise_resistance_bench (math-pool reuse)
+    "debug": 0xDEB8B003,         # v29.2 — debug_bench (procedural buggy-code fix)
+    "correction": 0xC0E2EC11,    # v29.4 — correction_bench (buggy code + error trace)
+    "multi_doc": 0x309AB54E,     # v29.4 — multi_doc_synthesis_bench
+    "calibration": 0xCAB1BA0F,   # v29.4 — calibration_bench (solvable + unsolvable)
+    "refactor": 0xBE6AF801,      # v29.4 — refactor_bench (style-constrained refactor)
 }
 
 _BENCH_BLOCK_SEED = None
@@ -2778,13 +3763,15 @@ _BENCH_POOLS: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [], "noise": [],
+    "robustness": [], "noise": [], "debug": [],
+    "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
-    "robustness": [], "noise": [],
+    "robustness": [], "noise": [], "debug": [],
+    "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
 }
 
 
@@ -4104,6 +5091,25 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["noise"] = _generate_math_items(
         block_seed ^ 0x4E4F, BENCH_NOISE_PER_ROUND,
     )
+    # v29.2 — debug_bench. Procedural buggy-code items.
+    _BENCH_SAMPLES["debug"] = _generate_debug_items(
+        block_seed, BENCH_DEBUG_PER_ROUND,
+    )
+    # v29.4 — procedural correction (buggy code + error trace), multi-doc
+    # synthesis (cross-card retrieval), calibration (solvable +
+    # unsolvable), refactoring (style-constrained refactor).
+    _BENCH_SAMPLES["correction"] = _generate_correction_items(
+        block_seed, BENCH_CORRECTION_PER_ROUND,
+    )
+    _BENCH_SAMPLES["multi_doc"] = _generate_multi_doc_items(
+        block_seed, BENCH_MULTI_DOC_PER_ROUND,
+    )
+    _BENCH_SAMPLES["calibration"] = _generate_calibration_items(
+        block_seed, BENCH_CALIBRATION_PER_ROUND,
+    )
+    _BENCH_SAMPLES["refactor"] = _generate_refactor_items(
+        block_seed, BENCH_REFACTOR_PER_ROUND,
+    )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -4119,7 +5125,8 @@ def set_bench_block_seed(block_seed):
         f"long_context={len(_BENCH_SAMPLES['long_context'])}, "
         f"procedural={len(_BENCH_SAMPLES['procedural'])}, "
         f"robustness={len(_BENCH_SAMPLES['robustness'])}, "
-        f"noise={len(_BENCH_SAMPLES['noise'])}",
+        f"noise={len(_BENCH_SAMPLES['noise'])}, "
+        f"debug={len(_BENCH_SAMPLES['debug'])}",
         flush=True,
     )
 
@@ -4248,11 +5255,19 @@ def _math_score_one(pred: str, gold: str) -> int:
 
 
 def _bench_finalize_token_stats(out: dict) -> None:
-    """Populate ``mean_gen_tokens`` and ``mean_gen_tokens_correct`` from
-    the per-item ``gen_tokens`` fields. Called by every bench probe right
-    before returning so the Session 3.2 ``reasoning_density`` axis can
-    detect both answer-only memorization (too few tokens) and
-    inefficient over-thinking (too many tokens).
+    """Populate ``mean_gen_tokens`` / ``mean_gen_tokens_correct`` and
+    ``per_src`` from the per-item ``gen_tokens`` / ``ok`` / ``src``
+    fields. Called by every bench probe right before returning.
+
+    ``per_src`` (added 2026-04-29 v29.3) is the per-template breakdown:
+    ``{src: {"n": int, "correct": int, "pass_frac": float}}``. The
+    composite scoring doesn't read this directly, but downstream
+    saturation telemetry (``scripts/audit/per_template_saturation.py``)
+    uses it to surface which procedural templates have hit ceiling /
+    floor across recent rounds — the signal that tells operators which
+    template family to harden, retire, or rebalance. Adds ~1-2 KB per
+    student per round to ``h2h_history.json``: cheap relative to the
+    50× signal-to-noise improvement on per-template tuning decisions.
 
     Items with an ``error`` field are skipped. ``gen_tokens`` is an
     integer — if absent we fall back to zero rather than None so the
@@ -4263,9 +5278,15 @@ def _bench_finalize_token_stats(out: dict) -> None:
     tok_sum_correct = 0
     n_all = 0
     n_correct = 0
+    per_src: dict[str, dict[str, int]] = {}
     for it in items:
         if not isinstance(it, dict) or it.get("error"):
             continue
+        src = it.get("src") or "unknown"
+        bucket = per_src.setdefault(src, {"n": 0, "correct": 0})
+        bucket["n"] += 1
+        if it.get("ok"):
+            bucket["correct"] += 1
         tok = int(it.get("gen_tokens") or 0)
         if tok <= 0:
             continue
@@ -4278,6 +5299,15 @@ def _bench_finalize_token_stats(out: dict) -> None:
     out["mean_gen_tokens_correct"] = (
         round(tok_sum_correct / n_correct, 1) if n_correct else 0.0
     )
+    # Materialize per-template pass-frac for downstream telemetry.
+    out["per_src"] = {
+        src: {
+            "n": bucket["n"],
+            "correct": bucket["correct"],
+            "pass_frac": round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0,
+        }
+        for src, bucket in per_src.items()
+    }
 
 
 def math_bench_probe(model, tokenizer, device="cuda"):
@@ -4371,6 +5401,479 @@ def code_bench_probe(model, tokenizer, device="cuda"):
                 "task_id": it.get("task_id"),
                 "entry_point": it.get("entry_point"),
                 "ok": ok,
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+def debug_bench_probe(model, tokenizer, device="cuda"):
+    """Run the debug_bench probe (v29.2 — procedural code-debugging).
+
+    Items are generated by ``_generate_debug_items`` and have the same
+    {prompt, test, entry_point, task_id} shape as ``code_bench``. The
+    prompt embeds the buggy reference (commented out) + the test cases
+    (commented out) + a fresh signature with docstring; the model
+    completes the body. The existing ``humaneval_sandbox`` grader runs
+    unchanged — its auto-indent / prose-trim / fence-strip layer all
+    apply because the prompt ends mid-``def`` block exactly like
+    ``code_bench``.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("debug") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Fix the bug in the following Python function. "
+                        "Output only the function body (no extra "
+                        "explanation, no markdown fences).\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_DEBUG_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, tok, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            ok = bool(r and r.passed)
+            out["items"].append({
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── correction_bench (v29.4) ─────────────────────────────────────────────
+
+def correction_bench_probe(model, tokenizer, device="cuda"):
+    """Run the correction_bench probe (v29.4 — buggy code + error trace fix).
+
+    Same shape + sandbox grader as ``debug_bench`` and ``code_bench``:
+    the prompt embeds a buggy reference (commented out) + an explicit
+    error trace + the fresh signature; the model emits the corrected
+    body. Item-level pass = sandbox runs the corrected function and all
+    asserts pass.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("correction") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, int, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Read the test failure trace and fix the bug. "
+                        "Output only the corrected function body (no extra "
+                        "explanation, no markdown fences).\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_CORRECTION_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, tok, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "src": it.get("src", ""),
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            ok = bool(r and r.passed)
+            out["items"].append({
+                "src": it.get("src", ""),
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── multi_doc_synthesis_bench (v29.4) ───────────────────────────────────
+
+def _format_multi_doc_prompt(it: dict) -> str:
+    """Wrap a multi-doc item with the same context-question-answer
+    skeleton long_context_bench uses, but adapted for multiple
+    discrete documents in the context."""
+    return (
+        "Read the documents below and answer the question that follows. "
+        "Reply with just the answer (no extra text).\n\n"
+        f"{it['context']}\n\n"
+        f"Question: {it['question']}\n\nAnswer:"
+    )
+
+
+def multi_doc_synthesis_bench_probe(model, tokenizer, device="cuda"):
+    """Run the multi_doc_synthesis_bench probe (v29.4)."""
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("multi_doc") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_multi_doc_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_MULTI_DOC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    confuser_answers = it.get("confuser_answers") or []
+                    pred_lower = cleaned.lower()
+                    gold_in_pred = bool(gold and gold.lower() in pred_lower)
+                    confuser_in_pred = any(
+                        ca and ca.lower() in pred_lower for ca in confuser_answers
+                    )
+                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "kind": it.get("kind"),
+                        "gold": gold[:60],
+                        "pred_tail": cleaned[-160:],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "confuser_hit": bool(confuser_answers and confuser_in_pred),
+                        "gold_in_pred": gold_in_pred,
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── calibration_bench (v29.4) ────────────────────────────────────────────
+
+def _calibration_grade_one(text: str, gold: str, kind: str) -> bool:
+    """Return True if the model's response correctly handles the item.
+
+    For ``solv`` items: gold is a numeric string; pass if gold appears
+    as a substring in the response AND no refusal token appears (so a
+    model that refuses to confidently answer doesn't get free credit
+    when the gold happens to also appear).
+
+    For ``unsolv`` items: pass if response contains a refusal token AND
+    no standalone integer (so a model that says "I don't know, but if
+    I had to guess, 42" doesn't get credit — that's confabulation
+    wearing a refusal hat).
+    """
+    if not text:
+        return False
+    cleaned = text.lower().strip()
+    has_refusal = any(tok in cleaned for tok in _CALIBRATION_REFUSAL_TOKENS)
+    import re as _re
+    standalone_int_re = _re.compile(r"(?<![A-Za-z0-9])-?\d+(?![A-Za-z0-9])")
+    has_integer = bool(standalone_int_re.search(text))
+    if kind == "solv":
+        # Solvable: gold integer must appear; refusal disqualifies.
+        if not gold or gold == "REFUSE":
+            return False
+        return (gold in text) and not has_refusal
+    # Unsolvable: must refuse AND not emit a confident integer.
+    return has_refusal and not has_integer
+
+
+def calibration_bench_probe(model, tokenizer, device="cuda"):
+    """Run the calibration_bench probe (v29.4 — solvable + unsolvable mix)."""
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": [],
+           "n_solv": 0, "n_unsolv": 0,
+           "correct_solv": 0, "correct_unsolv": 0}
+    samples = _BENCH_SAMPLES.get("calibration") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Answer the question below. If the question cannot be "
+                        "answered from the information given, reply 'I don't "
+                        "know' or 'insufficient information'. Otherwise reply "
+                        "with the answer only.\n\n"
+                        f"Question: {it['question']}\n\nAnswer:"
+                    )
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_CALIBRATION_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    gold = str(it.get("answer", ""))
+                    kind = it.get("kind", "solv")
+                    ok = _calibration_grade_one(cleaned, gold, kind)
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "kind": kind,
+                        "gold": gold[:40],
+                        "pred_tail": cleaned[-120:].strip(),
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                    })
+                    out["n"] += 1
+                    if kind == "solv":
+                        out["n_solv"] += 1
+                        if ok:
+                            out["correct_solv"] += 1
+                    else:
+                        out["n_unsolv"] += 1
+                        if ok:
+                            out["correct_unsolv"] += 1
+                    out["correct"] += int(ok)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        # Per-half pass-fracs surface in telemetry so we can tell which
+        # half a model is failing on (always-refuse vs always-confabulate).
+        out["solv_pass_frac"] = (
+            out["correct_solv"] / out["n_solv"] if out["n_solv"] else 0.0
+        )
+        out["unsolv_pass_frac"] = (
+            out["correct_unsolv"] / out["n_unsolv"] if out["n_unsolv"] else 0.0
+        )
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── refactor_bench (v29.4) ───────────────────────────────────────────────
+
+def _refactor_check_constraint(model_code: str, item: dict) -> tuple[bool, str]:
+    """Check the model's emitted code against the style constraint.
+
+    Returns (passed, reason). ``model_code`` is the raw text the model
+    emitted (post-fence-strip). We parse it with ``ast`` and apply the
+    appropriate check. Failure to parse → constraint considered failed
+    (the sandbox will also have caught a SyntaxError, but we keep this
+    defensive).
+    """
+    import ast
+    constraint = item.get("constraint_kind", "")
+    try:
+        tree = ast.parse(model_code)
+    except Exception as e:
+        return False, f"parse_error:{type(e).__name__}"
+    # Find the function definition that matches entry_point.
+    entry = item.get("entry_point", "")
+    func_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == entry:
+            func_node = node
+            break
+    if func_node is None:
+        return False, "entry_point_not_found"
+    if constraint == "no_nested_loops":
+        # Walk the function body; flag any for/while inside another for/while.
+        def _has_nested(n, depth=0):
+            for child in ast.iter_child_nodes(n):
+                if isinstance(child, (ast.For, ast.While, ast.AsyncFor)):
+                    if depth >= 1:
+                        return True
+                    if _has_nested(child, depth + 1):
+                        return True
+                else:
+                    if _has_nested(child, depth):
+                        return True
+            return False
+        if _has_nested(func_node):
+            return False, "nested_loop_present"
+        return True, "ok"
+    if constraint == "no_explicit_loop":
+        for n in ast.walk(func_node):
+            if isinstance(n, (ast.For, ast.While, ast.AsyncFor)):
+                return False, "explicit_loop_present"
+        return True, "ok"
+    if constraint == "max_lines":
+        max_lines = int(item.get("max_lines") or 8)
+        # Count non-blank, non-comment source lines in the function body
+        # (excluding signature + docstring).
+        body_lines = 0
+        # Use raw source segments when available; otherwise use line
+        # counts from the AST nodes.
+        if func_node.body:
+            for stmt in func_node.body:
+                # Skip the leading docstring expression.
+                if (isinstance(stmt, ast.Expr)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)
+                        and stmt is func_node.body[0]):
+                    continue
+                # Estimate line count from end_lineno - lineno + 1.
+                start = stmt.lineno
+                end = getattr(stmt, "end_lineno", start) or start
+                body_lines += max(1, end - start + 1)
+        if body_lines > max_lines:
+            return False, f"body_lines={body_lines}>max={max_lines}"
+        return True, "ok"
+    return True, "unknown_constraint_passed_through"
+
+
+def refactor_bench_probe(model, tokenizer, device="cuda"):
+    """Run the refactor_bench probe (v29.4 — preserve behavior + style constraint)."""
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("refactor") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, int, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Refactor the function shown. Your refactor must "
+                        "preserve behaviour AND meet the style constraint. "
+                        "Output only the function (signature + body), no "
+                        "extra explanation.\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_REFACTOR_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, tok, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "src": it.get("src", ""),
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            tests_passed = bool(r and r.passed)
+            constraint_ok = False
+            constraint_reason = "tests_failed_skip_constraint"
+            if tests_passed:
+                # Build the same code the sandbox saw to apply AST
+                # constraint check on it.
+                cleaned_gen = _strip_thinking_probe(gen or "")
+                try:
+                    cleaned_gen = hs._strip_code_fences(cleaned_gen)
+                except Exception:
+                    pass
+                # Concatenate prompt + gen so we have the full module
+                # source to AST-parse (same as sandbox).
+                full_src = it["prompt"] + cleaned_gen
+                constraint_ok, constraint_reason = _refactor_check_constraint(
+                    full_src, it,
+                )
+            ok = tests_passed and constraint_ok
+            out["items"].append({
+                "src": it.get("src", ""),
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "tests_passed": tests_passed,
+                "constraint_ok": constraint_ok,
+                "constraint_reason": constraint_reason,
                 "gen_tokens": int(tok),
                 "reason": (r.reason if r else "no_result")[:120],
                 "tail": (gen or "")[-160:],
@@ -5152,215 +6655,320 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
 
 # ── long_context_bench (Session 3.5 — procedural needle-in-haystack) ──
 
-# Distractor templates for long_context_bench. Each line is a complete
-# sentence that slots into the filler document. Chosen to be thematically
-# diverse (travel, cooking, weather, sports, fauna) so the needle doesn't
-# stand out by topic. Procedurally varied via random name/number picks
-# so the document is fresh every round.
-_LC_DISTRACTORS = [
-    "Anna opened the windows to let in the evening breeze.",
-    "The library's north wing closed for renovations last month.",
-    "Ben made pancakes on Saturday morning using the old recipe.",
-    "Snow fell steadily over the small village in the highlands.",
-    "Clara found an old photograph tucked inside a paperback.",
-    "The tram to the harbour departs every fifteen minutes.",
-    "Dmitri repainted the garden fence a soft sage green.",
-    "A peregrine falcon circled the cathedral tower before dusk.",
-    "Elena's bakery sells four kinds of sourdough on weekends.",
-    "The autumn leaves turned early this year in the valley.",
-    "Felix mistakenly took the wrong umbrella from the lobby.",
-    "A family of deer wandered across the university lawn.",
-    "Greta carried her violin carefully down the wet steps.",
-    "The national park extended its summer hours by two weeks.",
-    "Hector practiced card tricks at the coffee shop for hours.",
-    "Freshly baked bread cooled on the counter by the window.",
-    "Ingrid hiked the ridge trail before the weather changed.",
-    "The fog rolled in from the coast just after seven PM.",
-    "Jakob cleaned his grandfather's camera for the first time.",
-    "A small pumpkin patch sits just beyond the picket fence.",
-    "Kira repaired the bicycle's flat tire in under ten minutes.",
-    "The neighbours adopted a black-and-white kitten named Pepper.",
-    "Leo reread his favorite childhood novel every winter.",
-    "An old lighthouse guards the northern cove from storms.",
-    "Mira arranged the bookshop's paperbacks by author's surname.",
-    "The train slowed as it entered the tunnel at Clearwater.",
-    "Noel studied French phrases each morning over breakfast tea.",
-    "Wild sunflowers bloomed along the highway's median strip.",
-    "Olive forgot her keys at the coworking space overnight.",
-    "A brass bell tolled three times from the town square.",
-    "Paul's startup released its first public beta this winter.",
-    "The river trail remained icy well into early April.",
-    "Quinn painted watercolor landscapes on Sunday afternoons.",
-    "Two border collies herded sheep across the meadow at dawn.",
-    "Rosa taught beginner yoga classes every Tuesday evening.",
-    "The bakery closes early on holidays and all Sundays.",
-    "Sam organised a neighbourhood book swap in the autumn.",
-    "A crescent moon hung above the rooftops by midnight.",
-    "Tomas grew tomatoes in clay pots on the sunny balcony.",
-    "The museum's ancient coin exhibit opens again next Thursday.",
-    "Uma volunteered at the animal shelter on alternate Saturdays.",
-    "An orchestra rehearsed the overture twice before the show.",
-    "Viktor learned to bake bread from a video series online.",
-    "The planetarium will replace its projector later this year.",
-    "Wendy finished knitting the scarf just before the first frost.",
-    "Wild rosemary grew along the stone wall behind the school.",
-    "Xavier walked the dog before the morning rain arrived.",
-    "A new cafe opened near the old train station last Tuesday.",
-    "Yara repaired the broken porch swing with reclaimed oak.",
-    "The village holds a pumpkin festival every October weekend.",
-]
+# 2026-04-29 (v29.5): replace the 50-entry static distractor pool with
+# the procedural ``_synthetic_distractor_sentence`` synthesiser. The
+# legacy list is preserved as an empty tuple for backwards
+# compatibility (any straggler caller fetching ``_LC_DISTRACTORS``
+# gets nothing — the real generator below pulls from the synthesiser
+# directly). Combinatorial space ≈ 8000 names × 23 verbs × 13 adjs
+# × 17 nouns × 11 time-mods ≈ 446M unique sentences ⇒ effectively
+# uncacheable by any miner.
+_LC_DISTRACTORS: tuple = ()
 
-# Needle templates. Each needle pairs a question with an answer format
-# that's trivially extractable (we grade with substring containment, so
-# "the vault code is 42" → model should say "42" or "the vault code is 42").
-_LC_NEEDLE_TEMPLATES = [
-    ("The secret access code for the archive is {ANS}.",
-     "What is the secret access code for the archive?"),
-    ("The treasure chest is buried at coordinates {ANS}.",
-     "Where is the treasure chest buried?"),
-    ("The keeper's favorite password is {ANS}.",
-     "What is the keeper's favorite password?"),
-    ("The lost vault combination is {ANS}.",
-     "What is the lost vault combination?"),
-    ("Professor Aldric's rare ingredient is {ANS}.",
-     "What is Professor Aldric's rare ingredient?"),
-    ("The winning lottery number from last week was {ANS}.",
-     "What was last week's winning lottery number?"),
-    ("Captain Nia's lucky charm is called {ANS}.",
-     "What is Captain Nia's lucky charm called?"),
-    ("The hidden guild's signal word is {ANS}.",
-     "What is the hidden guild's signal word?"),
-]
+# 2026-04-29 (v29.5): replace the 8-entry static needle template list
+# with a procedural per-item synthesiser. Each long_context item picks a
+# fresh batch of (entity_phrase, item_word) pairs from the lex
+# inventory, so the question + needle wording rotates per item AND per
+# round. The legacy list is preserved as an empty tuple for any
+# backwards-compat caller; the actual generator below uses
+# ``_synth_needle_templates_for_item`` to build a fresh batch.
+_LC_NEEDLE_TEMPLATES: tuple = ()
+
+
+def _synth_needle_templates_for_item(rng: "random.Random",
+                                     n_templates: int) -> list[tuple[str, str]]:
+    """Synthesise ``n_templates`` fresh (sentence_template,
+    question_template) pairs for one long_context item.
+
+    Each pair carries a procedurally-generated entity (e.g.
+    ``"the Sliva Vandel courier"``) + item-word (e.g. ``"recall token"``)
+    so the model can disambiguate confusers by entity-matching the
+    question to the correct sentence — which is the same grading
+    mechanic as the legacy fixed-template version, but with rotated
+    surface forms.
+
+    Within one item all entities are distinct (we resample on
+    collision). Across items the entity space is effectively-infinite
+    so a memoriser cannot pre-cache (entity → answer) pairs.
+    """
+    templates: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+    attempts = 0
+    while len(templates) < n_templates and attempts < n_templates * 8:
+        attempts += 1
+        entity_phrase, possessive_phrase, item_word = _synthetic_entity(rng)
+        # Use entity + item_word as a uniqueness key so the same
+        # entity doesn't show up twice in one document.
+        key = f"{entity_phrase}|{item_word}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        sentence_tpl = f"{possessive_phrase} is {{ANS}}."
+        # Capitalise the leading article for the sentence; questions
+        # use lowercase mid-sentence form by default.
+        sentence_tpl = sentence_tpl[0].upper() + sentence_tpl[1:]
+        question_tpl = f"What is {entity_phrase}'s {item_word}?"
+        templates.append((sentence_tpl, question_tpl))
+    return templates
 
 
 def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: int) -> list[dict]:
     """Create ``n_items`` fresh needle-in-haystack prompts seeded by the
     round's block_seed.
 
-    Each document contains ONE real needle whose question is asked AND
+    v29.2 (2026-04-29) — multi-needle reasoning rebalance. The 2026-04-28
+    saturation audit showed long_context_bench at 93 % pass-rate ≥0.95
+    across 115 records — a dead axis with no signal at the top. Cause:
+    with only 3 confusers and ~14-line documents, every 4B-class model
+    trivially identified the entity-matched needle (archive vs vault vs
+    guild). The grader's confuser-rejection logic was sound, but the
+    items themselves did not require *long-context reasoning* — just
+    *long-context retrieval*.
+
+    v29.2 closes this with two changes:
+      * Bump confusers 3 → 6 and distractors 40 → 60 so single-needle
+        items remain non-trivial (random pick is 1/7 instead of 1/4,
+        document is ~80 lines instead of ~14).
+      * **Multi-needle items** (default 40 % of round): the model must
+        retrieve 2-3 distinct needles AND combine them via arithmetic /
+        comparison / concatenation. Multi-needle subtypes:
+          - ``sum_digits``  : sum of digits of two codes
+          - ``compare``     : which code is alphabetically first
+          - ``concatenate`` : concatenate two codes with hyphen
+          - ``count``       : count letters in three codes total
+        These force the model to read context AND reason — pure pattern
+        matching against the question's entity gets at most 1 of 2-3
+        needles and produces a wrong combined answer.
+
+    Single-needle items: the document contains ONE real needle plus
     ``BENCH_LC_N_CONFUSERS`` confuser needles drawn from different
-    templates, each with their own fake-answer 7-char code. Document
-    structure (positions chosen uniformly at random over the final doc):
+    templates. The model must return the real ANS. Grading is
+    case-insensitive substring containment of the gold AND
+    rejection of any confuser-code substring (so a model that emits
+    "the codes are X, Y, Z, W" loses even if X is correct).
 
-        distractor_1
-        confuser_needle_A   <- fake answer for "What is X?"
-        ...
-        real_needle         <- correct answer for the question we ask
-        ...
-        confuser_needle_B   <- fake answer for "What is Y?"
-        ...
+    Multi-needle items: the document contains 2-3 real needles whose
+    codes feed into a combined gold answer (computed in Python from the
+    same params, exact match required), plus 4-5 confuser needles
+    drawn from unrelated templates. The grader checks the combined
+    gold appears in the response AND no confuser code appears.
 
-    Models that just regex out any 7-character ALL-CAPS code now have to
-    discriminate among (1 real + N confusers) candidates. With 1 confuser
-    the 4B reference still scored 1.0 (Round 9 telemetry: 3/3 on every
-    student). Bumping the default to 3 confusers drops the random-match
-    pass rate from 1/2 to 1/4 and forces the model to actually match the
-    question to the right named entity (archive vs vault vs guild vs
-    professor vs treasure-chest).
+    All needle answers (real + confusers) are distinct 7-char codes so
+    a stray substring match against the wrong needle is impossible.
 
-    The model must return the real ANS. Grading: case-insensitive
-    substring containment so the model can answer "XYZ1234" or "the code
-    is XYZ1234". A response that contains *only* a confuser's answer
-    fails because the substring check is for the real ANS.
-
-    All needle answers are guaranteed to be distinct so a stray substring
-    match against the wrong needle's answer is impossible.
+    Cross-validator agreement: all generation is deterministic on
+    ``block_seed`` and per-item RNG-derived seeds, so every validator
+    materializes the same items.
     """
     import random
     out: list[dict] = []
     rng = random.Random((block_seed ^ _BENCH_STREAM["long_context"]) & 0xFFFFFFFF)
     alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no confusing chars
     n_templates = len(_LC_NEEDLE_TEMPLATES)
-    n_confusers = max(0, min(BENCH_LC_N_CONFUSERS, n_templates - 1))
-    for i in range(n_items):
-        # Seed each item independently so swapping n_items doesn't change
-        # the first item's content.
-        r = random.Random(rng.randint(0, 2**31 - 1))
-        # Pick (1 + n_confusers) distinct templates — one real, the rest
-        # confusers. Fewer templates → fewer confusers; the cap above
-        # guarantees we never duplicate the real template.
-        n_picked = 1 + n_confusers
-        idxs = r.sample(range(n_templates), min(n_picked, n_templates))
-        real_idx = idxs[0]
-        confuser_idxs = idxs[1:]
-        needle_tpl, question = _LC_NEEDLE_TEMPLATES[real_idx]
-        # Generate distinct 7-char codes for real + every confuser. We
-        # need n_picked unique codes; redraw any duplicates against the
-        # whole pool to avoid biasing (collision probability is tiny but
-        # non-zero with a 31^7 alphabet).
+    # 2026-04-29 (v29.5): the needle template list is procedurally
+    # synthesised per-item now; ``n_templates`` is the size we'd LIKE
+    # to draw from per item, not a fixed pool size. Use the operator
+    # cap from BENCH_LC_N_CONFUSERS to bound how many distinct entities
+    # one item carries (real + confusers).
+    n_confusers = max(0, BENCH_LC_N_CONFUSERS)
+    n_multi = max(0, int(round(n_items * BENCH_LC_MULTI_FRACTION)))
+    n_single = max(0, n_items - n_multi)
+    # 2026-04-29 (v29.2): only multi-needle subtypes whose gold has a
+    # *unique* surface shape (hyphenated codes) keep the existing
+    # substring grader correct. Subtypes whose gold is a small integer
+    # or a single code can collide with code substrings or let the model
+    # "hedge" by mentioning both candidates — those are deferred to a
+    # follow-up pass with structured-output grading. Concatenation is
+    # both the cleanest gold and the most representative real long-
+    # context skill (retrieve N spans + emit them in a specified order).
+    multi_kinds = ["concatenate_two", "concatenate_three"]
+    multi_kind_seq = (multi_kinds * ((n_multi // len(multi_kinds)) + 1))[:n_multi]
+    rng.shuffle(multi_kind_seq)
+
+    def _gen_unique_codes(r: random.Random, k: int) -> list[str]:
         codes: list[str] = []
-        seen_codes: set[str] = set()
-        while len(codes) < n_picked:
+        seen: set[str] = set()
+        while len(codes) < k:
             code = "".join(r.choice(alphabet) for _ in range(7))
-            if code in seen_codes:
-                continue
-            seen_codes.add(code)
-            codes.append(code)
-        answer = codes[0]
-        confuser_answers = codes[1:]
-        # Pick distractors without replacement; fall back to sampling
-        # with replacement if n_distractors exceeds pool size.
-        if n_distractors <= len(_LC_DISTRACTORS):
-            distractors = r.sample(_LC_DISTRACTORS, n_distractors)
-        else:
-            distractors = [r.choice(_LC_DISTRACTORS) for _ in range(n_distractors)]
-        # Build needle sentences (real + confusers).
-        real_sentence = needle_tpl.format(ANS=answer)
-        confuser_sentences = [
-            _LC_NEEDLE_TEMPLATES[ci][0].format(ANS=ca)
-            for ci, ca in zip(confuser_idxs, confuser_answers)
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+        return codes
+
+    def _entity_label(template_idx: int) -> str:
+        """Short human-readable label for the question template (e.g.
+        "archive code"). Used to refer to specific needles in
+        multi-needle questions without leaking the answer."""
+        # Map question text to the entity referred to. Question is the
+        # second element of each ``_LC_NEEDLE_TEMPLATES`` tuple.
+        q = _LC_NEEDLE_TEMPLATES[template_idx][1].lower()
+        if "archive" in q: return "archive's secret access code"
+        if "treasure" in q: return "treasure-chest coordinates"
+        if "keeper" in q: return "keeper's favorite password"
+        if "vault" in q: return "lost vault combination"
+        if "professor" in q: return "professor Aldric's rare ingredient"
+        if "lottery" in q: return "last week's winning lottery number"
+        if "captain" in q: return "captain Nia's lucky charm name"
+        if "guild" in q: return "hidden guild's signal word"
+        return "value"
+
+    def _emit_layout(r: random.Random, slot_sentences: list[str], n_dist: int) -> tuple[str, list[int]]:
+        """Place needle sentences uniformly through a doc of size
+        ``n_dist + len(slot_sentences)``. Returns (rendered_doc,
+        per-needle 0-indexed positions in the same order as
+        ``slot_sentences``)."""
+        n_needles = len(slot_sentences)
+        final_n = n_dist + n_needles
+        # 2026-04-29 (v29.5): distractors are procedurally synthesised
+        # per item from the lex inventory (no static pool to memorise).
+        # Each call yields a fresh sentence; combinatorial space is
+        # effectively uncacheable.
+        distractors_picked = [
+            _synthetic_distractor_sentence(r) for _ in range(n_dist)
         ]
-        # Pick positions in the FINAL-document index space so the
-        # recorded positions match the rendered context. Real needle in
-        # the middle half (NOT at start/end); each confuser at least 3
-        # lines away from every other needle so they don't cluster.
-        final_n = n_distractors + n_picked
-        real_pos = r.randint(final_n // 4, 3 * final_n // 4)
-        chosen_positions = [real_pos]
-        confuser_positions: list[int] = []
-        for _ in confuser_sentences:
-            cp = real_pos
+        # Pick distinct positions for each needle, at least 3 apart.
+        # Real / first-real needle goes in the middle half (avoids start/end).
+        first_pos = r.randint(final_n // 4, 3 * final_n // 4)
+        positions: list[int] = [first_pos]
+        for _ in range(n_needles - 1):
+            cp = first_pos
             attempts = 0
-            while attempts < 32 and any(abs(cp - p) < 3 for p in chosen_positions):
+            while attempts < 64 and any(abs(cp - p) < 3 for p in positions):
                 cp = r.randint(0, final_n - 1)
                 attempts += 1
-            confuser_positions.append(cp)
-            chosen_positions.append(cp)
-        # Build the final document directly so positions are exact.
-        # Slots are reserved for the needles; the rest are distractors
-        # in order (their internal order doesn't matter for grading).
-        slot_specs: list[tuple[int, str]] = [(real_pos, real_sentence)]
-        slot_specs.extend(zip(confuser_positions, confuser_sentences))
-        slot_specs.sort(key=lambda x: x[0])
+            positions.append(cp)
+        # Build the doc by walking final_n slots in order.
+        slot_map = sorted(zip(positions, slot_sentences), key=lambda x: x[0])
         next_slot = 0
         distract_idx = 0
         lines: list[str] = []
         for j in range(final_n):
-            if next_slot < len(slot_specs) and j == slot_specs[next_slot][0]:
-                lines.append(slot_specs[next_slot][1])
+            if next_slot < len(slot_map) and j == slot_map[next_slot][0]:
+                lines.append(slot_map[next_slot][1])
                 next_slot += 1
             else:
-                lines.append(distractors[distract_idx])
+                lines.append(distractors_picked[distract_idx])
                 distract_idx += 1
-        context = "\n".join(lines)
+        return "\n".join(lines), positions
+
+    # ── single-needle items (legacy difficulty floor) ─────────────────
+    for _ in range(n_single):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        n_picked = 1 + n_confusers
+        # v29.5: synthesise a fresh template list for THIS item so the
+        # entity wording rotates per item, not just per round.
+        item_templates = _synth_needle_templates_for_item(r, n_picked)
+        if not item_templates:
+            continue  # synth pathology; skip rather than break the round
+        real_idx = 0  # index 0 is the "real" needle, the rest are confusers
+        needle_tpl, question = item_templates[real_idx]
+        codes = _gen_unique_codes(r, n_picked)
+        answer = codes[0]
+        confuser_answers = codes[1:]
+        real_sentence = needle_tpl.format(ANS=answer)
+        confuser_sentences = [
+            item_templates[ci][0].format(ANS=ca)
+            for ci, ca in enumerate(confuser_answers, start=1)
+        ]
+        all_slots = [real_sentence] + confuser_sentences
+        context, positions = _emit_layout(r, all_slots, n_distractors)
         out.append({
-            "src": "long_context",
+            "src": "long_context/single",
             "context": context,
             "question": question,
             "answer": answer,
             "confuser_answers": confuser_answers,
-            "needle_position": real_pos,
-            "confuser_positions": confuser_positions,
+            "needle_position": positions[0],
+            "confuser_positions": positions[1:],
         })
+
+    # ── multi-needle items (combined-answer reasoning) ────────────────
+    for kind in multi_kind_seq:
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        # Pick 2-3 real needles depending on the multi-kind, plus a few
+        # confusers so the model still has to discriminate signal from
+        # noise.
+        n_real = 3 if kind == "concatenate_three" else 2
+        n_extra_confusers = max(2, n_confusers - 1)
+        n_total_templates = n_real + n_extra_confusers
+        item_templates = _synth_needle_templates_for_item(r, n_total_templates)
+        if len(item_templates) < n_real + 1:
+            # Pathological synth result; skip this multi-needle item.
+            continue
+        # Real needles are the first n_real templates; confusers are the rest.
+        codes = _gen_unique_codes(r, len(item_templates))
+        real_codes = codes[:n_real]
+        confuser_codes = codes[n_real:]
+        real_sentences = [
+            item_templates[ri][0].format(ANS=rc)
+            for ri, rc in enumerate(real_codes)
+        ]
+        confuser_sentences = [
+            item_templates[ci][0].format(ANS=cc)
+            for ci, cc in enumerate(confuser_codes, start=n_real)
+        ]
+        all_sentences = real_sentences + confuser_sentences
+        context, positions = _emit_layout(r, all_sentences, n_distractors)
+        # Entity labels for the question come straight from the
+        # procedurally-synthesised question templates: each template's
+        # question is ``"What is the X's Y?"``. We strip ``"What is "``
+        # and ``"the "`` (since the multi-needle question wraps each
+        # entity with ``"the "`` already) and the trailing ``"?"``,
+        # producing ``"X's Y"`` ready to drop into the question.
+        entities: list[str] = []
+        for ri in range(n_real):
+            qtpl = item_templates[ri][1]
+            phrase = qtpl
+            for prefix in ("What is ", "what is "):
+                if phrase.startswith(prefix):
+                    phrase = phrase[len(prefix):]
+                    break
+            for prefix in ("the ", "The "):
+                if phrase.startswith(prefix):
+                    phrase = phrase[len(prefix):]
+                    break
+            phrase = phrase.rstrip("?").strip()
+            entities.append(phrase)
+        gold = "-".join(real_codes)
+        if kind == "concatenate_two":
+            question = (
+                f"Concatenate the {entities[0]} and the {entities[1]} "
+                f"with a single hyphen between them (no spaces, no other "
+                f"text). Reply with just the concatenated codes."
+            )
+        else:  # concatenate_three
+            question = (
+                f"Concatenate (in order) the {entities[0]}, the "
+                f"{entities[1]}, and the {entities[2]} — separating each "
+                f"pair with a single hyphen (no spaces, no other text). "
+                f"Reply with just the concatenated codes."
+            )
+        out.append({
+            "src": f"long_context/multi:{kind}",
+            "context": context,
+            "question": question,
+            "answer": gold,
+            # Confusers are the UNRELATED codes only. Real codes appear
+            # in the gold and are not rejected by the grader; only the
+            # confuser codes (drawn from unrelated templates) trip the
+            # confuser-rejection check.
+            "confuser_answers": confuser_codes,
+            "real_codes": real_codes,
+            "needle_position": positions[0],
+            "confuser_positions": positions[n_real:],
+        })
+    # Shuffle so single + multi items aren't grouped at the boundary
+    # (graders see them in random order, which improves variance).
+    rng.shuffle(out)
     return out
 
 
 # ── procedural_bench (Session 3.6 — fresh synthetic tasks) ────────────
 
-_PROC_NAMES = [
-    "Aster", "Beryl", "Canto", "Doria", "Elowen", "Faro", "Galen", "Hedra",
-    "Ivara", "Juno", "Kestrel", "Lumen", "Mira", "Nadir", "Orin", "Pavo",
-]
+# 2026-04-29 (v29.5): static name list replaced with the procedural
+# synthesiser ``_synthetic_name`` — every per-item caller pulls fresh
+# names from the lex inventory.
+_PROC_NAMES: tuple = ()
 
 
 def _rot_text(s: str, n: int) -> str:
@@ -5429,53 +7037,371 @@ def _v27_int_to_words(n: int) -> str:
 
 
 def _generate_math_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural math items for math_bench (v27).
+    """Procedural math items for math_bench (v29 — gsm8k-narrative rebalance).
 
-    Subtypes (rotated per round, per item):
-      * ``modular_linear``    — ((a*x + b*y + c) mod m), small primes
-      * ``rate_distance``     — relative-velocity word problems
-      * ``mixture``           — concentration/blend word problems
-      * ``percentage``        — applied percent of a base, with a twist
-      * ``gcd_lcm``           — number-theory short forms
-      * ``polynomial_eval``   — evaluate ax^2 + bx + c at integer point
-      * ``arithmetic_series`` — sum of arithmetic progression
-      * ``geometric_series``  — finite geometric series with small r
-      * ``digit_sum``         — multi-step digit manipulation
-      * ``unit_conversion``   — currency / percentage / time conversions
-      * ``simultaneous``      — solve 2-variable linear system
-      * ``factorial_mod``     — n! mod p with Wilson's-theorem checkable
-      * ``set_intersect``     — counting from inclusion-exclusion
-      * ``probability_count`` — combinatorial probability with small N
-      * ``triangle_area``     — Heron's formula, integer outcomes
-      * ``coin_change``       — exact-change combinations (DP-checkable)
-      * ``time_arithmetic``   — duration / clock arithmetic
-      * ``proportion``        — ratio with one unknown leg
-    All items use the GSM8K-style ``#### N`` answer marker so the
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed reference
+    Qwen3.5-4B scoring **0.5** on procedural math_bench while scoring
+    **0.93** on held-out gsm8k. That 40+ pp gap is a distribution
+    mismatch — the v27 templates lean toward "Compute (a*x + b*y + c)
+    mod m" computer-science style problems, which test a *different*
+    skill than gsm8k's multi-step narrative word problems. Optimising
+    v27-math doesn't transfer to gsm8k, so kings climb the validator
+    composite while regressing -7.4pp on the held-out canary (audit
+    ``2026-04-28-goodhart-deep-pass``). v29 rebalances so ~70 % of
+    items are gsm8k-narrative-style and ~30 % are the legacy v27
+    direct-compute templates. The procedural skill surface still spans
+    arithmetic / number-theory / combinatorics, but the SHAPE of each
+    item now matches what gsm8k miners actually need to solve, so
+    validator-eval pass-rate becomes a faithful predictor of
+    held-out-canary pass-rate.
+
+    NEW v29 narrative subtypes (gsm8k-style, multi-step, named
+    entities, no formula leak in the prompt):
+      * ``shopping_budget``   — buy/sell with running total, change
+      * ``recipe_scale``      — proportions across servings/batches
+      * ``travel_distance``   — multi-leg trips, layovers, stops
+      * ``school_classroom``  — students/teachers/grades multi-step
+      * ``garden_orchard``    — planting/harvesting/yields per row
+      * ``bakery_orders``     — daily production minus orders + storage
+      * ``library_books``     — borrowed/returned/fines accumulating
+      * ``fundraiser``        — donors/pledges/multipliers per source
+      * ``trip_planning``     — lodging/meals/transport split
+      * ``pets_animals``      — eggs/litters/feed costs over weeks
+      * ``sports_tournament`` — wins/losses/points/medals tally
+      * ``construction``      — materials per unit/wall/room aggregation
+    Each narrative subtype wires 3–5 sub-calculations into a single
+    word problem with at least three named entities and one numeric
+    distractor so a model that just multiplies the largest two numbers
+    fails. The gold answer is computed in Python from the same params
+    so cross-validator agreement is exact (no rounding ambiguity).
+
+    Legacy v27 subtypes (kept for skill-surface coverage, ~30 % weight):
+      * ``modular_linear``, ``polynomial_eval``, ``gcd_lcm``,
+        ``factorial_mod``, ``arithmetic_series``, ``geometric_series``,
+        ``simultaneous``, ``digit_sum``, ``unit_conversion``,
+        ``time_arithmetic``, ``probability_count``, ``triangle_area``,
+        ``set_intersect``, ``coin_change``, ``mixture``, ``proportion``,
+        ``rate_distance``, ``percentage`` — direct-compute / one-shot
+        items. Useful for symbolic competence and as easy-floor items.
+
+    All items end with the GSM8K-style "#### N" answer marker so the
     existing ``_math_extract_answer`` pipeline grades them unchanged.
 
-    Difficulty calibration: targets a 4B-class instruction-tuned model
-    at ~50% pass-rate on a clean reference (Qwen3.5-4B baseline). Easier
-    subtypes (digit_sum, percentage) balance harder ones (factorial_mod,
-    simultaneous) so the round mean lands ~0.4-0.6 with low variance.
+    Difficulty calibration: each narrative subtype is calibrated so
+    Qwen3.5-4B-base scores ~0.55-0.70 on a private smoke set (closer
+    to gsm8k's 0.93 than the v27 0.50 floor; the procedural rotation
+    keeps the items fresh per round so memorisation is impossible
+    while distributional similarity to gsm8k is preserved).
     """
     import random
     from math import gcd
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["math"]) & 0xFFFFFFFF)
-    kinds = [
+    # ── v29 narrative subtypes (target ~70 % of round) ───────────────
+    narrative_kinds = [
+        "shopping_budget", "recipe_scale", "travel_distance",
+        "school_classroom", "garden_orchard", "bakery_orders",
+        "library_books", "fundraiser", "trip_planning",
+        "pets_animals", "sports_tournament", "construction",
+    ]
+    # ── v27 legacy direct-compute subtypes (target ~30 %) ────────────
+    legacy_kinds = [
         "modular_linear", "rate_distance", "mixture", "percentage",
         "gcd_lcm", "polynomial_eval", "arithmetic_series", "geometric_series",
         "digit_sum", "unit_conversion", "simultaneous", "factorial_mod",
         "set_intersect", "probability_count", "triangle_area", "coin_change",
         "time_arithmetic", "proportion",
     ]
+    # Build kinds list with ~70/30 split. Ensures every round has
+    # representation from both buckets even at small n_items so the
+    # composite signal is stable.
+    kinds: list[str] = []
+    n_narrative = max(1, (n_items * 70 + 50) // 100)
+    n_legacy = max(0, n_items - n_narrative)
+    nar_pool = narrative_kinds * ((n_narrative // len(narrative_kinds)) + 1)
+    leg_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
+    rng.shuffle(nar_pool)
+    rng.shuffle(leg_pool)
+    kinds = nar_pool[:n_narrative] + leg_pool[:n_legacy]
     rng.shuffle(kinds)
     out: list[dict] = []
+    # ── v29 narrative templates (gsm8k-distribution-similar) ─────────
+    # These mimic the gsm8k narrative format: a multi-step word problem
+    # with named entities, real-world context, no formula in the prompt,
+    # and at least one numeric distractor. The model has to read the
+    # full scenario, identify the relevant numbers, and chain 3-5
+    # operations to the final integer answer. This is the SAME skill
+    # gsm8k tests, so optimising procedural math_bench transfers to
+    # gsm8k held-out scoring (the v27 direct-compute items did not).
+    # 2026-04-29 (v29.5): replace static name/shop/item lists with
+    # procedural synthesisers so the surface form rotates per item.
+    # Each per-item RNG below draws fresh names; shops and items use
+    # procedural nouns synthesised from the lex inventory plus a
+    # plural-marker suffix. The math is invariant to the surface
+    # tokens (a buying scenario is still recognisable as a buying
+    # scenario regardless of whether the shop is called "bakery" or
+    # "Drenshire") so the procedural form is grading-equivalent to
+    # the legacy lists.
+    def _synth_shop(rr):
+        # A procedural common-noun shop label.
+        return _synthetic_word(rr, 2) + rr.choice(["shop", "stand", "stall", "house"])
+    def _synth_item(rr):
+        # A procedural plural noun item label.
+        word = _synthetic_word(rr, 2)
+        # Pluralise: append "s" / "es" depending on terminal char.
+        return word + ("es" if word.endswith(("s", "x", "z", "ch", "sh")) else "s")
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         question = ""
         gold = ""
-        if kind == "modular_linear":
+        if kind == "shopping_budget":
+            name = _synthetic_name(r)
+            friend = _synthetic_name(r)
+            start_money = r.choice([40, 50, 60, 80, 100, 120])
+            n_items_a = r.randint(3, 8)
+            price_a = r.choice([2, 3, 4, 5, 6, 7, 8])
+            n_items_b = r.randint(2, 6)
+            price_b = r.choice([3, 4, 5, 6, 8, 9, 10])
+            distractor = r.choice([7, 11, 13, 14])  # noise: friend's age etc.
+            shop = _synth_shop(r)
+            item_a = _synth_item(r)
+            item_b = _synth_item(r)
+            spent = n_items_a * price_a + n_items_b * price_b
+            gold_n = start_money - spent
+            question = (
+                f"{name} goes to the {shop} with ${start_money}. "
+                f"Their friend {friend}, who is {distractor} years old, "
+                f"comes along but doesn't buy anything. "
+                f"{name} buys {n_items_a} {item_a} at ${price_a} each "
+                f"and {n_items_b} {item_b} at ${price_b} each. "
+                f"How many dollars does {name} have left after the visit?"
+            )
+            gold = str(gold_n)
+        elif kind == "recipe_scale":
+            name = _synthetic_name(r)
+            base_servings = r.choice([4, 6, 8, 12])
+            target_servings = base_servings * r.choice([2, 3, 4])
+            cups_per_base = r.choice([2, 3, 4, 5])
+            extra_topping = r.randint(2, 8)
+            distractor = r.choice([45, 60, 90])  # oven temp / time noise
+            cups_total = (target_servings // base_servings) * cups_per_base + extra_topping
+            gold_n = cups_total
+            recipe = r.choice(["banana bread", "pancakes", "cornbread", "biscuits"])
+            question = (
+                f"A {recipe} recipe makes {base_servings} servings and uses "
+                f"{cups_per_base} cups of flour. {name} wants to make "
+                f"{target_servings} servings for a school bake sale. "
+                f"They also need to add {extra_topping} extra cups of flour "
+                f"for a dusting on top. The oven is preheated to "
+                f"{distractor*5} degrees, but that doesn't change the recipe. "
+                f"How many total cups of flour does {name} need?"
+            )
+            gold = str(gold_n)
+        elif kind == "travel_distance":
+            name = _synthetic_name(r)
+            leg_a_speed = r.choice([40, 50, 60, 70])
+            leg_a_hours = r.randint(2, 5)
+            stop_distance = r.randint(15, 40)
+            leg_b_speed = r.choice([45, 55, 65, 75])
+            leg_b_hours = r.randint(2, 4)
+            distractor = r.choice([8, 12, 24])  # tank size, irrelevant
+            total = leg_a_speed * leg_a_hours + stop_distance + leg_b_speed * leg_b_hours
+            gold_n = total
+            question = (
+                f"{name} drives east on the highway at {leg_a_speed} mph for "
+                f"{leg_a_hours} hours. They stop at a rest area, then drive "
+                f"another {stop_distance} miles north to pick up a friend. "
+                f"From there, they continue at {leg_b_speed} mph for "
+                f"{leg_b_hours} hours. The car holds {distractor} gallons of "
+                f"fuel. How many miles total has {name} driven?"
+            )
+            gold = str(gold_n)
+        elif kind == "school_classroom":
+            teacher = _synthetic_name(r)
+            n_classes = r.randint(3, 6)
+            students_per_class = r.choice([18, 22, 24, 28, 30])
+            absent_per_class = r.randint(1, 4)
+            volunteer_helpers = r.randint(2, 5)
+            distractor = r.choice([7, 9, 11])  # number of grades total
+            present = n_classes * (students_per_class - absent_per_class)
+            gold_n = present + volunteer_helpers
+            question = (
+                f"Teacher {teacher} runs an after-school program with "
+                f"{n_classes} classes. Each class has {students_per_class} "
+                f"students enrolled, but on Monday {absent_per_class} students "
+                f"in each class were absent. {volunteer_helpers} parent "
+                f"volunteers also stayed to help. The school district has "
+                f"{distractor} total grades, but that's not relevant here. "
+                f"How many people (students plus volunteers) were present at "
+                f"the program on Monday?"
+            )
+            gold = str(gold_n)
+        elif kind == "garden_orchard":
+            farmer = _synthetic_name(r)
+            n_rows = r.randint(4, 9)
+            trees_per_row = r.randint(5, 12)
+            apples_per_tree = r.choice([20, 25, 30, 40, 50])
+            spoiled_pct = r.choice([10, 20, 25])  # we use raw count: apples * pct/100
+            saved_for_market = r.randint(50, 200)
+            apples_total = n_rows * trees_per_row * apples_per_tree
+            spoiled = apples_total * spoiled_pct // 100
+            gold_n = apples_total - spoiled - saved_for_market
+            question = (
+                f"{farmer} runs an orchard with {n_rows} rows of apple trees. "
+                f"Each row has {trees_per_row} trees, and each tree produces "
+                f"{apples_per_tree} apples this season. {spoiled_pct}% of the "
+                f"apples are spoiled by frost, and {farmer} saves "
+                f"{saved_for_market} apples for the farmer's market next "
+                f"weekend. How many apples are left for {farmer} to sell to "
+                f"the local grocer?"
+            )
+            gold = str(gold_n)
+        elif kind == "bakery_orders":
+            baker = _synthetic_name(r)
+            n_days = r.randint(3, 6)
+            loaves_per_day = r.choice([24, 30, 36, 48, 60])
+            wholesale_per_day = r.randint(8, 18)
+            walkin_total = r.randint(10, 35)
+            distractor = r.choice([5, 6, 7])  # number of staff
+            produced = n_days * loaves_per_day
+            sold = n_days * wholesale_per_day + walkin_total
+            gold_n = produced - sold
+            question = (
+                f"Baker {baker} runs a small bakery with {distractor} staff. "
+                f"They bake {loaves_per_day} loaves of sourdough every day "
+                f"for {n_days} days straight. Each day they sell "
+                f"{wholesale_per_day} loaves to a wholesale partner, and over "
+                f"the {n_days} days they sell {walkin_total} loaves total to "
+                f"walk-in customers. How many loaves are left in storage at "
+                f"the end of the period?"
+            )
+            gold = str(gold_n)
+        elif kind == "library_books":
+            librarian = _synthetic_name(r)
+            n_borrowers = r.randint(8, 20)
+            books_per_borrower = r.randint(2, 5)
+            late_returns = r.randint(3, 12)
+            fine_per_late = r.choice([2, 3, 5])
+            replacements_bought = r.randint(5, 15)
+            distractor = r.choice([12, 15, 18])  # opening hour noise
+            late_revenue = late_returns * fine_per_late
+            books_borrowed = n_borrowers * books_per_borrower
+            # Net books currently out: borrowed minus all that were returned (some late, some on time)
+            # simpler: how many fines collected = late_returns * fine_per_late
+            gold_n = late_revenue
+            question = (
+                f"Librarian {librarian} runs a reading club. {n_borrowers} "
+                f"members each borrowed {books_per_borrower} books for the "
+                f"month. The library opens at {distractor}:00 each day. By "
+                f"the deadline, {late_returns} books were returned late. The "
+                f"library charges ${fine_per_late} per late book. They also "
+                f"used the fines to buy {replacements_bought} replacement "
+                f"books later. How many dollars in late fees did the library "
+                f"collect?"
+            )
+            gold = str(gold_n)
+        elif kind == "fundraiser":
+            organizer = _synthetic_name(r)
+            silver_donors = r.randint(8, 25)
+            silver_amount = r.choice([10, 15, 20, 25])
+            gold_donors = r.randint(3, 9)
+            gold_amount = r.choice([50, 75, 100, 150])
+            corporate_match = r.choice([100, 200, 300, 500])
+            distractor = r.choice([3, 5, 7])  # event hour noise
+            silver_total = silver_donors * silver_amount
+            gold_total = gold_donors * gold_amount
+            gold_n = silver_total + gold_total + corporate_match
+            question = (
+                f"{organizer} ran a {distractor}-hour charity fundraiser. "
+                f"{silver_donors} silver-tier donors gave ${silver_amount} "
+                f"each. {gold_donors} gold-tier donors gave ${gold_amount} "
+                f"each. A local company contributed an additional "
+                f"${corporate_match} as a flat corporate match. How many "
+                f"dollars did the fundraiser raise in total?"
+            )
+            gold = str(gold_n)
+        elif kind == "trip_planning":
+            traveler = _synthetic_name(r)
+            nights = r.randint(3, 8)
+            lodging_per_night = r.choice([60, 80, 90, 120, 150])
+            meals_per_day = r.choice([20, 30, 40])
+            transport = r.choice([80, 120, 150, 200])
+            distractor = r.choice([2, 4, 6])  # number of travelers? noise
+            lodging = nights * lodging_per_night
+            meals = nights * meals_per_day
+            gold_n = lodging + meals + transport
+            question = (
+                f"{traveler} is planning a {nights}-night trip with "
+                f"{distractor} other people, but they're each paying their "
+                f"own way. {traveler}'s lodging costs ${lodging_per_night} "
+                f"per night, meals cost ${meals_per_day} per day, and "
+                f"round-trip transport costs ${transport}. How many dollars "
+                f"will {traveler}'s share of the trip cost?"
+            )
+            gold = str(gold_n)
+        elif kind == "pets_animals":
+            owner = _synthetic_name(r)
+            n_chickens = r.randint(8, 25)
+            eggs_per_week_per_chicken = r.choice([4, 5, 6, 7])
+            n_weeks = r.randint(2, 6)
+            eggs_for_breakfast = r.randint(10, 25)
+            eggs_donated = r.randint(5, 18)
+            distractor = r.choice([12, 15, 18])  # coop dimension noise
+            total_eggs = n_chickens * eggs_per_week_per_chicken * n_weeks
+            gold_n = total_eggs - eggs_for_breakfast - eggs_donated
+            question = (
+                f"{owner} keeps {n_chickens} chickens in a "
+                f"{distractor}-meter coop. Each chicken lays "
+                f"{eggs_per_week_per_chicken} eggs per week. Over "
+                f"{n_weeks} weeks, the family ate {eggs_for_breakfast} eggs "
+                f"for breakfast and donated {eggs_donated} eggs to a "
+                f"neighbor. How many eggs are left at the end of the "
+                f"{n_weeks} weeks?"
+            )
+            gold = str(gold_n)
+        elif kind == "sports_tournament":
+            captain = _synthetic_name(r)
+            n_games = r.randint(8, 20)
+            n_wins = r.randint(3, n_games - 2)
+            n_losses = n_games - n_wins
+            points_per_win = r.choice([2, 3])
+            points_per_loss = r.choice([0, 1])
+            bonus_pts = r.randint(2, 8)
+            distractor = r.choice([5, 6, 7])  # players on field noise
+            gold_n = n_wins * points_per_win + n_losses * points_per_loss + bonus_pts
+            sport = r.choice(["soccer", "hockey", "basketball", "rugby"])
+            question = (
+                f"Captain {captain}'s {sport} team played {n_games} games "
+                f"with {distractor} players on the field at any time. They "
+                f"won {n_wins} games and lost {n_losses} games. Each win is "
+                f"worth {points_per_win} league points, each loss is worth "
+                f"{points_per_loss} consolation points, and the team got an "
+                f"extra {bonus_pts} bonus points for fair play. How many "
+                f"total league points did {captain}'s team end the season "
+                f"with?"
+            )
+            gold = str(gold_n)
+        elif kind == "construction":
+            contractor = _synthetic_name(r)
+            n_walls = r.randint(3, 8)
+            bricks_per_wall = r.choice([80, 100, 120, 150, 200])
+            mortar_per_wall = r.choice([3, 4, 5, 6])  # bags
+            broken_bricks = r.randint(5, 25)
+            extra_safety = r.choice([20, 30, 50])
+            distractor = r.choice([8, 10, 12])  # ladder height noise
+            bricks_total = n_walls * bricks_per_wall + extra_safety
+            gold_n = bricks_total - broken_bricks
+            question = (
+                f"Contractor {contractor} is building {n_walls} brick walls "
+                f"using a {distractor}-foot ladder. Each wall needs "
+                f"{bricks_per_wall} bricks. {contractor} also orders "
+                f"{extra_safety} extra bricks as a safety margin. During "
+                f"delivery, {broken_bricks} bricks arrive broken and have "
+                f"to be discarded. How many usable bricks does {contractor} "
+                f"have to build the walls?"
+            )
+            gold = str(gold_n)
+        elif kind == "modular_linear":
             a, b, c = r.randint(2, 11), r.randint(2, 11), r.randint(1, 49)
             x, y = r.randint(7, 39), r.randint(7, 39)
             m = r.choice([7, 11, 13, 17, 19, 23, 29, 31])
@@ -5802,31 +7728,69 @@ def _generate_aime_items(block_seed, n_items: int) -> list[dict]:
 
 
 def _generate_code_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural code-synthesis tasks for code_bench (v27).
+    """Procedural code-synthesis tasks for code_bench (v29 — humaneval-difficulty rebalance).
 
-    Each item produces ``{prompt, test, entry_point, task_id}`` so the
-    existing ``humaneval_sandbox`` grader runs unchanged. The function
-    signatures and docstrings are generated freshly per round; the test
-    harness uses random inputs (also block-seeded) and a reference
-    implementation to derive expected outputs.
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed code_bench
+    saturating near 1.0 for most trained miners while held-out HumanEval
+    pass@1 stayed flat ~0.40. The v27 templates are humaneval-*shape* but
+    not humaneval-*difficulty* — they're one-line list comprehensions and
+    trivial string ops. Optimising v27-code teaches the model to nail
+    "double every element" but doesn't transfer to HumanEval's stack
+    machines, parsing, and DP problems. v29 keeps the v27 easy tier as
+    a difficulty floor (~30 %) and adds a new humaneval-distribution-
+    similar hard tier (~70 %) covering:
 
-    Subtypes (each tests a distinct skill cluster):
-      * ``transform_list``   — map/filter/reverse/dedupe over a list
-      * ``aggregate_list``   — sum/min/max/count with predicate
-      * ``string_predicate`` — palindrome / anagram / valid-id checks
-      * ``digit_sum``        — recurrent digit-sum / divisor checks
-      * ``window_sum``       — sliding-window aggregation
-      * ``pair_count``       — count pairs satisfying a relation
-      * ``run_length``       — encode/decode run-length pairs
-      * ``string_transform`` — case / repeat / interleave variants
+      * ``coin_change_min``       — DP, min coins to make amount
+      * ``merge_intervals``       — interval merging, sort + scan
+      * ``rolling_max``           — running max of last k elements
+      * ``nested_paren_groups``   — split balanced () groups (HE/1)
+      * ``evaluate_postfix``      — RPN evaluator with int ops
+      * ``roman_to_int``          — parse roman numerals
+      * ``binary_search_first``   — find leftmost index of target
+      * ``unique_paths_grid``     — DP grid traversal small N
+      * ``longest_no_repeat``     — longest substr w/o repeat (sliding window)
+      * ``validate_brackets``     — multi-type bracket matching ([{}])
+      * ``sliding_window_min``    — running min of window k
+      * ``most_freq_elem``        — most-frequent element with tie rule
+      * ``compress_string``       — RLE-encode unless longer than original
+      * ``two_sum_pairs``         — find unordered pair indices summing to t
+
+    Each item still produces ``{prompt, test, entry_point, task_id}`` so
+    the existing ``humaneval_sandbox`` grader runs unchanged. The hard
+    tier templates have richer test inputs (edge cases: empty, single,
+    duplicates, negatives) calibrated so Qwen3.5-4B-base scores ~0.45-0.60
+    on a private smoke set (closer to HumanEval's 0.40 than v27 code_bench
+    saturating at >0.95).
+
+    v27 legacy easy templates kept (~30 %): transform_list, aggregate_list,
+    string_predicate, digit_sum, window_sum, pair_count, run_length,
+    string_transform.
+
+    Procedural rotation per round_seed prevents memorisation; humaneval-
+    distribution similarity makes validator pass-rate predict HumanEval
+    pass-rate (the v27 saturation gap broke that link).
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
-    kinds = [
+    hard_kinds = [
+        "coin_change_min", "merge_intervals", "rolling_max",
+        "nested_paren_groups", "evaluate_postfix", "roman_to_int",
+        "binary_search_first", "unique_paths_grid", "longest_no_repeat",
+        "validate_brackets", "sliding_window_min", "most_freq_elem",
+        "compress_string", "two_sum_pairs",
+    ]
+    legacy_kinds = [
         "transform_list", "aggregate_list", "string_predicate",
         "digit_sum", "window_sum", "pair_count", "run_length",
         "string_transform",
     ]
+    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_legacy = max(0, n_items - n_hard)
+    hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
+    legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
+    rng.shuffle(hard_pool)
+    rng.shuffle(legacy_pool)
+    kinds = hard_pool[:n_hard] + legacy_pool[:n_legacy]
     rng.shuffle(kinds)
     out: list[dict] = []
     for i in range(n_items):
@@ -6126,7 +8090,7 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 s = "".join(r.choice("abcd") * r.randint(1, 3) for _ in range(r.randint(1, 4)))
                 test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
-        else:  # string_transform
+        elif kind == "string_transform":
             op = r.choice(["alternate_case", "repeat_each_char", "swap_pairs"])
             if op == "alternate_case":
                 entry_point = "alternate_case"
@@ -6180,10 +8144,412 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 s = "".join(r.choice("abcdefABCDEF12!?") for _ in range(r.randint(0, 7)))
                 test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        # ── v29 hard tier (humaneval-distribution-similar) ──────────────
+        elif kind == "coin_change_min":
+            coins = sorted(r.sample([1, 2, 5, 10, 20, 25, 50], r.randint(2, 4)))
+            entry_point = "min_coins"
+            prompt = (
+                f"def min_coins(amount):\n"
+                f"    \"\"\"Return the minimum number of coins needed to make ``amount`` "
+                f"using denominations {coins}. ``amount`` is a non-negative integer.\n"
+                f"    Each denomination may be used any number of times. If ``amount`` "
+                f"cannot be made with these coins, return -1. ``min_coins(0)`` is 0.\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_coins(amount, c=tuple(coins)):
+                if amount < 0:
+                    return -1
+                INF = 10**9
+                dp = [0] + [INF] * amount
+                for a in range(1, amount + 1):
+                    for v in c:
+                        if v <= a and dp[a - v] + 1 < dp[a]:
+                            dp[a] = dp[a - v] + 1
+                return dp[amount] if dp[amount] < INF else -1
+            ref = _ref_coins
+            test_amounts = [0, 1] + sorted({r.randint(2, 50) for _ in range(5)})
+            for a in test_amounts[:6]:
+                test_lines.append(f"    assert candidate({a!r}) == {ref(a)!r}")
+        elif kind == "merge_intervals":
+            entry_point = "merge"
+            prompt = (
+                "def merge(intervals):\n"
+                "    \"\"\"Given a list of [start, end] integer intervals (closed on both ends), "
+                "return a new list of merged, non-overlapping intervals sorted by start. "
+                "Two intervals are considered overlapping if they share at least one integer. "
+                "Empty input returns []. Singletons (start==end) are allowed.\n"
+                "    \"\"\"\n"
+            )
+            def _ref_merge(intervals):
+                if not intervals:
+                    return []
+                xs = sorted([list(iv) for iv in intervals], key=lambda p: (p[0], p[1]))
+                out_iv = [xs[0]]
+                for s, e in xs[1:]:
+                    if s <= out_iv[-1][1] + 1 - 1:
+                        out_iv[-1][1] = max(out_iv[-1][1], e)
+                    else:
+                        out_iv.append([s, e])
+                return out_iv
+            ref = _ref_merge
+            for _ in range(5):
+                k = r.randint(0, 5)
+                ivs = []
+                for _ in range(k):
+                    a = r.randint(0, 12)
+                    b = a + r.randint(0, 6)
+                    ivs.append([a, b])
+                test_lines.append(f"    assert candidate({ivs!r}) == {ref(ivs)!r}")
+        elif kind == "rolling_max":
+            k = r.randint(2, 4)
+            entry_point = "rolling_max"
+            prompt = (
+                f"def rolling_max(xs):\n"
+                f"    \"\"\"Return a list where the i-th element is the maximum of the last "
+                f"{k} elements of ``xs`` ending at index i (inclusive). For i < {k - 1}, "
+                f"use whatever elements are available (i.e. the prefix). The output has the "
+                f"same length as ``xs``. Empty input returns [].\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_rmax(xs, w=k):
+                if not xs:
+                    return []
+                return [max(xs[max(0, i - w + 1): i + 1]) for i in range(len(xs))]
+            ref = _ref_rmax
+            for _ in range(5):
+                xs = [r.randint(-9, 9) for _ in range(r.randint(0, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "nested_paren_groups":
+            entry_point = "split_paren_groups"
+            prompt = (
+                "def split_paren_groups(s):\n"
+                "    \"\"\"The input is a string containing only '(' and ')' characters and "
+                "spaces. The parentheses form one or more balanced groups concatenated "
+                "(possibly separated by spaces, which should be ignored). Return a list of "
+                "the balanced groups in order, with all spaces removed. Each output group "
+                "is itself balanced. The empty input returns [].\n\n"
+                "    >>> split_paren_groups('( ) (( ))')\n"
+                "    ['()', '(())']\n"
+                "    \"\"\"\n"
+            )
+            def _ref_spg(s):
+                s = s.replace(" ", "")
+                groups, cur, depth = [], "", 0
+                for c in s:
+                    cur += c
+                    if c == "(":
+                        depth += 1
+                    else:
+                        depth -= 1
+                    if depth == 0 and cur:
+                        groups.append(cur)
+                        cur = ""
+                return groups
+            ref = _ref_spg
+            test_strs = []
+            for _ in range(5):
+                n_grp = r.randint(0, 3)
+                groups = []
+                for _ in range(n_grp):
+                    d = r.randint(1, 3)
+                    groups.append("(" * d + ")" * d)
+                sep = r.choice([" ", "  ", ""])
+                test_strs.append(sep.join(groups))
+            for s in test_strs:
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "evaluate_postfix":
+            entry_point = "eval_rpn"
+            prompt = (
+                "def eval_rpn(tokens):\n"
+                "    \"\"\"Evaluate the expression in Reverse Polish Notation given as a "
+                "list of tokens. Each token is either an integer (Python int) or one of "
+                "the operators '+', '-', '*'. Division is not used. Return the integer "
+                "result. The expression is well-formed.\n\n"
+                "    >>> eval_rpn([2, 3, '+'])\n"
+                "    5\n"
+                "    \"\"\"\n"
+            )
+            def _ref_rpn(tokens):
+                stack = []
+                for t in tokens:
+                    if t == "+":
+                        b = stack.pop(); a = stack.pop(); stack.append(a + b)
+                    elif t == "-":
+                        b = stack.pop(); a = stack.pop(); stack.append(a - b)
+                    elif t == "*":
+                        b = stack.pop(); a = stack.pop(); stack.append(a * b)
+                    else:
+                        stack.append(t)
+                return stack[0]
+            ref = _ref_rpn
+            for _ in range(5):
+                n_terms = r.randint(2, 4)
+                vals = [r.randint(-5, 9) for _ in range(n_terms)]
+                ops_p = [r.choice(["+", "-", "*"]) for _ in range(n_terms - 1)]
+                tokens = [vals[0], vals[1], ops_p[0]]
+                for j in range(1, n_terms - 1):
+                    tokens.extend([vals[j + 1], ops_p[j]])
+                test_lines.append(f"    assert candidate({tokens!r}) == {ref(tokens)!r}")
+        elif kind == "roman_to_int":
+            entry_point = "roman_to_int"
+            prompt = (
+                "def roman_to_int(s):\n"
+                "    \"\"\"Convert a valid roman numeral string ``s`` (using I, V, X, L, "
+                "C, D, M with the standard subtractive notation IV, IX, XL, XC, CD, CM) "
+                "to its integer value. Input is in the range 1..3999. Empty string "
+                "returns 0.\n"
+                "    \"\"\"\n"
+            )
+            roman_map = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+            def _ref_roman(s):
+                total = 0
+                prev = 0
+                for c in reversed(s):
+                    v = roman_map[c]
+                    if v < prev:
+                        total -= v
+                    else:
+                        total += v
+                    prev = v
+                return total
+            ref = _ref_roman
+            def _to_roman(n):
+                table = [(1000,"M"),(900,"CM"),(500,"D"),(400,"CD"),(100,"C"),
+                         (90,"XC"),(50,"L"),(40,"XL"),(10,"X"),(9,"IX"),
+                         (5,"V"),(4,"IV"),(1,"I")]
+                out_s = ""
+                for v, sym in table:
+                    while n >= v:
+                        out_s += sym; n -= v
+                return out_s
+            test_nums = sorted({r.randint(1, 1888) for _ in range(5)})
+            for n in test_nums[:5]:
+                test_lines.append(
+                    f"    assert candidate({_to_roman(n)!r}) == {ref(_to_roman(n))!r}"
+                )
+            test_lines.append("    assert candidate('') == 0")
+        elif kind == "binary_search_first":
+            entry_point = "first_index"
+            prompt = (
+                "def first_index(xs, target):\n"
+                "    \"\"\"Given a non-decreasing list of integers ``xs`` and an integer "
+                "``target``, return the leftmost index ``i`` such that ``xs[i] == target``. "
+                "If ``target`` is not present, return -1. Run in O(log n).\n"
+                "    \"\"\"\n"
+            )
+            def _ref_fi(xs, target):
+                lo, hi = 0, len(xs)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if xs[mid] < target:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                return lo if lo < len(xs) and xs[lo] == target else -1
+            ref = _ref_fi
+            for _ in range(5):
+                xs = sorted([r.randint(0, 9) for _ in range(r.randint(0, 8))])
+                target = r.randint(0, 11)
+                test_lines.append(f"    assert candidate({xs!r}, {target!r}) == {ref(xs, target)!r}")
+        elif kind == "unique_paths_grid":
+            m = r.randint(2, 4)
+            n = r.randint(2, 4)
+            entry_point = "unique_paths"
+            prompt = (
+                f"def unique_paths(m, n):\n"
+                f"    \"\"\"Return the number of unique paths from the top-left corner to "
+                f"the bottom-right corner of an ``m × n`` grid where you can only move "
+                f"right or down at each step. ``m`` and ``n`` are positive integers.\n\n"
+                f"    >>> unique_paths(2, 2)\n"
+                f"    2\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_up(m, n):
+                dp = [[1] * n for _ in range(m)]
+                for i in range(1, m):
+                    for j in range(1, n):
+                        dp[i][j] = dp[i - 1][j] + dp[i][j - 1]
+                return dp[m - 1][n - 1]
+            ref = _ref_up
+            test_grids = [(2, 2), (3, 3), (1, 5), (4, 2), (m, n)]
+            seen = set()
+            for mm, nn in test_grids:
+                if (mm, nn) in seen:
+                    continue
+                seen.add((mm, nn))
+                test_lines.append(f"    assert candidate({mm!r}, {nn!r}) == {ref(mm, nn)!r}")
+        elif kind == "longest_no_repeat":
+            entry_point = "longest_unique"
+            prompt = (
+                "def longest_unique(s):\n"
+                "    \"\"\"Return the length of the longest contiguous substring of ``s`` "
+                "containing no repeated characters. Empty string returns 0.\n\n"
+                "    >>> longest_unique('abcabcbb')\n"
+                "    3\n"
+                "    \"\"\"\n"
+            )
+            def _ref_lu(s):
+                last = {}
+                start = 0
+                best = 0
+                for i, c in enumerate(s):
+                    if c in last and last[c] >= start:
+                        start = last[c] + 1
+                    last[c] = i
+                    if i - start + 1 > best:
+                        best = i - start + 1
+                return best
+            ref = _ref_lu
+            for _ in range(5):
+                s = "".join(r.choice("abcde") for _ in range(r.randint(0, 10)))
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "validate_brackets":
+            entry_point = "is_balanced_multi"
+            prompt = (
+                "def is_balanced_multi(s):\n"
+                "    \"\"\"Return True iff every opening bracket in ``s`` has a matching "
+                "closing bracket of the same type and they are properly nested. The bracket "
+                "types are '()', '[]', and '{}'. Other characters are ignored. Empty string "
+                "is True.\n\n"
+                "    >>> is_balanced_multi('([{}])')\n"
+                "    True\n"
+                "    \"\"\"\n"
+            )
+            pairs = {")": "(", "]": "[", "}": "{"}
+            def _ref_bm(s):
+                stack = []
+                for c in s:
+                    if c in "([{":
+                        stack.append(c)
+                    elif c in ")]}":
+                        if not stack or stack[-1] != pairs[c]:
+                            return False
+                        stack.pop()
+                return not stack
+            ref = _ref_bm
+            test_strs = []
+            for _ in range(5):
+                n_pair = r.randint(0, 4)
+                buf = []
+                if n_pair == 0:
+                    buf = ""
+                else:
+                    op = r.choice(["()", "[]", "{}"])
+                    buf = op[0] * n_pair + op[1] * n_pair
+                    if r.random() < 0.4:
+                        buf = "x" + buf + "y"
+                    if r.random() < 0.3 and buf:
+                        idx = r.randint(0, len(buf) - 1)
+                        buf = buf[:idx] + r.choice(")]}") + buf[idx + 1:]
+                test_strs.append("".join(buf) if isinstance(buf, list) else buf)
+            for s in test_strs:
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "sliding_window_min":
+            k = r.randint(2, 4)
+            entry_point = "window_min"
+            prompt = (
+                f"def window_min(xs):\n"
+                f"    \"\"\"Return a list of the minimums of every contiguous window of "
+                f"exactly {k} elements in ``xs``. If ``xs`` has fewer than {k} elements, "
+                f"return []. The output has length ``max(0, len(xs) - {k} + 1)``.\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_wm(xs, w=k):
+                if len(xs) < w:
+                    return []
+                return [min(xs[i:i + w]) for i in range(len(xs) - w + 1)]
+            ref = _ref_wm
+            for _ in range(5):
+                xs = [r.randint(-9, 9) for _ in range(r.randint(0, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "most_freq_elem":
+            entry_point = "most_frequent"
+            prompt = (
+                "def most_frequent(xs):\n"
+                "    \"\"\"Return the element that appears most often in the list ``xs``. "
+                "If multiple elements tie for highest frequency, return the smallest such "
+                "element. The list always has at least one element.\n"
+                "    \"\"\"\n"
+            )
+            def _ref_mf(xs):
+                from collections import Counter
+                c = Counter(xs)
+                best = max(c.values())
+                return min(k for k, v in c.items() if v == best)
+            ref = _ref_mf
+            for _ in range(5):
+                xs = [r.randint(0, 5) for _ in range(r.randint(1, 8))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "compress_string":
+            entry_point = "compress"
+            prompt = (
+                "def compress(s):\n"
+                "    \"\"\"Return a run-length-encoded version of ``s`` of the form "
+                "'a3b2c4' (character followed by run length, with run length=1 also "
+                "written as 'a1'). If the encoded form is not strictly shorter than the "
+                "original, return the original string instead. Empty input returns ''.\n\n"
+                "    >>> compress('aaabbc')\n"
+                "    'a3b2c1'\n"
+                "    \"\"\"\n"
+            )
+            def _ref_cs(s):
+                if not s:
+                    return ""
+                out_parts: list[str] = []
+                cur = s[0]; cnt = 1
+                for ch in s[1:]:
+                    if ch == cur:
+                        cnt += 1
+                    else:
+                        out_parts.append(cur + str(cnt))
+                        cur = ch; cnt = 1
+                out_parts.append(cur + str(cnt))
+                enc = "".join(out_parts)
+                return enc if len(enc) < len(s) else s
+            ref = _ref_cs
+            for _ in range(5):
+                s = "".join(r.choice("abc") * r.randint(1, 4) for _ in range(r.randint(0, 4)))
+                test_lines.append(f"    assert candidate({s!r}) == {ref(s)!r}")
+        elif kind == "two_sum_pairs":
+            target = r.randint(3, 12)
+            entry_point = "two_sum_indices"
+            prompt = (
+                f"def two_sum_indices(xs):\n"
+                f"    \"\"\"Return a sorted list of all unordered pairs (i, j) with i < j "
+                f"such that ``xs[i] + xs[j] == {target}``. Pairs are tuples. The output "
+                f"is sorted by (i, j). Empty result returns [].\n"
+                f"    \"\"\"\n"
+            )
+            def _ref_ts(xs, t=target):
+                pairs = []
+                for i in range(len(xs)):
+                    for j in range(i + 1, len(xs)):
+                        if xs[i] + xs[j] == t:
+                            pairs.append((i, j))
+                return pairs
+            ref = _ref_ts
+            for _ in range(5):
+                xs = [r.randint(0, target) for _ in range(r.randint(0, 7))]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        else:
+            entry_point = "noop"
+            prompt = (
+                "def noop():\n"
+                "    \"\"\"Return 0.\"\"\"\n"
+            )
+            test_lines = ["    assert candidate() == 0"]
+        # ─────────────────────────────────────────────────────────────────
         test_block = "def check(candidate):\n" + "\n".join(test_lines) + "\n"
+        version_tag = "v29" if kind in (
+            "coin_change_min", "merge_intervals", "rolling_max",
+            "nested_paren_groups", "evaluate_postfix", "roman_to_int",
+            "binary_search_first", "unique_paths_grid", "longest_no_repeat",
+            "validate_brackets", "sliding_window_min", "most_freq_elem",
+            "compress_string", "two_sum_pairs",
+        ) else "v27"
         out.append({
             "src": f"procedural_code/{kind}",
-            "task_id": f"v27/{kind}/{i:02d}",
+            "task_id": f"{version_tag}/{kind}/{i:02d}",
             "prompt": prompt,
             "test": test_block,
             "entry_point": entry_point,
@@ -6191,24 +8557,1114 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
     return out
 
 
+def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural code-debugging items for ``debug_bench`` (v29.2, 2026-04-29).
+
+    Why this axis exists. The 2026-04-28 capability audit identified a
+    real-world coding skill not currently scored: **fixing existing
+    code**. ``code_bench`` and ``mbpp_bench`` test the model's ability
+    to write a function from scratch given a docstring. SOTA models
+    are equally important on the *debugging* side: read an existing
+    implementation, find the bug, edit it. This is half of practical
+    coding (the other half being writing-from-scratch) and a 4B model
+    that scores well on code_bench but flat on debug_bench is
+    differentially weaker than a model strong on both.
+
+    Item shape (matches code_bench so the existing ``humaneval_sandbox``
+    grader runs unchanged):
+
+        {
+            "src":         "procedural_debug/<bug_kind>",
+            "task_id":     "debug/<kind>/NN",
+            "prompt":      "<all-comments header + entry-point signature>",
+            "test":        "def check(candidate):\\n    ...\\n",
+            "entry_point": "<function name>",
+        }
+
+    Prompt structure: every line above the entry-point ``def`` is a
+    Python comment (``# ...``) so the prompt + model body parses as
+    valid Python. The buggy reference is shown commented-out so the
+    model can read it for context, but it never executes. The prompt
+    ends with the FRESH function signature + docstring; the model
+    writes the corrected body — same shape as ``code_bench``, so the
+    existing sandbox auto-indent / format-recovery layer Just Works.
+
+    Bug kinds (block-rotated, all procedural):
+
+      * ``off_by_one_range``  — ``range(n)`` should be ``range(n+1)``
+      * ``swap_subtract``     — returns ``b - a`` instead of ``a - b``
+      * ``wrong_comparator``  — ``>`` instead of ``>=``
+      * ``wrong_init``        — accumulator init wrong (``0`` for product etc.)
+      * ``early_break``       — ``break`` after first match instead of scanning
+      * ``wrong_index``       — ``arr[-1]`` instead of ``arr[-2]``
+      * ``wrong_modulo``      — ``%`` against wrong modulus
+      * ``missing_edge_case`` — empty / None case crashes / wrong default
+
+    Each kind has parameters drawn from ``block_seed XOR
+    _BENCH_STREAM["debug"]`` so the (function, bug, tests) triple is
+    fresh every round and exists nowhere on disk — no memorisation
+    vector. Difficulty is calibrated so Qwen-4B-base scores ~0.40-0.55
+    on a smoke set (debugging is harder than write-from-scratch for
+    small models because they must first identify the bug, then fix it
+    without breaking other behaviour).
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["debug"]) & 0xFFFFFFFF)
+    bug_kinds = [
+        "off_by_one_range", "swap_subtract", "wrong_comparator",
+        "wrong_init", "early_break", "wrong_index", "wrong_modulo",
+        "missing_edge_case",
+    ]
+    pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
+    rng.shuffle(pool)
+    out: list[dict] = []
+    # Each branch builds (entry, buggy_def_source, signature_with_docstring, tests).
+    # signature_with_docstring is what the model fills in below — same shape as
+    # code_bench so the sandbox auto-indent layer applies the body indentation
+    # automatically when the model emits a bare ``return ...``.
+    for i, kind in enumerate(pool):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        if kind == "off_by_one_range":
+            entry = "sum_to"
+            buggy = (
+                "def sum_to(n: int) -> int:\n"
+                '    """Return the sum of integers from 1 to n inclusive."""\n'
+                "    total = 0\n"
+                "    for i in range(1, n):\n"
+                "        total += i\n"
+                "    return total\n"
+            )
+            sig = (
+                "def sum_to(n: int) -> int:\n"
+                '    """Return the sum of integers from 1 to n inclusive.\n'
+                "    Examples: sum_to(3) == 6 (1+2+3); sum_to(5) == 15."
+                '\n    """\n'
+            )
+            n_t = r.randint(5, 15)
+            tests = [
+                f"    assert candidate({n_t}) == {sum(range(1, n_t+1))}",
+                f"    assert candidate({n_t+1}) == {sum(range(1, n_t+2))}",
+                "    assert candidate(1) == 1",
+                "    assert candidate(2) == 3",
+            ]
+        elif kind == "swap_subtract":
+            entry = "first_minus_second"
+            buggy = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                '    """Return a minus b (i.e. a - b)."""\n'
+                "    return b - a\n"
+            )
+            sig = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                '    """Return a minus b (i.e. a - b).\n'
+                "    Examples: first_minus_second(10, 3) == 7; first_minus_second(0, 5) == -5."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate(10, 3) == 7",
+                "    assert candidate(0, 5) == -5",
+                "    assert candidate(-4, -2) == -2",
+                "    assert candidate(100, 99) == 1",
+            ]
+        elif kind == "wrong_comparator":
+            threshold = r.randint(3, 9)
+            entry = "at_least"
+            buggy = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                '    """Count elements in arr that are >= threshold."""\n'
+                "    return sum(1 for x in arr if x > threshold)\n"
+            )
+            sig = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                '    """Return the count of elements in arr that are >= threshold.\n'
+                f"    Default threshold is {threshold}.\n"
+                f"    Example: at_least([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}]) returns 3 "
+                f"(elements >= {threshold})."
+                '\n    """\n'
+            )
+            tests = [
+                f"    assert candidate([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([{threshold}, {threshold}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([0, 1, 2], threshold={threshold}) == 0",
+                "    assert candidate([], threshold=1) == 0",
+            ]
+        elif kind == "wrong_init":
+            entry = "product_of_list"
+            buggy = (
+                "def product_of_list(arr):\n"
+                '    """Return the product of integers in arr."""\n'
+                "    total = 0\n"
+                "    for x in arr:\n"
+                "        total *= x\n"
+                "    return total\n"
+            )
+            sig = (
+                "def product_of_list(arr: list[int]) -> int:\n"
+                '    """Return the product of all integers in arr.\n'
+                "    The product of an empty list is 1 (multiplicative identity).\n"
+                "    Example: product_of_list([2, 3, 4]) returns 24."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate([2, 3, 4]) == 24",
+                "    assert candidate([5]) == 5",
+                "    assert candidate([]) == 1",
+                "    assert candidate([1, 2, 3, 4, 5]) == 120",
+                "    assert candidate([2, -3, 4]) == -24",
+            ]
+        elif kind == "early_break":
+            entry = "find_largest"
+            buggy = (
+                "def find_largest(arr):\n"
+                '    """Return the largest integer in arr."""\n'
+                "    largest = arr[0]\n"
+                "    for x in arr:\n"
+                "        if x > largest:\n"
+                "            largest = x\n"
+                "            break\n"
+                "    return largest\n"
+            )
+            sig = (
+                "def find_largest(arr: list[int]) -> int:\n"
+                '    """Return the largest integer in arr. Assume arr is non-empty.\n'
+                "    Example: find_largest([3, 7, 2, 9, 4]) returns 9."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate([3, 7, 2, 9, 4]) == 9",
+                "    assert candidate([1, 2, 3, 4, 5, 6]) == 6",
+                "    assert candidate([5, 4, 3, 2, 1]) == 5",
+                "    assert candidate([-3, -1, -7, -2]) == -1",
+                "    assert candidate([42]) == 42",
+            ]
+        elif kind == "wrong_index":
+            n = r.randint(5, 9)
+            entry = "second_last"
+            buggy = (
+                "def second_last(arr):\n"
+                '    """Return the second-to-last element of arr."""\n'
+                "    return arr[-1]\n"
+            )
+            sig = (
+                "def second_last(arr: list):\n"
+                '    """Return the second-to-last element of arr.\n'
+                "    Assume arr has at least 2 elements.\n"
+                "    Example: second_last([1, 2, 3, 4]) returns 3."
+                '\n    """\n'
+            )
+            sample_arr = [r.randint(1, 99) for _ in range(n)]
+            tests = [
+                f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}",
+                "    assert candidate([1, 2]) == 1",
+                "    assert candidate(['a', 'b', 'c']) == 'b'",
+                "    assert candidate([10, 20, 30, 40, 50]) == 40",
+            ]
+        elif kind == "wrong_modulo":
+            mod = r.choice([7, 11, 13])
+            wrong_mod = mod + 1
+            entry = "mod_then_double"
+            buggy = (
+                f"def mod_then_double(n, modulus={mod}):\n"
+                '    """Return 2 * (n mod modulus)."""\n'
+                f"    return 2 * (n % {wrong_mod})\n"
+            )
+            sig = (
+                f"def mod_then_double(n: int, modulus: int = {mod}) -> int:\n"
+                '    """Return (n mod modulus) doubled, i.e. 2 * (n % modulus).\n'
+                f"    Default modulus is {mod}.\n"
+                f"    Example: mod_then_double(10, modulus={mod}) returns 2 * (10 % {mod}) = {2 * (10 % mod)}."
+                '\n    """\n'
+            )
+            tests = [
+                f"    assert candidate(10, modulus={mod}) == {2 * (10 % mod)}",
+                f"    assert candidate({mod*2 + 3}, modulus={mod}) == {2 * ((mod*2 + 3) % mod)}",
+                f"    assert candidate(0, modulus={mod}) == 0",
+                f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
+            ]
+        else:  # missing_edge_case
+            entry = "first_or_default"
+            buggy = (
+                "def first_or_default(arr, default=None):\n"
+                '    """Return arr[0] if non-empty, else default."""\n'
+                "    return arr[0]\n"
+            )
+            sig = (
+                "def first_or_default(arr: list, default=None):\n"
+                '    """Return arr[0] if arr is non-empty, else return default.\n'
+                "    Examples: first_or_default([7, 8, 9]) returns 7;\n"
+                "              first_or_default([], default=-1) returns -1."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert candidate([7, 8, 9]) == 7",
+                "    assert candidate([]) is None",
+                "    assert candidate([], default=-1) == -1",
+                "    assert candidate(['a']) == 'a'",
+                "    assert candidate([], default=[]) == []",
+            ]
+
+        # The buggy version goes in the prompt as a comment block so it
+        # never executes but the model can still read it. The prompt
+        # ends with the corrected function's signature + docstring,
+        # ready for the model to fill in the body — same shape as
+        # code_bench, so the existing sandbox machinery (auto-indent,
+        # prose-trim, fence-strip) applies unchanged.
+        # 2026-04-29 (v29.6): rotate the function name per item so the
+        # entry-point identifier is procedural too. Tests call
+        # ``candidate(...)`` so they don't need rewriting; only the
+        # ``def <name>(`` site in buggy + sig needs the rename.
+        original_entry = entry
+        suffix = "_" + _synthetic_word(r, 1)
+        entry = original_entry + suffix
+        buggy = buggy.replace(f"def {original_entry}(", f"def {entry}(")
+        sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
+        buggy_commented = "\n".join(
+            "# " + line if line else "#" for line in buggy.splitlines()
+        )
+        commented_tests = "\n".join(
+            ("# " + line.lstrip()) if line.startswith("    ") else ("# " + line)
+            for line in tests
+        )
+        prompt = (
+            "# The function below has a bug. Read the buggy version + the\n"
+            "# corrected docstring (which states the INTENDED behaviour),\n"
+            "# then write a CORRECTED implementation that passes the tests.\n"
+            "# Output only the function body (no extra explanation, no\n"
+            "# markdown fences).\n"
+            "#\n"
+            "# Buggy version (commented out — DO NOT include in your output):\n"
+            f"{buggy_commented}\n"
+            "#\n"
+            "# Tests the corrected version must pass:\n"
+            f"{commented_tests}\n"
+            "#\n"
+            "# Now complete the corrected version below.\n"
+            f"{sig}"
+        )
+        test_block_str = "\n".join(tests)
+        test_block = "def check(candidate):\n" + test_block_str + "\n"
+        out.append({
+            "src": f"procedural_debug/{kind}",
+            "task_id": f"debug/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry,
+        })
+    return out
+
+
+def _generate_correction_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural code-correction items for ``correction_bench`` (v29.4, 2026-04-29).
+
+    Why this axis exists. ``debug_bench`` tests "given buggy code, find
+    AND fix the bug." ``correction_bench`` tests the closely-related but
+    distinct skill: "given buggy code AND an explicit error trace, apply
+    the targeted fix." This is the read→run→see-error→fix workflow that
+    SOTA models use constantly in real coding sessions. The model
+    doesn't need to find the bug — it's told what's wrong via a
+    pytest-style assertion failure — but it has to PARSE the error,
+    map it to the relevant line, and emit a corrected version.
+
+    Same shape + sandbox grader as ``debug_bench`` and ``code_bench``;
+    distinct prompt structure that includes a simulated error trace
+    deterministically computed from the bug kind + test inputs (no
+    actual sandbox call at generation time, so item generation stays
+    fast and validator-side deterministic).
+
+    Bug kinds reuse the ``_generate_debug_items`` taxonomy because the
+    failure-trace shapes are different per bug kind (an off-by-one in a
+    sum produces a different assertion failure than an early-break in
+    find_largest), and we want the model to learn to discriminate
+    based on the trace. Per-kind error formats:
+
+      * ``off_by_one_range``  → ``AssertionError: assert sum_to(5) == 15``
+                                + actual=10 hint
+      * ``swap_subtract``     → ``AssertionError: assert candidate(10,3)==7``
+                                + actual=-7
+      * ``wrong_comparator``  → fails on equality cases
+      * ``wrong_init``        → fails on empty / single-element cases
+      * ``early_break``       → fails when largest isn't first
+      * ``wrong_index``       → fails consistently
+      * ``wrong_modulo``      → fails on ``modulus=mod`` arg
+      * ``missing_edge_case`` → ``IndexError: list index out of range`` (real exception)
+
+    The deterministic error-trace generation means item generation is
+    pure-Python and microsecond-fast — no subprocess, no sandbox. Cross-
+    validator agreement is guaranteed.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["correction"]) & 0xFFFFFFFF)
+    bug_kinds = [
+        "off_by_one_range", "swap_subtract", "wrong_comparator",
+        "wrong_init", "early_break", "wrong_index", "wrong_modulo",
+        "missing_edge_case",
+    ]
+    pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
+    rng.shuffle(pool)
+    out: list[dict] = []
+    for i, kind in enumerate(pool):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        # Dispatch on kind: build (entry, buggy_def, signature_with_docstring, tests, error_trace).
+        if kind == "off_by_one_range":
+            entry = "sum_to"
+            n_t = r.randint(5, 15)
+            buggy = (
+                "def sum_to(n: int) -> int:\n"
+                "    total = 0\n"
+                "    for i in range(1, n):\n"
+                "        total += i\n"
+                "    return total\n"
+            )
+            sig = (
+                "def sum_to(n: int) -> int:\n"
+                '    """Return the sum of integers from 1 to n inclusive.\n'
+                "    Examples: sum_to(3) == 6 (1+2+3); sum_to(5) == 15."
+                '\n    """\n'
+            )
+            tests = [
+                f"    assert candidate({n_t}) == {sum(range(1, n_t+1))}",
+                f"    assert candidate({n_t+1}) == {sum(range(1, n_t+2))}",
+                "    assert candidate(1) == 1",
+                "    assert candidate(2) == 3",
+            ]
+            actual_buggy = sum(range(1, n_t))
+            error_trace = (
+                f"  File \"test_sum_to.py\", line 3, in test_sum_to\n"
+                f"    assert candidate({n_t}) == {sum(range(1, n_t+1))}\n"
+                f"AssertionError: expected {sum(range(1, n_t+1))}, "
+                f"got {actual_buggy} (off by {sum(range(1, n_t+1)) - actual_buggy})"
+            )
+        elif kind == "swap_subtract":
+            entry = "first_minus_second"
+            buggy = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                "    return b - a\n"
+            )
+            sig = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                '    """Return a minus b (i.e. a - b)."""\n'
+            )
+            tests = [
+                "    assert candidate(10, 3) == 7",
+                "    assert candidate(0, 5) == -5",
+                "    assert candidate(-4, -2) == -2",
+                "    assert candidate(100, 99) == 1",
+            ]
+            error_trace = (
+                "  File \"test_subtract.py\", line 3, in test_subtract\n"
+                "    assert candidate(10, 3) == 7\n"
+                "AssertionError: expected 7, got -7 (sign reversed)"
+            )
+        elif kind == "wrong_comparator":
+            threshold = r.randint(3, 9)
+            entry = "at_least"
+            buggy = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                "    return sum(1 for x in arr if x > threshold)\n"
+            )
+            sig = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                '    """Count elements in arr that are >= threshold (inclusive)."""\n'
+            )
+            tests = [
+                f"    assert candidate([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([{threshold}, {threshold}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([0, 1, 2], threshold={threshold}) == 0",
+                "    assert candidate([], threshold=1) == 0",
+            ]
+            error_trace = (
+                "  File \"test_at_least.py\", line 3, in test_at_least\n"
+                f"    assert candidate([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}], threshold={threshold}) == 3\n"
+                "AssertionError: expected 3, got 1 (only counted strictly-greater values)"
+            )
+        elif kind == "wrong_init":
+            entry = "product_of_list"
+            buggy = (
+                "def product_of_list(arr):\n"
+                "    total = 0\n"
+                "    for x in arr:\n"
+                "        total *= x\n"
+                "    return total\n"
+            )
+            sig = (
+                "def product_of_list(arr: list[int]) -> int:\n"
+                '    """Return the product of integers in arr. Empty list returns 1."""\n'
+            )
+            tests = [
+                "    assert candidate([2, 3, 4]) == 24",
+                "    assert candidate([5]) == 5",
+                "    assert candidate([]) == 1",
+                "    assert candidate([1, 2, 3, 4, 5]) == 120",
+            ]
+            error_trace = (
+                "  File \"test_product.py\", line 1, in test_product\n"
+                "    assert candidate([2, 3, 4]) == 24\n"
+                "AssertionError: expected 24, got 0 (accumulator initialised wrong)"
+            )
+        elif kind == "early_break":
+            entry = "find_largest"
+            buggy = (
+                "def find_largest(arr):\n"
+                "    largest = arr[0]\n"
+                "    for x in arr:\n"
+                "        if x > largest:\n"
+                "            largest = x\n"
+                "            break\n"
+                "    return largest\n"
+            )
+            sig = (
+                "def find_largest(arr: list[int]) -> int:\n"
+                '    """Return the largest integer in arr. Assume non-empty."""\n'
+            )
+            tests = [
+                "    assert candidate([3, 7, 2, 9, 4]) == 9",
+                "    assert candidate([1, 2, 3, 4, 5, 6]) == 6",
+                "    assert candidate([5, 4, 3, 2, 1]) == 5",
+                "    assert candidate([42]) == 42",
+            ]
+            error_trace = (
+                "  File \"test_largest.py\", line 1, in test_largest\n"
+                "    assert candidate([3, 7, 2, 9, 4]) == 9\n"
+                "AssertionError: expected 9, got 7 (loop exited too early)"
+            )
+        elif kind == "wrong_index":
+            entry = "second_last"
+            buggy = (
+                "def second_last(arr):\n"
+                "    return arr[-1]\n"
+            )
+            sig = (
+                "def second_last(arr: list):\n"
+                '    """Return the second-to-last element of arr."""\n'
+            )
+            sample_arr = [r.randint(1, 99) for _ in range(r.randint(5, 9))]
+            tests = [
+                f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}",
+                "    assert candidate([1, 2]) == 1",
+                "    assert candidate(['a', 'b', 'c']) == 'b'",
+                "    assert candidate([10, 20, 30, 40, 50]) == 40",
+            ]
+            error_trace = (
+                "  File \"test_second_last.py\", line 1, in test_second_last\n"
+                f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}\n"
+                f"AssertionError: expected {sample_arr[-2]}, got {sample_arr[-1]} (off-by-one index)"
+            )
+        elif kind == "wrong_modulo":
+            mod = r.choice([7, 11, 13])
+            wrong_mod = mod + 1
+            entry = "mod_then_double"
+            buggy = (
+                f"def mod_then_double(n, modulus={mod}):\n"
+                f"    return 2 * (n % {wrong_mod})\n"
+            )
+            sig = (
+                f"def mod_then_double(n: int, modulus: int = {mod}) -> int:\n"
+                '    """Return 2 * (n % modulus)."""\n'
+            )
+            tests = [
+                f"    assert candidate(10, modulus={mod}) == {2 * (10 % mod)}",
+                f"    assert candidate({mod*2 + 3}, modulus={mod}) == {2 * ((mod*2 + 3) % mod)}",
+                f"    assert candidate(0, modulus={mod}) == 0",
+                f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
+            ]
+            error_trace = (
+                "  File \"test_mod.py\", line 1, in test_mod\n"
+                f"    assert candidate(10, modulus={mod}) == {2 * (10 % mod)}\n"
+                f"AssertionError: expected {2 * (10 % mod)}, got {2 * (10 % wrong_mod)} "
+                f"(used wrong divisor: {wrong_mod} instead of {mod})"
+            )
+        else:  # missing_edge_case
+            entry = "first_or_default"
+            buggy = (
+                "def first_or_default(arr, default=None):\n"
+                "    return arr[0]\n"
+            )
+            sig = (
+                "def first_or_default(arr: list, default=None):\n"
+                '    """Return arr[0] if non-empty, else return default."""\n'
+            )
+            tests = [
+                "    assert candidate([7, 8, 9]) == 7",
+                "    assert candidate([]) is None",
+                "    assert candidate([], default=-1) == -1",
+                "    assert candidate(['a']) == 'a'",
+            ]
+            # missing_edge_case raises a real IndexError on []
+            error_trace = (
+                "  File \"test_default.py\", line 2, in test_default\n"
+                "    assert candidate([]) is None\n"
+                "  File \"<solution>\", line 2, in first_or_default\n"
+                "    return arr[0]\n"
+                "IndexError: list index out of range"
+            )
+
+        # v29.6: rotate the function name per item so the entry-point
+        # identifier is procedural too — same approach as debug_bench.
+        # Tests call ``candidate(...)`` so they don't need rewriting;
+        # only the ``def <name>(`` sites in buggy + sig + error trace
+        # mention need the rename.
+        original_entry = entry
+        suffix = "_" + _synthetic_word(r, 1)
+        entry = original_entry + suffix
+        buggy = buggy.replace(f"def {original_entry}(", f"def {entry}(")
+        sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
+        # Also rename the function reference inside the simulated
+        # error trace (e.g. "in first_or_default" → "in first_or_default_<sfx>").
+        error_trace = error_trace.replace(f"in {original_entry}\n", f"in {entry}\n")
+        buggy_commented = "\n".join(
+            "# " + line if line else "#" for line in buggy.splitlines()
+        )
+        commented_tests = "\n".join(
+            ("# " + line.lstrip()) if line.startswith("    ") else ("# " + line)
+            for line in tests
+        )
+        error_commented = "\n".join("# " + line for line in error_trace.splitlines())
+        prompt = (
+            "# The following Python function fails its tests with the\n"
+            "# error trace shown below. The intended behaviour is in the\n"
+            "# corrected docstring. Read the trace, identify the line\n"
+            "# that produces the wrong value, and write the CORRECTED\n"
+            "# implementation. Output only the function body (no extra\n"
+            "# explanation, no markdown fences).\n"
+            "#\n"
+            "# Buggy version (DO NOT include in your output):\n"
+            f"{buggy_commented}\n"
+            "#\n"
+            "# Test failure trace:\n"
+            f"{error_commented}\n"
+            "#\n"
+            "# All tests the corrected version must pass:\n"
+            f"{commented_tests}\n"
+            "#\n"
+            "# Now complete the corrected version below.\n"
+            f"{sig}"
+        )
+        test_block_str = "\n".join(tests)
+        test_block = "def check(candidate):\n" + test_block_str + "\n"
+        out.append({
+            "src": f"procedural_correction/{kind}",
+            "task_id": f"correction/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry,
+        })
+    return out
+
+
+# 2026-04-29 (v29.5): replace the 26-entry static topic list with a
+# procedural synthesiser. Each multi_doc item now picks fresh topics
+# via ``_synthetic_org_topic`` from the lex inventory, so card content
+# rotates per item and per round (combinatorial space ≫ 1M unique
+# topics ⇒ uncacheable).
+_MULTI_DOC_TOPICS: tuple = ()
+
+
+def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural multi-document synthesis items for ``multi_doc_synthesis_bench``.
+
+    v29.4 (2026-04-29). Why this axis exists. ``long_context_bench``
+    tests retrieval + assembly within ONE long document. Real SOTA
+    models also handle **cross-document synthesis**: given 3-4 short,
+    distinct documents (each describing a different entity), answer a
+    question requiring info from 2 of them.
+
+    Item structure:
+
+      * ``BENCH_MULTI_DOC_N_CARDS`` short fact cards (default 4), each
+        a 3-5 line paragraph about a unique fictional organisation
+        with a specific numeric attribute (members, founded year,
+        annual harvest, distance, etc.).
+      * One focused question that requires retrieving exactly two
+        of the four facts AND combining them (sum / difference /
+        ratio / comparison).
+
+    Question kinds (block-rotated):
+      * ``sum``        — "Combined, X+Y have how many ...?"
+      * ``difference`` — "How many more ... does X have than Y?"
+      * ``compare``    — "Which has more ...: X or Y?" → name answer
+      * ``ratio``      — "X has how many times more ... than Y?"
+
+    Substring grading like ``long_context_bench``: the gold has a
+    distinctive surface form (integer or full topic name) that won't
+    collide with other cards' values. Confuser-rejection: if the
+    response contains any ``other-card`` numeric value as a standalone
+    integer, fail the item (catches "I'll mention all numbers and hope
+    one matches").
+
+    Cross-validator agreement: deterministic on ``block_seed`` +
+    per-item RNG-derived seeds. Numbers are calibrated to be in
+    distinct ranges per topic so substring collisions don't sneak in.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["multi_doc"]) & 0xFFFFFFFF)
+    qkinds = ["sum", "difference", "compare", "ratio"]
+    n_cards = max(2, BENCH_MULTI_DOC_N_CARDS)
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        # v29.5: procedurally synthesise a fresh batch of distinct
+        # topics for THIS item — no static list, surface form
+        # rotates per item.
+        topics: list[str] = []
+        seen_topics: set[str] = set()
+        synth_attempts = 0
+        while len(topics) < n_cards and synth_attempts < n_cards * 16:
+            synth_attempts += 1
+            t = _synthetic_org_topic(r)
+            if t in seen_topics:
+                continue
+            seen_topics.add(t)
+            topics.append(t)
+        if len(topics) < 2:
+            # Pathology: synth produced too few distinct topics. Skip.
+            continue
+        # Per-card unique attribute. Use distinct ranges to avoid
+        # cross-card numeric collisions (so the substring grader sees
+        # only one match for the gold integer).
+        # Range spread: card[0]∈[100,199], card[1]∈[200,399], etc.
+        values: list[int] = []
+        used: set[int] = set()
+        for c in range(n_cards):
+            lo, hi = 100 * (2 * c + 1), 100 * (2 * c + 1) + 80
+            v = r.randint(lo, hi)
+            while v in used:
+                v += 7
+            used.add(v)
+            values.append(v)
+        # Generate fact-card paragraphs. All templates use named
+        # ``{topic}`` and ``{n}`` placeholders for the per-card numeric
+        # attribute; no positional formats so every card renders cleanly.
+        attribute_templates = [
+            "Founded a long time ago, {topic} reports a current membership of {n}.",
+            "{topic} catalogs {n} unique entries in its public archive.",
+            "An annual yield of {n} units is recorded by {topic} each season.",
+            "The roster of {topic} stands at {n} active members this year.",
+            "Records from {topic} list {n} distinct artefacts on display.",
+        ]
+        cards_text: list[str] = []
+        for c, (topic, v) in enumerate(zip(topics, values)):
+            tmpl = attribute_templates[c % len(attribute_templates)]
+            ctx = (
+                f"--- Document {c + 1} ---\n"
+                + tmpl.format(topic=topic, n=v)
+                + " Visitors describe its hall as quiet and orderly. "
+                "Its committee meets quarterly to review activities."
+            )
+            cards_text.append(ctx)
+        document = "\n\n".join(cards_text)
+        # Pick the two cards involved in the question.
+        a_idx, b_idx = r.sample(range(n_cards), 2)
+        a_topic, b_topic = topics[a_idx], topics[b_idx]
+        a_val, b_val = values[a_idx], values[b_idx]
+        kind = qkinds[i % len(qkinds)]
+        if kind == "sum":
+            gold = str(a_val + b_val)
+            question = (
+                f"Considering only {a_topic} and {b_topic}, what is the "
+                f"COMBINED total of the numeric attribute reported in "
+                f"each of their documents? Reply with the integer only."
+            )
+        elif kind == "difference":
+            larger, smaller = (a_val, b_val) if a_val > b_val else (b_val, a_val)
+            larger_t, smaller_t = (
+                (a_topic, b_topic) if a_val > b_val else (b_topic, a_topic)
+            )
+            gold = str(larger - smaller)
+            question = (
+                f"How many more does {larger_t} have than {smaller_t} "
+                f"on the numeric attribute reported in their documents? "
+                f"Reply with the integer only."
+            )
+        elif kind == "compare":
+            # Gold is the FULL topic-name string. Substring grading
+            # requires gold ⊆ pred AND no OTHER topic ⊆ pred (so we
+            # set confusers to the other 2 topic names).
+            larger_t = a_topic if a_val > b_val else b_topic
+            gold = larger_t
+            question = (
+                f"Comparing the numeric attribute reported by {a_topic} "
+                f"and {b_topic}, which one has the LARGER value? Reply "
+                f"with the full name of the larger one."
+            )
+        else:  # ratio (integer division to keep gold an integer)
+            larger, smaller = (a_val, b_val) if a_val >= b_val else (b_val, a_val)
+            gold = str(larger // smaller)
+            question = (
+                f"How many times larger (rounded down to integer) is the "
+                f"numeric attribute of {a_topic} compared to {b_topic}? "
+                f"If {a_topic} is smaller, swap the order. Reply with the integer only."
+            )
+        # Confusers: numeric values from cards NOT used in the gold.
+        # These should not appear as standalone integers in the response.
+        # For "compare" the gold is a topic name; confusers are the OTHER
+        # topic names (so the model can't hedge by listing all of them).
+        if kind == "compare":
+            confuser_answers = [
+                t for ti, t in enumerate(topics) if ti not in (a_idx, b_idx)
+            ]
+            # Add the LOSER as a confuser too — model must commit.
+            loser_t = b_topic if a_val > b_val else a_topic
+            confuser_answers.append(loser_t)
+        else:
+            confuser_answers = [
+                str(values[ci]) for ci in range(n_cards) if ci not in (a_idx, b_idx)
+            ]
+        out.append({
+            "src": f"multi_doc_synthesis/{kind}",
+            "context": document,
+            "question": question,
+            "answer": gold,
+            "confuser_answers": confuser_answers,
+            "involved_topics": [a_topic, b_topic],
+            "kind": kind,
+        })
+    return out
+
+
+# Calibration bench: solvable + intentionally unsolvable items.
+# Solvable items have a clean numeric / short-string answer; unsolvable
+# items lack the information needed (e.g., one of two required values
+# is omitted) so the correct response is to refuse.
+_CALIBRATION_REFUSAL_TOKENS = (
+    "i don't know", "i do not know", "insufficient information",
+    "not enough information", "cannot determine", "can not determine",
+    "unknown", "no answer", "no solution", "indeterminate", "cannot tell",
+    "not provided", "missing", "incomplete", "n/a",
+)
+
+
+def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural calibration / honest-hedging items for ``calibration_bench``.
+
+    v29.4 (2026-04-29). Why this axis exists. SOTA models say "I don't
+    know" when the information needed to answer is missing, instead of
+    confabulating a plausible-sounding wrong answer. Currently no
+    validator axis measures this — a model that hallucinates fluently
+    could pass our other axes by always emitting confident-but-wrong
+    answers on hard items.
+
+    Item structure: each item is either ``solvable`` or ``unsolvable``,
+    with the split controlled by ``BENCH_CALIBRATION_UNSOLVABLE_FRACTION``
+    (default 0.5).
+
+      * ``solvable`` items have a clean numeric or short-string gold;
+        the model is graded on producing the correct answer (substring
+        containment, lenient).
+      * ``unsolvable`` items are constructed by REMOVING one of the
+        two values needed for the computation, so the answer is
+        underdetermined. The model is graded on producing one of the
+        ``_CALIBRATION_REFUSAL_TOKENS`` (case-insensitive substring),
+        AND not producing a confident numeric answer (no ``\\d+``).
+
+    Why both kinds matter. A model that always refuses scores 0 on
+    solvable items; a model that always confabulates scores 0 on
+    unsolvable. Only a calibrated model passes both halves.
+
+    Pure-Python procedural generation; no model-specific assumptions.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["calibration"]) & 0xFFFFFFFF)
+    n_unsolv = int(round(n_items * BENCH_CALIBRATION_UNSOLVABLE_FRACTION))
+    n_solv = n_items - n_unsolv
+    # Question templates are simple narrative arithmetic so the
+    # solvable / unsolvable contrast is on the INFORMATION CONTENT,
+    # not the difficulty of the math.
+    templates = [
+        ("books_total",
+         "{name} owns {a} books in the kitchen and {b} books in the study. "
+         "How many books does {name} own in total? Reply with an integer.",
+         "{name} owns books in the kitchen and {b} books in the study. "
+         "How many books does {name} own in total? Reply with an integer.",
+         lambda a, b: a + b),
+        ("trail_distance",
+         "A trail is split into a steep section of {a} km and a flat "
+         "section of {b} km. What is the total length of the trail? "
+         "Reply with an integer.",
+         "A trail is split into a steep section and a flat section of {b} km. "
+         "What is the total length of the trail? Reply with an integer.",
+         lambda a, b: a + b),
+        ("class_total",
+         "A class has {a} morning students and {b} evening students. "
+         "How many students are in the class total? Reply with an integer.",
+         "A class has morning students and {b} evening students. "
+         "How many students are in the class total? Reply with an integer.",
+         lambda a, b: a + b),
+        ("orchard_yield",
+         "An orchard produced {a} kg of apples and {b} kg of pears this "
+         "season. What was the total fruit yield in kg? Reply with an integer.",
+         "An orchard produced {a} kg of apples and pears this "
+         "season. What was the total fruit yield in kg? Reply with an integer.",
+         lambda a, b: a + b),
+        ("library_books",
+         "On Monday {name} borrowed {a} books and on Tuesday {name} borrowed "
+         "{b} books. How many books has {name} borrowed total? Reply with an integer.",
+         "On Monday {name} borrowed books and on Tuesday {name} borrowed "
+         "{b} books. How many books has {name} borrowed total? Reply with an integer.",
+         lambda a, b: a + b),
+    ]
+    out: list[dict] = []
+    plan = (["solv"] * n_solv) + (["unsolv"] * n_unsolv)
+    rng.shuffle(plan)
+    for i, plan_kind in enumerate(plan):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        tmpl_id, solv_template, unsolv_template, gold_fn = r.choice(templates)
+        a, b = r.randint(5, 60), r.randint(5, 60)
+        # v29.5: procedurally synthesise a fresh name per item; no
+        # static name pool to memorise.
+        name = _synthetic_name(r)
+        if plan_kind == "solv":
+            question = solv_template.format(a=a, b=b, name=name)
+            gold = str(gold_fn(a, b))
+        else:
+            # Pass both a + b: each unsolv template omits ONE of the
+            # two slots and may legitimately reference the other (e.g.
+            # the orchard template keeps {a} but drops {b}, the books
+            # template keeps {b} but drops {a}). Passing both is safe
+            # because Python ignores extra kwargs in str.format.
+            question = unsolv_template.format(a=a, b=b, name=name)
+            gold = "REFUSE"  # sentinel; grader handles refusal recognition
+        out.append({
+            "src": f"calibration/{tmpl_id}/{plan_kind}",
+            "question": question,
+            "answer": gold,
+            "kind": plan_kind,  # "solv" or "unsolv"
+        })
+    return out
+
+
+def _generate_refactor_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural refactoring items for ``refactor_bench`` (v29.4, 2026-04-29).
+
+    Why this axis exists. ``code_bench`` / ``mbpp_bench`` test
+    write-from-scratch; ``debug_bench`` / ``correction_bench`` test
+    bug fixing. None measure **refactoring** — the SOTA-distinct skill
+    of restructuring working code to meet a style constraint while
+    preserving behaviour.
+
+    Item structure: each item presents a working function (deliberately
+    written with a code smell — nested loops, repeated conditionals,
+    or a verbose imperative style) along with:
+
+      * the function's docstring + tests (the model must preserve
+        behaviour: tests must pass against the refactor)
+      * a STYLE CONSTRAINT (e.g., "no nested loops", "≤ 12 lines")
+
+    Grading runs the model's refactor through ``humaneval_sandbox``
+    AND ALSO inspects the AST of the model's output to verify the
+    style constraint. Item-level pass requires BOTH:
+
+      1. all tests pass (behaviour preserved)
+      2. the AST satisfies the constraint
+
+    Constraint kinds (block-rotated):
+
+      * ``no_nested_loops`` — refactor must contain ≤ 1 ``for`` /
+        ``while`` loop nested inside another loop (depth limit 1).
+      * ``max_lines`` — refactor body must be ≤ N source lines
+        (counting non-blank, non-comment lines).
+      * ``no_explicit_loop`` — refactor must use comprehension /
+        ``sum`` / ``map`` / ``any`` / ``all`` instead of ``for``.
+
+    The grader runs the whole sandbox first; if tests pass, it ALSO
+    parses the model's emitted code (everything after the prompt)
+    with ``ast`` and applies the constraint check. AST failure → item
+    fails even if tests pass.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["refactor"]) & 0xFFFFFFFF)
+    constraint_kinds = ["no_nested_loops", "max_lines", "no_explicit_loop"]
+    pool = (constraint_kinds * ((n_items // len(constraint_kinds)) + 1))[:n_items]
+    rng.shuffle(pool)
+    # Function templates: each is a working but ugly implementation.
+    # The signature stays clean; the prompt presents the ugly version
+    # commented out PLUS the docstring on a fresh signature, like
+    # debug_bench. Model writes the body to satisfy both behaviour
+    # tests and the AST constraint.
+    templates = [
+        ("count_evens_ugly", "count_evens",
+         (
+             "def count_evens(arr):\n"
+             "    n = 0\n"
+             "    for x in arr:\n"
+             "        if x % 2 == 0:\n"
+             "            for y in [x]:\n"  # spurious nested loop
+             "                n += 1\n"
+             "    return n\n"
+         ),
+         (
+             "def count_evens(arr: list[int]) -> int:\n"
+             '    """Return the number of even integers in arr."""\n'
+         ),
+         [
+             "    assert candidate([1, 2, 3, 4, 5, 6]) == 3",
+             "    assert candidate([2, 4, 6]) == 3",
+             "    assert candidate([]) == 0",
+             "    assert candidate([1, 3, 5]) == 0",
+         ],
+        ),
+        ("sum_squares_ugly", "sum_of_squares",
+         (
+             "def sum_of_squares(n):\n"
+             "    total = 0\n"
+             "    i = 1\n"
+             "    while i <= n:\n"
+             "        j = 0\n"
+             "        while j < 1:\n"   # nested while; spurious
+             "            total = total + i * i\n"
+             "            j = j + 1\n"
+             "        i = i + 1\n"
+             "    return total\n"
+         ),
+         (
+             "def sum_of_squares(n: int) -> int:\n"
+             '    """Return 1**2 + 2**2 + ... + n**2."""\n'
+         ),
+         [
+             "    assert candidate(3) == 14",
+             "    assert candidate(5) == 55",
+             "    assert candidate(1) == 1",
+             "    assert candidate(0) == 0",
+         ],
+        ),
+        ("flatten_ugly", "flatten_two_level",
+         (
+             "def flatten_two_level(matrix):\n"
+             "    out = []\n"
+             "    for row in matrix:\n"
+             "        for x in row:\n"
+             "            out.append(x)\n"
+             "    return out\n"
+         ),
+         (
+             "def flatten_two_level(matrix: list[list[int]]) -> list[int]:\n"
+             '    """Flatten a 2D list of integers into a flat list."""\n'
+         ),
+         [
+             "    assert candidate([[1, 2], [3, 4]]) == [1, 2, 3, 4]",
+             "    assert candidate([[5]]) == [5]",
+             "    assert candidate([]) == []",
+             "    assert candidate([[1], [2], [3]]) == [1, 2, 3]",
+         ],
+        ),
+    ]
+    out: list[dict] = []
+    for i, kind in enumerate(pool):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        tmpl_id, entry, ugly, sig, tests = r.choice(templates)
+        # 2026-04-29 (v29.6): rotate the function name per item so the
+        # entry-point identifier is procedural too — same approach as
+        # debug_bench / correction_bench. Tests call ``candidate(...)``
+        # so they don't need rewriting; only the ``def <name>(`` sites
+        # in ugly + sig need the rename.
+        original_entry = entry
+        suffix = "_" + _synthetic_word(r, 1)
+        entry = original_entry + suffix
+        ugly = ugly.replace(f"def {original_entry}(", f"def {entry}(")
+        sig = sig.replace(f"def {original_entry}(", f"def {entry}(")
+        # Set a max_lines bound so it's deterministic per item but rotates.
+        if kind == "max_lines":
+            max_lines = r.choice([6, 7, 8])
+            constraint_text = (
+                f"The refactor body must be at most {max_lines} non-blank, "
+                f"non-comment SOURCE LINES."
+            )
+        elif kind == "no_nested_loops":
+            constraint_text = (
+                "The refactor must contain NO loop nested inside another "
+                "loop (no for-inside-for, no while-inside-while, no "
+                "for-inside-while, no while-inside-for)."
+            )
+            max_lines = None
+        else:  # no_explicit_loop
+            constraint_text = (
+                "The refactor must NOT use any explicit ``for`` or ``while`` "
+                "loop. Use a comprehension, ``sum``, ``map``, ``any``, "
+                "``all``, or recursion instead."
+            )
+            max_lines = None
+        ugly_commented = "\n".join(
+            "# " + line if line else "#" for line in ugly.splitlines()
+        )
+        commented_tests = "\n".join(
+            ("# " + line.lstrip()) if line.startswith("    ") else ("# " + line)
+            for line in tests
+        )
+        prompt = (
+            "# Refactor the following Python function. The reference\n"
+            "# implementation below is correct but stylistically poor.\n"
+            "# Your refactor must preserve EXACT behaviour (same inputs\n"
+            "# return same outputs) AND satisfy the style constraint.\n"
+            "#\n"
+            "# Style constraint:\n"
+            f"# {constraint_text}\n"
+            "#\n"
+            "# Reference (poor style — DO NOT include in your output):\n"
+            f"{ugly_commented}\n"
+            "#\n"
+            "# Behaviour tests the refactor must pass:\n"
+            f"{commented_tests}\n"
+            "#\n"
+            "# Now write the refactor below. Output only the function body.\n"
+            f"{sig}"
+        )
+        test_block_str = "\n".join(tests)
+        test_block = "def check(candidate):\n" + test_block_str + "\n"
+        item = {
+            "src": f"procedural_refactor/{tmpl_id}/{kind}",
+            "task_id": f"refactor/{tmpl_id}/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry,
+            "constraint_kind": kind,
+        }
+        if max_lines is not None:
+            item["max_lines"] = max_lines
+        out.append(item)
+    return out
+
+
 def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural reasoning / multiple-choice items for reasoning_bench (v27).
+    """Procedural reasoning items for reasoning_bench (v29 — BBH rebalance).
 
-    Subtypes:
-      * ``boolean_eval``    — evaluate a small boolean expression
-      * ``ordering``        — pick the correct ordering of items by a rule
-      * ``deduction``       — small constraint-satisfaction with 3-4 entities
-      * ``sequence_next``   — guess the next term of a procedurally-generated sequence
-      * ``odd_one_out``     — pick the entry that violates a procedural rule
-      * ``analogy_letter``  — letter-arithmetic A→B :: C→? (Caesar shift)
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed
+    reasoning_bench saturating near 1.0 for trained miners while held-out
+    BBH (logical_deduction, web_of_lies, navigate, tracking_shuffled_*)
+    stays flat — same distribution-mismatch class as math/code v27→v29.
+    The v27 templates lean toward one-step lookups (sort by height,
+    sequence next term, Caesar shift). Optimising v27 teaches miners to
+    nail tiny-state arithmetic but doesn't transfer to BBH's multi-step
+    state tracking, temporal/spatial reasoning, and logical chains.
 
-    Items are emitted in BBH ``(A)/(B)/...`` MC format so the existing
-    ``_reasoning_extract_answer`` grader handles them unchanged.
+    v29 keeps the v27 templates as a difficulty floor (~30 %) and adds a
+    BBH-distribution-similar hard tier (~70 %, 4 new templates):
+
+      * ``date_arithmetic``     — date + Δdays (BBH date_understanding)
+      * ``web_of_lies``         — chained truth-teller/liar inference
+      * ``navigate_steps``      — directional path + final position query
+      * ``tracking_objects``    — N-person N-object swap state-tracking
+
+    Each hard template emits multi-step natural-language scenarios with
+    named entities and irrelevant numeric distractors so a model that
+    relies on a single key heuristic fails. All items emit the BBH
+    ``(A)/(B)/...`` MC format so ``_reasoning_extract_answer`` handles
+    them unchanged.
+
+    Procedural rotation per block_seed prevents memorisation; BBH
+    distribution similarity makes validator pass-rate predict held-out
+    BBH pass-rate (the v27 saturation gap broke that link).
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["reasoning"]) & 0xFFFFFFFF)
-    kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
-             "odd_one_out", "analogy_letter"]
+    hard_kinds = ["date_arithmetic", "web_of_lies", "navigate_steps", "tracking_objects"]
+    legacy_kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
+                    "odd_one_out", "analogy_letter"]
+    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_legacy = max(0, n_items - n_hard)
+    hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
+    legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
+    rng.shuffle(hard_pool)
+    rng.shuffle(legacy_pool)
+    kinds = hard_pool[:n_hard] + legacy_pool[:n_legacy]
     rng.shuffle(kinds)
     out: list[dict] = []
 
@@ -6258,7 +9714,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
         elif kind == "ordering":
             n = r.randint(3, 4)
             heights = r.sample(range(140, 200), n)
-            names = r.sample(_PROC_NAMES, n)
+            names = _synthetic_names(r, n)
             sort_dir = r.choice(["tallest", "shortest"])
             paired = sorted(zip(heights, names), reverse=(sort_dir == "tallest"))
             correct_order = [p[1] for p in paired]
@@ -6283,7 +9739,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             )
             out.append(_mc(qtext, options, gold_idx, "procedural_reasoning/ordering"))
         elif kind == "deduction":
-            people = r.sample(_PROC_NAMES, 3)
+            people = _synthetic_names(r, 3)
             colours = r.sample(["red", "blue", "green", "yellow", "purple"], 3)
             mapping = dict(zip(people, colours))
             clue1 = f"{people[0]}'s favorite colour is not {mapping[people[1]]}."
@@ -6369,7 +9825,7 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                     "Which one does not?"
                 )
             out.append(_mc(qtext, opts, gold_idx, "procedural_reasoning/odd_one_out"))
-        else:  # analogy_letter
+        elif kind == "analogy_letter":
             shift = r.randint(1, 12)
             a = r.choice("ABCDEFGHIJ")
             b = chr(((ord(a) - ord("A") + shift) % 26) + ord("A"))
@@ -6387,6 +9843,151 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             )
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/analogy_letter"))
+        # ── v29 hard tier (BBH-distribution-similar) ────────────────────
+        elif kind == "date_arithmetic":
+            from datetime import date, timedelta
+            year = r.choice([2023, 2024])
+            month = r.randint(1, 12)
+            day = r.randint(1, 28)
+            d0 = date(year, month, day)
+            direction = r.choice(["after", "before"])
+            delta = r.randint(7, 95)
+            if direction == "after":
+                target = d0 + timedelta(days=delta)
+            else:
+                target = d0 - timedelta(days=delta)
+            extra_age = r.randint(7, 73)  # noise distractor
+            extra_friend = _synthetic_name(r)
+            qtext = (
+                f"Today is {d0.strftime('%B %-d, %Y')}. {extra_friend} is "
+                f"{extra_age} days old. What is the date {delta} days "
+                f"{direction} today? Answer in MM/DD/YYYY format."
+            )
+            ans = target.strftime("%m/%d/%Y")
+            distractors = []
+            for off in (-3, -1, 1, 3, 7):
+                d_alt = target + timedelta(days=off)
+                distractors.append(d_alt.strftime("%m/%d/%Y"))
+            distractors = list(dict.fromkeys(d for d in distractors if d != ans))
+            options = [ans] + distractors[:3]
+            r.shuffle(options)
+            gold_idx = options.index(ans)
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/date_arithmetic"))
+        elif kind == "web_of_lies":
+            n_chain = r.randint(3, 5)
+            people = _synthetic_names(r,
+                              n_chain)
+            truth = [r.choice([True, False]) for _ in range(n_chain)]
+            statements = []
+            for i in range(1, n_chain):
+                claimed = truth[i]
+                if not truth[i - 1]:
+                    claimed = not claimed
+                verb = "tells the truth" if claimed else "lies"
+                statements.append(f"{people[i - 1]} says {people[i]} {verb}.")
+            base_truth = "tells the truth" if truth[0] else "lies"
+            preamble = f"{people[0]} {base_truth}."
+            target = people[-1]
+            target_truth = truth[-1]
+            distractor_n = r.randint(2, 9)
+            qtext = (
+                f"{preamble} {' '.join(statements)} A bystander mentions there "
+                f"are {distractor_n} people in the room (not relevant). Does "
+                f"{target} tell the truth?"
+            )
+            options = ["Yes", "No"]
+            r.shuffle(options)
+            gold_idx = options.index("Yes" if target_truth else "No")
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/web_of_lies"))
+        elif kind == "navigate_steps":
+            cardinals = ["north", "east", "south", "west"]
+            initial = r.choice(cardinals)
+            heading_idx = cardinals.index(initial)
+            x, y = 0, 0
+            steps_log = []
+            for _ in range(r.randint(3, 6)):
+                kind2 = r.choice(["walk", "turn_left", "turn_right", "turn_around"])
+                if kind2 == "walk":
+                    n = r.randint(1, 7)
+                    steps_log.append(f"walk {n} steps forward")
+                    if heading_idx == 0:
+                        y += n
+                    elif heading_idx == 1:
+                        x += n
+                    elif heading_idx == 2:
+                        y -= n
+                    else:
+                        x -= n
+                elif kind2 == "turn_left":
+                    steps_log.append("turn left")
+                    heading_idx = (heading_idx - 1) % 4
+                elif kind2 == "turn_right":
+                    steps_log.append("turn right")
+                    heading_idx = (heading_idx + 1) % 4
+                else:
+                    steps_log.append("turn around")
+                    heading_idx = (heading_idx + 2) % 4
+            qtext_query = r.choice(["start", "facing"])
+            distractor_n = r.randint(2, 13)
+            instructions = ", then ".join(steps_log)
+            if qtext_query == "start":
+                qtext = (
+                    f"You start at the origin facing {initial}. "
+                    f"There is a {distractor_n}-foot lamp at the origin (irrelevant). "
+                    f"You {instructions}. Are you back at the starting point?"
+                )
+                options = ["Yes", "No"]
+                r.shuffle(options)
+                back = (x == 0 and y == 0)
+                gold_idx = options.index("Yes" if back else "No")
+            else:
+                qtext = (
+                    f"You start at the origin facing {initial}. "
+                    f"There is a {distractor_n}-foot fence (irrelevant). "
+                    f"You {instructions}. Which direction are you facing?"
+                )
+                final = cardinals[heading_idx]
+                options = list(cardinals)
+                r.shuffle(options)
+                gold_idx = options.index(final)
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/navigate_steps"))
+        elif kind == "tracking_objects":
+            n = r.randint(3, 4)
+            people = _synthetic_names(r, n)
+            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange"], n)
+            holds = dict(zip(people, colors))
+            n_swaps = r.randint(2, 4)
+            ops = []
+            for _ in range(n_swaps):
+                a, b = r.sample(people, 2)
+                ops.append(f"{a} swaps the ball with {b}")
+                holds[a], holds[b] = holds[b], holds[a]
+            target_person = r.choice(people)
+            ans = holds[target_person]
+            distractor_age = r.randint(20, 50)
+            preamble = ", ".join(f"{p} has the {c} ball" for p, c in zip(people, colors))
+            qtext = (
+                f"At the start: {preamble}. {target_person} is "
+                f"{distractor_age} years old (irrelevant). Then, in order: "
+                + "; then ".join(ops) + "."
+                + f" Which colour ball does {target_person} have at the end?"
+            )
+            options = list(set(colors))
+            while len(options) < 4:
+                extra = r.choice(["red", "blue", "green", "yellow", "purple", "orange",
+                                  "white", "black"])
+                if extra not in options:
+                    options.append(extra)
+            options = options[:4]
+            if ans not in options:
+                options[0] = ans
+            r.shuffle(options)
+            gold_idx = options.index(ans)
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/tracking_objects"))
     return out
 
 
@@ -6462,7 +10063,7 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
         elif kind == "ordering_mc":
             n = 3
             heights = r.sample(range(140, 200), n)
-            names = r.sample(_PROC_NAMES, n)
+            names = _synthetic_names(r, n)
             sort_dir = r.choice(["tallest", "shortest"])
             paired = sorted(zip(heights, names), reverse=(sort_dir == "tallest"))
             correct = ", ".join(p[1] for p in paired)
@@ -6642,18 +10243,35 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
 
 
 def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
-    """Procedural instruction-following items for ifeval_bench (v27).
+    """Procedural instruction-following items for ifeval_bench (v29 — compound rebalance).
+
+    v29 (2026-04-28): the audit at ``state/benchmarks/`` showed
+    ifeval_bench saturating at high pass-rates (mean 0.85+) for trained
+    miners while held-out IFEval pass@1 stays around the Qwen 4B-base
+    baseline. Real IFEval includes a 25-30 % "compound" tail where one
+    prompt has 2-3 stacked constraints all of which must pass — the
+    v27 templates were 100 % single-constraint, so optimising v27
+    teaches the model to nail one constraint at a time but doesn't
+    transfer to compound IFEval items where a model has to balance
+    multiple format/length/keyword rules simultaneously.
+
+    v29 keeps the 13 v27 single-constraint kinds at ~70 % weight as the
+    skill floor, and adds a v29 ``compound`` tier at ~30 % that stacks
+    two non-conflicting constraints from the v27 pool (e.g. "write 30
+    words exactly AND end with 'Thank you'"). All constraints still come
+    from ``ifeval_vendor.SUPPORTED_VERIFIERS`` so the existing
+    ``evaluate_item`` grader (which already handles multi-instruction
+    items via ``all(results)``) works unchanged.
 
     Each item carries:
-      * ``prompt``         — the user-facing instruction
+      * ``prompt``         — the user-facing instruction (concatenates
+                             multiple constraints when compound)
       * ``instruction_ids`` — list of canonical constraint identifiers
                               (parallel to ``kwargs``); the existing
                               ``ifeval_vendor`` evaluator reads these
       * ``kwargs``         — list of per-instruction kwargs dicts
-      * ``src``            — telemetry tag
-
-    All constraints are drawn from ``ifeval_vendor.SUPPORTED_VERIFIERS``
-    so the existing grader works unchanged.
+      * ``src``            — telemetry tag (compound items tagged
+                             ``procedural_ifeval/compound:<a>+<b>``)
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["ifeval"]) & 0xFFFFFFFF)
@@ -6668,6 +10286,16 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
         "title_format",
         "bullet_list",
     ]
+    # v29: ~30 % compound items. We replace `compound` placeholders in
+    # the per-item loop below with two stacked constraints (chosen from
+    # a curated whitelist of non-conflicting pairs).
+    n_compound = max(0, (n_items * 30 + 50) // 100)
+    n_single = n_items - n_compound
+    single_pool = (kinds * ((n_single // len(kinds)) + 1))[:n_single]
+    rng.shuffle(single_pool)
+    item_kinds = single_pool + ["compound"] * n_compound
+    rng.shuffle(item_kinds)
+    kinds = item_kinds  # consumed below as kinds[i % len(kinds)]
     rng.shuffle(kinds)
     nouns = ["pelican", "lighthouse", "harbor", "compass", "blueprint",
              "magnolia", "obsidian", "carousel", "satellite", "sycamore"]
@@ -6783,7 +10411,7 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             )
             instruction_ids = ["detectable_format:title"]
             kwargs_list = [{}]
-        else:  # bullet_list
+        elif kind == "bullet_list":
             n = r.randint(3, 5)
             prompt = (
                 f"List {n} interesting facts about {topic}. Format the list with "
@@ -6791,6 +10419,95 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             )
             instruction_ids = ["detectable_format:number_bullet_lists"]
             kwargs_list = [{"num_bullets": n}]
+        elif kind == "compound":
+            # Curated pairs of non-conflicting constraints. Stack each pair
+            # into a single prompt — the model must satisfy BOTH for credit.
+            # Avoids combos like "all uppercase" + "exact_words=N" where N
+            # uppercase words fight the word-count count, and avoids combos
+            # that share a verifier family (e.g. min_words + max_words).
+            pair_options = [
+                ("min_words", "ends_with_phrase"),
+                ("min_words", "include_keyword"),
+                ("max_words", "no_comma"),
+                ("exact_sentences", "no_comma"),
+                ("exact_sentences", "ends_with_phrase"),
+                ("all_lowercase", "include_keyword"),
+                ("all_lowercase", "ends_with_phrase"),
+                ("bullet_list", "min_words"),
+                ("bullet_list", "include_keyword"),
+                ("title_format", "exact_sentences"),
+                ("title_format", "ends_with_phrase"),
+                ("forbid_keyword", "min_words"),
+                ("forbid_keyword", "exact_sentences"),
+            ]
+            a, b = r.choice(pair_options)
+            # Build each piece independently
+            def _build(k_local: str):
+                ii: list[str] = []
+                kk: list[dict] = []
+                pp: str = ""
+                if k_local == "min_words":
+                    n_w = r.choice([30, 40, 60])
+                    pp = f"contain at least {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at least"}]
+                elif k_local == "max_words":
+                    n_w = r.choice([20, 30, 40])
+                    pp = f"contain no more than {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at most"}]
+                elif k_local == "exact_sentences":
+                    n_s = r.choice([2, 3, 4])
+                    pp = f"contain exactly {n_s} sentences"
+                    ii = ["length_constraints:number_sentences"]
+                    kk = [{"num_sentences": n_s, "relation": "exactly"}]
+                elif k_local == "all_lowercase":
+                    pp = "use only lowercase letters"
+                    ii = ["change_case:english_lowercase"]
+                    kk = [{}]
+                elif k_local == "no_comma":
+                    pp = "contain no commas"
+                    ii = ["punctuation:no_comma"]
+                    kk = [{}]
+                elif k_local == "ends_with_phrase":
+                    phrase = r.choice([
+                        "Is there anything else I can help with?",
+                        "Thank you for reading.",
+                        "End of report.",
+                    ])
+                    pp = f"end with the exact phrase {phrase!r}"
+                    ii = ["startend:end_checker"]
+                    kk = [{"end_phrase": phrase}]
+                elif k_local == "include_keyword":
+                    n_k = r.randint(2, 4)
+                    pp = f"include the word {keyword!r} at least {n_k} times"
+                    ii = ["keywords:frequency"]
+                    kk = [{"keyword": keyword, "relation": "at least", "frequency": n_k}]
+                elif k_local == "forbid_keyword":
+                    forbidden = r.choice([n_ for n_ in nouns if n_ != keyword])
+                    pp = f"never use the word {forbidden!r}"
+                    ii = ["keywords:forbidden_words"]
+                    kk = [{"forbidden_words": [forbidden]}]
+                elif k_local == "bullet_list":
+                    n_b = r.randint(3, 5)
+                    pp = f"include exactly {n_b} markdown bullet points (lines starting with `* ` or `- `)"
+                    ii = ["detectable_format:number_bullet_lists"]
+                    kk = [{"num_bullets": n_b}]
+                elif k_local == "title_format":
+                    pp = "begin with a title wrapped in double angle brackets like ``<<Title Goes Here>>`` on the first line"
+                    ii = ["detectable_format:title"]
+                    kk = [{}]
+                return ii, kk, pp
+            ii_a, kk_a, pp_a = _build(a)
+            ii_b, kk_b, pp_b = _build(b)
+            prompt = (
+                f"Write a short response about {topic}. Your response must "
+                f"satisfy ALL of the following constraints simultaneously: "
+                f"(1) {pp_a}; (2) {pp_b}."
+            )
+            instruction_ids = ii_a + ii_b
+            kwargs_list = kk_a + kk_b
+            kind = f"compound:{a}+{b}"
         out.append({
             "src": f"procedural_ifeval/{kind}",
             "prompt": prompt,
@@ -6853,7 +10570,7 @@ def _generate_procedural_items(block_seed: int, n_items: int) -> list[dict]:
             records = []
             target_idx = r.randint(0, 4)
             for j in range(5):
-                name = f"{r.choice(_PROC_NAMES)}-{r.randint(10, 99)}"
+                name = f"{_synthetic_name(r)}-{r.randint(10, 99)}"
                 color = r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
                 rank = r.randint(100, 999)
                 records.append((name, color, rank))
@@ -6900,7 +10617,7 @@ def _generate_procedural_items(block_seed: int, n_items: int) -> list[dict]:
             forced_name = None
             best_score = -1
             for j in range(7):
-                name = f"{r.choice(_PROC_NAMES)}-{r.randint(100, 999)}"
+                name = f"{_synthetic_name(r)}-{r.randint(100, 999)}"
                 color = target_color if j in (2, 5) else r.choice(["amber", "blue", "crimson", "green", "silver", "violet"])
                 tier = target_tier if j in (2, 5) else r.choice(["A", "B", "C"])
                 score = r.randint(20, 98)
@@ -7762,6 +11479,19 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("procedural_bench", procedural_bench_probe),
         ("robustness_bench", robustness_bench_probe),
         ("noise_resistance_bench", noise_resistance_bench_probe),
+        # v29.2 — procedural buggy-code fix probe.
+        ("debug_bench", debug_bench_probe),
+        # v29.4 — buggy code + explicit error trace; tests
+        # read→run→see-error→fix workflow.
+        ("correction_bench", correction_bench_probe),
+        # v29.4 — multi-document synthesis (fact-card retrieval +
+        # cross-doc reasoning).
+        ("multi_doc_synthesis_bench", multi_doc_synthesis_bench_probe),
+        # v29.4 — calibration / honest hedging (solvable + unsolvable
+        # mix; reward correct refusals).
+        ("calibration_bench", calibration_bench_probe),
+        # v29.4 — refactor under style constraint (AST-graded).
+        ("refactor_bench", refactor_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:
@@ -9120,9 +12850,35 @@ def _align_prompt_boundary(full_text, prompt_text, full_ids, tokenizer):
         return len(ids_list)
 
 
+# 2026-04-29 (v29.7): vLLM-died-mid-eval signal. When a worker thread sees a
+# connection-refused / remote-disconnected error, it marks this Event so
+# concurrent peers stop wasting time on the dead server and fail fast. Reset
+# at the top of every ``generate_via_vllm`` call.
+_VLLM_DEAD_EVENT = None  # populated lazily as a threading.Event
+
+
+def _vllm_dead_event():
+    """Lazy-init a process-wide Event used to short-circuit the worker
+    pool when vLLM dies mid-eval. Per-call reset by ``generate_via_vllm``."""
+    global _VLLM_DEAD_EVENT
+    if _VLLM_DEAD_EVENT is None:
+        import threading as _th
+        _VLLM_DEAD_EVENT = _th.Event()
+    return _VLLM_DEAD_EVENT
+
+
 def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
                             logprobs_k, tokenizer, token_to_id):
-    """Generate a single prompt via vLLM. Used by both sequential and concurrent paths."""
+    """Generate a single prompt via vLLM. Used by both sequential and concurrent paths.
+
+    v29.7 (2026-04-29): added the ``_vllm_dead_event()`` short-circuit so
+    that when one worker hits a hard connection failure (the vLLM server
+    crashed / hung), every other in-flight worker bails out within one
+    retry attempt instead of grinding through the full backoff loop. Cuts
+    "vLLM dies at prompt 200 of 300" recovery time from ~10 min of
+    flailing requests to ~5 s of fast-fail, then the caller falls back to
+    HF for the remaining prompts cleanly.
+    """
     import requests
 
     payload = {
@@ -9139,7 +12895,14 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
         payload["logprobs"] = logprobs_k
         payload["prompt_logprobs"] = 0
 
+    dead = _vllm_dead_event()
     for attempt in range(3):
+        # Fast-fail: another worker already determined vLLM is dead. Don't
+        # waste time on the same dead server.
+        if dead.is_set() and attempt > 0:
+            raise RuntimeError(
+                f"vLLM dead (peer worker detected); skipping prompt {idx}"
+            )
         try:
             resp = requests.post(
                 f"{VLLM_URL}/v1/completions",
@@ -9169,6 +12932,19 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
                     )
             return idx, result
         except Exception as e:
+            # Detect a fatal vLLM-server failure pattern (connection
+            # refused, peer reset). On these, set the global dead event
+            # so the rest of the worker pool fails fast.
+            err_str = (str(e) or "").lower()
+            err_name = type(e).__name__
+            is_fatal = (
+                "connection refused" in err_str
+                or "remote end closed" in err_str
+                or err_name == "ConnectionError"
+                or "max retries exceeded" in err_str
+            )
+            if is_fatal:
+                dead.set()
             if attempt < 2:
                 print(
                     f"  [vllm] Prompt {idx} attempt {attempt + 1} failed: "
@@ -9220,6 +12996,9 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
 
     # Concurrent generation
     print(f"  [vllm] Concurrent generation: {concurrency} parallel requests", flush=True)
+    # 2026-04-29 (v29.7): reset the dead-event so a previous round's
+    # vLLM crash doesn't poison this round's first attempt.
+    _vllm_dead_event().clear()
     result_slots = [None] * len(prompts)
     completed = 0
     last_log = 0
@@ -9252,9 +13031,29 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
                     progress_cb(completed, len(prompts))
             except Exception as e:
                 failed.append((orig_idx, str(e)))
-                print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
+                # If vLLM is dead, every still-pending future in this
+                # pool is going to fail. We don't bother logging each
+                # one — print once and bail loud.
+                if _vllm_dead_event().is_set():
+                    pass
+                else:
+                    print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
 
-    # Retry failed prompts sequentially
+    # 2026-04-29 (v29.7): if the dead-event fired, the vLLM server crashed
+    # mid-eval. Bail loud and fast so the caller falls back to HF for the
+    # whole eval rather than thrashing on a dead server. Without this we
+    # spent ~45 min last round retrying connection-refused before giving up.
+    if _vllm_dead_event().is_set():
+        n_done = sum(1 for r in result_slots if r is not None)
+        n_failed = len(prompts) - n_done
+        raise RuntimeError(
+            f"vLLM crashed mid-eval after {n_done}/{len(prompts)} prompts "
+            f"({n_failed} failed). Caller should fall back to HF generation."
+        )
+
+    # Retry failed prompts sequentially. We only get here if the dead-event
+    # never fired (i.e. failures were transient per-prompt errors, not a
+    # server-side crash).
     if failed:
         print(f"  [vllm] Retrying {len(failed)} failed prompts sequentially...", flush=True)
         for idx, err in failed:
@@ -9690,9 +13489,15 @@ def main():
                     progress_cb=_vllm_progress, concurrency=args.concurrency,
                 )
                 timings["vllm_generation"] = time.time() - t0
+                # 2026-04-29 (v29.7): explicit path tag so snapshot tools can
+                # distinguish "ran on vLLM" from "fell back to HF". The bot's
+                # 40-line tail snapshot needs this to answer "is the eval
+                # using HF again?" correctly.
+                print(f"[teacher_path] vllm  prompts_done={len(sequences_data)}/{len(prompts)}", flush=True)
                 print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
+                print(f"[teacher_path] hf-fallback-after-vllm-crash  reason={type(e).__name__}", flush=True)
 
             # Probe-ref collection while vLLM is still hot (cheap: ~15 prompts).
             # Populates _TEACHER_PROBE_SAMPLES so the MAD-z degeneracy branch
@@ -9720,6 +13525,7 @@ def main():
             stop_vllm_server()
         else:
             print(f"[eval] vLLM failed to start — falling back to HF", flush=True)
+            print(f"[teacher_path] hf-fallback-vllm-failed-to-start", flush=True)
 
         if sequences_data:
             # Check if vLLM returned logprobs for all prompts
@@ -9849,6 +13655,9 @@ def main():
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1 FALLBACK: HF teacher generation + logit extraction", flush=True)
         print(f"{'='*60}", flush=True)
+        # 2026-04-29 (v29.7): visible path tag so the bot's snapshot can
+        # see we're on HF generation now (not vLLM).
+        print(f"[teacher_path] hf-generation-active", flush=True)
 
         ensure_disk_space(args.teacher, threshold=70)
 

@@ -40,22 +40,22 @@ else
     # We limit to ``uid_*_summary.json`` to avoid pulling the full
     # per-prompt prediction logs (each benchmark run can produce 1GB+ of
     # JSONL, and we only need the aggregated scores).
-    REMOTE_LIST_CMD="cd \"$REMOTE_DIR\" 2>/dev/null && ls uid_*_summary.json 2>/dev/null | tr '\n' '\0'"
-    if files_nul="$($SSH_CMD "$EVAL_POD" "$REMOTE_LIST_CMD" 2>"$SYNC_ERR")"; then
-        if [ -n "$files_nul" ]; then
-            # xargs -0 to survive any weird filenames; tar c | ssh | tar x
-            # over stdin gives us the full-atomic copy semantics rsync had.
-            if ! $SSH_CMD "$EVAL_POD" \
-                    "cd \"$REMOTE_DIR\" && printf '%s' \"$files_nul\" | xargs -0 tar -cf -" \
-                    2>>"$SYNC_ERR" | tar -xf - -C "$LOCAL_DIR" 2>>"$SYNC_ERR"; then
-                REASON="$(tr '\n' ' ' < "$SYNC_ERR" | sed 's/  */ /g' | head -c 200)"
-                echo "benchmark-sync: tar fallback failed (${REASON:-unknown}); skipping this cycle" >&2
-                exit 0
-            fi
-        fi
-    else
+    #
+    # Filenames are matched by glob on the remote side and tarred in one
+    # shot. Earlier this stage tried to stream a `\0`-separated list back
+    # through bash's ``$(…)`` substitution and re-feed it to xargs -0 —
+    # bash strips null bytes from command substitutions so the fallback
+    # was seeing one mashed-together string ("uid_18_summary.jsonuid_2_…")
+    # and tar would fail with "Cannot stat: No such file or directory"
+    # every cycle for ~2 weeks. The dashboard's held-out canary went
+    # stale silently because the rsync-less Lium pods are the steady
+    # state. Skip the round-trip — let the remote shell glob and tar
+    # in one ssh call.
+    if ! $SSH_CMD "$EVAL_POD" \
+            "cd \"$REMOTE_DIR\" 2>/dev/null && tar -cf - uid_*_summary.json 2>/dev/null" \
+            2>>"$SYNC_ERR" | tar -xf - -C "$LOCAL_DIR" 2>>"$SYNC_ERR"; then
         REASON="$(tr '\n' ' ' < "$SYNC_ERR" | sed 's/  */ /g' | head -c 200)"
-        echo "benchmark-sync: remote unreachable (${REASON:-unknown}); skipping this cycle" >&2
+        echo "benchmark-sync: tar fallback failed (${REASON:-unknown}); skipping this cycle" >&2
         exit 0
     fi
 fi

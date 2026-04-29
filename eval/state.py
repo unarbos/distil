@@ -75,6 +75,11 @@ H2H_TESTED_KING_FILE = "h2h_tested_against_king.json"
 # ``KING_REGRESSION_GATE=1`` flips, used by results.py to force
 # dethronement. Shadow until we've observed ≥1 week of data.
 KING_REGRESSION_FILE = "king_regression_streak.json"
+# 2026-04-28: held-out canary regression streak. Sibling of
+# KING_REGRESSION_FILE — the latter tracks composite-internal at-risk
+# rounds, this one tracks held-out evalscope regression vs Qwen 4B base.
+# See ``composite._compute_king_canary_regression``.
+KING_CANARY_FILE = "king_canary_streak.json"
 ANNOUNCEMENT_FILE = "announcement.json"
 MODEL_HASHES_FILE = "model_hashes.json"
 SCORE_HISTORY_FILE = "score_history.json"
@@ -191,6 +196,8 @@ class ValidatorState:
         self.h2h_tested_against_king = _load_json(self._path(H2H_TESTED_KING_FILE), {})
         raw_streak = _load_json(self._path(KING_REGRESSION_FILE), {})
         self.king_regression_streak = raw_streak if isinstance(raw_streak, dict) else {}
+        raw_canary = _load_json(self._path(KING_CANARY_FILE), {})
+        self.king_canary_streak = raw_canary if isinstance(raw_canary, dict) else {}
 
         self.model_score_history = _load_json(self._path(MODEL_SCORE_HISTORY_FILE), {})
         raw_bad = _load_json(self._path(PERMANENTLY_BAD_FILE), [])

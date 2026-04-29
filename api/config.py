@@ -23,7 +23,12 @@ from eval.runtime import (
 CHAT_POD_PORT = CHAT_POD_APP_PORT
 
 # ── Tunables (single source of truth, duplicated in several places before) ──
-STALE_EVAL_BLOCKS = 50
+# 2026-04-28: STALE_EVAL_BLOCKS retired (was a misleading time-based cooldown
+# in the dashboard ``eval_status`` text). Single-eval mode re-evaluates a UID
+# only when its on-chain commitment changes; there is no time-based re-test.
+# Kept here only so any external consumer that imports the constant still
+# resolves (returns the legacy default), but the API routes no longer use it.
+STALE_EVAL_BLOCKS = 50  # deprecated, retained for backward-compat import only
 EPOCH_BLOCKS = 360
 CHAT_RESTART_COOLDOWN = 120
 CHAT_SERVER_SCRIPT = "/root/chat_server.py"

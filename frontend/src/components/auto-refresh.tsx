@@ -70,10 +70,30 @@ type Theme = "light" | "dark" | "system";
  *
  * Three states (system → dark → light), uses the same glyphs as the
  * site-header version (○/●/◐) so users learn one icon language.
+ *
+ * 2026-04-28 (Discord rao_2222): the footer button used to read the
+ * saved theme on mount but never call ``apply()``, so if a user landed
+ * with no saved value and clicked the FOOTER button first, the
+ * data-theme attribute matched but the React state did not. The
+ * site-header toggle would then disagree on the next click. Two fixes:
+ *   1. ``apply(saved)`` on mount so the runtime state mirrors the DOM.
+ *   2. Listen for the ``distil:theme-changed`` custom event so both
+ *      toggles stay in sync within the same tab when EITHER is clicked
+ *      (storage events only fire cross-tab, which is why same-tab
+ *      header+footer used to drift).
  */
+export const THEME_CHANGED_EVENT = "distil:theme-changed";
+
 export function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>("system");
   const [mounted, setMounted] = useState(false);
+
+  function apply(next: Theme) {
+    if (typeof document === "undefined") return;
+    const el = document.documentElement;
+    if (next === "system") el.removeAttribute("data-theme");
+    else el.setAttribute("data-theme", next);
+  }
 
   useEffect(() => {
     setMounted(true);
@@ -83,14 +103,17 @@ export function ThemeToggle() {
       if (v === "light" || v === "dark" || v === "system") saved = v;
     } catch {}
     setTheme(saved);
+    apply(saved);
+    const onChange = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ theme?: Theme }>).detail;
+      if (detail?.theme === "light" || detail?.theme === "dark" || detail?.theme === "system") {
+        setTheme(detail.theme);
+        apply(detail.theme);
+      }
+    };
+    window.addEventListener(THEME_CHANGED_EVENT, onChange);
+    return () => window.removeEventListener(THEME_CHANGED_EVENT, onChange);
   }, []);
-
-  function apply(next: Theme) {
-    if (typeof document === "undefined") return;
-    const el = document.documentElement;
-    if (next === "system") el.removeAttribute("data-theme");
-    else el.setAttribute("data-theme", next);
-  }
 
   function cycle() {
     const order: Theme[] = ["system", "dark", "light"];
@@ -99,6 +122,9 @@ export function ThemeToggle() {
     apply(next);
     try {
       window.localStorage.setItem("distil:theme", next);
+    } catch {}
+    try {
+      window.dispatchEvent(new CustomEvent(THEME_CHANGED_EVENT, { detail: { theme: next } }));
     } catch {}
   }
 

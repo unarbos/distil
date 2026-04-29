@@ -123,11 +123,29 @@ def benchmarks():
             mtime = 0
         entries.append((mtime, name, full))
     entries.sort(key=lambda e: e[0], reverse=True)
+    # 2026-04-28: enrich each benchmark payload with the validator's
+    # composite.worst for that UID so the dashboard Goodhart canary can
+    # co-plot the validator score line against the held-out trend on
+    # the same X-axis. Loaded once outside the per-file loop because
+    # composite_scores.json is shared state.
+    composite_scores_data = read_state("composite_scores.json", {})
+    if not isinstance(composite_scores_data, dict):
+        composite_scores_data = {}
     for mtime, _, full in entries:
         data = _read(full, None)
         if not isinstance(data, dict):
             continue
         data.setdefault("fetched_at", mtime)
+        uid = data.get("uid")
+        if isinstance(uid, int) or (isinstance(uid, str) and uid.isdigit()):
+            comp = composite_scores_data.get(str(uid))
+            if isinstance(comp, dict):
+                worst = comp.get("composite", {}).get("worst") if isinstance(comp.get("composite"), dict) else comp.get("worst")
+                weighted = comp.get("composite", {}).get("weighted") if isinstance(comp.get("composite"), dict) else comp.get("weighted")
+                if isinstance(worst, (int, float)):
+                    data["composite_worst"] = worst
+                if isinstance(weighted, (int, float)):
+                    data["composite_weighted"] = weighted
         if data.get("is_baseline"):
             if baseline is None:
                 baseline = data

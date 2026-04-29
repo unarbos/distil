@@ -45,15 +45,15 @@ BENCH_DATASET_ARGS = {
 }
 
 MAX_TOKENS = {
-    "gsm8k": 4096,
-    "ifeval": 8192,
-    "humaneval": 8192,
-    "bbh": 4096,
-    "arc": 2048,
-    "mmlu_pro": 8192,
-    "mmlu": 2048,
-    "hellaswag": 1024,
-    "winogrande": 512,
+    "gsm8k": 2048,
+    "ifeval": 2048,
+    "humaneval": 4096,
+    "bbh": 2048,
+    "arc": 1024,
+    "mmlu_pro": 1024,
+    "mmlu": 1024,
+    "hellaswag": 512,
+    "winogrande": 256,
 }
 
 _THINK_TAG = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
@@ -145,7 +145,13 @@ def run_one(cfg_cls, run_fn, bench, extra_dataset_args):
         work_dir=WORK_DIR,
         generation_config={
             "temperature": 0.7,
-            "max_tokens": MAX_TOKENS.get(bench, 4096),
+            # Conservative caps — Qwen3.5-4B-class models cap at
+            # 8192-token context. Setting max_tokens=8192 here makes
+            # vLLM 400 every request whose prompt is non-empty (the
+            # 4/27 humaneval/ifeval/mmlu_pro 0/0 outage). Keep
+            # max_tokens well below the model's max_model_len so
+            # there's always room for the prompt.
+            "max_tokens": MAX_TOKENS.get(bench, 2048),
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         },
         eval_batch_size=BATCH_SIZE,

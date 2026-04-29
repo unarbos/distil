@@ -1,13 +1,13 @@
 {
   "netuid": 97,
   "teacher": {
-    "model": "Qwen/Qwen3.5-35B-A3B",
-    "architecture": "qwen3_5_moe",
+    "model": "Qwen/Qwen3.6-35B-A3B",
+    "architecture": "qwen3_6_moe",
     "totalParams": 35000000000,
     "activeParams": 3000000000,
     "vocabSize": 248044,
     "configVocabSize": 248320,
-    "maxStudentParams": 5250000000
+    "maxStudentParams": 7000000000
   },
   "validator": {
     "maxKlThreshold": 2.0,

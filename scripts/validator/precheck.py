@@ -3,6 +3,7 @@ import logging
 import math
 import time
 
+from eval.hf_upload_meta import get_first_upload_epoch
 from eval.model_checker import (
     check_duplicate_content_hash,
     check_duplicate_hash,
@@ -37,9 +38,81 @@ def _cosine_sim(a: list, b: list) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _hf_upload_griefing_swap(
+    *,
+    state_dir,
+    this_uid,
+    this_repo,
+    this_revision,
+    this_block,
+    this_hotkey,
+    orig_uid,
+    orig_repo,
+    orig_revision,
+    orig_block,
+    orig_hotkey,
+    detection_label: str,
+):
+    """Tiebreak duplicate-detection by HuggingFace upload time.
+
+    The chain ``commit_block`` is not authoritative for "who came
+    first": a miner can recycle a UID slot, commit the bare model
+    name on chain at block X, then upload stolen weights to that
+    repo days later. Their on-chain block X then makes them appear
+    earlier than the legitimate miner.
+
+    HF, by contrast, records when the safetensors actually became
+    available — which is the timeline copy detection cares about.
+    Returns the *true* (copy_uid, copy_repo, copy_block, copy_hotkey,
+    original_uid, original_repo, original_block, original_hotkey)
+    using HF order when both lookups succeed.
+
+    If HF says the would-be "original" was uploaded *later* than the
+    would-be "copy", we swap the labels and emit a HF_UPLOAD_GRIEFING
+    warning. Otherwise we leave the caller's chain-based decision
+    alone.
+
+    Returns ``None`` when no swap is needed (HF agrees with chain or
+    HF is unreachable).
+    """
+    try:
+        this_ts = get_first_upload_epoch(this_repo, this_revision, state_dir=state_dir)
+        orig_ts = get_first_upload_epoch(orig_repo, orig_revision, state_dir=state_dir)
+    except Exception as exc:
+        logger.info(f"hf_upload_meta lookup failed ({detection_label}): {exc}")
+        return None
+    if this_ts is None or orig_ts is None:
+        return None
+    if orig_ts <= this_ts:
+        return None
+    logger.warning(
+        f"{detection_label} HF_UPLOAD_GRIEFING: chain says UID {orig_uid} ({orig_repo}) "
+        f"committed earlier (block {orig_block}) than UID {this_uid} ({this_repo}) "
+        f"(block {this_block}), but HF says {orig_repo} was uploaded "
+        f"{int(orig_ts - this_ts)}s AFTER {this_repo}. Reversing DQ direction — "
+        f"UID {orig_uid} flagged as the copy, UID {this_uid} protected."
+    )
+    return {
+        "copy_uid": orig_uid,
+        "copy_repo": orig_repo,
+        "copy_block": orig_block,
+        "copy_hotkey": orig_hotkey,
+        "original_uid": this_uid,
+        "original_repo": this_repo,
+        "original_block": this_block,
+        "original_hotkey": this_hotkey,
+        "this_ts": this_ts,
+        "orig_ts": orig_ts,
+    }
+
+
 def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, state_dir,
                                  commit_block=None, uid_to_commit_block=None,
-                                 uid_to_coldkey=None):
+                                 uid_to_coldkey=None,
+                                 evaluated_uids=None, composite_scores=None,
+                                 revision: str = "main",
+                                 uid_to_model: dict = None,
+                                 uid_to_revision: dict = None):
     """Compare the incoming model's activation fingerprint against stored ones.
 
     Returns: (is_copy, copy_uid, copy_model, original_uid, original_model, sim)
@@ -60,6 +133,18 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     scoring can use it as a tiebreaker, but we do NOT DQ either side — a miner
     griefing themselves is not the attack we're protecting against, and losing a
     legitimate hotkey slot is worse than letting a self-copy sit un-crowned.
+
+    Anti-griefing guard (2026-04-28, crypsick discord report): if the
+    "later-committed" side has been EVALUATED (in evaluated_uids and has a
+    composite_scores entry) but the "earlier-committed" side has NEVER been
+    evaluated, the earlier UID is the griefing copy — the attacker reserved
+    a slot on-chain ahead of time, then uploaded the king's weights to their
+    HF repo after the king was crowned. In that case we REVERSE the DQ
+    direction: the unevaluated, earlier-committed UID is the copy to DQ.
+    Pass ``evaluated_uids`` (set of stringified UIDs) and ``composite_scores``
+    (dict keyed by stringified UID) to enable the guard. Without them we fall
+    back to the commit_block-only logic, which was vulnerable to the
+    pre-commit-then-copy attack.
     """
     from pathlib import Path
 
@@ -166,6 +251,61 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                 copy_model = max_sim_model
                 original_uid = uid
                 original_model = model_name
+
+        # ── Anti-griefing guard (2026-04-28) ─────────────────────────────
+        # Reverse the DQ if commit_block-based logic would DQ an evaluated
+        # model in favour of an unevaluated one. See docstring; this is
+        # the activation-fingerprint mirror of the SHA256/content-hash
+        # guard added in beafc1f.
+        if is_copy and evaluated_uids is not None and copy_uid is not None and original_uid is not None:
+            def _is_real_eval(u):
+                if u is None:
+                    return False
+                key = str(u)
+                in_eval = key in evaluated_uids
+                in_comp = composite_scores is None or key in composite_scores
+                return in_eval and in_comp
+            copy_eval = _is_real_eval(copy_uid)
+            orig_eval = _is_real_eval(original_uid)
+            if copy_eval and not orig_eval:
+                logger.warning(
+                    f"ACTIVATION GRIEFING: UID {original_uid} ({original_model}) committed earlier "
+                    f"(block {other_b if original_uid == max_sim_uid else my_b}) but never evaluated; "
+                    f"UID {copy_uid} ({copy_model}) has composite scores. Reversing DQ direction "
+                    f"— UID {original_uid} flagged as the copy, UID {copy_uid} protected."
+                )
+                copy_uid, original_uid = original_uid, copy_uid
+                copy_model, original_model = original_model, copy_model
+
+        # ── HF-upload-time anti-griefing guard (2026-04-28) ───────────────
+        # Even when both UIDs have been evaluated, the on-chain
+        # commit_block can be tricked: a miner reserves a slot on
+        # chain pointing to ``namespace/repo`` *before* ``namespace/repo``
+        # actually exists, then uploads stolen weights to that repo days
+        # later. HF, by contrast, records when the safetensors became
+        # available — which is the timeline copy-detection cares about.
+        # If HF says the would-be original was uploaded *after* the
+        # would-be copy, we reverse the DQ direction.
+        if is_copy and copy_uid is not None and original_uid is not None and copy_model and original_model:
+            def _resolve_revision(u):
+                if uid_to_revision and u in uid_to_revision:
+                    return uid_to_revision[u]
+                return revision if u == uid else "main"
+            try:
+                copy_ts = get_first_upload_epoch(copy_model, _resolve_revision(copy_uid), state_dir=state_dir)
+                orig_ts = get_first_upload_epoch(original_model, _resolve_revision(original_uid), state_dir=state_dir)
+            except Exception:
+                copy_ts = orig_ts = None
+            if copy_ts is not None and orig_ts is not None and orig_ts > copy_ts:
+                logger.warning(
+                    f"ACTIVATION HF_UPLOAD_GRIEFING: chain says UID {original_uid} ({original_model}) "
+                    f"committed earlier than UID {copy_uid} ({copy_model}), but HF says "
+                    f"{original_model} was uploaded {int(orig_ts - copy_ts)}s AFTER {copy_model}. "
+                    f"Reversing DQ direction — UID {original_uid} flagged as the copy, "
+                    f"UID {copy_uid} protected."
+                )
+                copy_uid, original_uid = original_uid, copy_uid
+                copy_model, original_model = original_model, copy_model
 
     if not is_copy or copy_uid != uid:
         stored[str(uid)] = {
@@ -315,8 +455,45 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             if original_uid is not None:
                 orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
                 this_block = commit.get("block", float("inf"))
-                if this_block >= orig_block:
-                    orig_model = commitments.get(original_uid, {}).get("model", "?")
+                orig_model = commitments.get(original_uid, {}).get("model", "?")
+                orig_revision = commitments.get(original_uid, {}).get("revision", "main")
+                orig_hotkey_str = uid_to_hotkey.get(original_uid, str(original_uid))
+                orig_commit_block = commitments.get(original_uid, {}).get("block")
+
+                hf_swap = _hf_upload_griefing_swap(
+                    state_dir=state.state_dir,
+                    this_uid=uid, this_repo=model_repo, this_revision=revision,
+                    this_block=this_block, this_hotkey=hotkey,
+                    orig_uid=original_uid, orig_repo=orig_model, orig_revision=orig_revision,
+                    orig_block=orig_block, orig_hotkey=orig_hotkey_str,
+                    detection_label="SHA256-hash copy:",
+                )
+                if hf_swap is not None:
+                    griefer_uid = hf_swap["copy_uid"]
+                    griefer_repo = hf_swap["copy_repo"]
+                    griefer_hotkey = hf_swap["copy_hotkey"]
+                    griefer_block = hf_swap["copy_block"]
+                    keeper_uid = hf_swap["original_uid"]
+                    keeper_repo = hf_swap["original_repo"]
+                    state.scores[str(griefer_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        griefer_hotkey,
+                        f"copy: identical weights to UID {keeper_uid} ({keeper_repo}), "
+                        f"HF upload griefing (chain block {griefer_block} earlier than victim, "
+                        f"but HF upload was {int(hf_swap['orig_ts'] - hf_swap['this_ts'])}s "
+                        f"after victim's upload)",
+                        state.dq_reasons,
+                        commit_block=griefer_block,
+                    )
+                    valid_models.pop(griefer_uid, None)
+                    disqualified.add(griefer_uid)
+                    register_model_hash(model_hash, keeper_uid, state.state_dir)
+                    if griefer_uid == uid:
+                        continue
+
+                this_evaluated = str(uid) in state.evaluated_uids and str(uid) in state.composite_scores
+                orig_evaluated = str(original_uid) in state.evaluated_uids and str(original_uid) in state.composite_scores
+                if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
                     logger.info(f"UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}")
                     state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
                     disqualify(
@@ -327,19 +504,34 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     )
                     disqualified.add(uid)
                     continue
-                logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
-                state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
-                orig_commit_block = commitments.get(original_uid, {}).get("block")
-                disqualify(
-                    orig_hotkey,
-                    f"copy: identical weights to UID {uid} ({model_repo}), committed later",
-                    state.dq_reasons,
-                    commit_block=orig_commit_block,
-                )
-                valid_models.pop(original_uid, None)
-                disqualified.add(original_uid)
-                register_model_hash(model_hash, uid, state.state_dir)
+                if this_evaluated and not orig_evaluated and this_block >= orig_block:
+                    logger.warning(
+                        f"UID {original_uid} ({orig_model}): GRIEFING COPY — committed earlier "
+                        f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
+                        f"DQ'ing the unevaluated model."
+                    )
+                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        orig_hotkey_str,
+                        f"copy: identical weights to UID {uid} ({model_repo}), griefing attack (committed earlier but never evaluated)",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(original_uid, None)
+                    disqualified.add(original_uid)
+                    register_model_hash(model_hash, uid, state.state_dir)
+                else:
+                    logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
+                    state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        orig_hotkey_str,
+                        f"copy: identical weights to UID {uid} ({model_repo}), committed later",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(original_uid, None)
+                    disqualified.add(original_uid)
+                    register_model_hash(model_hash, uid, state.state_dir)
             else:
                 register_model_hash(model_hash, uid, state.state_dir)
         # Shard-invariant content hash — catches re-sharded copies that slip
@@ -350,8 +542,44 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             if dup_uid is not None:
                 orig_block = commitments.get(dup_uid, {}).get("block", float("inf"))
                 this_block = commit.get("block", float("inf"))
-                if this_block >= orig_block:
-                    orig_model = commitments.get(dup_uid, {}).get("model", "?")
+                orig_model = commitments.get(dup_uid, {}).get("model", "?")
+                orig_revision = commitments.get(dup_uid, {}).get("revision", "main")
+                orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
+                orig_commit_block = commitments.get(dup_uid, {}).get("block")
+
+                hf_swap = _hf_upload_griefing_swap(
+                    state_dir=state.state_dir,
+                    this_uid=uid, this_repo=model_repo, this_revision=revision,
+                    this_block=this_block, this_hotkey=hotkey,
+                    orig_uid=dup_uid, orig_repo=orig_model, orig_revision=orig_revision,
+                    orig_block=orig_block, orig_hotkey=orig_hotkey,
+                    detection_label="content-hash copy:",
+                )
+                if hf_swap is not None:
+                    griefer_uid = hf_swap["copy_uid"]
+                    griefer_repo = hf_swap["copy_repo"]
+                    griefer_hotkey = hf_swap["copy_hotkey"]
+                    griefer_block = hf_swap["copy_block"]
+                    keeper_uid = hf_swap["original_uid"]
+                    keeper_repo = hf_swap["original_repo"]
+                    state.scores[str(griefer_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        griefer_hotkey,
+                        f"copy: identical tensor content as UID {keeper_uid} ({keeper_repo}) (re-sharded), "
+                        f"HF upload griefing (chain block {griefer_block} earlier than victim, but HF upload "
+                        f"was {int(hf_swap['orig_ts'] - hf_swap['this_ts'])}s after victim)",
+                        state.dq_reasons,
+                        commit_block=griefer_block,
+                    )
+                    valid_models.pop(griefer_uid, None)
+                    disqualified.add(griefer_uid)
+                    register_content_hash(content_hash, keeper_uid, state.state_dir)
+                    if griefer_uid == uid:
+                        continue
+
+                this_evaluated = str(uid) in state.evaluated_uids and str(uid) in state.composite_scores
+                orig_evaluated = str(dup_uid) in state.evaluated_uids and str(dup_uid) in state.composite_scores
+                if this_block >= orig_block and not (this_evaluated and not orig_evaluated):
                     logger.info(f"UID {uid} ({model_repo}): CONTENT-DUPLICATE of UID {dup_uid}")
                     state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
                     disqualify(
@@ -362,19 +590,34 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     )
                     disqualified.add(uid)
                     continue
-                orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
-                orig_commit_block = commitments.get(dup_uid, {}).get("block")
-                logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
-                state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
-                disqualify(
-                    orig_hotkey,
-                    f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
-                    state.dq_reasons,
-                    commit_block=orig_commit_block,
-                )
-                valid_models.pop(dup_uid, None)
-                disqualified.add(dup_uid)
-                register_content_hash(content_hash, uid, state.state_dir)
+                if this_evaluated and not orig_evaluated and this_block >= orig_block:
+                    logger.warning(
+                        f"UID {dup_uid} ({orig_model}): GRIEFING COPY (content hash) — committed earlier "
+                        f"(block {orig_block}) but never evaluated; UID {uid} has composite scores. "
+                        f"DQ'ing the unevaluated model."
+                    )
+                    state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        orig_hotkey,
+                        f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), griefing attack (committed earlier but never evaluated)",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(dup_uid, None)
+                    disqualified.add(dup_uid)
+                    register_content_hash(content_hash, uid, state.state_dir)
+                else:
+                    logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
+                    state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(
+                        orig_hotkey,
+                        f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
+                        state.dq_reasons,
+                        commit_block=orig_commit_block,
+                    )
+                    valid_models.pop(dup_uid, None)
+                    disqualified.add(dup_uid)
+                    register_content_hash(content_hash, uid, state.state_dir)
             else:
                 register_content_hash(content_hash, uid, state.state_dir)
         expected_hash = state.model_hashes.get(str(uid))
