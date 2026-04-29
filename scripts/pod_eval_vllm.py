@@ -84,10 +84,16 @@ MIN_COMPLETION_TOKENS = 10  # Skip prompts producing fewer continuation tokens
 KL_CHUNK_SIZE = 128
 
 # -- Activation fingerprinting (functional copy detection) --
+# 2026-04-29: vocab size is teacher-tokenizer-specific (Qwen=248320,
+# Kimi/GLM/etc would differ on swap). Read from env so the planned
+# teacher swap doesn't require a code change here. Default still
+# matches Qwen3.5 for backward compatibility.
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
-ACTIVATION_FP_VOCAB_SIZE = 248320  # Qwen tokenizer vocab
+ACTIVATION_FP_VOCAB_SIZE = int(
+    os.environ.get("ACTIVATION_FP_VOCAB_SIZE", "248320")
+)  # default matches Qwen3.5; override on teacher swap
 
 # -- vLLM server --
 VLLM_PORT = 9100
@@ -183,7 +189,19 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     When revision is set, pins to that exact HF commit hash.
     """
     from transformers import AutoModelForCausalLM
-    is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
+    # 2026-04-29: teacher-detection heuristic generalised so the planned
+    # swap to Kimi/GLM/Qwen3.6 doesn't require a code change here. We
+    # match the configured TEACHER_MODEL name (read from subnet-config)
+    # rather than hardcoding "Qwen3.5". Falls back to the legacy
+    # Qwen-substring check if the import fails (e.g. running the script
+    # outside the validator venv).
+    try:
+        from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
+        is_teacher = (name == _TEACHER_NAME) or (
+            "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
+        )
+    except Exception:
+        is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
     kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
     if revision and revision != "main":
         kwargs["revision"] = revision
@@ -2259,8 +2277,16 @@ CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", 
 # unmemorizable) items: 12 static (down from 24) + 24 procedural (up from
 # 12) per round, swapping the old 2:1 static-favoured ratio for a 1:2
 # procedural-favoured ratio. See COMPOSITE_SHADOW_VERSION==19 docstring.
-CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "12"))
-CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "24"))
+# 2026-04-29 (v29.4) — capability mix rebalance after saturation audit.
+# 53 % of records were saturated at 1.0 with the 12 static + 24 procedural
+# split; the static trivia pool was the bottleneck (small, easy, public).
+# Drop static 12 → 4 (kept as a difficulty floor / format diversity) and
+# bump procedural 24 → 32, which now also mixes 7 new harder kinds
+# (multi_step_arithmetic, seq_next, string_chain, list_chain,
+# counterfactual, nested_logic, two_step_compare) — see
+# ``_procedural_capability_prompts`` for the full list.
+CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "4"))
+CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "32"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
 
 # Pool of common simple words used as random subjects for procedural
@@ -2303,12 +2329,29 @@ def _procedural_capability_prompts(rng, n):
     alias ``_procedural_math_prompts`` retained below for old callers
     that explicitly want arithmetic-only.
     """
+    # v29.4 (2026-04-29): saturation audit on 163 UIDs showed capability
+    # at 53 % saturated (mean 0.90, weight 0.25). The legacy kinds below
+    # are too easy for 4B-class models. We add 7 harder kinds (post-v29.4)
+    # that require multi-step reasoning rather than single-step lookup:
+    #   * ``multi_step_arithmetic`` — chained 3-4 ops with parens
+    #   * ``seq_next``              — pattern-recognition (Fibonacci-like / polynomial)
+    #   * ``string_chain``          — multi-step string ops (reverse + uppercase + count vowels)
+    #   * ``list_chain``            — multi-step list ops (filter even + sum + multiply by 2)
+    #   * ``counterfactual``        — "if X were Y, what would Z be"
+    #   * ``nested_logic``          — boolean evaluation with negation + parens
+    #   * ``two_step_compare``      — compare results of two computations
+    # These shift mean pass-rate from ~0.90 toward ~0.55-0.65, restoring
+    # discrimination on a 0.25-weight axis.
     kinds = (
+        # legacy easy floor (kept for diversity, ~30 % of the procedural pool)
         "add", "sub", "mul", "div", "mod",
         "power_small", "sum_digits", "even_or_odd", "divisible_by",
         "count_chars", "count_vowels",
         "list_min", "list_max", "count_evens",
         "which_larger",
+        # v29.4 hard tier (each appears ~once per round at n=24)
+        "multi_step_arithmetic", "seq_next", "string_chain",
+        "list_chain", "counterfactual", "nested_logic", "two_step_compare",
     )
     out = []
     for _ in range(n):
@@ -2384,6 +2427,123 @@ def _procedural_capability_prompts(rng, n):
             ans = str(a) if a > b else str(b)
             out.append({"q": f"Which is larger: {a} or {b}? Answer with just the number.",
                         "a": ans, "kind": "int"})
+        # ── v29.4 hard tier ────────────────────────────────────────
+        elif kind == "multi_step_arithmetic":
+            a = rng.randint(5, 25)
+            b = rng.randint(3, 15)
+            c = rng.randint(2, 10)
+            d = rng.randint(2, 8)
+            ans = (a + b) * c - d
+            out.append({
+                "q": f"Compute ({a} + {b}) * {c} - {d}. Answer with only the number.",
+                "a": str(ans), "kind": "int",
+            })
+        elif kind == "seq_next":
+            # Pick a sequence type and ask for the next term.
+            seq_kind = rng.choice(["arith", "geom", "fib_like", "square"])
+            if seq_kind == "arith":
+                a0 = rng.randint(2, 20)
+                d = rng.randint(2, 12)
+                seq = [a0 + i * d for i in range(5)]
+                nxt = a0 + 5 * d
+            elif seq_kind == "geom":
+                a0 = rng.randint(2, 6)
+                r = rng.choice([2, 3])
+                seq = [a0 * (r ** i) for i in range(5)]
+                nxt = a0 * (r ** 5)
+            elif seq_kind == "fib_like":
+                a, b = rng.randint(1, 5), rng.randint(2, 6)
+                seq = [a, b]
+                for _ in range(3):
+                    seq.append(seq[-1] + seq[-2])
+                nxt = seq[-1] + seq[-2]
+            else:  # square
+                start = rng.randint(2, 6)
+                seq = [(start + i) ** 2 for i in range(5)]
+                nxt = (start + 5) ** 2
+            seq_str = ", ".join(str(s) for s in seq)
+            out.append({
+                "q": f"What is the next number in the sequence {seq_str}, ...? Answer with only the number.",
+                "a": str(nxt), "kind": "int",
+            })
+        elif kind == "string_chain":
+            w = rng.choice(_PROC_CAPABILITY_WORD_POOL)
+            # Reverse, uppercase, then count vowels in original — the
+            # answer is the count of original-vowels which doesn't
+            # change with case but the model has to track the chain.
+            n_v = sum(1 for c in w.lower() if c in "aeiou")
+            out.append({
+                "q": (
+                    f"Take the word '{w}'. Reverse it, then convert to "
+                    f"uppercase. How many vowels (A, E, I, O, U) appear "
+                    f"in the result? Answer with only the number."
+                ),
+                "a": str(n_v), "kind": "int",
+            })
+        elif kind == "list_chain":
+            vals = [rng.randint(1, 30) for _ in range(rng.randint(5, 8))]
+            evens = [v for v in vals if v % 2 == 0]
+            ans = sum(evens) * 2 if evens else 0
+            out.append({
+                "q": (
+                    f"From the list [{', '.join(str(v) for v in vals)}], "
+                    f"select the even numbers, sum them, then multiply by 2. "
+                    f"Answer with only the resulting number."
+                ),
+                "a": str(ans), "kind": "int",
+            })
+        elif kind == "counterfactual":
+            # Build a hypothetical scenario where one fact is changed.
+            real_a = rng.randint(5, 15)
+            real_b = rng.randint(20, 40)
+            # Change the original 'a' to a new value 'a2' and ask for a*b
+            a2 = rng.randint(2, 50)
+            while a2 == real_a:
+                a2 = rng.randint(2, 50)
+            ans = a2 * real_b
+            out.append({
+                "q": (
+                    f"In our world, x = {real_a} and y = {real_b}. "
+                    f"Suppose instead that x were {a2} (everything else "
+                    f"unchanged). What would the product x * y equal? "
+                    f"Answer with only the number."
+                ),
+                "a": str(ans), "kind": "int",
+            })
+        elif kind == "nested_logic":
+            # Build a boolean expression with negations and parens.
+            vals = [rng.choice([True, False]) for _ in range(3)]
+            ops = [rng.choice(["and", "or"]) for _ in range(2)]
+            negs = [rng.random() < 0.5 for _ in range(3)]
+            parts = [
+                ("not " if neg else "") + str(v)
+                for v, neg in zip(vals, negs)
+            ]
+            expr = f"({parts[0]} {ops[0]} {parts[1]}) {ops[1]} {parts[2]}"
+            ans = "yes" if eval(expr) else "no"
+            out.append({
+                "q": (
+                    f"Evaluate the boolean expression: {expr}. "
+                    f"Answer 'yes' if True, 'no' if False."
+                ),
+                "a": ans, "kind": "yesno",
+            })
+        elif kind == "two_step_compare":
+            a1 = rng.randint(5, 30)
+            b1 = rng.randint(2, 8)
+            a2 = rng.randint(10, 60)
+            b2 = rng.randint(3, 12)
+            res1 = a1 * b1
+            res2 = a2 + b2 * 5  # different shape
+            larger = "first" if res1 > res2 else ("second" if res2 > res1 else "equal")
+            out.append({
+                "q": (
+                    f"Compute these two values: (1) {a1} * {b1}; "
+                    f"(2) {a2} + {b2} * 5. Which is larger? Answer 'first', "
+                    f"'second', or 'equal'."
+                ),
+                "a": larger, "kind": "word",
+            })
     return out
 
 
@@ -3045,6 +3205,30 @@ BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
 # Start at 6 items per round; ratchet based on saturation telemetry.
 BENCH_DEBUG_PER_ROUND = int(os.environ.get("BENCH_DEBUG_PER_ROUND", "6"))
 BENCH_DEBUG_MAX_TOKENS = int(os.environ.get("BENCH_DEBUG_MAX_TOKENS", "512"))
+# v29.4 (2026-04-29) — correction_bench. Procedural buggy-code +
+# explicit error trace; model emits the corrected function. Tests the
+# read→run→see-error→fix workflow specifically. Same item shape as
+# debug_bench so humaneval_sandbox runs unchanged. 6 items per round,
+# weight 0.05.
+BENCH_CORRECTION_PER_ROUND = int(os.environ.get("BENCH_CORRECTION_PER_ROUND", "6"))
+BENCH_CORRECTION_MAX_TOKENS = int(os.environ.get("BENCH_CORRECTION_MAX_TOKENS", "512"))
+# v29.4 — multi_doc_synthesis_bench. Procedural fact cards + cross-card
+# question. Tests info integration across discrete sources.
+BENCH_MULTI_DOC_PER_ROUND = int(os.environ.get("BENCH_MULTI_DOC_PER_ROUND", "6"))
+BENCH_MULTI_DOC_N_CARDS = int(os.environ.get("BENCH_MULTI_DOC_N_CARDS", "4"))
+BENCH_MULTI_DOC_MAX_TOKENS = int(os.environ.get("BENCH_MULTI_DOC_MAX_TOKENS", "64"))
+# v29.4 — calibration_bench. Mix solvable + intentionally unsolvable
+# items; reward correct answers AND correct refusals. Discourages
+# confabulation.
+BENCH_CALIBRATION_PER_ROUND = int(os.environ.get("BENCH_CALIBRATION_PER_ROUND", "8"))
+BENCH_CALIBRATION_UNSOLVABLE_FRACTION = float(
+    os.environ.get("BENCH_CALIBRATION_UNSOLVABLE_FRACTION", "0.5"),
+)
+BENCH_CALIBRATION_MAX_TOKENS = int(os.environ.get("BENCH_CALIBRATION_MAX_TOKENS", "96"))
+# v29.4 — refactor_bench. Working code + style constraint, AST-graded.
+# Tests refactoring skill (preserve behavior + improve form).
+BENCH_REFACTOR_PER_ROUND = int(os.environ.get("BENCH_REFACTOR_PER_ROUND", "4"))
+BENCH_REFACTOR_MAX_TOKENS = int(os.environ.get("BENCH_REFACTOR_MAX_TOKENS", "512"))
 
 # Token budgets.
 BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
@@ -3090,6 +3274,10 @@ _BENCH_STREAM = {
     "robustness": 0x80B057E5,    # Session 3.7 — robustness_bench (math-pool reuse)
     "noise": 0x80152BE9,         # Session 3.7 — noise_resistance_bench (math-pool reuse)
     "debug": 0xDEB8B003,         # v29.2 — debug_bench (procedural buggy-code fix)
+    "correction": 0xC0E2EC11,    # v29.4 — correction_bench (buggy code + error trace)
+    "multi_doc": 0x309AB54E,     # v29.4 — multi_doc_synthesis_bench
+    "calibration": 0xCAB1BA0F,   # v29.4 — calibration_bench (solvable + unsolvable)
+    "refactor": 0xBE6AF801,      # v29.4 — refactor_bench (style-constrained refactor)
 }
 
 _BENCH_BLOCK_SEED = None
@@ -3098,12 +3286,14 @@ _BENCH_POOLS: dict[str, list[dict]] = {
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
     "robustness": [], "noise": [], "debug": [],
+    "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
 }
 _BENCH_SAMPLES: dict[str, list[dict]] = {
     "math": [], "code": [], "reasoning": [], "knowledge": [], "ifeval": [],
     "aime": [], "mbpp": [], "tool_use": [], "self_consistency": [],
     "arc": [], "truthful": [], "long_context": [], "procedural": [],
     "robustness": [], "noise": [], "debug": [],
+    "correction": [], "multi_doc": [], "calibration": [], "refactor": [],
 }
 
 
@@ -4427,6 +4617,21 @@ def set_bench_block_seed(block_seed):
     _BENCH_SAMPLES["debug"] = _generate_debug_items(
         block_seed, BENCH_DEBUG_PER_ROUND,
     )
+    # v29.4 — procedural correction (buggy code + error trace), multi-doc
+    # synthesis (cross-card retrieval), calibration (solvable +
+    # unsolvable), refactoring (style-constrained refactor).
+    _BENCH_SAMPLES["correction"] = _generate_correction_items(
+        block_seed, BENCH_CORRECTION_PER_ROUND,
+    )
+    _BENCH_SAMPLES["multi_doc"] = _generate_multi_doc_items(
+        block_seed, BENCH_MULTI_DOC_PER_ROUND,
+    )
+    _BENCH_SAMPLES["calibration"] = _generate_calibration_items(
+        block_seed, BENCH_CALIBRATION_PER_ROUND,
+    )
+    _BENCH_SAMPLES["refactor"] = _generate_refactor_items(
+        block_seed, BENCH_REFACTOR_PER_ROUND,
+    )
     print(
         f"[bench] round samples: math={len(_BENCH_SAMPLES['math'])}, "
         f"code={len(_BENCH_SAMPLES['code'])}, "
@@ -4793,6 +4998,404 @@ def debug_bench_probe(model, tokenizer, device="cuda"):
                 "task_id": it.get("task_id"),
                 "entry_point": it.get("entry_point"),
                 "ok": ok,
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── correction_bench (v29.4) ─────────────────────────────────────────────
+
+def correction_bench_probe(model, tokenizer, device="cuda"):
+    """Run the correction_bench probe (v29.4 — buggy code + error trace fix).
+
+    Same shape + sandbox grader as ``debug_bench`` and ``code_bench``:
+    the prompt embeds a buggy reference (commented out) + an explicit
+    error trace + the fresh signature; the model emits the corrected
+    body. Item-level pass = sandbox runs the corrected function and all
+    asserts pass.
+    """
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("correction") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, int, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Read the test failure trace and fix the bug. "
+                        "Output only the corrected function body (no extra "
+                        "explanation, no markdown fences).\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_CORRECTION_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, tok, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "src": it.get("src", ""),
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            ok = bool(r and r.passed)
+            out["items"].append({
+                "src": it.get("src", ""),
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "gen_tokens": int(tok),
+                "reason": (r.reason if r else "no_result")[:120],
+                "tail": (gen or "")[-160:],
+            })
+            out["n"] += 1
+            out["correct"] += int(ok)
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── multi_doc_synthesis_bench (v29.4) ───────────────────────────────────
+
+def _format_multi_doc_prompt(it: dict) -> str:
+    """Wrap a multi-doc item with the same context-question-answer
+    skeleton long_context_bench uses, but adapted for multiple
+    discrete documents in the context."""
+    return (
+        "Read the documents below and answer the question that follows. "
+        "Reply with just the answer (no extra text).\n\n"
+        f"{it['context']}\n\n"
+        f"Question: {it['question']}\n\nAnswer:"
+    )
+
+
+def multi_doc_synthesis_bench_probe(model, tokenizer, device="cuda"):
+    """Run the multi_doc_synthesis_bench probe (v29.4)."""
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("multi_doc") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = _format_multi_doc_prompt(it)
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_MULTI_DOC_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "").strip()
+                    gold = str(it.get("answer", ""))
+                    confuser_answers = it.get("confuser_answers") or []
+                    pred_lower = cleaned.lower()
+                    gold_in_pred = bool(gold and gold.lower() in pred_lower)
+                    confuser_in_pred = any(
+                        ca and ca.lower() in pred_lower for ca in confuser_answers
+                    )
+                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "kind": it.get("kind"),
+                        "gold": gold[:60],
+                        "pred_tail": cleaned[-160:],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                        "confuser_hit": bool(confuser_answers and confuser_in_pred),
+                        "gold_in_pred": gold_in_pred,
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""), "error": str(e)[:120],
+                    })
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── calibration_bench (v29.4) ────────────────────────────────────────────
+
+def _calibration_grade_one(text: str, gold: str, kind: str) -> bool:
+    """Return True if the model's response correctly handles the item.
+
+    For ``solv`` items: gold is a numeric string; pass if gold appears
+    as a substring in the response AND no refusal token appears (so a
+    model that refuses to confidently answer doesn't get free credit
+    when the gold happens to also appear).
+
+    For ``unsolv`` items: pass if response contains a refusal token AND
+    no standalone integer (so a model that says "I don't know, but if
+    I had to guess, 42" doesn't get credit — that's confabulation
+    wearing a refusal hat).
+    """
+    if not text:
+        return False
+    cleaned = text.lower().strip()
+    has_refusal = any(tok in cleaned for tok in _CALIBRATION_REFUSAL_TOKENS)
+    import re as _re
+    standalone_int_re = _re.compile(r"(?<![A-Za-z0-9])-?\d+(?![A-Za-z0-9])")
+    has_integer = bool(standalone_int_re.search(text))
+    if kind == "solv":
+        # Solvable: gold integer must appear; refusal disqualifies.
+        if not gold or gold == "REFUSE":
+            return False
+        return (gold in text) and not has_refusal
+    # Unsolvable: must refuse AND not emit a confident integer.
+    return has_refusal and not has_integer
+
+
+def calibration_bench_probe(model, tokenizer, device="cuda"):
+    """Run the calibration_bench probe (v29.4 — solvable + unsolvable mix)."""
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": [],
+           "n_solv": 0, "n_unsolv": 0,
+           "correct_solv": 0, "correct_unsolv": 0}
+    samples = _BENCH_SAMPLES.get("calibration") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Answer the question below. If the question cannot be "
+                        "answered from the information given, reply 'I don't "
+                        "know' or 'insufficient information'. Otherwise reply "
+                        "with the answer only.\n\n"
+                        f"Question: {it['question']}\n\nAnswer:"
+                    )
+                    text, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_CALIBRATION_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    cleaned = _strip_thinking_probe(text or "")
+                    gold = str(it.get("answer", ""))
+                    kind = it.get("kind", "solv")
+                    ok = _calibration_grade_one(cleaned, gold, kind)
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "kind": kind,
+                        "gold": gold[:40],
+                        "pred_tail": cleaned[-120:].strip(),
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                    })
+                    out["n"] += 1
+                    if kind == "solv":
+                        out["n_solv"] += 1
+                        if ok:
+                            out["correct_solv"] += 1
+                    else:
+                        out["n_unsolv"] += 1
+                        if ok:
+                            out["correct_unsolv"] += 1
+                    out["correct"] += int(ok)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+        if was_training:
+            model.train()
+        out["pass_frac"] = out["correct"] / max(1, out["n"])
+        # Per-half pass-fracs surface in telemetry so we can tell which
+        # half a model is failing on (always-refuse vs always-confabulate).
+        out["solv_pass_frac"] = (
+            out["correct_solv"] / out["n_solv"] if out["n_solv"] else 0.0
+        )
+        out["unsolv_pass_frac"] = (
+            out["correct_unsolv"] / out["n_unsolv"] if out["n_unsolv"] else 0.0
+        )
+        _bench_finalize_token_stats(out)
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    return out
+
+
+# ── refactor_bench (v29.4) ───────────────────────────────────────────────
+
+def _refactor_check_constraint(model_code: str, item: dict) -> tuple[bool, str]:
+    """Check the model's emitted code against the style constraint.
+
+    Returns (passed, reason). ``model_code`` is the raw text the model
+    emitted (post-fence-strip). We parse it with ``ast`` and apply the
+    appropriate check. Failure to parse → constraint considered failed
+    (the sandbox will also have caught a SyntaxError, but we keep this
+    defensive).
+    """
+    import ast
+    constraint = item.get("constraint_kind", "")
+    try:
+        tree = ast.parse(model_code)
+    except Exception as e:
+        return False, f"parse_error:{type(e).__name__}"
+    # Find the function definition that matches entry_point.
+    entry = item.get("entry_point", "")
+    func_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == entry:
+            func_node = node
+            break
+    if func_node is None:
+        return False, "entry_point_not_found"
+    if constraint == "no_nested_loops":
+        # Walk the function body; flag any for/while inside another for/while.
+        def _has_nested(n, depth=0):
+            for child in ast.iter_child_nodes(n):
+                if isinstance(child, (ast.For, ast.While, ast.AsyncFor)):
+                    if depth >= 1:
+                        return True
+                    if _has_nested(child, depth + 1):
+                        return True
+                else:
+                    if _has_nested(child, depth):
+                        return True
+            return False
+        if _has_nested(func_node):
+            return False, "nested_loop_present"
+        return True, "ok"
+    if constraint == "no_explicit_loop":
+        for n in ast.walk(func_node):
+            if isinstance(n, (ast.For, ast.While, ast.AsyncFor)):
+                return False, "explicit_loop_present"
+        return True, "ok"
+    if constraint == "max_lines":
+        max_lines = int(item.get("max_lines") or 8)
+        # Count non-blank, non-comment source lines in the function body
+        # (excluding signature + docstring).
+        body_lines = 0
+        # Use raw source segments when available; otherwise use line
+        # counts from the AST nodes.
+        if func_node.body:
+            for stmt in func_node.body:
+                # Skip the leading docstring expression.
+                if (isinstance(stmt, ast.Expr)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)
+                        and stmt is func_node.body[0]):
+                    continue
+                # Estimate line count from end_lineno - lineno + 1.
+                start = stmt.lineno
+                end = getattr(stmt, "end_lineno", start) or start
+                body_lines += max(1, end - start + 1)
+        if body_lines > max_lines:
+            return False, f"body_lines={body_lines}>max={max_lines}"
+        return True, "ok"
+    return True, "unknown_constraint_passed_through"
+
+
+def refactor_bench_probe(model, tokenizer, device="cuda"):
+    """Run the refactor_bench probe (v29.4 — preserve behavior + style constraint)."""
+    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+    samples = _BENCH_SAMPLES.get("refactor") or []
+    if not samples or model is None or tokenizer is None:
+        return out
+    try:
+        import humaneval_sandbox as hs  # type: ignore
+    except ImportError:
+        out["error"] = "humaneval_sandbox not importable on pod"
+        return out
+    try:
+        generations: list[tuple[str, int, dict]] = []
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for it in samples:
+                try:
+                    prompt_text = (
+                        "Refactor the function shown. Your refactor must "
+                        "preserve behaviour AND meet the style constraint. "
+                        "Output only the function (signature + body), no "
+                        "extra explanation.\n\n"
+                        f"{it['prompt']}"
+                    )
+                    gen, tok = _bench_generate(
+                        model, tokenizer, prompt_text,
+                        BENCH_REFACTOR_MAX_TOKENS, device, enable_thinking=False,
+                    )
+                    generations.append((gen, int(tok), it))
+                except Exception as e:
+                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if was_training:
+            model.train()
+        sandbox_input = [
+            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            for gen, _tok, it in generations if "gen_error" not in it
+        ]
+        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
+        idx = 0
+        for gen, tok, it in generations:
+            if "gen_error" in it:
+                out["items"].append({
+                    "src": it.get("src", ""),
+                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                })
+                continue
+            r = sandbox_results[idx] if idx < len(sandbox_results) else None
+            idx += 1
+            tests_passed = bool(r and r.passed)
+            constraint_ok = False
+            constraint_reason = "tests_failed_skip_constraint"
+            if tests_passed:
+                # Build the same code the sandbox saw to apply AST
+                # constraint check on it.
+                cleaned_gen = _strip_thinking_probe(gen or "")
+                try:
+                    cleaned_gen = hs._strip_code_fences(cleaned_gen)
+                except Exception:
+                    pass
+                # Concatenate prompt + gen so we have the full module
+                # source to AST-parse (same as sandbox).
+                full_src = it["prompt"] + cleaned_gen
+                constraint_ok, constraint_reason = _refactor_check_constraint(
+                    full_src, it,
+                )
+            ok = tests_passed and constraint_ok
+            out["items"].append({
+                "src": it.get("src", ""),
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": ok,
+                "tests_passed": tests_passed,
+                "constraint_ok": constraint_ok,
+                "constraint_reason": constraint_reason,
                 "gen_tokens": int(tok),
                 "reason": (r.reason if r else "no_result")[:120],
                 "tail": (gen or "")[-160:],
@@ -7752,6 +8355,748 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
     return out
 
 
+def _generate_correction_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural code-correction items for ``correction_bench`` (v29.4, 2026-04-29).
+
+    Why this axis exists. ``debug_bench`` tests "given buggy code, find
+    AND fix the bug." ``correction_bench`` tests the closely-related but
+    distinct skill: "given buggy code AND an explicit error trace, apply
+    the targeted fix." This is the read→run→see-error→fix workflow that
+    SOTA models use constantly in real coding sessions. The model
+    doesn't need to find the bug — it's told what's wrong via a
+    pytest-style assertion failure — but it has to PARSE the error,
+    map it to the relevant line, and emit a corrected version.
+
+    Same shape + sandbox grader as ``debug_bench`` and ``code_bench``;
+    distinct prompt structure that includes a simulated error trace
+    deterministically computed from the bug kind + test inputs (no
+    actual sandbox call at generation time, so item generation stays
+    fast and validator-side deterministic).
+
+    Bug kinds reuse the ``_generate_debug_items`` taxonomy because the
+    failure-trace shapes are different per bug kind (an off-by-one in a
+    sum produces a different assertion failure than an early-break in
+    find_largest), and we want the model to learn to discriminate
+    based on the trace. Per-kind error formats:
+
+      * ``off_by_one_range``  → ``AssertionError: assert sum_to(5) == 15``
+                                + actual=10 hint
+      * ``swap_subtract``     → ``AssertionError: assert candidate(10,3)==7``
+                                + actual=-7
+      * ``wrong_comparator``  → fails on equality cases
+      * ``wrong_init``        → fails on empty / single-element cases
+      * ``early_break``       → fails when largest isn't first
+      * ``wrong_index``       → fails consistently
+      * ``wrong_modulo``      → fails on ``modulus=mod`` arg
+      * ``missing_edge_case`` → ``IndexError: list index out of range`` (real exception)
+
+    The deterministic error-trace generation means item generation is
+    pure-Python and microsecond-fast — no subprocess, no sandbox. Cross-
+    validator agreement is guaranteed.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["correction"]) & 0xFFFFFFFF)
+    bug_kinds = [
+        "off_by_one_range", "swap_subtract", "wrong_comparator",
+        "wrong_init", "early_break", "wrong_index", "wrong_modulo",
+        "missing_edge_case",
+    ]
+    pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
+    rng.shuffle(pool)
+    out: list[dict] = []
+    for i, kind in enumerate(pool):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        # Dispatch on kind: build (entry, buggy_def, signature_with_docstring, tests, error_trace).
+        if kind == "off_by_one_range":
+            entry = "sum_to"
+            n_t = r.randint(5, 15)
+            buggy = (
+                "def sum_to(n: int) -> int:\n"
+                "    total = 0\n"
+                "    for i in range(1, n):\n"
+                "        total += i\n"
+                "    return total\n"
+            )
+            sig = (
+                "def sum_to(n: int) -> int:\n"
+                '    """Return the sum of integers from 1 to n inclusive.\n'
+                "    Examples: sum_to(3) == 6 (1+2+3); sum_to(5) == 15."
+                '\n    """\n'
+            )
+            tests = [
+                f"    assert candidate({n_t}) == {sum(range(1, n_t+1))}",
+                f"    assert candidate({n_t+1}) == {sum(range(1, n_t+2))}",
+                "    assert candidate(1) == 1",
+                "    assert candidate(2) == 3",
+            ]
+            actual_buggy = sum(range(1, n_t))
+            error_trace = (
+                f"  File \"test_sum_to.py\", line 3, in test_sum_to\n"
+                f"    assert candidate({n_t}) == {sum(range(1, n_t+1))}\n"
+                f"AssertionError: expected {sum(range(1, n_t+1))}, "
+                f"got {actual_buggy} (off by {sum(range(1, n_t+1)) - actual_buggy})"
+            )
+        elif kind == "swap_subtract":
+            entry = "first_minus_second"
+            buggy = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                "    return b - a\n"
+            )
+            sig = (
+                "def first_minus_second(a: int, b: int) -> int:\n"
+                '    """Return a minus b (i.e. a - b)."""\n'
+            )
+            tests = [
+                "    assert candidate(10, 3) == 7",
+                "    assert candidate(0, 5) == -5",
+                "    assert candidate(-4, -2) == -2",
+                "    assert candidate(100, 99) == 1",
+            ]
+            error_trace = (
+                "  File \"test_subtract.py\", line 3, in test_subtract\n"
+                "    assert candidate(10, 3) == 7\n"
+                "AssertionError: expected 7, got -7 (sign reversed)"
+            )
+        elif kind == "wrong_comparator":
+            threshold = r.randint(3, 9)
+            entry = "at_least"
+            buggy = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                "    return sum(1 for x in arr if x > threshold)\n"
+            )
+            sig = (
+                f"def at_least(arr, threshold={threshold}):\n"
+                '    """Count elements in arr that are >= threshold (inclusive)."""\n'
+            )
+            tests = [
+                f"    assert candidate([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([{threshold}, {threshold}, {threshold}], threshold={threshold}) == 3",
+                f"    assert candidate([0, 1, 2], threshold={threshold}) == 0",
+                "    assert candidate([], threshold=1) == 0",
+            ]
+            error_trace = (
+                "  File \"test_at_least.py\", line 3, in test_at_least\n"
+                f"    assert candidate([1, {threshold}, {threshold-1}, {threshold+1}, {threshold}], threshold={threshold}) == 3\n"
+                "AssertionError: expected 3, got 1 (only counted strictly-greater values)"
+            )
+        elif kind == "wrong_init":
+            entry = "product_of_list"
+            buggy = (
+                "def product_of_list(arr):\n"
+                "    total = 0\n"
+                "    for x in arr:\n"
+                "        total *= x\n"
+                "    return total\n"
+            )
+            sig = (
+                "def product_of_list(arr: list[int]) -> int:\n"
+                '    """Return the product of integers in arr. Empty list returns 1."""\n'
+            )
+            tests = [
+                "    assert candidate([2, 3, 4]) == 24",
+                "    assert candidate([5]) == 5",
+                "    assert candidate([]) == 1",
+                "    assert candidate([1, 2, 3, 4, 5]) == 120",
+            ]
+            error_trace = (
+                "  File \"test_product.py\", line 1, in test_product\n"
+                "    assert candidate([2, 3, 4]) == 24\n"
+                "AssertionError: expected 24, got 0 (accumulator initialised wrong)"
+            )
+        elif kind == "early_break":
+            entry = "find_largest"
+            buggy = (
+                "def find_largest(arr):\n"
+                "    largest = arr[0]\n"
+                "    for x in arr:\n"
+                "        if x > largest:\n"
+                "            largest = x\n"
+                "            break\n"
+                "    return largest\n"
+            )
+            sig = (
+                "def find_largest(arr: list[int]) -> int:\n"
+                '    """Return the largest integer in arr. Assume non-empty."""\n'
+            )
+            tests = [
+                "    assert candidate([3, 7, 2, 9, 4]) == 9",
+                "    assert candidate([1, 2, 3, 4, 5, 6]) == 6",
+                "    assert candidate([5, 4, 3, 2, 1]) == 5",
+                "    assert candidate([42]) == 42",
+            ]
+            error_trace = (
+                "  File \"test_largest.py\", line 1, in test_largest\n"
+                "    assert candidate([3, 7, 2, 9, 4]) == 9\n"
+                "AssertionError: expected 9, got 7 (loop exited too early)"
+            )
+        elif kind == "wrong_index":
+            entry = "second_last"
+            buggy = (
+                "def second_last(arr):\n"
+                "    return arr[-1]\n"
+            )
+            sig = (
+                "def second_last(arr: list):\n"
+                '    """Return the second-to-last element of arr."""\n'
+            )
+            sample_arr = [r.randint(1, 99) for _ in range(r.randint(5, 9))]
+            tests = [
+                f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}",
+                "    assert candidate([1, 2]) == 1",
+                "    assert candidate(['a', 'b', 'c']) == 'b'",
+                "    assert candidate([10, 20, 30, 40, 50]) == 40",
+            ]
+            error_trace = (
+                "  File \"test_second_last.py\", line 1, in test_second_last\n"
+                f"    assert candidate({sample_arr!r}) == {sample_arr[-2]}\n"
+                f"AssertionError: expected {sample_arr[-2]}, got {sample_arr[-1]} (off-by-one index)"
+            )
+        elif kind == "wrong_modulo":
+            mod = r.choice([7, 11, 13])
+            wrong_mod = mod + 1
+            entry = "mod_then_double"
+            buggy = (
+                f"def mod_then_double(n, modulus={mod}):\n"
+                f"    return 2 * (n % {wrong_mod})\n"
+            )
+            sig = (
+                f"def mod_then_double(n: int, modulus: int = {mod}) -> int:\n"
+                '    """Return 2 * (n % modulus)."""\n'
+            )
+            tests = [
+                f"    assert candidate(10, modulus={mod}) == {2 * (10 % mod)}",
+                f"    assert candidate({mod*2 + 3}, modulus={mod}) == {2 * ((mod*2 + 3) % mod)}",
+                f"    assert candidate(0, modulus={mod}) == 0",
+                f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
+            ]
+            error_trace = (
+                "  File \"test_mod.py\", line 1, in test_mod\n"
+                f"    assert candidate(10, modulus={mod}) == {2 * (10 % mod)}\n"
+                f"AssertionError: expected {2 * (10 % mod)}, got {2 * (10 % wrong_mod)} "
+                f"(used wrong divisor: {wrong_mod} instead of {mod})"
+            )
+        else:  # missing_edge_case
+            entry = "first_or_default"
+            buggy = (
+                "def first_or_default(arr, default=None):\n"
+                "    return arr[0]\n"
+            )
+            sig = (
+                "def first_or_default(arr: list, default=None):\n"
+                '    """Return arr[0] if non-empty, else return default."""\n'
+            )
+            tests = [
+                "    assert candidate([7, 8, 9]) == 7",
+                "    assert candidate([]) is None",
+                "    assert candidate([], default=-1) == -1",
+                "    assert candidate(['a']) == 'a'",
+            ]
+            # missing_edge_case raises a real IndexError on []
+            error_trace = (
+                "  File \"test_default.py\", line 2, in test_default\n"
+                "    assert candidate([]) is None\n"
+                "  File \"<solution>\", line 2, in first_or_default\n"
+                "    return arr[0]\n"
+                "IndexError: list index out of range"
+            )
+
+        buggy_commented = "\n".join(
+            "# " + line if line else "#" for line in buggy.splitlines()
+        )
+        commented_tests = "\n".join(
+            ("# " + line.lstrip()) if line.startswith("    ") else ("# " + line)
+            for line in tests
+        )
+        error_commented = "\n".join("# " + line for line in error_trace.splitlines())
+        prompt = (
+            "# The following Python function fails its tests with the\n"
+            "# error trace shown below. The intended behaviour is in the\n"
+            "# corrected docstring. Read the trace, identify the line\n"
+            "# that produces the wrong value, and write the CORRECTED\n"
+            "# implementation. Output only the function body (no extra\n"
+            "# explanation, no markdown fences).\n"
+            "#\n"
+            "# Buggy version (DO NOT include in your output):\n"
+            f"{buggy_commented}\n"
+            "#\n"
+            "# Test failure trace:\n"
+            f"{error_commented}\n"
+            "#\n"
+            "# All tests the corrected version must pass:\n"
+            f"{commented_tests}\n"
+            "#\n"
+            "# Now complete the corrected version below.\n"
+            f"{sig}"
+        )
+        test_block_str = "\n".join(tests)
+        test_block = "def check(candidate):\n" + test_block_str + "\n"
+        out.append({
+            "src": f"procedural_correction/{kind}",
+            "task_id": f"correction/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry,
+        })
+    return out
+
+
+# Multi-doc synthesis: pool of made-up fact-card templates. Each card
+# has a topic (named entity) + a single numeric or short-string fact.
+# Procedurally instantiated per round; the question requires combining
+# 2-3 facts across cards (sum, compare, lookup-then-arithmetic).
+_MULTI_DOC_TOPICS = [
+    "the Aldovian Spice Festival", "the Brindley Lighthouse Trust",
+    "the Carmine Valley Vineyard", "the Driftwood Boatyard Co-op",
+    "the Endesar Music Conservatory", "the Forneau Patisserie Guild",
+    "the Glasswind Aviary", "the Holman Mountain Retreat",
+    "the Iversfeld Observatory", "the Juniper Quarry Society",
+    "the Kestrel Beekeepers' Union", "the Lamplighter Tea Society",
+    "the Marbletop Quartz Mill", "the Northgate Carriage Works",
+    "the Oxbow Pottery Studio", "the Pemberton Garden Conservancy",
+    "the Quailwood Soap Factory", "the Rookhaven Tannery",
+    "the Sandhill Bookbinders' Hall", "the Tessville Bell Foundry",
+    "the Underhill Apiary", "the Vesper Telescope Workshop",
+    "the Wickwinden Weavers' Hall", "the Xanadu Pewter Works",
+    "the Yarrowbane Distillery", "the Zelnov Smithy",
+]
+
+
+def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural multi-document synthesis items for ``multi_doc_synthesis_bench``.
+
+    v29.4 (2026-04-29). Why this axis exists. ``long_context_bench``
+    tests retrieval + assembly within ONE long document. Real SOTA
+    models also handle **cross-document synthesis**: given 3-4 short,
+    distinct documents (each describing a different entity), answer a
+    question requiring info from 2 of them.
+
+    Item structure:
+
+      * ``BENCH_MULTI_DOC_N_CARDS`` short fact cards (default 4), each
+        a 3-5 line paragraph about a unique fictional organisation
+        with a specific numeric attribute (members, founded year,
+        annual harvest, distance, etc.).
+      * One focused question that requires retrieving exactly two
+        of the four facts AND combining them (sum / difference /
+        ratio / comparison).
+
+    Question kinds (block-rotated):
+      * ``sum``        — "Combined, X+Y have how many ...?"
+      * ``difference`` — "How many more ... does X have than Y?"
+      * ``compare``    — "Which has more ...: X or Y?" → name answer
+      * ``ratio``      — "X has how many times more ... than Y?"
+
+    Substring grading like ``long_context_bench``: the gold has a
+    distinctive surface form (integer or full topic name) that won't
+    collide with other cards' values. Confuser-rejection: if the
+    response contains any ``other-card`` numeric value as a standalone
+    integer, fail the item (catches "I'll mention all numbers and hope
+    one matches").
+
+    Cross-validator agreement: deterministic on ``block_seed`` +
+    per-item RNG-derived seeds. Numbers are calibrated to be in
+    distinct ranges per topic so substring collisions don't sneak in.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["multi_doc"]) & 0xFFFFFFFF)
+    qkinds = ["sum", "difference", "compare", "ratio"]
+    n_cards = max(2, BENCH_MULTI_DOC_N_CARDS)
+    out: list[dict] = []
+    for i in range(n_items):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        # Pick distinct topics + assign each a numeric attribute.
+        topic_idxs = r.sample(range(len(_MULTI_DOC_TOPICS)), n_cards)
+        topics = [_MULTI_DOC_TOPICS[ti] for ti in topic_idxs]
+        # Per-card unique attribute. Use distinct ranges to avoid
+        # cross-card numeric collisions (so the substring grader sees
+        # only one match for the gold integer).
+        # Range spread: card[0]∈[100,199], card[1]∈[200,399], etc.
+        values: list[int] = []
+        used: set[int] = set()
+        for c in range(n_cards):
+            lo, hi = 100 * (2 * c + 1), 100 * (2 * c + 1) + 80
+            v = r.randint(lo, hi)
+            while v in used:
+                v += 7
+            used.add(v)
+            values.append(v)
+        # Generate fact-card paragraphs. All templates use named
+        # ``{topic}`` and ``{n}`` placeholders for the per-card numeric
+        # attribute; no positional formats so every card renders cleanly.
+        attribute_templates = [
+            "Founded a long time ago, {topic} reports a current membership of {n}.",
+            "{topic} catalogs {n} unique entries in its public archive.",
+            "An annual yield of {n} units is recorded by {topic} each season.",
+            "The roster of {topic} stands at {n} active members this year.",
+            "Records from {topic} list {n} distinct artefacts on display.",
+        ]
+        cards_text: list[str] = []
+        for c, (topic, v) in enumerate(zip(topics, values)):
+            tmpl = attribute_templates[c % len(attribute_templates)]
+            ctx = (
+                f"--- Document {c + 1} ---\n"
+                + tmpl.format(topic=topic, n=v)
+                + " Visitors describe its hall as quiet and orderly. "
+                "Its committee meets quarterly to review activities."
+            )
+            cards_text.append(ctx)
+        document = "\n\n".join(cards_text)
+        # Pick the two cards involved in the question.
+        a_idx, b_idx = r.sample(range(n_cards), 2)
+        a_topic, b_topic = topics[a_idx], topics[b_idx]
+        a_val, b_val = values[a_idx], values[b_idx]
+        kind = qkinds[i % len(qkinds)]
+        if kind == "sum":
+            gold = str(a_val + b_val)
+            question = (
+                f"Considering only {a_topic} and {b_topic}, what is the "
+                f"COMBINED total of the numeric attribute reported in "
+                f"each of their documents? Reply with the integer only."
+            )
+        elif kind == "difference":
+            larger, smaller = (a_val, b_val) if a_val > b_val else (b_val, a_val)
+            larger_t, smaller_t = (
+                (a_topic, b_topic) if a_val > b_val else (b_topic, a_topic)
+            )
+            gold = str(larger - smaller)
+            question = (
+                f"How many more does {larger_t} have than {smaller_t} "
+                f"on the numeric attribute reported in their documents? "
+                f"Reply with the integer only."
+            )
+        elif kind == "compare":
+            # Gold is the FULL topic-name string. Substring grading
+            # requires gold ⊆ pred AND no OTHER topic ⊆ pred (so we
+            # set confusers to the other 2 topic names).
+            larger_t = a_topic if a_val > b_val else b_topic
+            gold = larger_t
+            question = (
+                f"Comparing the numeric attribute reported by {a_topic} "
+                f"and {b_topic}, which one has the LARGER value? Reply "
+                f"with the full name of the larger one."
+            )
+        else:  # ratio (integer division to keep gold an integer)
+            larger, smaller = (a_val, b_val) if a_val >= b_val else (b_val, a_val)
+            gold = str(larger // smaller)
+            question = (
+                f"How many times larger (rounded down to integer) is the "
+                f"numeric attribute of {a_topic} compared to {b_topic}? "
+                f"If {a_topic} is smaller, swap the order. Reply with the integer only."
+            )
+        # Confusers: numeric values from cards NOT used in the gold.
+        # These should not appear as standalone integers in the response.
+        # For "compare" the gold is a topic name; confusers are the OTHER
+        # topic names (so the model can't hedge by listing all of them).
+        if kind == "compare":
+            confuser_answers = [
+                t for ti, t in enumerate(topics) if ti not in (a_idx, b_idx)
+            ]
+            # Add the LOSER as a confuser too — model must commit.
+            loser_t = b_topic if a_val > b_val else a_topic
+            confuser_answers.append(loser_t)
+        else:
+            confuser_answers = [
+                str(values[ci]) for ci in range(n_cards) if ci not in (a_idx, b_idx)
+            ]
+        out.append({
+            "src": f"multi_doc_synthesis/{kind}",
+            "context": document,
+            "question": question,
+            "answer": gold,
+            "confuser_answers": confuser_answers,
+            "involved_topics": [a_topic, b_topic],
+            "kind": kind,
+        })
+    return out
+
+
+# Calibration bench: solvable + intentionally unsolvable items.
+# Solvable items have a clean numeric / short-string answer; unsolvable
+# items lack the information needed (e.g., one of two required values
+# is omitted) so the correct response is to refuse.
+_CALIBRATION_REFUSAL_TOKENS = (
+    "i don't know", "i do not know", "insufficient information",
+    "not enough information", "cannot determine", "can not determine",
+    "unknown", "no answer", "no solution", "indeterminate", "cannot tell",
+    "not provided", "missing", "incomplete", "n/a",
+)
+
+
+def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural calibration / honest-hedging items for ``calibration_bench``.
+
+    v29.4 (2026-04-29). Why this axis exists. SOTA models say "I don't
+    know" when the information needed to answer is missing, instead of
+    confabulating a plausible-sounding wrong answer. Currently no
+    validator axis measures this — a model that hallucinates fluently
+    could pass our other axes by always emitting confident-but-wrong
+    answers on hard items.
+
+    Item structure: each item is either ``solvable`` or ``unsolvable``,
+    with the split controlled by ``BENCH_CALIBRATION_UNSOLVABLE_FRACTION``
+    (default 0.5).
+
+      * ``solvable`` items have a clean numeric or short-string gold;
+        the model is graded on producing the correct answer (substring
+        containment, lenient).
+      * ``unsolvable`` items are constructed by REMOVING one of the
+        two values needed for the computation, so the answer is
+        underdetermined. The model is graded on producing one of the
+        ``_CALIBRATION_REFUSAL_TOKENS`` (case-insensitive substring),
+        AND not producing a confident numeric answer (no ``\\d+``).
+
+    Why both kinds matter. A model that always refuses scores 0 on
+    solvable items; a model that always confabulates scores 0 on
+    unsolvable. Only a calibrated model passes both halves.
+
+    Pure-Python procedural generation; no model-specific assumptions.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["calibration"]) & 0xFFFFFFFF)
+    n_unsolv = int(round(n_items * BENCH_CALIBRATION_UNSOLVABLE_FRACTION))
+    n_solv = n_items - n_unsolv
+    # Question templates are simple narrative arithmetic so the
+    # solvable / unsolvable contrast is on the INFORMATION CONTENT,
+    # not the difficulty of the math.
+    templates = [
+        ("books_total",
+         "{name} owns {a} books in the kitchen and {b} books in the study. "
+         "How many books does {name} own in total? Reply with an integer.",
+         "{name} owns books in the kitchen and {b} books in the study. "
+         "How many books does {name} own in total? Reply with an integer.",
+         lambda a, b: a + b),
+        ("trail_distance",
+         "A trail is split into a steep section of {a} km and a flat "
+         "section of {b} km. What is the total length of the trail? "
+         "Reply with an integer.",
+         "A trail is split into a steep section and a flat section of {b} km. "
+         "What is the total length of the trail? Reply with an integer.",
+         lambda a, b: a + b),
+        ("class_total",
+         "A class has {a} morning students and {b} evening students. "
+         "How many students are in the class total? Reply with an integer.",
+         "A class has morning students and {b} evening students. "
+         "How many students are in the class total? Reply with an integer.",
+         lambda a, b: a + b),
+        ("orchard_yield",
+         "An orchard produced {a} kg of apples and {b} kg of pears this "
+         "season. What was the total fruit yield in kg? Reply with an integer.",
+         "An orchard produced {a} kg of apples and pears this "
+         "season. What was the total fruit yield in kg? Reply with an integer.",
+         lambda a, b: a + b),
+        ("library_books",
+         "On Monday {name} borrowed {a} books and on Tuesday {name} borrowed "
+         "{b} books. How many books has {name} borrowed total? Reply with an integer.",
+         "On Monday {name} borrowed books and on Tuesday {name} borrowed "
+         "{b} books. How many books has {name} borrowed total? Reply with an integer.",
+         lambda a, b: a + b),
+    ]
+    names = ["Alex", "Beth", "Cara", "Dan", "Eve", "Finn", "Gita", "Hanna",
+             "Ivan", "Joon", "Kira", "Leo", "Mira", "Niko", "Owen", "Pia"]
+    out: list[dict] = []
+    plan = (["solv"] * n_solv) + (["unsolv"] * n_unsolv)
+    rng.shuffle(plan)
+    for i, plan_kind in enumerate(plan):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        tmpl_id, solv_template, unsolv_template, gold_fn = r.choice(templates)
+        a, b = r.randint(5, 60), r.randint(5, 60)
+        name = r.choice(names)
+        if plan_kind == "solv":
+            question = solv_template.format(a=a, b=b, name=name)
+            gold = str(gold_fn(a, b))
+        else:
+            question = unsolv_template.format(b=b, name=name)
+            gold = "REFUSE"  # special sentinel; grader handles refusal recognition
+        out.append({
+            "src": f"calibration/{tmpl_id}/{plan_kind}",
+            "question": question,
+            "answer": gold,
+            "kind": plan_kind,  # "solv" or "unsolv"
+        })
+    return out
+
+
+def _generate_refactor_items(block_seed, n_items: int) -> list[dict]:
+    """Procedural refactoring items for ``refactor_bench`` (v29.4, 2026-04-29).
+
+    Why this axis exists. ``code_bench`` / ``mbpp_bench`` test
+    write-from-scratch; ``debug_bench`` / ``correction_bench`` test
+    bug fixing. None measure **refactoring** — the SOTA-distinct skill
+    of restructuring working code to meet a style constraint while
+    preserving behaviour.
+
+    Item structure: each item presents a working function (deliberately
+    written with a code smell — nested loops, repeated conditionals,
+    or a verbose imperative style) along with:
+
+      * the function's docstring + tests (the model must preserve
+        behaviour: tests must pass against the refactor)
+      * a STYLE CONSTRAINT (e.g., "no nested loops", "≤ 12 lines")
+
+    Grading runs the model's refactor through ``humaneval_sandbox``
+    AND ALSO inspects the AST of the model's output to verify the
+    style constraint. Item-level pass requires BOTH:
+
+      1. all tests pass (behaviour preserved)
+      2. the AST satisfies the constraint
+
+    Constraint kinds (block-rotated):
+
+      * ``no_nested_loops`` — refactor must contain ≤ 1 ``for`` /
+        ``while`` loop nested inside another loop (depth limit 1).
+      * ``max_lines`` — refactor body must be ≤ N source lines
+        (counting non-blank, non-comment lines).
+      * ``no_explicit_loop`` — refactor must use comprehension /
+        ``sum`` / ``map`` / ``any`` / ``all`` instead of ``for``.
+
+    The grader runs the whole sandbox first; if tests pass, it ALSO
+    parses the model's emitted code (everything after the prompt)
+    with ``ast`` and applies the constraint check. AST failure → item
+    fails even if tests pass.
+    """
+    import random
+    rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["refactor"]) & 0xFFFFFFFF)
+    constraint_kinds = ["no_nested_loops", "max_lines", "no_explicit_loop"]
+    pool = (constraint_kinds * ((n_items // len(constraint_kinds)) + 1))[:n_items]
+    rng.shuffle(pool)
+    # Function templates: each is a working but ugly implementation.
+    # The signature stays clean; the prompt presents the ugly version
+    # commented out PLUS the docstring on a fresh signature, like
+    # debug_bench. Model writes the body to satisfy both behaviour
+    # tests and the AST constraint.
+    templates = [
+        ("count_evens_ugly", "count_evens",
+         (
+             "def count_evens(arr):\n"
+             "    n = 0\n"
+             "    for x in arr:\n"
+             "        if x % 2 == 0:\n"
+             "            for y in [x]:\n"  # spurious nested loop
+             "                n += 1\n"
+             "    return n\n"
+         ),
+         (
+             "def count_evens(arr: list[int]) -> int:\n"
+             '    """Return the number of even integers in arr."""\n'
+         ),
+         [
+             "    assert candidate([1, 2, 3, 4, 5, 6]) == 3",
+             "    assert candidate([2, 4, 6]) == 3",
+             "    assert candidate([]) == 0",
+             "    assert candidate([1, 3, 5]) == 0",
+         ],
+        ),
+        ("sum_squares_ugly", "sum_of_squares",
+         (
+             "def sum_of_squares(n):\n"
+             "    total = 0\n"
+             "    i = 1\n"
+             "    while i <= n:\n"
+             "        j = 0\n"
+             "        while j < 1:\n"   # nested while; spurious
+             "            total = total + i * i\n"
+             "            j = j + 1\n"
+             "        i = i + 1\n"
+             "    return total\n"
+         ),
+         (
+             "def sum_of_squares(n: int) -> int:\n"
+             '    """Return 1**2 + 2**2 + ... + n**2."""\n'
+         ),
+         [
+             "    assert candidate(3) == 14",
+             "    assert candidate(5) == 55",
+             "    assert candidate(1) == 1",
+             "    assert candidate(0) == 0",
+         ],
+        ),
+        ("flatten_ugly", "flatten_two_level",
+         (
+             "def flatten_two_level(matrix):\n"
+             "    out = []\n"
+             "    for row in matrix:\n"
+             "        for x in row:\n"
+             "            out.append(x)\n"
+             "    return out\n"
+         ),
+         (
+             "def flatten_two_level(matrix: list[list[int]]) -> list[int]:\n"
+             '    """Flatten a 2D list of integers into a flat list."""\n'
+         ),
+         [
+             "    assert candidate([[1, 2], [3, 4]]) == [1, 2, 3, 4]",
+             "    assert candidate([[5]]) == [5]",
+             "    assert candidate([]) == []",
+             "    assert candidate([[1], [2], [3]]) == [1, 2, 3]",
+         ],
+        ),
+    ]
+    out: list[dict] = []
+    for i, kind in enumerate(pool):
+        r = random.Random(rng.randint(0, 2**31 - 1))
+        tmpl_id, entry, ugly, sig, tests = r.choice(templates)
+        # Set a max_lines bound so it's deterministic per item but rotates.
+        if kind == "max_lines":
+            max_lines = r.choice([6, 7, 8])
+            constraint_text = (
+                f"The refactor body must be at most {max_lines} non-blank, "
+                f"non-comment SOURCE LINES."
+            )
+        elif kind == "no_nested_loops":
+            constraint_text = (
+                "The refactor must contain NO loop nested inside another "
+                "loop (no for-inside-for, no while-inside-while, no "
+                "for-inside-while, no while-inside-for)."
+            )
+            max_lines = None
+        else:  # no_explicit_loop
+            constraint_text = (
+                "The refactor must NOT use any explicit ``for`` or ``while`` "
+                "loop. Use a comprehension, ``sum``, ``map``, ``any``, "
+                "``all``, or recursion instead."
+            )
+            max_lines = None
+        ugly_commented = "\n".join(
+            "# " + line if line else "#" for line in ugly.splitlines()
+        )
+        commented_tests = "\n".join(
+            ("# " + line.lstrip()) if line.startswith("    ") else ("# " + line)
+            for line in tests
+        )
+        prompt = (
+            "# Refactor the following Python function. The reference\n"
+            "# implementation below is correct but stylistically poor.\n"
+            "# Your refactor must preserve EXACT behaviour (same inputs\n"
+            "# return same outputs) AND satisfy the style constraint.\n"
+            "#\n"
+            "# Style constraint:\n"
+            f"# {constraint_text}\n"
+            "#\n"
+            "# Reference (poor style — DO NOT include in your output):\n"
+            f"{ugly_commented}\n"
+            "#\n"
+            "# Behaviour tests the refactor must pass:\n"
+            f"{commented_tests}\n"
+            "#\n"
+            "# Now write the refactor below. Output only the function body.\n"
+            f"{sig}"
+        )
+        test_block_str = "\n".join(tests)
+        test_block = "def check(candidate):\n" + test_block_str + "\n"
+        item = {
+            "src": f"procedural_refactor/{tmpl_id}/{kind}",
+            "task_id": f"refactor/{tmpl_id}/{kind}/{i:02d}",
+            "prompt": prompt,
+            "test": test_block,
+            "entry_point": entry,
+            "constraint_kind": kind,
+        }
+        if max_lines is not None:
+            item["max_lines"] = max_lines
+        out.append(item)
+    return out
+
+
 def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
     """Procedural reasoning items for reasoning_bench (v29 — BBH rebalance).
 
@@ -9612,6 +10957,17 @@ def run_bench_battery(model, tokenizer, device="cuda"):
         ("noise_resistance_bench", noise_resistance_bench_probe),
         # v29.2 — procedural buggy-code fix probe.
         ("debug_bench", debug_bench_probe),
+        # v29.4 — buggy code + explicit error trace; tests
+        # read→run→see-error→fix workflow.
+        ("correction_bench", correction_bench_probe),
+        # v29.4 — multi-document synthesis (fact-card retrieval +
+        # cross-doc reasoning).
+        ("multi_doc_synthesis_bench", multi_doc_synthesis_bench_probe),
+        # v29.4 — calibration / honest hedging (solvable + unsolvable
+        # mix; reward correct refusals).
+        ("calibration_bench", calibration_bench_probe),
+        # v29.4 — refactor under style constraint (AST-graded).
+        ("refactor_bench", refactor_bench_probe),
     )
     _probes = _live_probes + (_shadow_probes if BENCH_BATTERY_SHADOW_AXES else ())
     if not BENCH_BATTERY_SHADOW_AXES:
