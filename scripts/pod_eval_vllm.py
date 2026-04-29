@@ -4572,11 +4572,19 @@ def _math_score_one(pred: str, gold: str) -> int:
 
 
 def _bench_finalize_token_stats(out: dict) -> None:
-    """Populate ``mean_gen_tokens`` and ``mean_gen_tokens_correct`` from
-    the per-item ``gen_tokens`` fields. Called by every bench probe right
-    before returning so the Session 3.2 ``reasoning_density`` axis can
-    detect both answer-only memorization (too few tokens) and
-    inefficient over-thinking (too many tokens).
+    """Populate ``mean_gen_tokens`` / ``mean_gen_tokens_correct`` and
+    ``per_src`` from the per-item ``gen_tokens`` / ``ok`` / ``src``
+    fields. Called by every bench probe right before returning.
+
+    ``per_src`` (added 2026-04-29 v29.3) is the per-template breakdown:
+    ``{src: {"n": int, "correct": int, "pass_frac": float}}``. The
+    composite scoring doesn't read this directly, but downstream
+    saturation telemetry (``scripts/audit/per_template_saturation.py``)
+    uses it to surface which procedural templates have hit ceiling /
+    floor across recent rounds — the signal that tells operators which
+    template family to harden, retire, or rebalance. Adds ~1-2 KB per
+    student per round to ``h2h_history.json``: cheap relative to the
+    50× signal-to-noise improvement on per-template tuning decisions.
 
     Items with an ``error`` field are skipped. ``gen_tokens`` is an
     integer — if absent we fall back to zero rather than None so the
@@ -4587,9 +4595,15 @@ def _bench_finalize_token_stats(out: dict) -> None:
     tok_sum_correct = 0
     n_all = 0
     n_correct = 0
+    per_src: dict[str, dict[str, int]] = {}
     for it in items:
         if not isinstance(it, dict) or it.get("error"):
             continue
+        src = it.get("src") or "unknown"
+        bucket = per_src.setdefault(src, {"n": 0, "correct": 0})
+        bucket["n"] += 1
+        if it.get("ok"):
+            bucket["correct"] += 1
         tok = int(it.get("gen_tokens") or 0)
         if tok <= 0:
             continue
@@ -4602,6 +4616,15 @@ def _bench_finalize_token_stats(out: dict) -> None:
     out["mean_gen_tokens_correct"] = (
         round(tok_sum_correct / n_correct, 1) if n_correct else 0.0
     )
+    # Materialize per-template pass-frac for downstream telemetry.
+    out["per_src"] = {
+        src: {
+            "n": bucket["n"],
+            "correct": bucket["correct"],
+            "pass_frac": round(bucket["correct"] / bucket["n"], 4) if bucket["n"] else 0.0,
+        }
+        for src, bucket in per_src.items()
+    }
 
 
 def math_bench_probe(model, tokenizer, device="cuda"):

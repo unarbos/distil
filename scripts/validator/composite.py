@@ -1535,6 +1535,21 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     if king_model and king_model in students_data:
         king_raw_axes = compute_axes(students_data[king_model], king_kl, king_rkl)
 
+    # 2026-04-29 (v29.3): which bench axes carry per-template breakdown.
+    # We surface ``composite.per_src`` so the saturation audit can attribute
+    # pass-rate per procedural template across rounds. Cheap to compute
+    # (already populated by ``_bench_finalize_token_stats``); we just
+    # forward it onto the h2h entry. Filter to bench axes only — the
+    # relative axes (``kl`` etc.) don't have a meaningful template
+    # breakdown.
+    PER_SRC_AXES = (
+        "math_bench", "code_bench", "reasoning_bench", "ifeval_bench",
+        "aime_bench", "mbpp_bench", "tool_use_bench", "long_context_bench",
+        "robustness_bench", "noise_resistance_bench", "knowledge_bench",
+        "self_consistency_bench", "arc_bench", "truthful_bench",
+        "procedural_bench", "debug_bench",
+    )
+
     for entry in h2h_results:
         model = entry.get("model")
         if not model or model not in students_data:
@@ -1560,6 +1575,18 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
             comp["pareto"] = compute_pareto_dominance(
                 challenger_raw_axes, king_raw_axes, include_shadow=True,
             )
+        # v29.3: forward per-template breakdown (`per_src`) for each
+        # bench axis that has it. Used by the saturation audit script
+        # to identify dead/saturated templates per axis.
+        per_src_summary: dict[str, dict] = {}
+        for axis in PER_SRC_AXES:
+            payload = students_data[model].get(axis)
+            if isinstance(payload, dict):
+                ps = payload.get("per_src")
+                if isinstance(ps, dict) and ps:
+                    per_src_summary[axis] = ps
+        if per_src_summary:
+            comp["per_src"] = per_src_summary
         entry["composite"] = comp
 
     # ── King health (2026-04-24 shadow) ─────────────────────────────
