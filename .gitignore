@@ -46,3 +46,9 @@ memory/
 HEARTBEAT.md
 SESSION_MEMORY.md
 REWRITE_PLAN.md
+
+# Tweet drafts (local only)
+.tweet-drafts.md
+.tweet-drafts*.md
+reports/2026-04-*-tweet-drafts.md
+
