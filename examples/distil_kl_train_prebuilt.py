@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 import math
 import statistics
@@ -148,6 +149,23 @@ def kl_loss_masked(
     return per_seq.mean()
 
 
+def kl_loss_masked_positions(
+    student_logits,
+    teacher_logits,
+    loss_mask: torch.Tensor,
+):
+    """Forward KL(teacher || student) at positions selected by ``loss_mask`` [B, L]."""
+    s = student_logits.contiguous()
+    t = teacher_logits.detach().to(s.device).contiguous()
+    t_log_p = F.log_softmax(t.float(), dim=-1)
+    s_log_p = F.log_softmax(s.float(), dim=-1)
+    t_p = t_log_p.exp()
+    per_pos = (t_p * (t_log_p - s_log_p)).sum(-1)
+    m = loss_mask.to(device=per_pos.device, dtype=per_pos.dtype)
+    per_seq = (per_pos * m).sum(dim=1) / m.sum(dim=1).clamp(min=1e-8)
+    return per_seq.mean()
+
+
 def _pad_token_batch(
     tokens: list[torch.Tensor],
     pad_id: int,
@@ -163,6 +181,125 @@ def _pad_token_batch(
         out[i, :li] = x
         mask[i, :li] = 1.0
     return out, mask
+
+
+def _build_loss_mask(tokens: list[torch.Tensor], loss_starts: list[int]) -> torch.Tensor:
+    """Build a [B, L] float mask enabling KL from each sample's response start onward."""
+    lengths = [int(x.shape[0]) for x in tokens]
+    lmax = max(lengths)
+    mask = torch.zeros((len(tokens), lmax), dtype=torch.float32)
+    for i, (length, loss_start) in enumerate(zip(lengths, loss_starts)):
+        start = max(0, min(int(loss_start), length - 1))
+        mask[i, start:length] = 1.0
+    return mask
+
+
+# Patterns that mark the start of an assistant reply in a chat-template transcript.
+_CHAT_ASSISTANT_PATTERNS = (
+    re.compile(r"(?s)<\|im_start\|>\s*assistant(?:[^\S\r\n]*\r?\n+|\s+)"),
+    re.compile(r"(?s)<\|start_header_id\|>\s*assistant\s*<\|end_header_id\|>\s*\r?\n+"),
+    re.compile(r"(?im)^\s*assistant\s*:\s*"),
+)
+
+
+def _split_chat_transcript_text(text: str) -> tuple[str, str] | None:
+    """Return (prompt_prefix, assistant_completion) from a full chat transcript string.
+
+    Finds the *last* assistant turn header and splits there.  Returns ``None`` when
+    no recognisable header is found or the completion would be empty.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    for pattern in _CHAT_ASSISTANT_PATTERNS:
+        matches = list(pattern.finditer(text))
+        for match in reversed(matches):
+            boundary = match.end()
+            completion = text[boundary:]
+            stripped = completion.strip()
+            if not stripped:
+                continue
+            # Skip if the completion is only a closing im_end tag.
+            if re.fullmatch(r"(?:<\|im_end\|>\s*)+", stripped, flags=re.IGNORECASE):
+                continue
+            return text[:boundary], completion
+    return None
+
+
+def _first_nonempty_text(item: dict, keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _normalize_chat_messages(messages: list) -> list[dict[str, str]]:
+    normalized = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or msg.get("from")
+        content = msg.get("content") or msg.get("value")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if role in {"human", "user"}:
+            role = "user"
+        elif role in {"gpt", "assistant"}:
+            role = "assistant"
+        else:
+            role = "system" if role == "system" else "user"
+        normalized.append({"role": role, "content": content.strip()})
+    return normalized
+
+
+def _render_chat_messages(tokenizer, messages: list[dict[str, str]], add_generation_prompt: bool) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt
+        )
+    except Exception:
+        parts = [f"{msg['role'].title()}: {msg['content']}" for msg in messages]
+        if add_generation_prompt:
+            parts.append("Assistant:")
+        return "\n\n".join(parts)
+
+
+def _extract_prompt_completion_text(item: dict, tokenizer) -> tuple[str, str] | None:
+    """Try to split a JSONL row into (prompt, completion) strings.
+
+    Priority:
+    1. ``messages`` / ``conversations`` list → apply_chat_template split.
+    2. ``text`` field containing a chat-template transcript → regex split.
+    3. Separate prompt / completion fields (question/answer, instruction/output, …).
+    """
+    messages = item.get("messages") or item.get("conversations")
+    if isinstance(messages, list) and messages:
+        normalized = _normalize_chat_messages(messages)
+        if len(normalized) >= 2 and normalized[-1]["role"] == "assistant":
+            prompt = _render_chat_messages(tokenizer, normalized[:-1], add_generation_prompt=True)
+            full = _render_chat_messages(tokenizer, normalized, add_generation_prompt=False)
+            if full.startswith(prompt):
+                completion = full[len(prompt):]
+                if completion.strip():
+                    return prompt, completion
+
+    text = _first_nonempty_text(item, ("text",))
+    if text:
+        split = _split_chat_transcript_text(text)
+        if split is not None:
+            return split
+
+    prompt = _first_nonempty_text(
+        item,
+        ("question", "query", "instruction", "prompt", "problem", "input", "task"),
+    )
+    completion = _first_nonempty_text(
+        item,
+        ("answer", "response", "output", "solution", "completion", "chosen", "target"),
+    )
+    if prompt and completion and prompt != completion:
+        return prompt, completion
+    return None
 
 
 def _chunk_list(items: list, chunk_size: int):
@@ -769,7 +906,11 @@ def _open_hf_streaming_iterator(dataset: str, split: str, skip_rows: int):
     from datasets import load_dataset
 
     skip_rows = int(max(0, skip_rows))
-    ds = load_dataset(dataset, split=split, streaming=True)
+    dataset_path = Path(str(dataset)).expanduser()
+    if dataset_path.exists() and dataset_path.suffix.lower() in {".json", ".jsonl"}:
+        ds = load_dataset("json", data_files=str(dataset_path), split=split, streaming=True)
+    else:
+        ds = load_dataset(dataset, split=split, streaming=True)
     if skip_rows > 0 and hasattr(ds, "skip"):
         ds = ds.skip(skip_rows)
         return iter(ds)
@@ -819,6 +960,53 @@ class StreamingTokenStream:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+    def _tokenize_item(self, item: dict) -> tuple[torch.Tensor, int] | None:
+        """Tokenize one dataset row; return (input_ids, loss_start_token_idx) or None."""
+        encode_kwargs = {
+            "return_tensors": "pt",
+            "truncation": True,
+            "max_length": self.max_seq_len,
+        }
+        split = _extract_prompt_completion_text(item, self.tokenizer)
+        if split is not None:
+            prompt_text, completion_text = split
+            full_text = prompt_text + completion_text
+            # Try to get char-level offsets so we can map prompt end → token index precisely.
+            try:
+                enc = self.tokenizer(full_text, return_offsets_mapping=True, **encode_kwargs)
+                ids = enc.input_ids.squeeze(0).to(torch.int32)
+                offsets = enc["offset_mapping"][0].tolist()  # list of (char_start, char_end)
+                prompt_chars = len(prompt_text)
+                loss_start = None
+                for tok_idx, (cs, ce) in enumerate(offsets):
+                    if ce <= cs:
+                        continue
+                    if cs >= prompt_chars:
+                        loss_start = max(0, tok_idx - 1)
+                        break
+            except (TypeError, KeyError, Exception):
+                enc = self.tokenizer(full_text, **encode_kwargs)
+                ids = enc.input_ids.squeeze(0).to(torch.int32)
+                prompt_ids = self.tokenizer(prompt_text, **encode_kwargs).input_ids.squeeze(0)
+                loss_start = max(0, int(prompt_ids.shape[0]) - 1)
+
+            if loss_start is None:
+                # Fallback: count prompt tokens directly.
+                prompt_ids = self.tokenizer(prompt_text, **encode_kwargs).input_ids.squeeze(0)
+                loss_start = max(0, int(prompt_ids.shape[0]) - 1)
+
+            if ids.shape[0] <= loss_start + 1:
+                return None
+            return ids, int(loss_start)
+
+        # No split found — treat as plain text with a sentinel loss_start of -1
+        # so the caller substitutes the global kl_start_pos.
+        text = _first_nonempty_text(item, ("text",))
+        if not text or len(text) < self.min_chars:
+            return None
+        ids = self.tokenizer(text, **encode_kwargs).input_ids.squeeze(0).to(torch.int32)
+        return ids, -1
+
     def get_batch(self, n: int):
         out = []
         scanned = 0
@@ -830,16 +1018,11 @@ class StreamingTokenStream:
                 break
             scanned += 1
             self._consumed += 1
-            text = item.get("text", "")
-            if not text or len(text) < self.min_chars:
+            sample = self._tokenize_item(item)
+            if sample is None:
                 continue
-            ids = self.tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=self.max_seq_len,
-            ).input_ids.squeeze(0).to(torch.int32)
-            out.append(ids)
+            ids, loss_start = sample
+            out.append({"input_ids": ids, "loss_start": int(loss_start)})
         return out
 
     @property
@@ -1315,8 +1498,17 @@ def train_online(args):
 
         t0 = time.time()
         batch = data.get_batch(args.samples_per_step)
-        tokens = [t for t in batch if t.shape[0] > args.kl_start_pos + 10]
-        if not tokens:
+        # Resolve per-sample loss starts; fall back to the global kl_start_pos for
+        # plain-text rows that couldn't be split (loss_start == -1).
+        samples = []
+        for row in batch:
+            ids = row["input_ids"]
+            loss_start = int(row.get("loss_start", -1))
+            if loss_start < 0 or loss_start >= ids.shape[0] - 1:
+                loss_start = int(args.kl_start_pos)
+            if ids.shape[0] > loss_start + 10:
+                samples.append({"input_ids": ids, "loss_start": loss_start})
+        if not samples:
             log.warning("No valid tokens in batch after filtering.")
             break
 
@@ -1329,12 +1521,15 @@ def train_online(args):
         if pad_id is None:
             pad_id = tokenizer.eos_token_id
         chunk_sz = max(1, int(getattr(args, "online_chunk_size", 1)))
-        n_tokens = len(tokens)
+        n_tokens = len(samples)
         total_loss = 0.0
         _dt = next(student.parameters()).dtype
-        for sub in _chunk_list(tokens, chunk_sz):
+        for sub in _chunk_list(samples, chunk_sz):
             n_sub = len(sub)
-            input_ids_cpu, pos_mask = _pad_token_batch(sub, pad_id)
+            sub_tokens = [row["input_ids"] for row in sub]
+            sub_starts = [int(row["loss_start"]) for row in sub]
+            input_ids_cpu, _ = _pad_token_batch(sub_tokens, pad_id)
+            loss_mask = _build_loss_mask(sub_tokens, sub_starts)
             attn_cpu = (input_ids_cpu != pad_id).long()
             input_ids_t = input_ids_cpu.to(device=tdev, dtype=torch.long, non_blocking=True)
             attn_t = attn_cpu.to(device=tdev, dtype=torch.long, non_blocking=True)
@@ -1345,8 +1540,8 @@ def train_online(args):
             input_ids_s = input_ids_cpu.to(device=sdev, dtype=torch.long, non_blocking=True)
             attn_s = attn_cpu.to(device=sdev, dtype=torch.long, non_blocking=True)
             s_logits = student(input_ids_s, attention_mask=attn_s).logits
-            tail_mask = pos_mask[:, args.kl_start_pos :].to(device=sdev, dtype=torch.float32)
-            loss_c = kl_loss_masked(s_logits, t_logits, args.kl_start_pos, tail_mask)
+            loss_mask_dev = loss_mask.to(device=sdev, dtype=torch.float32)
+            loss_c = kl_loss_masked_positions(s_logits, t_logits, loss_mask_dev)
             (loss_c * (n_sub / n_tokens)).backward()
             total_loss += loss_c.item() * (n_sub / n_tokens)
             del t_logits, s_logits, loss_c

@@ -45,6 +45,37 @@ python3 examples/distil_kl_train_prebuilt.py train \
   --output_dir ./distil-checkpoints
 ```
 
+## Build a Benchmark-Mix JSONL
+
+Use `examples/build_benchmark_mix_jsonl.py` to create a local `text` JSONL that targets the validator's composite axes: math, code, reasoning, instruction following, calibration, long-context retrieval, multi-document synthesis, and refactoring.
+
+```bash
+python3 examples/build_benchmark_mix_jsonl.py \
+  --output ./distil-checkpoints/arena_mix.jsonl \
+  --max_examples 50000
+```
+
+The builder streams from public instruction/code/math datasets and adds synthetic validator-style tasks. The generated file can be passed directly to `distil_kl_train_prebuilt.py` because local `.jsonl` files are supported as training datasets.
+
+```bash
+python3 examples/distil_kl_train_prebuilt.py train \
+  --teacher Qwen/Qwen3.5-35B-A3B \
+  --student <YOUR_CURRENT_DISTILLED_MODEL_OR_CHECKPOINT> \
+  --teacher_gpu 0 --teacher_gpu_count 1 \
+  --student_gpu 1 --student_gpu_count 1 \
+  --dataset ./distil-checkpoints/arena_mix.jsonl \
+  --dataset_split train \
+  --min_chars 0 \
+  --max_seq_len 1536 \
+  --kl_start_pos 64 \
+  --lr 2e-6 \
+  --samples_per_step 24 \
+  --max_steps 1000 \
+  --output_dir ./distil-checkpoints-arena
+```
+
+This is intended as a continued-training pass after KL distillation. Keep the learning rate low and continue checking KL/king metrics, because pure benchmark SFT can improve absolute axes while damaging KL, on-policy behavior, length discipline, or generation quality.
+
 ## Train with king comparison
 
 ```bash
