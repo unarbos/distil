@@ -14567,17 +14567,28 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
                 else:
                     print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
 
-    # 2026-04-29 (v29.7): if the dead-event fired, the vLLM server crashed
-    # mid-eval. Bail loud and fast so the caller falls back to HF for the
-    # whole eval rather than thrashing on a dead server. Without this we
-    # spent ~45 min last round retrying connection-refused before giving up.
+    # 2026-04-30 (v30.3.4): if the dead-event fired, return partial
+    # results PLUS the list of failed indices instead of raising.
+    # The caller will restart vLLM and retry only the failed prompts.
+    # Pre-v30.3.4 behaviour was "raise RuntimeError → caller falls back
+    # to HF for the entire round", which made a single transient vLLM
+    # crash cost ~80 minutes of HF wall-clock time. With Qwen3.x-A3B
+    # (hybrid Mamba) on H200 the crash rate is ~50% per round; we
+    # cannot afford to abandon vLLM on first crash.
     if _vllm_dead_event().is_set():
         n_done = sum(1 for r in result_slots if r is not None)
         n_failed = len(prompts) - n_done
-        raise RuntimeError(
-            f"vLLM crashed mid-eval after {n_done}/{len(prompts)} prompts "
-            f"({n_failed} failed). Caller should fall back to HF generation."
+        failed_idxs = [i for i, r in enumerate(result_slots) if r is None]
+        print(
+            f"  [vllm] crashed mid-eval: {n_done}/{len(prompts)} done, "
+            f"{n_failed} failed (caller will restart vLLM and retry)",
+            flush=True,
         )
+        return {
+            "results": result_slots,
+            "failed_idxs": failed_idxs,
+            "vllm_crashed": True,
+        }
 
     # Retry failed prompts sequentially. We only get here if the dead-event
     # never fired (i.e. failures were transient per-prompt errors, not a
@@ -15086,18 +15097,134 @@ def main():
                 _write_phase(progress_path, students, "vllm_generating",
                              teacher_done=done, prompts_total=total)
             try:
-                sequences_data = generate_via_vllm(
-                    prompts, tokenizer, args.max_new_tokens, args.block_seed,
-                    logprobs_k=args.logprobs_k, token_to_id=token_to_id,
-                    progress_cb=_vllm_progress, concurrency=args.concurrency,
-                )
-                timings["vllm_generation"] = time.time() - t0
-                # 2026-04-29 (v29.7): explicit path tag so snapshot tools can
-                # distinguish "ran on vLLM" from "fell back to HF". The bot's
-                # 40-line tail snapshot needs this to answer "is the eval
-                # using HF again?" correctly.
-                print(f"[teacher_path] vllm  prompts_done={len(sequences_data)}/{len(prompts)}", flush=True)
-                print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
+                # 2026-04-30 (v30.3.4): vLLM auto-restart-and-resume.
+                # vLLM 0.19.1 + Qwen3.x-A3B (hybrid Mamba/transformer
+                # MoE) crashes intermittently on H200 mid-eval: the
+                # EngineCore subprocess exits cleanly (no OOM, KV
+                # cache <5%, no CUDA errors) and the API server
+                # exits with the leaked-semaphore signature. Crash
+                # rate is ~50% per round across both Qwen3.5 and
+                # Qwen3.6, so a single-shot fall-back to HF was
+                # costing ~80 min of wall-clock per affected round.
+                #
+                # New behaviour: when vLLM crashes mid-eval, we
+                # restart the server and re-submit ONLY the failed
+                # prompts. Up to MAX_RESTARTS attempts. Successful
+                # results are preserved across restarts. Caller
+                # falls back to HF only if every restart attempt
+                # crashes again — extremely unlikely given crashes
+                # are intermittent rather than deterministic.
+                MAX_RESTARTS = int(os.environ.get(
+                    "DISTIL_VLLM_MAX_RESTARTS", "3"
+                ) or 3)
+                pending_idxs = list(range(len(prompts)))
+                accumulated = [None] * len(prompts)
+                attempt = 0
+                last_partial = None
+                while pending_idxs:
+                    pending_prompts = [prompts[i] for i in pending_idxs]
+                    out = generate_via_vllm(
+                        pending_prompts, tokenizer, args.max_new_tokens,
+                        args.block_seed, logprobs_k=args.logprobs_k,
+                        token_to_id=token_to_id,
+                        progress_cb=lambda d, t: _vllm_progress(
+                            sum(1 for r in accumulated if r is not None) + d,
+                            len(prompts),
+                        ),
+                        concurrency=args.concurrency,
+                    )
+                    if isinstance(out, dict) and out.get("vllm_crashed"):
+                        # Partial success — fold completed slots in.
+                        for local_i, item_idx in enumerate(pending_idxs):
+                            if out["results"][local_i] is not None:
+                                accumulated[item_idx] = out["results"][local_i]
+                        # Recompute pending = still-None positions in
+                        # the accumulated list.
+                        pending_idxs = [
+                            i for i, r in enumerate(accumulated) if r is None
+                        ]
+                        n_done = len(prompts) - len(pending_idxs)
+                        last_partial = (n_done, attempt + 1)
+                        attempt += 1
+                        if attempt >= MAX_RESTARTS:
+                            print(
+                                f"  [vllm] gave up after {MAX_RESTARTS} "
+                                f"restart attempts ({n_done}/{len(prompts)} "
+                                f"done). Falling back to HF for the "
+                                f"remaining {len(pending_idxs)} prompts.",
+                                flush=True,
+                            )
+                            break
+                        print(
+                            f"  [vllm] restart attempt "
+                            f"{attempt}/{MAX_RESTARTS}: stopping dead "
+                            f"vLLM and starting fresh server "
+                            f"({n_done}/{len(prompts)} prompts already "
+                            f"have results, {len(pending_idxs)} pending)",
+                            flush=True,
+                        )
+                        stop_vllm_server()
+                        time.sleep(5)
+                        if not start_vllm_server(
+                            args.teacher, args.vllm_gpu_util,
+                            args.vllm_max_model_len,
+                            tensor_parallel_size=args.tensor_parallel_size,
+                        ):
+                            print(
+                                "  [vllm] restart failed — falling back "
+                                "to HF for remaining prompts",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        # Plain list = full success (or per-prompt
+                        # transient retries already reconciled).
+                        # Fold all results into accumulated and exit
+                        # the loop.
+                        for local_i, item_idx in enumerate(pending_idxs):
+                            accumulated[item_idx] = out[local_i]
+                        pending_idxs = []
+                if not pending_idxs:
+                    sequences_data = accumulated
+                    timings["vllm_generation"] = time.time() - t0
+                    if attempt > 0:
+                        print(
+                            f"[eval] vLLM generation succeeded after "
+                            f"{attempt} restart(s); "
+                            f"{timings['vllm_generation']:.1f}s total",
+                            flush=True,
+                        )
+                    print(
+                        f"[teacher_path] vllm "
+                        f"prompts_done={len(sequences_data)}/{len(prompts)} "
+                        f"restarts={attempt}",
+                        flush=True,
+                    )
+                    print(
+                        f"[eval] vLLM generation: "
+                        f"{timings['vllm_generation']:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    # vLLM exhausted MAX_RESTARTS and we still have
+                    # pending prompts. Discard the partial accumulator
+                    # and fall through to the HF-fallback path so the
+                    # whole batch is regenerated by HF transformers.
+                    # We could in principle merge partial vLLM results
+                    # with HF-generated remainder, but the two paths
+                    # produce slightly different logprob distributions
+                    # (vLLM sparse top-K vs HF dense), and mixing them
+                    # in one round risks subtle bias. Cleaner to redo
+                    # the round on a uniform path. Future v30.3.5
+                    # could add HF top-up if crash rate stays high.
+                    sequences_data = None
+                    n_done = len(prompts) - len(pending_idxs)
+                    print(
+                        f"[teacher_path] vllm-restarts-exhausted "
+                        f"partial={n_done}/{len(prompts)} "
+                        f"discarding-and-falling-back-to-HF",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
                 print(f"[teacher_path] hf-fallback-after-vllm-crash  reason={type(e).__name__}", flush=True)
