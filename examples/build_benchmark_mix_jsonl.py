@@ -5,10 +5,14 @@ Build a local JSONL training mix for the Arena-v3 style validator axes.
 The output has one field per row:
   {"text": "..."}
 
+HF rows are read with streaming + an IterableDataset shuffle buffer so draws
+are not fixed to the split head, then examples are interleaved across sources
+and finally shuffled so any line in the JSONL can be any mix component.
+
 It can be used directly with examples/distil_kl_train_prebuilt.py after the
 local JSONL loader support in that script:
 
-  python distil/examples/build_benchmark_mix_jsonl.py \
+  python examples/build_benchmark_mix_jsonl.py \
     --output ./distil-checkpoints/arena_mix.jsonl \
     --max_examples 50000
 
@@ -27,8 +31,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -129,10 +134,28 @@ def row_to_text(tokenizer, row: dict[str, Any], kind: str) -> str | None:
     return chat_text(tokenizer, user, assistant, system_by_kind.get(kind))
 
 
-def load_iter(name: str, config: str | None, split: str):
+def _stable_stream_seed(base_seed: int, dataset_name: str) -> int:
+    """Process-stable seed so HF stream shuffle is reproducible for a given --seed."""
+    h = zlib.adler32(dataset_name.encode("utf-8")) & 0xFFFFFFFF
+    return (base_seed * 1_000_003 + h) % (2**31)
+
+
+def load_iter(
+    name: str,
+    config: str | None,
+    split: str,
+    *,
+    stream_seed: int,
+    stream_shuffle_buffer: int,
+) -> Iterator[dict[str, Any]]:
     if config:
-        return iter(load_dataset(name, config, split=split, streaming=True))
-    return iter(load_dataset(name, split=split, streaming=True))
+        ds = load_dataset(name, config, split=split, streaming=True)
+    else:
+        ds = load_dataset(name, split=split, streaming=True)
+    if stream_shuffle_buffer > 0:
+        buf = max(256, stream_shuffle_buffer)
+        ds = ds.shuffle(seed=stream_seed, buffer_size=buf)
+    return iter(ds)
 
 
 def synthetic_examples(rng: random.Random, tokenizer, n: int):
@@ -189,6 +212,25 @@ def main():
     parser.add_argument("--max_examples", type=int, default=50000)
     parser.add_argument("--synthetic_frac", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=97)
+    parser.add_argument(
+        "--no-shuffle",
+        dest="shuffle",
+        action="store_false",
+        help="Write in collection order (synthetics still before HF if no interleave).",
+    )
+    parser.set_defaults(shuffle=True)
+    parser.add_argument(
+        "--stream-shuffle-buffer",
+        type=int,
+        default=10_000,
+        help="HF streaming shuffle buffer (IterableDataset.shuffle). 0 disables stream shuffle.",
+    )
+    parser.add_argument(
+        "--max-scan-multiplier",
+        type=int,
+        default=30,
+        help="Max rows scanned per HF source ~= quota * this (skip bad rows).",
+    )
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
@@ -203,40 +245,72 @@ def main():
     quotas = [int(hf_n * w / total_w) for w in weights]
     quotas[0] += hf_n - sum(quotas)
 
-    written = 0
-    with out_path.open("w", encoding="utf-8") as f:
-        for text in synthetic_examples(rng, tokenizer, synthetic_n):
-            f.write(json.dumps({"text": text}, ensure_ascii=True) + "\n")
-            written += 1
+    lines: list[str] = []
+    for text in synthetic_examples(rng, tokenizer, synthetic_n):
+        lines.append(json.dumps({"text": text}, ensure_ascii=True) + "\n")
 
-        for (name, config, split, _weight, kind), quota in zip(HF_SOURCES, quotas):
-            if quota <= 0:
-                continue
-            try:
-                it = load_iter(name, config, split)
-            except Exception as exc:
-                print(f"skip {name}: {exc}")
-                continue
-            kept = 0
-            scanned = 0
-            while kept < quota and scanned < quota * 30:
-                scanned += 1
-                try:
-                    row = next(it)
-                except StopIteration:
-                    break
-                except Exception as exc:
-                    print(f"stop {name}: {exc}")
-                    break
-                text = row_to_text(tokenizer, row, kind)
-                if not text or len(text) < 80:
-                    continue
-                f.write(json.dumps({"text": text}, ensure_ascii=True) + "\n")
-                kept += 1
-                written += 1
-            print(f"{name}: wrote {kept}/{quota}")
+    states: list[dict[str, Any]] = []
+    for (name, config, split, _weight, kind), quota in zip(HF_SOURCES, quotas):
+        if quota <= 0:
+            continue
+        try:
+            it = load_iter(
+                name,
+                config,
+                split,
+                stream_seed=_stable_stream_seed(args.seed, name),
+                stream_shuffle_buffer=args.stream_shuffle_buffer,
+            )
+        except Exception as exc:
+            print(f"skip {name}: {exc}")
+            continue
+        states.append(
+            {
+                "name": name,
+                "kind": kind,
+                "quota": quota,
+                "kept": 0,
+                "scanned": 0,
+                "it": it,
+            }
+        )
 
-    print(f"Wrote {written} examples to {out_path}")
+    scan_cap = args.max_scan_multiplier
+    while states:
+        active = [
+            s
+            for s in states
+            if s["kept"] < s["quota"] and s["scanned"] < s["quota"] * scan_cap
+        ]
+        if not active:
+            break
+        weights = [s["quota"] - s["kept"] for s in active]
+        s = rng.choices(active, weights=weights, k=1)[0]
+        s["scanned"] += 1
+        try:
+            row = next(s["it"])
+        except StopIteration:
+            states = [x for x in states if x is not s]
+            print(f"{s['name']}: stream exhausted at {s['kept']}/{s['quota']}")
+            continue
+        except Exception as exc:
+            print(f"stop {s['name']}: {exc}")
+            states = [x for x in states if x is not s]
+            continue
+        text = row_to_text(tokenizer, row, s["kind"])
+        if not text or len(text) < 80:
+            continue
+        lines.append(json.dumps({"text": text}, ensure_ascii=True) + "\n")
+        s["kept"] += 1
+
+    for s in states:
+        print(f"{s['name']}: wrote {s['kept']}/{s['quota']}")
+
+    if args.shuffle:
+        rng.shuffle(lines)
+
+    out_path.write_text("".join(lines), encoding="utf-8")
+    print(f"Wrote {len(lines)} examples to {out_path}")
 
 
 if __name__ == "__main__":

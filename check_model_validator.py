@@ -14,6 +14,9 @@ Use --offline-eval to use the local climbmix sampler (legacy) instead.
 Requirements:
     pip install click huggingface_hub transformers safetensors
 
+Private models: set HF_TOKEN (or HUGGING_FACE_HUB_TOKEN), or pass --hf-token, or use
+``huggingface-cli login`` so the hub can resolve credentials (token=True).
+
 For --eval mode (optional):
     pip install torch datasets  # + CUDA GPU
 
@@ -40,9 +43,23 @@ import hashlib
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import click
+
+
+def _resolve_hf_hub_token(explicit: Optional[str]) -> Union[bool, str]:
+    """Token for huggingface_hub / transformers: env, --hf-token, else True (CLI cache)."""
+    if explicit:
+        return explicit.strip()
+    env = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or ""
+    ).strip()
+    if env:
+        return env
+    return True
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,6 +171,11 @@ def check_info(name: str, detail: str = ""):
               help="King model repo (default: king_model from --validator-h2h-url)")
 @click.option("--king-revision", default=None,
               help="King model revision")
+@click.option(
+    "--hf-token",
+    default=None,
+    help="Hugging Face access token (or set HF_TOKEN / HUGGING_FACE_HUB_TOKEN env)",
+)
 def main(
     model_repo,
     revision,
@@ -166,6 +188,7 @@ def main(
     validator_h2h_url,
     king_repo,
     king_revision,
+    hf_token,
 ):
     """
     Comprehensive pre-submission checker for Distil SN97.
@@ -174,6 +197,10 @@ def main(
     whether your model will be accepted or rejected.
     """
     from huggingface_hub import model_info as hf_model_info, hf_hub_download, repo_info
+
+    hub_token = _resolve_hf_hub_token(hf_token)
+    if isinstance(hub_token, str) and hub_token:
+        os.environ["HF_TOKEN"] = hub_token
 
     max_params_b = TEACHER_TOTAL_PARAMS_B * MAX_PARAM_RATIO
     max_model_bytes = max_params_b * 2.2e9
@@ -189,7 +216,7 @@ def main(
     # ── Resolve revision ────────────────────────────────────────────────
     if not revision:
         try:
-            info = repo_info(model_repo, repo_type="model")
+            info = repo_info(model_repo, repo_type="model", token=hub_token)
             revision = info.sha
             print(f"  Pinned revision: {revision[:12]}...")
         except Exception as e:
@@ -203,10 +230,18 @@ def main(
     # ══════════════════════════════════════════════════════════════════════
     banner("CHECK 1: Repository Accessibility")
     try:
-        info = hf_model_info(model_repo, revision=revision, files_metadata=True)
+        info = hf_model_info(
+            model_repo, revision=revision, files_metadata=True, token=hub_token
+        )
         if info.private:
-            check_fail("Public access", "Model is PRIVATE — must be public")
-            failures.append(("accessibility", "Model is private"))
+            check_warn(
+                "Private repository",
+                "Authenticated access OK for this pre-check; on-chain submission "
+                "usually requires the model repo to be public.",
+            )
+            warnings.append(
+                ("accessibility", "Private repo — make public before submitting if required"),
+            )
         elif info.disabled:
             check_fail("Public access", "Model is DISABLED on HuggingFace")
             failures.append(("accessibility", "Model is disabled"))
@@ -316,7 +351,10 @@ def main(
     banner("CHECK 4: Model Configuration")
     try:
         config_path = hf_hub_download(
-            repo_id=model_repo, filename="config.json", revision=revision
+            repo_id=model_repo,
+            filename="config.json",
+            revision=revision,
+            token=hub_token,
         )
         with open(config_path) as f:
             config = json.load(f)
@@ -428,13 +466,25 @@ def main(
     try:
         from transformers import AutoTokenizer
 
-        teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+        teacher_tok = AutoTokenizer.from_pretrained(
+            TEACHER_MODEL, trust_remote_code=True, token=hub_token
+        )
         try:
-            student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
+            student_tok = AutoTokenizer.from_pretrained(
+                model_repo,
+                revision=revision,
+                trust_remote_code=False,
+                token=hub_token,
+            )
         except Exception:
             # Some tokenizers need trust_remote_code or have custom backends
             # The validator also allows this with a warning, so we do the same
-            student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=True)
+            student_tok = AutoTokenizer.from_pretrained(
+                model_repo,
+                revision=revision,
+                trust_remote_code=True,
+                token=hub_token,
+            )
 
         test_strings = [
             "The quick brown fox jumps over the lazy dog.",
@@ -503,7 +553,9 @@ def main(
     try:
         from eval.model_checker import verify_model_integrity
 
-        integrity = verify_model_integrity(model_repo, revision)
+        integrity = verify_model_integrity(
+            model_repo, revision, allow_private=True,
+        )
         if integrity["pass"]:
             check_pass("Integrity", "Model accessible and weights verifiable")
         else:
@@ -578,7 +630,9 @@ def main(
 
         # ── Load tokenizer (teacher) ─────────────────────────────────
         banner("Loading Teacher Model")
-        teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+        teacher_tok = AutoTokenizer.from_pretrained(
+            TEACHER_MODEL, trust_remote_code=True, token=hub_token
+        )
 
         # ── Prompts: live eval-data OR offline climbmix ──────────────
         banner("Sampling Eval Prompts")
@@ -740,6 +794,7 @@ def main(
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=True,
+                token=hub_token,
             )
             teacher.eval()
             print(f"  Teacher loaded in {time.time() - t0:.1f}s")
@@ -842,6 +897,7 @@ def main(
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=False,
+            token=hub_token,
         )
         student.eval()
         load_time = time.time() - t0
@@ -967,6 +1023,7 @@ def main(
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=False,
+                token=hub_token,
             )
             king.eval()
 

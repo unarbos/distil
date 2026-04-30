@@ -43,7 +43,9 @@ def model_info(model_repo, revision=None, files_metadata=False, token=None, **kw
     working. ``token`` defaults to the validator's ``HF_TOKEN`` so we don't
     have to touch 5+ existing call sites.
     """
-    effective_token = token if token is not None else _HF_TOKEN
+    # Prefer explicit token, then HF_TOKEN env, else True so huggingface_hub can
+    # use the CLI cache / netrc (needed for private repos without env export).
+    effective_token = token if token is not None else (_HF_TOKEN if _HF_TOKEN else True)
     last_exc = None
     for attempt, delay in enumerate((0.0,) + _MODEL_INFO_RETRY_DELAYS):
         if delay:
@@ -449,10 +451,13 @@ def verify_model_integrity(
     model_repo: str,
     revision: str = None,
     expected_hash: Optional[str] = None,
+    *,
+    allow_private: bool = False,
 ) -> dict:
     """
     Pre-weight-setting integrity check:
-    1. Model is still publicly accessible on HuggingFace
+    1. Model is reachable on HuggingFace (public by default; private only if
+       allow_private=True and your token can access the repo)
     2. Repo revision hasn't changed since commitment (git SHA match)
     3. Falls back to weight hash if no stored revision SHA
 
@@ -461,13 +466,15 @@ def verify_model_integrity(
       reason: str
       current_hash: str or None  (git SHA of repo HEAD, or weight hash for legacy)
     """
-    cache_key = (model_repo, revision or "", expected_hash or "")
+    cache_key = (model_repo, revision or "", expected_hash or "", allow_private)
     cached = _INTEGRITY_CACHE.get(cache_key)
     if cached is not None:
         result, ts = cached
         if (time.time() - ts) < _INTEGRITY_CACHE_TTL and result.get("pass") and not result.get("transient"):
             return dict(result)  # copy so callers can't mutate cache
-    result = _verify_model_integrity_uncached(model_repo, revision, expected_hash)
+    result = _verify_model_integrity_uncached(
+        model_repo, revision, expected_hash, allow_private=allow_private,
+    )
     if result.get("pass") and not result.get("transient"):
         _INTEGRITY_CACHE[cache_key] = (dict(result), time.time())
     return result
@@ -477,17 +484,28 @@ def _verify_model_integrity_uncached(
     model_repo: str,
     revision: str = None,
     expected_hash: Optional[str] = None,
+    *,
+    allow_private: bool = False,
 ) -> dict:
     """Inner impl — see ``verify_model_integrity`` for contract."""
     try:
-        # 1. Check model is still public (HEAD request to repo)
+        # 1. Check model is reachable (validator precheck: public only unless allow_private)
         info = model_info(model_repo, revision=revision)
         if info.private:
-            return {
-                "pass": False,
-                "reason": f"Model {model_repo} is now private — must be public for transparency",
-                "current_hash": None,
-            }
+            if allow_private:
+                logger.info(
+                    "Integrity: %s is private but accessible with current credentials "
+                    "(allow_private=True; on-chain may still require public)",
+                    model_repo,
+                )
+            else:
+                return {
+                    "pass": False,
+                    "reason": (
+                        f"Model {model_repo} is now private — must be public for transparency"
+                    ),
+                    "current_hash": None,
+                }
         if info.disabled:
             return {
                 "pass": False,
