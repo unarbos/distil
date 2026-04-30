@@ -55,7 +55,14 @@ except (TypeError, ValueError):
 MAX_PROMPT_TOKENS = VALIDATOR["maxPromptTokens"]
 EVAL_PROMPTS_FULL = VALIDATOR["evalPromptsFull"]
 EVAL_PROMPTS_H2H = VALIDATOR["evalPromptsH2h"]
-VLLM_CONCURRENCY = VALIDATOR["vllmConcurrency"]
+_ENV_VLLM_CONCURRENCY = os.environ.get("DISTIL_VLLM_CONCURRENCY")
+try:
+    VLLM_CONCURRENCY = (
+        int(_ENV_VLLM_CONCURRENCY)
+        if _ENV_VLLM_CONCURRENCY else int(VALIDATOR["vllmConcurrency"])
+    )
+except (TypeError, ValueError):
+    VLLM_CONCURRENCY = int(VALIDATOR["vllmConcurrency"])
 EPSILON = VALIDATOR["epsilon"]
 PAIRED_TEST_ALPHA = VALIDATOR["pairedTestAlpha"]
 STALE_H2H_EPOCHS = VALIDATOR["staleH2hEpochs"]

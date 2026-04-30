@@ -14033,7 +14033,7 @@ def _teacher_cache_complete(model_name, revision=None):
     return True
 
 
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384, revision=None, tensor_parallel_size=1, _attempt=1):
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=8192, revision=None, tensor_parallel_size=1, _attempt=1):
     """Start vLLM server via subprocess. Returns True on success. Retries once on crash."""
     ensure_disk_space(model_name, threshold=80)
 
@@ -14070,6 +14070,21 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
     except Exception as e:
         print(f"[vllm] preprocessor stub failed (non-fatal): {e}", flush=True)
 
+    # 2026-04-30 (v30.3.2): cap concurrent KV-cache slots to prevent the
+    # crash-loop we saw on Qwen3.6-35B-A3B at 48-way concurrency on a
+    # single H200 (140GB). vLLM v0.6+ "AsyncEngineDeadError" / port-9100
+    # connection-refused mid-eval is the symptom of KV-cache thrashing
+    # when (concurrent_seqs × per-seq KV) ≥ available VRAM minus weights.
+    # 70GB weights + 0.85 util on 140GB = 49GB for KV, which fits ~32
+    # concurrent 4k-token streams comfortably. We size max_num_seqs to
+    # this budget so vLLM queues the rest internally instead of OOM-ing.
+    # Override via DISTIL_VLLM_MAX_NUM_SEQS for tuning.
+    max_num_seqs = int(os.environ.get("DISTIL_VLLM_MAX_NUM_SEQS", "32") or 32)
+    # The default util is 0.65 (left over from earlier T4/A100 tests).
+    # On H200 / multi-GPU pods we have headroom — bump the floor so the
+    # KV cache actually has room. Caller can still pass an explicit value.
+    if gpu_memory_utilization is None or gpu_memory_utilization < 0.7:
+        gpu_memory_utilization = 0.85
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_name,
@@ -14079,6 +14094,7 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--dtype", "bfloat16",
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", str(max_model_len),
+        "--max-num-seqs", str(max_num_seqs),
         "--enable-prefix-caching",
         "--no-enable-log-requests",
         "--reasoning-parser", "qwen3",
@@ -14818,7 +14834,7 @@ def main():
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
-    parser.add_argument("--vllm-max-model-len", type=int, default=16384)
+    parser.add_argument("--vllm-max-model-len", type=int, default=8192)
     parser.add_argument("--logprobs-k", type=int, default=128,
                         help="Top-k logprobs to store (128=sparse, 0=full vocab). Default 128.")
     parser.add_argument("--hf-batch-size", type=int, default=2,
