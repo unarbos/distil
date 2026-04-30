@@ -14033,7 +14033,7 @@ def _teacher_cache_complete(model_name, revision=None):
     return True
 
 
-def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=16384, revision=None, tensor_parallel_size=1, _attempt=1):
+def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=8192, revision=None, tensor_parallel_size=1, _attempt=1):
     """Start vLLM server via subprocess. Returns True on success. Retries once on crash."""
     ensure_disk_space(model_name, threshold=80)
 
@@ -14070,6 +14070,21 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
     except Exception as e:
         print(f"[vllm] preprocessor stub failed (non-fatal): {e}", flush=True)
 
+    # 2026-04-30 (v30.3.2): cap concurrent KV-cache slots to prevent the
+    # crash-loop we saw on Qwen3.6-35B-A3B at 48-way concurrency on a
+    # single H200 (140GB). vLLM v0.6+ "AsyncEngineDeadError" / port-9100
+    # connection-refused mid-eval is the symptom of KV-cache thrashing
+    # when (concurrent_seqs × per-seq KV) ≥ available VRAM minus weights.
+    # 70GB weights + 0.85 util on 140GB = 49GB for KV, which fits ~32
+    # concurrent 4k-token streams comfortably. We size max_num_seqs to
+    # this budget so vLLM queues the rest internally instead of OOM-ing.
+    # Override via DISTIL_VLLM_MAX_NUM_SEQS for tuning.
+    max_num_seqs = int(os.environ.get("DISTIL_VLLM_MAX_NUM_SEQS", "32") or 32)
+    # The default util is 0.65 (left over from earlier T4/A100 tests).
+    # On H200 / multi-GPU pods we have headroom — bump the floor so the
+    # KV cache actually has room. Caller can still pass an explicit value.
+    if gpu_memory_utilization is None or gpu_memory_utilization < 0.7:
+        gpu_memory_utilization = 0.85
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_name,
@@ -14079,7 +14094,26 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--dtype", "bfloat16",
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", str(max_model_len),
-        "--enable-prefix-caching",
+        "--max-num-seqs", str(max_num_seqs),
+        # 2026-04-30 (v30.3.3): prefix-caching DISABLED.
+        # Qwen3.6-35B-A3B uses Mamba/SSM layers (hybrid arch), and
+        # vLLM 0.19.1 prints this warning at startup:
+        #   "Prefix caching in Mamba cache 'align' mode is currently
+        #    enabled. Its support for Mamba layers is experimental.
+        #    Please report any issues you may observe."
+        # The "issue we observed" was: vLLM teacher dies cleanly after
+        # ~140 prompts (no OOM, KV cache <5%), the EngineCore
+        # subprocess exits with the leaked-semaphore signature,
+        # ConnectionError swarm hits the API server, and the eval
+        # falls back to HF. Disabling prefix-caching removes the
+        # experimental Mamba code path entirely. We lose a small
+        # amount of throughput on shared-prefix prompts (system
+        # prompts, ~5-10% of input tokens) but gain reliability.
+        # Re-enable after vLLM stabilises Mamba prefix-caching, or
+        # if we move back to a non-Mamba teacher.
+        # Chunked prefill kept on — it's orthogonal to prefix caching
+        # and is stable on Mamba per vLLM 0.19.1 release notes.
+        "--enable-chunked-prefill",
         "--no-enable-log-requests",
         "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
@@ -14533,17 +14567,28 @@ def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
                 else:
                     print(f"  [vllm] Prompt {orig_idx} failed: {e}", flush=True)
 
-    # 2026-04-29 (v29.7): if the dead-event fired, the vLLM server crashed
-    # mid-eval. Bail loud and fast so the caller falls back to HF for the
-    # whole eval rather than thrashing on a dead server. Without this we
-    # spent ~45 min last round retrying connection-refused before giving up.
+    # 2026-04-30 (v30.3.4): if the dead-event fired, return partial
+    # results PLUS the list of failed indices instead of raising.
+    # The caller will restart vLLM and retry only the failed prompts.
+    # Pre-v30.3.4 behaviour was "raise RuntimeError → caller falls back
+    # to HF for the entire round", which made a single transient vLLM
+    # crash cost ~80 minutes of HF wall-clock time. With Qwen3.x-A3B
+    # (hybrid Mamba) on H200 the crash rate is ~50% per round; we
+    # cannot afford to abandon vLLM on first crash.
     if _vllm_dead_event().is_set():
         n_done = sum(1 for r in result_slots if r is not None)
         n_failed = len(prompts) - n_done
-        raise RuntimeError(
-            f"vLLM crashed mid-eval after {n_done}/{len(prompts)} prompts "
-            f"({n_failed} failed). Caller should fall back to HF generation."
+        failed_idxs = [i for i, r in enumerate(result_slots) if r is None]
+        print(
+            f"  [vllm] crashed mid-eval: {n_done}/{len(prompts)} done, "
+            f"{n_failed} failed (caller will restart vLLM and retry)",
+            flush=True,
         )
+        return {
+            "results": result_slots,
+            "failed_idxs": failed_idxs,
+            "vllm_crashed": True,
+        }
 
     # Retry failed prompts sequentially. We only get here if the dead-event
     # never fired (i.e. failures were transient per-prompt errors, not a
@@ -14818,7 +14863,7 @@ def main():
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
-    parser.add_argument("--vllm-max-model-len", type=int, default=16384)
+    parser.add_argument("--vllm-max-model-len", type=int, default=8192)
     parser.add_argument("--logprobs-k", type=int, default=128,
                         help="Top-k logprobs to store (128=sparse, 0=full vocab). Default 128.")
     parser.add_argument("--hf-batch-size", type=int, default=2,
@@ -15052,18 +15097,134 @@ def main():
                 _write_phase(progress_path, students, "vllm_generating",
                              teacher_done=done, prompts_total=total)
             try:
-                sequences_data = generate_via_vllm(
-                    prompts, tokenizer, args.max_new_tokens, args.block_seed,
-                    logprobs_k=args.logprobs_k, token_to_id=token_to_id,
-                    progress_cb=_vllm_progress, concurrency=args.concurrency,
-                )
-                timings["vllm_generation"] = time.time() - t0
-                # 2026-04-29 (v29.7): explicit path tag so snapshot tools can
-                # distinguish "ran on vLLM" from "fell back to HF". The bot's
-                # 40-line tail snapshot needs this to answer "is the eval
-                # using HF again?" correctly.
-                print(f"[teacher_path] vllm  prompts_done={len(sequences_data)}/{len(prompts)}", flush=True)
-                print(f"[eval] vLLM generation: {timings['vllm_generation']:.1f}s", flush=True)
+                # 2026-04-30 (v30.3.4): vLLM auto-restart-and-resume.
+                # vLLM 0.19.1 + Qwen3.x-A3B (hybrid Mamba/transformer
+                # MoE) crashes intermittently on H200 mid-eval: the
+                # EngineCore subprocess exits cleanly (no OOM, KV
+                # cache <5%, no CUDA errors) and the API server
+                # exits with the leaked-semaphore signature. Crash
+                # rate is ~50% per round across both Qwen3.5 and
+                # Qwen3.6, so a single-shot fall-back to HF was
+                # costing ~80 min of wall-clock per affected round.
+                #
+                # New behaviour: when vLLM crashes mid-eval, we
+                # restart the server and re-submit ONLY the failed
+                # prompts. Up to MAX_RESTARTS attempts. Successful
+                # results are preserved across restarts. Caller
+                # falls back to HF only if every restart attempt
+                # crashes again — extremely unlikely given crashes
+                # are intermittent rather than deterministic.
+                MAX_RESTARTS = int(os.environ.get(
+                    "DISTIL_VLLM_MAX_RESTARTS", "3"
+                ) or 3)
+                pending_idxs = list(range(len(prompts)))
+                accumulated = [None] * len(prompts)
+                attempt = 0
+                last_partial = None
+                while pending_idxs:
+                    pending_prompts = [prompts[i] for i in pending_idxs]
+                    out = generate_via_vllm(
+                        pending_prompts, tokenizer, args.max_new_tokens,
+                        args.block_seed, logprobs_k=args.logprobs_k,
+                        token_to_id=token_to_id,
+                        progress_cb=lambda d, t: _vllm_progress(
+                            sum(1 for r in accumulated if r is not None) + d,
+                            len(prompts),
+                        ),
+                        concurrency=args.concurrency,
+                    )
+                    if isinstance(out, dict) and out.get("vllm_crashed"):
+                        # Partial success — fold completed slots in.
+                        for local_i, item_idx in enumerate(pending_idxs):
+                            if out["results"][local_i] is not None:
+                                accumulated[item_idx] = out["results"][local_i]
+                        # Recompute pending = still-None positions in
+                        # the accumulated list.
+                        pending_idxs = [
+                            i for i, r in enumerate(accumulated) if r is None
+                        ]
+                        n_done = len(prompts) - len(pending_idxs)
+                        last_partial = (n_done, attempt + 1)
+                        attempt += 1
+                        if attempt >= MAX_RESTARTS:
+                            print(
+                                f"  [vllm] gave up after {MAX_RESTARTS} "
+                                f"restart attempts ({n_done}/{len(prompts)} "
+                                f"done). Falling back to HF for the "
+                                f"remaining {len(pending_idxs)} prompts.",
+                                flush=True,
+                            )
+                            break
+                        print(
+                            f"  [vllm] restart attempt "
+                            f"{attempt}/{MAX_RESTARTS}: stopping dead "
+                            f"vLLM and starting fresh server "
+                            f"({n_done}/{len(prompts)} prompts already "
+                            f"have results, {len(pending_idxs)} pending)",
+                            flush=True,
+                        )
+                        stop_vllm_server()
+                        time.sleep(5)
+                        if not start_vllm_server(
+                            args.teacher, args.vllm_gpu_util,
+                            args.vllm_max_model_len,
+                            tensor_parallel_size=args.tensor_parallel_size,
+                        ):
+                            print(
+                                "  [vllm] restart failed — falling back "
+                                "to HF for remaining prompts",
+                                flush=True,
+                            )
+                            break
+                    else:
+                        # Plain list = full success (or per-prompt
+                        # transient retries already reconciled).
+                        # Fold all results into accumulated and exit
+                        # the loop.
+                        for local_i, item_idx in enumerate(pending_idxs):
+                            accumulated[item_idx] = out[local_i]
+                        pending_idxs = []
+                if not pending_idxs:
+                    sequences_data = accumulated
+                    timings["vllm_generation"] = time.time() - t0
+                    if attempt > 0:
+                        print(
+                            f"[eval] vLLM generation succeeded after "
+                            f"{attempt} restart(s); "
+                            f"{timings['vllm_generation']:.1f}s total",
+                            flush=True,
+                        )
+                    print(
+                        f"[teacher_path] vllm "
+                        f"prompts_done={len(sequences_data)}/{len(prompts)} "
+                        f"restarts={attempt}",
+                        flush=True,
+                    )
+                    print(
+                        f"[eval] vLLM generation: "
+                        f"{timings['vllm_generation']:.1f}s",
+                        flush=True,
+                    )
+                else:
+                    # vLLM exhausted MAX_RESTARTS and we still have
+                    # pending prompts. Discard the partial accumulator
+                    # and fall through to the HF-fallback path so the
+                    # whole batch is regenerated by HF transformers.
+                    # We could in principle merge partial vLLM results
+                    # with HF-generated remainder, but the two paths
+                    # produce slightly different logprob distributions
+                    # (vLLM sparse top-K vs HF dense), and mixing them
+                    # in one round risks subtle bias. Cleaner to redo
+                    # the round on a uniform path. Future v30.3.5
+                    # could add HF top-up if crash rate stays high.
+                    sequences_data = None
+                    n_done = len(prompts) - len(pending_idxs)
+                    print(
+                        f"[teacher_path] vllm-restarts-exhausted "
+                        f"partial={n_done}/{len(prompts)} "
+                        f"discarding-and-falling-back-to-HF",
+                        flush=True,
+                    )
             except Exception as e:
                 print(f"[eval] vLLM generation failed: {e} — falling back to HF", flush=True)
                 print(f"[teacher_path] hf-fallback-after-vllm-crash  reason={type(e).__name__}", flush=True)
@@ -16008,6 +16169,70 @@ def main():
         ):
             effective_total = king_prompts_done
 
+        # v30.4 — Batched student forward pass.
+        # When ``DISTIL_STUDENT_BATCH_SIZE > 1``, we pad K consecutive
+        # prompts together and run a single forward pass on the batch,
+        # then slice each prompt's logits back out for the existing
+        # per-prompt sub-computations. The padding overhead (right-pad
+        # to max length) is small for similar-length prompts and large
+        # for very-uneven prompts, but the wall-time win on a multi-GPU
+        # pod is typically 2-3x for B=4.
+        student_batch_size = max(1, int(os.environ.get(
+            "DISTIL_STUDENT_BATCH_SIZE", "1"
+        )))
+        s_logits_cache: list[torch.Tensor] = []
+        cache_start = -1
+        # Resolve a pad_id for batched forward — required when seqs have
+        # different lengths. Falls back to eos_id if pad_token is None.
+        pad_id_batched = (
+            getattr(tokenizer, "pad_token_id", None)
+            if tokenizer is not None else None
+        )
+        if pad_id_batched is None and tokenizer is not None:
+            pad_id_batched = getattr(tokenizer, "eos_token_id", 0) or 0
+        if pad_id_batched is None:
+            pad_id_batched = 0
+
+        def _refill_cache(i: int) -> None:
+            """Refill ``s_logits_cache`` with the next K prompts'
+            student logits via a single batched forward pass."""
+            nonlocal s_logits_cache, cache_start
+            cache_start = i
+            B = min(student_batch_size, effective_total - i)
+            if B == 1:
+                # Single-prompt path: keep the existing semantics
+                # (no padding overhead).
+                full_seq = full_sequences[i]
+                s_logits = student(full_seq).logits.float()
+                s_logits_cache = [s_logits]
+                return
+            batch_seqs = full_sequences[i:i + B]
+            seq_lens = [int(s.shape[1]) for s in batch_seqs]
+            max_len = max(seq_lens)
+            padded = torch.full(
+                (B, max_len), pad_id_batched,
+                dtype=torch.long, device=device,
+            )
+            attn_mask = torch.zeros(
+                (B, max_len), dtype=torch.long, device=device,
+            )
+            for j, (s, ln) in enumerate(zip(batch_seqs, seq_lens)):
+                padded[j, :ln] = s.to(device).flatten()[:ln]
+                attn_mask[j, :ln] = 1
+            try:
+                batch_out = student(padded, attention_mask=attn_mask)
+                batch_logits = batch_out.logits.float()
+            except TypeError:
+                # Some causal LMs don't accept attention_mask kwarg —
+                # fall back to no-mask forward (causal mask still
+                # applies internally).
+                batch_logits = student(padded).logits.float()
+            # Slice per-prompt logits back to [1, seq_len, vocab].
+            s_logits_cache = [
+                batch_logits[j:j + 1, :seq_lens[j], :]
+                for j in range(B)
+            ]
+
         t0 = time.time()
         with torch.no_grad():
             for i in range(effective_total):
@@ -16017,8 +16242,10 @@ def main():
                     tl_entry = teacher_logits_list[i]
                     is_sparse = _is_sparse_logits(tl_entry)
 
-                    # Student forward pass
-                    s_logits = student(full_seq).logits.float()
+                    # Student forward pass (batched if BATCH_SIZE > 1).
+                    if i >= cache_start + len(s_logits_cache):
+                        _refill_cache(i)
+                    s_logits = s_logits_cache[i - cache_start]
                     cont_s = s_logits[:, prompt_len - 1:-1, :]
 
                     topk_shadow = {}

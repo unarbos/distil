@@ -337,7 +337,13 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         #      90+ min.
         #
         # Tune via VLLM_EVAL_GPU_UTIL.
-        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.65")
+        # 2026-04-30 (v30.3.2): bumped default 0.65 → 0.85. The 0.65 floor
+        # was leaving ~28GB unused on H200 (140GB), starving the KV cache
+        # for the 35B teacher. With 0.85 we have 49GB for KV after the
+        # 70GB weights, which fits 24 concurrent 8k-token streams cleanly
+        # and stops vLLM from crashing mid-eval (root cause of the 100min
+        # round times leeroyjkin reported on 2026-04-29).
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.85")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"

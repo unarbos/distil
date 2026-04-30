@@ -47,10 +47,10 @@ Miners submit distilled models and a validator scores each commitment on a **mul
 
 - **Teacher-similarity axes**: KL, on-policy RKL, top-K overlap, IS-KL (unbiased), forking-RKL, teacher-trace plausibility, entropy-aware KL, tail-decoupled KL
 - **Skill-group axes** (v30.2 — collapse without losing depth):
-  - `code_skill_group` = mean of {code_bench, mbpp_bench, debug_bench, correction_bench, refactor_bench}
-  - `math_skill_group` = mean of {math_bench, aime_bench, robustness_bench}
-  - `reasoning_skill_group` = mean of {reasoning_bench, multi_doc_synthesis_bench, long_context_bench}
-  - `knowledge_skill_group` = mean of {knowledge_bench, pragmatic_bench}
+  - `code_skill_group` = mean of {{code_bench, mbpp_bench, debug_bench, correction_bench, refactor_bench}}
+  - `math_skill_group` = mean of {{math_bench, aime_bench, robustness_bench}}
+  - `reasoning_skill_group` = mean of {{reasoning_bench, multi_doc_synthesis_bench, long_context_bench}}
+  - `knowledge_skill_group` = mean of {{knowledge_bench, pragmatic_bench}}
 - **Stand-alone capability axes**: tool_use_bench, ifeval_bench, calibration_bench
 - **Quality axes**: judge_probe (short answers), long_form_judge (300-500 word essays), chat_turns_probe (3-turn coherence)
 - **Discipline axes**: length, degeneracy, capability, reasoning_density
