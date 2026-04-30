@@ -14095,13 +14095,24 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
         "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--max-model-len", str(max_model_len),
         "--max-num-seqs", str(max_num_seqs),
-        "--enable-prefix-caching",
-        # 2026-04-30 (v30.3.2): chunked prefill interleaves prefill and
-        # decode tokens in the same step, which is a strict throughput
-        # improvement for variable-length prompts (our workload mixes
-        # ~200-token bench items with 4k-token long-context probes in
-        # the same round). Default-on in vLLM 0.6+ but explicitly
-        # setting it documents intent.
+        # 2026-04-30 (v30.3.3): prefix-caching DISABLED.
+        # Qwen3.6-35B-A3B uses Mamba/SSM layers (hybrid arch), and
+        # vLLM 0.19.1 prints this warning at startup:
+        #   "Prefix caching in Mamba cache 'align' mode is currently
+        #    enabled. Its support for Mamba layers is experimental.
+        #    Please report any issues you may observe."
+        # The "issue we observed" was: vLLM teacher dies cleanly after
+        # ~140 prompts (no OOM, KV cache <5%), the EngineCore
+        # subprocess exits with the leaked-semaphore signature,
+        # ConnectionError swarm hits the API server, and the eval
+        # falls back to HF. Disabling prefix-caching removes the
+        # experimental Mamba code path entirely. We lose a small
+        # amount of throughput on shared-prefix prompts (system
+        # prompts, ~5-10% of input tokens) but gain reliability.
+        # Re-enable after vLLM stabilises Mamba prefix-caching, or
+        # if we move back to a non-Mamba teacher.
+        # Chunked prefill kept on — it's orthogonal to prefix caching
+        # and is stable on Mamba per vLLM 0.19.1 release notes.
         "--enable-chunked-prefill",
         "--no-enable-log-requests",
         "--reasoning-parser", "qwen3",
