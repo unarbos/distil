@@ -14096,6 +14096,13 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
         "--max-model-len", str(max_model_len),
         "--max-num-seqs", str(max_num_seqs),
         "--enable-prefix-caching",
+        # 2026-04-30 (v30.3.2): chunked prefill interleaves prefill and
+        # decode tokens in the same step, which is a strict throughput
+        # improvement for variable-length prompts (our workload mixes
+        # ~200-token bench items with 4k-token long-context probes in
+        # the same round). Default-on in vLLM 0.6+ but explicitly
+        # setting it documents intent.
+        "--enable-chunked-prefill",
         "--no-enable-log-requests",
         "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
