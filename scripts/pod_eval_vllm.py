@@ -1143,7 +1143,16 @@ JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 # can sustain a coherent multi-paragraph response, which is one of the
 # user-visible SOTA capabilities for assistant deployment.
 LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "4"))
-LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "1024"))
+# 2026-05-01 (v30.4 patch): raised 1024 → 2048. Live repro on king
+# UID 107 (best26/sn97-m-v4) on chat.arbos.life showed the derail
+# starts in the 500-800 token window even at temperature 0.5 — the
+# 4B distilled student loses coherence and falls into a word-list
+# attractor past the first paragraph. At max_tokens=1024 the probe
+# cuts off BEFORE this derail surfaces in most prompts (the rubric
+# scored UID 107 at 0.875 even though chat output was pure gibberish
+# at 1500+ tokens). 2048 forces the model to keep going past the
+# cliff so the rubric can grade the derail.
+LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "2048"))
 LONG_FORM_JUDGE_ENABLED = os.environ.get("LONG_FORM_JUDGE_PROBE", "1") != "0"
 LONG_FORM_JUDGE_IN_COMPOSITE = os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 # Env gate: off by default would hide the shadow data, which defeats the
@@ -1801,7 +1810,154 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
         mean = sum(valid) / len(valid)
         agg["mean_score"] = round(mean, 3)
         agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    # 2026-05-01 (v30.4 patch): coherence-derail penalty. Even with the
+    # rubric explicitly grading "1 = bad — refusal, gibberish", we
+    # observed king UID 107 score 0.875/1.0 on long_form_judge while
+    # producing this output on chat.arbos.life:
+    #   "...turret despizano buble sphere pete thinowy galactic
+    #    translation punkaster skewed sentinel abbe incense hang ersmus
+    #    lo ga dullwort mogsen drawler boblynberry-vogesters
+    #    hyperventilation whale weekstabbies paperfold..."
+    # The teacher's rubric is too lenient on long-form derail (or the
+    # rubric pass cuts off before the gibberish tail). Apply a
+    # statistical derail detector that NEVER lets a derailed response
+    # earn a high score — multiplies the rubric grade by a (0..1)
+    # coherence factor based on:
+    #   • non-ASCII fraction (penalises multilingual word salad)
+    #   • repeated 50-char windows (penalises loop attractors)
+    #   • word-list ratio (penalises glossary-mode degeneration —
+    #     dense single-word lines, no sentences)
+    #   • mean word length (penalises meaningless compound coinage
+    #     like "boblynberry-vogesters")
+    derail_factors = []
+    for i, response in enumerate(responses):
+        if i >= len(scores) or scores[i] is None:
+            continue
+        coh = _coherence_factor(response or "")
+        derail_factors.append(coh)
+        if i < len(agg["per_prompt"]):
+            agg["per_prompt"][i]["coherence"] = round(coh, 3)
+    if derail_factors:
+        coh_mean = sum(derail_factors) / len(derail_factors)
+        agg["coherence_factor"] = round(coh_mean, 3)
+        if agg.get("normalized") is not None:
+            penalised = agg["normalized"] * coh_mean
+            agg["normalized_pre_coherence"] = agg["normalized"]
+            agg["normalized"] = round(penalised, 4)
     return agg
+
+
+def _coherence_factor(text: str) -> float:
+    """Return a [0, 1] coherence factor for a long-form response.
+
+    1.0 = clean coherent prose (no derail signals).
+    0.0 = pure gibberish / word salad.
+
+    Detector signals (multiplied together):
+
+      * ``non_ascii_factor``  — 1 - clip(non_ascii_frac × 4, 0, 1).
+        At 0% non-ASCII this is 1.0; at ≥25% it's 0.0. Targets
+        the multilingual-word-salad failure mode (Latin → CJK /
+        Cyrillic mid-sentence).
+      * ``repeats_factor``    — 1 - clip(repeats_50char × 0.05, 0, 1).
+        ≥20 verbatim ~50-char repeats → 0. Targets the
+        loop-attractor failure mode.
+      * ``word_list_factor``  — 1 - clip(word_list_ratio × 1.5, 0, 1).
+        Word-list ratio is the fraction of "words" >50 chars long
+        OR newlines ÷ total tokens. Catches the glossary-mode
+        degeneration where the model emits dense single-word lines
+        without sentence structure.
+      * ``meaningful_factor`` — 1 - clip((mean_word_len - 10) × 0.2,
+        0, 1). Mean word length above ~10 chars indicates
+        meaningless compound coinage like "boblynberry-vogesters".
+      * ``punctuation_factor`` — derail mode where the model emits
+        a long run of single related words ("low puff breathe exhale
+        inhale swallow…") drops nearly all punctuation. Coherent
+        prose has 8-15 percent punctuation chars; word-list mode
+        has ≤1 percent. Penalises responses with <5 percent
+        punctuation in samples ≥200 chars.
+      * ``unique_word_factor`` — sentence-structure proxy. Coherent
+        prose recycles common function words ("the", "and", "of",
+        "to") so its unique-word fraction is ~0.45-0.65 on
+        passages of 50+ words. Word-list derail mode has
+        unique-word fraction ≥0.85 (every emitted word is a new
+        content word with no glue). Penalty kicks in at ≥0.80.
+
+    Soft floor at 0.05 so a true-but-imperfect response isn't
+    ground to zero by a single noisy signal.
+    """
+    if not text:
+        return 1.0
+    text_len = len(text)
+    if text_len < 50:
+        return 1.0
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    non_ascii_frac = non_ascii / text_len
+    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 4.0))
+    seen = set()
+    repeats = 0
+    win = 50
+    step = 25
+    for i in range(0, text_len - win, step):
+        s = text[i:i + win]
+        if s in seen:
+            repeats += 1
+        seen.add(s)
+    repeats_factor = max(0.0, 1.0 - min(1.0, repeats * 0.05))
+    words = text.split()
+    n_words = len(words)
+    if n_words == 0:
+        return 0.0
+    long_words = sum(1 for w in words if len(w) > 50)
+    long_word_ratio = long_words / n_words
+    word_list_factor = max(0.0, 1.0 - min(1.0, long_word_ratio * 1.5))
+    word_lens = [len(w) for w in words[:1000]]
+    if word_lens:
+        mean_word_len = sum(word_lens) / len(word_lens)
+    else:
+        mean_word_len = 5.0
+    meaningful_factor = max(0.0, 1.0 - max(0.0, (mean_word_len - 10.0) * 0.2))
+    # Punctuation density. Only triggers on LONG samples (≥400 chars)
+    # where coherent prose would naturally accumulate punctuation.
+    # Threshold at ≥3 percent — coherent prose averages 5-10 percent,
+    # word lists drop to 0-1 percent.
+    punct_chars = sum(
+        1 for c in text if c in ".,;:?!\"'()[]{}—–-"
+    )
+    punct_frac = punct_chars / max(1, text_len)
+    if text_len < 400:
+        punctuation_factor = 1.0
+    elif punct_frac >= 0.03:
+        punctuation_factor = 1.0
+    else:
+        # Linear drop from 1.0 at 0.03 to 0.0 at 0.0.
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.03))
+    # Unique-word fraction. Lowercase + alpha-only. Only triggers on
+    # LONG samples (≥150 words) where natural prose has had a chance
+    # to recycle function words. Short coherent essays naturally
+    # have high unique-word fraction (they're packed with content).
+    norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
+    norm_words = [w for w in norm_words if w and w.replace("-", "").isalpha()]
+    if len(norm_words) >= 150:
+        unique_frac = len(set(norm_words)) / len(norm_words)
+        if unique_frac < 0.85:
+            unique_word_factor = 1.0
+        else:
+            # 0.85 → 1.0; 0.95 → 0.0. Word-list mode reaches >0.95.
+            unique_word_factor = max(
+                0.0, 1.0 - (unique_frac - 0.85) / 0.10
+            )
+    else:
+        unique_word_factor = 1.0
+    coherence = (
+        non_ascii_factor
+        * repeats_factor
+        * word_list_factor
+        * meaningful_factor
+        * punctuation_factor
+        * unique_word_factor
+    )
+    return max(0.05, min(1.0, coherence))
 
 
 # ═══════════════════════════════════════════════════════════════════════

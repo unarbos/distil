@@ -106,28 +106,46 @@ def _normalize_chat_payload(payload: dict) -> dict:
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
-    # 2026-05-01 (v30.4): tighter anti-derail defaults after a Discord
-    # report from the operator that the chat king sometimes "starts
-    # talking in multiple languages and characters". Symptoms:
-    #   • Latin → CJK/Cyrillic mid-sentence (high non_ascii_frac)
-    #   • Verbatim phrase loops at ~50-token boundaries (repeats_50char>0)
-    # Both are classic 4B-distilled-student narrow-attractor failure
-    # modes, especially under defaults of temp=0.7, top_p=0.9, no
-    # presence/frequency penalty. Raised repetition_penalty 1.05 → 1.10
-    # (the "robotic" 1.15 break-point we found earlier still gives
-    # plenty of headroom), added presence_penalty 0.6 (suppresses
-    # repeated topics across the response), and capped temperature at
-    # 0.6 (still creative, but well below the Mamba/MoE chaos
-    # threshold the king's hybrid arch hits at temp ≥ 0.85). Clients
-    # that need the old behaviour can pass an explicit value.
-    payload.setdefault("repetition_penalty", 1.10)
-    payload.setdefault("frequency_penalty", 0.3)
-    payload.setdefault("presence_penalty", 0.6)
+    # 2026-05-01 (v30.4 patch): SEVERE derail reproduced at every
+    # temperature 0.5–1.2 with max_tokens=1200. Tail mode at T=0.5:
+    #   "low puff breathe exhale inhale swallow chew bite lick taste
+    #    smell hear see look watch observe examine inspect analyze..."
+    # …i.e. even at low temperature the 4B distilled student falls
+    # into a word-list attractor past ~500-800 tokens. Higher temp +
+    # longer generations push it into multilingual word salad like
+    # the @sn97-king screenshot reported by the operator.
+    #
+    # The eval doesn't penalize this strongly enough yet
+    # (long_form_judge only probes at 1024 tokens × 4 prompts), so
+    # the chat-king proxy has to defend with hard sampling caps:
+    #   • repetition_penalty 1.10 → 1.20 (aggressive — the 1.15
+    #     "robotic" break-point applies to short answers; in chat
+    #     mode the derail risk dominates)
+    #   • presence_penalty   0.6  → 1.0 (max non-derail; suppresses
+    #     repeated topics across long generations)
+    #   • frequency_penalty  0.3  → 0.5 (suppresses recent-token
+    #     reuse without penalising domain vocabulary)
+    #   • temperature cap    0.85 → 0.7  (matches the headroom the
+    #     model can actually sustain coherently)
+    #   • top_p cap          n/a  → 0.92 (clip the chaos tail)
+    #   • top_k floor        n/a  → 50   (drop low-prob noise tokens)
+    # Clients can pass explicit values to opt out.
+    payload.setdefault("repetition_penalty", 1.20)
+    payload.setdefault("frequency_penalty", 0.5)
+    payload.setdefault("presence_penalty", 1.0)
+    payload.setdefault("top_k", 50)
     if "temperature" in payload:
         try:
-            payload["temperature"] = min(float(payload["temperature"]), 0.85)
+            payload["temperature"] = min(float(payload["temperature"]), 0.7)
         except (TypeError, ValueError):
             pass
+    if "top_p" in payload:
+        try:
+            payload["top_p"] = min(float(payload["top_p"]), 0.92)
+        except (TypeError, ValueError):
+            pass
+    else:
+        payload.setdefault("top_p", 0.92)
     return payload
 
 
@@ -403,13 +421,20 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    # 2026-05-01 (v30.4): default cap reduced 8192 → 4096. Long
-    # generations on 4B distilled students drift into tail-mode
-    # repetition / language-switching the longer they run; capping at
-    # 4k keeps essay-length answers usable while sharply reducing
-    # the multi-language derail miners reported on Discord. Clients
-    # that need longer can opt-in via explicit max_tokens.
-    max_tokens = body.get("max_tokens", 4096)
+    # 2026-05-01 (v30.4 patch): default cap reduced 4096 → 800. Live
+    # repro on king UID 107 (best26/sn97-m-v4) showed the derail
+    # starts around the 500-800 token mark even at temperature 0.5,
+    # not just at high temp / 1200+ tokens. 800 is well below the
+    # observed cliff while still sufficient for a normal essay-length
+    # answer. Clients that explicitly need longer can pass max_tokens
+    # — but they should not expect coherent output past ~1000 tokens
+    # until the underlying student improves. Hard-cap of 4096 to
+    # prevent client-supplied 16k requests from drift-trapping.
+    max_tokens = body.get("max_tokens", 800)
+    try:
+        max_tokens = min(int(max_tokens), 4096)
+    except (TypeError, ValueError):
+        max_tokens = 800
     stream = body.get("stream", False)
 
     if not messages:
