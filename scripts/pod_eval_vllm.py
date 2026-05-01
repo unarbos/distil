@@ -1958,22 +1958,27 @@ def _coherence_factor(text: str) -> float:
         mean_word_len = sum(word_lens) / len(word_lens)
     else:
         mean_word_len = 5.0
-    meaningful_factor = max(0.0, 1.0 - max(0.0, (mean_word_len - 10.0) * 0.2))
-    # Punctuation density. Only triggers on LONG samples (≥400 chars)
-    # where coherent prose would naturally accumulate punctuation.
-    # Threshold at ≥3 percent — coherent prose averages 5-10 percent,
-    # word lists drop to 0-1 percent.
+    # 2026-05-01 (v30.4 patch v2): raised threshold 10 → 20 chars.
+    # Academic / technical prose has 10-15 char words frequently
+    # (e.g. "Philosophical Inquiry into Artificial Intelligence")
+    # without being derailed; the signal targets the >50-char
+    # nonsense-compound mode like "jovialincarnacioappreciable".
+    meaningful_factor = max(0.0, 1.0 - max(0.0, (mean_word_len - 20.0) * 0.1))
+    # Punctuation density. 2026-05-01 (v30.4 patch v2): lowered
+    # floor 0.03 → 0.015 and raised the gate ≥400 → ≥600. Markdown-
+    # formatted long-form prose (with headers, lists, and code
+    # snippets) runs at 1.5-2.5 percent. True word-list derail
+    # runs at 0-0.5 percent across long stretches.
     punct_chars = sum(
         1 for c in text if c in ".,;:?!\"'()[]{}—–-"
     )
     punct_frac = punct_chars / max(1, text_len)
-    if text_len < 400:
+    if text_len < 600:
         punctuation_factor = 1.0
-    elif punct_frac >= 0.03:
+    elif punct_frac >= 0.015:
         punctuation_factor = 1.0
     else:
-        # Linear drop from 1.0 at 0.03 to 0.0 at 0.0.
-        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.03))
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.015))
     # Unique-word fraction. Lowercase + alpha-only. Only triggers on
     # LONG samples (≥150 words) where natural prose has had a chance
     # to recycle function words. Short coherent essays naturally

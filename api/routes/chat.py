@@ -241,17 +241,30 @@ def _coherence_factor_chat(text: str) -> float:
     )
     word_lens = [len(w) for w in words[:1000]]
     mean_word_len = sum(word_lens) / max(1, len(word_lens))
+    # 2026-05-01 (v30.4 patch v2): raised threshold 10 → 20. Academic
+    # prose ("Philosophical Inquiry into Artificial Intelligence") has
+    # 10-15 char words frequently and was scoring meaningful_factor
+    # ~0.6, false-positiving the truncator on legitimate long
+    # responses. The signal is meant to catch nonsense compound
+    # coinage ("jovialincarnacioappreciable", "boblynberry-vogesters")
+    # which has mean word length 50+ in single-word strings.
     meaningful_factor = max(
-        0.0, 1.0 - max(0.0, (mean_word_len - 10.0) * 0.2),
+        0.0, 1.0 - max(0.0, (mean_word_len - 20.0) * 0.1),
     )
     punct_chars = sum(1 for c in text if c in ".,;:?!\"'()[]{}—–-")
     punct_frac = punct_chars / max(1, text_len)
-    if text_len < 400:
+    # 2026-05-01 (v30.4 patch v2): lowered floor 0.03 → 0.015 and
+    # raised the ≥400 chars gate to ≥600. Academic / multi-paragraph
+    # prose with markdown headers (asterisks, no terminal
+    # punctuation) was hitting a 1.5-2.5 percent punct rate and
+    # getting falsely penalized. Real word-list derail mode runs
+    # 0-0.5 percent punctuation across long stretches.
+    if text_len < 600:
         punctuation_factor = 1.0
-    elif punct_frac >= 0.03:
+    elif punct_frac >= 0.015:
         punctuation_factor = 1.0
     else:
-        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.03))
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.015))
     norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
     norm_words = [
         w for w in norm_words
@@ -276,8 +289,8 @@ def _coherence_factor_chat(text: str) -> float:
 
 def _truncate_at_derail(
     text: str,
-    window: int = 400,
-    threshold: float = 0.4,
+    window: int = 800,
+    threshold: float = 0.5,
 ) -> tuple[str, bool]:
     """Find the last coherent prefix of ``text`` and truncate there.
 
@@ -289,12 +302,17 @@ def _truncate_at_derail(
     point, or newline), with a graceful "[truncated]" tail so the
     user knows the rest was discarded.
 
-    Cheap O(N): each window's coherence is computed on a 400-char
+    The window is 800 chars so that BOTH the punctuation_factor (≥600
+    chars threshold) AND the unique_word_factor (≥150 words threshold)
+    are active in each detector pass. The previous 400-char window
+    let derail chunks slip past those signals.
+
+    Cheap O(N): each window's coherence is computed on an 800-char
     slice and the loop stops at the first bad window. For a clean
     coherent response the loop runs through every window once
-    (typical 5000 chars → 25 windows × ~1ms each = 25ms).
+    (typical 5000 chars → ~12 windows × ~1ms each = ~12ms).
     """
-    if not text or len(text) < window * 2:
+    if not text or len(text) < window:
         return text, False
     text_len = len(text)
     step = max(1, window // 2)
@@ -395,15 +413,16 @@ def _stream_chat(payload, king_uid, king_model):
     payload["stream"] = True
 
     def generate():
-        # 2026-05-01 (v30.4 patch): incremental derail detection while
+        # 2026-05-01 (v30.4 patch v2): incremental derail detection while
         # streaming. We accumulate every delta into ``acc`` and re-run
         # the coherence detector every ``CHECK_EVERY_CHARS`` of new
         # text. As soon as the recent window goes below threshold we
         # stop forwarding deltas, send a final stop+truncation marker,
-        # and break.
+        # and break. Window 800 / threshold 0.5 matches
+        # ``_truncate_at_derail``.
         CHECK_EVERY_CHARS = 400
-        WINDOW = 400
-        THRESHOLD = 0.4
+        WINDOW = 800
+        THRESHOLD = 0.5
         acc = ""
         last_check_at = 0
         derailed = False
@@ -816,8 +835,8 @@ async def openai_chat_completions(request: Request):
             # derail.
             def generate():
                 CHECK_EVERY_CHARS = 400
-                WINDOW = 400
-                THRESHOLD = 0.4
+                WINDOW = 800
+                THRESHOLD = 0.5
                 acc = ""
                 last_check_at = 0
                 derailed = False
