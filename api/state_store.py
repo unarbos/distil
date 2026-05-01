@@ -157,7 +157,11 @@ def benchmarks():
                     data["composite_final"] = final_score
                 if isinstance(worst_3_mean, (int, float)):
                     data["composite_worst_3_mean"] = worst_3_mean
-                # v30.2 — surface group + super_teacher + shadow axes.
+                # v30.2 — surface group + shadow axes.
+                # 2026-05-02 (v30.5): super_teacher kept here for
+                # backwards-compat (older clients may still expect the
+                # field) but the value is always 0.0 since the axis
+                # was retired. New clients should ignore it.
                 for axis_name, payload_key in (
                     ("code_skill_group", "axis_code_skill_group"),
                     ("math_skill_group", "axis_math_skill_group"),

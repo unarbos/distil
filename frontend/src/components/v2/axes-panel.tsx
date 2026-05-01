@@ -77,14 +77,21 @@ interface LeaderboardResponse {
 }
 
 /**
- * v30.2/v30.3 macro axis groups for the radial chart. These reflect
- * the new composite where:
- *  - Five SKILL GROUPS replace per-bench-axis weights (sub-axes still
+ * v30.5 macro axis groups for the radial chart. These reflect the
+ * current composite where:
+ *  - FOUR SKILL GROUPS replace per-bench-axis weights (sub-axes still
  *    computed for telemetry but the GROUP is the ranking driver).
- *  - super_teacher: rewards exceeding the teacher on verifiable benches.
  *  - DISTILL: teacher-similarity cluster (KL, RKL, top_k_overlap, etc.)
  *  - QUALITY: judge_probe + long_form_judge + chat_turns_probe.
  *  - DISCIPLINE: length, degeneracy, capability, reasoning_density.
+ *  - STAND-ALONE: tool_use, ifeval, calibration (orthogonal to groups).
+ *
+ * 2026-05-02 (v30.5): EXCEEDS-TEACHER (super_teacher) removed. By
+ * construction a student matching the teacher's distribution cannot
+ * exceed the teacher; every trained miner sat at exactly 0.00 since
+ * launch, which both ruined the radar visualisation and wasted 10%
+ * composite weight. Weight redistributed to math/reasoning/knowledge
+ * skill groups.
  */
 const MACRO_AXES: { label: string; members: string[]; description: string }[] = [
   {
@@ -138,12 +145,6 @@ const MACRO_AXES: { label: string; members: string[]; description: string }[] = 
     members: ["knowledge_skill_group", "knowledge_bench", "pragmatic_bench"],
     description:
       "v30.2 knowledge_skill_group = mean of {knowledge_bench v2 (procedural fact-like reasoning), pragmatic_bench (theory-of-mind / scalar implicature / indirect-request)}.",
-  },
-  {
-    label: "EXCEEDS-TEACHER",
-    members: ["super_teacher"],
-    description:
-      "v30.2 super_teacher (weight 0.10): rewards exceeding the teacher on verifiable benches via tanh(mean(max(0, student - teacher)) / 0.10). Incentivises Stage-4 GRPO + post-distillation SFT — the only paths to producing models that exceed teacher capability.",
   },
   {
     label: "QUALITY",
@@ -769,8 +770,6 @@ const ALL_AXES: { key: string; group: string }[] = [
   { key: "math_skill_group", group: "Skill Groups" },
   { key: "reasoning_skill_group", group: "Skill Groups" },
   { key: "knowledge_skill_group", group: "Skill Groups" },
-  // Super-teacher
-  { key: "super_teacher", group: "Beyond Teacher" },
   // Teacher-similarity (live ranking axes)
   { key: "on_policy_rkl", group: "Teacher-Similarity" },
   { key: "kl", group: "Teacher-Similarity" },
@@ -832,10 +831,10 @@ function ScoresView({
         </strong>
         . The amber bar = primary; the grey marker = compare. The
         ranking key is{" "}
-        <code>composite.final = 0.7 × worst_3_mean + 0.3 × weighted</code>{" "}
-        — see the <strong>Skill Groups</strong> section first (those
-        are the ranking-relevant axes), then{" "}
-        <strong>Beyond Teacher</strong> (super_teacher), then the rest.
+          <code>composite.final = 0.7 × worst_3_mean + 0.3 × weighted</code>{" "}
+          — see the <strong>Skill Groups</strong> section first (those
+          are the ranking-relevant axes), then{" "}
+          <strong>Teacher-Similarity</strong>, then the rest.
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-x-12 gap-y-6">
         {Array.from(new Set(ALL_AXES.map((a) => a.group))).map((grp) => (

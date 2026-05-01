@@ -224,14 +224,25 @@ BENCH_AXIS_WEIGHTS = {
 #   shadow axes (kl_is etc.) 0.02 → 0.05 each
 BENCH_GROUP_AXIS_WEIGHTS = {
     "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.20")),
-    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.18")),
-    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.12")),
-    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.07")),
-    # v30.2 — super_teacher axis: rewards exceeding teacher on
-    # verifiable benches. Conservative initial weight 0.10 so it
-    # contributes to ranking without overwhelming the teacher-similarity
-    # axes during the transition while miners learn the new incentive.
-    "super_teacher":         float(os.environ.get("SUPER_TEACHER_WEIGHT", "0.10")),
+    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.20")),
+    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.14")),
+    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.10")),
+    # 2026-05-02 (v30.5): super_teacher axis REMOVED.
+    # Rationale: the axis was conceptually wrong for distillation — by
+    # construction, a student matching the teacher's distribution
+    # (which is what KL/RKL/top_k_overlap reward) cannot exceed the
+    # teacher on the same skill surface. Empirically every trained
+    # miner sat at exactly 0.00 on this axis since launch, which
+    # (a) ruined the radar-chart visualisation by anchoring one spoke
+    # at zero, and (b) wasted 10% composite weight that should be
+    # rewarding actual capability.
+    # The 0.10 weight is redistributed: math +0.02, reasoning +0.02,
+    # knowledge +0.03, leaving room for the bigger student cap (40B)
+    # to express more capability on the existing axes.
+    # ``_axis_super_teacher`` is kept as a private helper for legacy
+    # composite records that still reference it, but the weight is 0
+    # so it never contributes to the live composite ranking.
+    "super_teacher":         float(os.environ.get("SUPER_TEACHER_WEIGHT", "0.0")),
 }
 
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"

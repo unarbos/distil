@@ -391,7 +391,6 @@ Response per UID:
   - ``weighted`` (weighted mean of axes)
   - ``axes`` — full per-axis breakdown including:
     * v30.2 group axes: code_skill_group, math_skill_group, reasoning_skill_group, knowledge_skill_group
-    * super_teacher: rewards beating teacher on verifiable benches
     * shadow axes: top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl
     * sub-axes: math_bench, code_bench, ... (still in axes for telemetry, weight 0 for ranking)
     * relative axes: kl, on_policy_rkl, capability, length, degeneracy
@@ -657,11 +656,11 @@ def compare_miners(uids: str):
 @router.get("/api/miners/batch", tags=["Miners"], summary="Compact cards for a batch of UIDs",
          description=f"""Returns compact cards (`uid`, `model`, `kl_score`, `composite`, `is_king`, `disqualified`) for each requested UID.
 
-v30.2: each miner card now includes ``composite`` with the
+v30.2/v30.5: each miner card includes ``composite`` with the
 v30.2 ranking key (``final``), the legacy ``worst``, ``weighted``,
-the new ``worst_3_mean``, and per-axis values (groups,
-super_teacher, shadow axes). Lets miner scrapers track all
-ranking-relevant signals from a single endpoint.
+the new ``worst_3_mean``, and per-axis values (skill groups,
+shadow axes). Lets miner scrapers track all ranking-relevant
+signals from a single endpoint.
 
 Example: `/api/miners/batch?uids=1,2,3`. Limit: {MAX_BATCH_UIDS} UIDs per call.
 """)

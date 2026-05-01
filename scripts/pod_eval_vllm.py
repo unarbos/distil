@@ -8749,80 +8749,138 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
 
 
 def _generate_aime_items(block_seed, n_items: int) -> list[dict]:
-    """Harder procedural math for the (renamed) ``aime_bench`` axis (v27).
+    """Harder procedural math for the (renamed) ``aime_bench`` axis.
 
-    Drops the public AIME pool entirely; instead generates olympiad-flavoured
-    multi-step problems whose answer is a positive integer 0-999 (matching
-    the AIME convention so existing answer extraction works). Each item
-    requires combining two operations (e.g. solve a quadratic AND apply a
-    modular constraint) so a 4B-class model with brittle reasoning fails
-    at ~70-90% on the reference, while a strong distillation reaches 30-50%.
+    2026-05-02 (v30.5): hardening pass.
+    - Original 5 kinds kept but with deeper params (e.g. exponents 7-19
+      → 13-31; CRT 2-coprime → 3-coprime).
+    - Two new kinds: ``coordinate_geometry`` (lattice / right-triangle
+      enumeration) and ``polynomial_root_sum`` (Vieta-style root sum).
+    - Olympiad problems whose answer is a positive integer 0-999
+      (matching the AIME convention so existing answer extraction
+      works). Each item requires combining 3-4 operations so a
+      4B-class model with brittle reasoning fails at ~70-85 % on the
+      reference, while a strong distillation reaches 25-45 %.
     """
     import random
     from math import gcd
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["aime"]) & 0xFFFFFFFF)
-    kinds = ["chained_modular", "diophantine", "factor_chain", "lcm_residue", "iterated_digit"]
+    kinds = [
+        "chained_modular", "diophantine", "factor_chain", "lcm_residue",
+        "iterated_digit", "coordinate_geometry", "polynomial_root_sum",
+    ]
     rng.shuffle(kinds)
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         if kind == "chained_modular":
-            a = r.randint(2, 9)
-            b = r.randint(2, 9)
-            n = r.randint(7, 19)
-            mod = r.choice([97, 101, 103, 107, 109, 113])
-            val = pow(a, n, mod) * b % mod
+            # Hardened: exponents 7-19 → 13-31, plus a third operation
+            # so the chain is now 3-step (a^n * b + c) mod m.
+            a = r.randint(2, 11)
+            b = r.randint(2, 11)
+            c = r.randint(0, 50)
+            n = r.randint(13, 31)
+            mod = r.choice([97, 101, 103, 107, 109, 113, 127, 131, 137])
+            val = (pow(a, n, mod) * b + c) % mod
             gold = str(val)
             question = (
-                f"Compute the value of (({a}^{n}) * {b}) mod {mod}, where ^ "
-                f"denotes integer exponentiation. The final answer is a "
-                f"non-negative integer less than {mod}."
+                f"Compute the value of (({a}^{n}) * {b} + {c}) mod {mod}, "
+                f"where ^ denotes integer exponentiation. The final answer "
+                f"is a non-negative integer less than {mod}."
             )
         elif kind == "diophantine":
-            x = r.randint(2, 11)
-            y = r.randint(x, 13)
-            s = x + y
-            p = x * y
-            gold = str(x * x + y * y)
+            # Hardened: 2 unknowns → 3 unknowns. Pick x, y, z with
+            # bounded sums + products and ask for x^3 + y^3 + z^3.
+            x = r.randint(2, 9)
+            y = r.randint(x, 11)
+            z = r.randint(y, 13)
+            s = x + y + z
+            p_xy = x * y
+            p_yz = y * z
+            gold = str(x ** 3 + y ** 3 + z ** 3)
             question = (
-                f"Two positive integers x and y satisfy x + y = {s} and "
-                f"x * y = {p}, with 2 <= x <= y. Compute the integer x^2 + y^2."
+                f"Three positive integers x, y, z satisfy x + y + z = {s}, "
+                f"x * y = {p_xy}, and y * z = {p_yz}, with 2 <= x <= y <= z. "
+                f"Compute the integer x^3 + y^3 + z^3."
             )
         elif kind == "factor_chain":
-            primes = [3, 5, 7, 11, 13, 17, 19]
+            # Hardened: 3 primes → 4 primes; ask for ∏(p_i+1) instead of sum.
+            primes = [3, 5, 7, 11, 13, 17, 19, 23]
             r.shuffle(primes)
-            p1, p2, p3 = primes[0], primes[1], primes[2]
-            n_val = p1 * p2 * p3
-            extra = r.randint(0, 50)
-            gold = str(p1 + p2 + p3 + extra)
+            p1, p2, p3, p4 = primes[:4]
+            n_val = p1 * p2 * p3 * p4
+            mod = r.choice([100, 1000])
+            prod_inc = (p1 + 1) * (p2 + 1) * (p3 + 1) * (p4 + 1)
+            gold = str(prod_inc % mod)
             question = (
-                f"The integer {n_val} factors uniquely as a product of three "
-                f"distinct primes. Let s be the sum of those three primes. "
-                f"Compute s + {extra}."
+                f"The integer {n_val} factors uniquely as a product of four "
+                f"distinct primes. Let p_1 < p_2 < p_3 < p_4 be those four "
+                f"primes. Compute (p_1 + 1)(p_2 + 1)(p_3 + 1)(p_4 + 1) "
+                f"mod {mod}."
             )
         elif kind == "lcm_residue":
-            a = r.choice([6, 8, 10, 12, 14, 15])
-            b = r.choice([7, 9, 11, 13, 16])
-            while gcd(a, b) != 1:
-                b = r.choice([7, 9, 11, 13, 16, 17, 19])
-            modulus = a * b
+            # Hardened: CRT with 3 pairwise-coprime moduli (was 2).
+            a_pool = [3, 4, 5, 7, 8, 9, 11, 13]
+            r.shuffle(a_pool)
+            a = a_pool[0]
+            b = next((m for m in a_pool[1:] if gcd(m, a) == 1), 7)
+            c = next((m for m in a_pool[1:] if gcd(m, a) == 1 and gcd(m, b) == 1), 11)
+            modulus = a * b * c
             target = r.randint(2, modulus - 2)
             gold = str(target)
             question = (
-                f"Find the smallest positive integer x with x mod {a} = "
-                f"{target % a} and x mod {b} = {target % b}. The answer is "
-                f"a positive integer less than {modulus}."
+                f"Find the smallest positive integer x with "
+                f"x mod {a} = {target % a}, x mod {b} = {target % b}, "
+                f"and x mod {c} = {target % c}. The answer is a positive "
+                f"integer less than {modulus}."
             )
-        else:  # iterated_digit
+        elif kind == "iterated_digit":
+            # Hardened: 3 iterations → 5 iterations.
             seed_n = r.randint(50, 500)
             cur = seed_n
-            for _ in range(3):
+            for _ in range(5):
                 cur = sum(int(d) for d in str(cur)) * 7 + 3
-            gold = str(cur)
+            mod = 1000
+            gold = str(cur % mod)
             question = (
-                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at n_0 = "
-                f"{seed_n}, compute n_3 = f(f(f(n_0)))."
+                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at "
+                f"n_0 = {seed_n}, compute n_5 = f(f(f(f(f(n_0))))) mod 1000."
+            )
+        elif kind == "coordinate_geometry":
+            # Count lattice points (x, y) with 1 <= x <= a, 1 <= y <= b
+            # such that gcd(x, y) = 1. Cleanly procedural; the answer is
+            # the totient-style sum which a model has to actually
+            # enumerate (no closed form for arbitrary a, b).
+            a = r.randint(8, 18)
+            b = r.randint(8, 18)
+            count = 0
+            for x in range(1, a + 1):
+                for y in range(1, b + 1):
+                    if gcd(x, y) == 1:
+                        count += 1
+            gold = str(count)
+            question = (
+                f"Count the number of lattice points (x, y) with "
+                f"1 <= x <= {a} and 1 <= y <= {b} such that gcd(x, y) = 1. "
+                f"The final answer is a positive integer."
+            )
+        else:  # polynomial_root_sum
+            # Vieta's formulas on a procedural cubic: pick three integer
+            # roots, build the cubic, ask for the sum of squares of roots.
+            roots = sorted(r.sample(range(-9, 10), 3))
+            r1, r2, r3 = roots
+            # Coefficients: x^3 - (sum)x^2 + (pair-sum)x - (prod)
+            sum_r = r1 + r2 + r3
+            pair = r1 * r2 + r1 * r3 + r2 * r3
+            prod = r1 * r2 * r3
+            sum_sq = r1 ** 2 + r2 ** 2 + r3 ** 2
+            gold = str(sum_sq)
+            question = (
+                f"The cubic equation x^3 + ({-sum_r})x^2 + ({pair})x + "
+                f"({-prod}) = 0 has three integer roots. Compute the sum "
+                f"of the squares of the three roots (i.e. r_1^2 + r_2^2 + "
+                f"r_3^2). The final answer is a non-negative integer."
             )
         question = question + (
             "\n\nSolve carefully and end with '#### N' where N is the final integer answer."
@@ -10694,10 +10752,19 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
     per-item RNG-derived seeds. Numbers are calibrated to be in
     distinct ranges per topic so substring collisions don't sneak in.
     """
+    # 2026-05-02 (v30.5): hardened. Default n_cards 4 → 7, and added two
+    # 3-document synthesis kinds (``sum_three``, ``difference_three``)
+    # so ~30 % of items require retrieving and combining THREE values
+    # rather than two. The bigger card pool also means the
+    # confuser-rejection grader has more values to NOT match against,
+    # raising the bar against models that "mention all numbers".
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["multi_doc"]) & 0xFFFFFFFF)
-    qkinds = ["sum", "difference", "compare", "ratio"]
-    n_cards = max(2, BENCH_MULTI_DOC_N_CARDS)
+    qkinds = ["sum", "difference", "compare", "ratio",
+              "sum_three", "difference_three"]
+    # Default to 7 cards if env override not set; allow operator override.
+    _n_cards_default = max(BENCH_MULTI_DOC_N_CARDS, 7)
+    n_cards = max(3, _n_cards_default)
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
@@ -10785,13 +10852,46 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
                 f"and {b_topic}, which one has the LARGER value? Reply "
                 f"with the full name of the larger one."
             )
-        else:  # ratio (integer division to keep gold an integer)
+        elif kind == "ratio":
             larger, smaller = (a_val, b_val) if a_val >= b_val else (b_val, a_val)
             gold = str(larger // smaller)
             question = (
                 f"How many times larger (rounded down to integer) is the "
                 f"numeric attribute of {a_topic} compared to {b_topic}? "
                 f"If {a_topic} is smaller, swap the order. Reply with the integer only."
+            )
+        elif kind == "sum_three":
+            # 3-document synthesis: sum the values across three topics.
+            if n_cards < 3:
+                # Skip if not enough cards; should not happen with default 7.
+                continue
+            third_pool = [ci for ci in range(n_cards) if ci not in (a_idx, b_idx)]
+            c_idx = r.choice(third_pool)
+            c_topic = topics[c_idx]
+            c_val = values[c_idx]
+            gold = str(a_val + b_val + c_val)
+            question = (
+                f"Considering only {a_topic}, {b_topic}, and {c_topic}, "
+                f"what is the COMBINED total of the numeric attribute "
+                f"reported in their three documents? Reply with the "
+                f"integer only."
+            )
+        else:  # difference_three
+            # 3-document synthesis: max minus mid minus min.
+            if n_cards < 3:
+                continue
+            third_pool = [ci for ci in range(n_cards) if ci not in (a_idx, b_idx)]
+            c_idx = r.choice(third_pool)
+            c_topic = topics[c_idx]
+            c_val = values[c_idx]
+            three = sorted([(a_val, a_topic), (b_val, b_topic),
+                            (c_val, c_topic)], reverse=True)
+            gold = str(three[0][0] - three[1][0] - three[2][0])
+            question = (
+                f"Considering only {a_topic}, {b_topic}, and {c_topic}: "
+                f"take the LARGEST of the three numeric attributes, "
+                f"subtract the MIDDLE one, then subtract the SMALLEST. "
+                f"Reply with the integer only."
             )
         # Confusers: numeric values from cards NOT used in the gold.
         # These should not appear as standalone integers in the response.
@@ -10804,17 +10904,27 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
             # Add the LOSER as a confuser too — model must commit.
             loser_t = b_topic if a_val > b_val else a_topic
             confuser_answers.append(loser_t)
+        elif kind in ("sum_three", "difference_three"):
+            # Three-card kind: the third card's value is "involved", so
+            # only OTHER cards' values count as confusers.
+            involved = {a_idx, b_idx, c_idx}
+            confuser_answers = [
+                str(values[ci]) for ci in range(n_cards) if ci not in involved
+            ]
         else:
             confuser_answers = [
                 str(values[ci]) for ci in range(n_cards) if ci not in (a_idx, b_idx)
             ]
+        topics_for_record = [a_topic, b_topic]
+        if kind in ("sum_three", "difference_three"):
+            topics_for_record = [a_topic, b_topic, c_topic]
         out.append({
             "src": f"multi_doc_synthesis/{kind}",
             "context": document,
             "question": question,
             "answer": gold,
             "confuser_answers": confuser_answers,
-            "involved_topics": [a_topic, b_topic],
+            "involved_topics": topics_for_record,
             "kind": kind,
         })
     return out
@@ -11215,32 +11325,81 @@ def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
          "{b} books. How many books has {name} borrowed total? Reply with an integer.",
          lambda a, b: a + b),
     ]
+    # 2026-05-02 (v30.5): added two adversarial unsolvable kinds.
+    # Standard ``unsolv`` items are EASY to detect — the missing slot is
+    # obvious (e.g. "{name} owns books in the kitchen and {b} books..."
+    # — clearly missing a number). Adversarial unsolvables are MUCH
+    # harder:
+    #   - ``contradiction``: data is self-inconsistent (totals + parts
+    #     given disagree). A model that pattern-matches arithmetic
+    #     templates will compute the wrong answer; only a careful
+    #     reader notices the contradiction.
+    #   - ``unit_mismatch``: parts use incompatible units that aren't
+    #     convertible without an unstated rate (e.g. eggs + dozens
+    #     where the dozen-size isn't given). Confabulators will assume
+    #     12; calibrated models refuse.
+    # 30% of unsolvable items are adversarial; the rest stay as the
+    # easier "missing slot" form so the easy-floor remains in place.
     out: list[dict] = []
-    plan = (["solv"] * n_solv) + (["unsolv"] * n_unsolv)
+    plan_solv = ["solv"] * n_solv
+    n_adv = max(0, int(round(n_unsolv * 0.30)))
+    n_simple = n_unsolv - n_adv
+    plan = (
+        plan_solv
+        + ["unsolv"] * n_simple
+        + ["contradiction"] * (n_adv // 2 + n_adv % 2)
+        + ["unit_mismatch"] * (n_adv // 2)
+    )
     rng.shuffle(plan)
     for i, plan_kind in enumerate(plan):
         r = random.Random(rng.randint(0, 2**31 - 1))
         tmpl_id, solv_template, unsolv_template, gold_fn = r.choice(templates)
         a, b = r.randint(5, 60), r.randint(5, 60)
-        # v29.5: procedurally synthesise a fresh name per item; no
-        # static name pool to memorise.
-        name = _synthetic_name(r)
+        name = _realistic_name(r)
         if plan_kind == "solv":
             question = solv_template.format(a=a, b=b, name=name)
             gold = str(gold_fn(a, b))
-        else:
-            # Pass both a + b: each unsolv template omits ONE of the
-            # two slots and may legitimately reference the other (e.g.
-            # the orchard template keeps {a} but drops {b}, the books
-            # template keeps {b} but drops {a}). Passing both is safe
-            # because Python ignores extra kwargs in str.format.
+            kind_tag = "solv"
+        elif plan_kind == "unsolv":
             question = unsolv_template.format(a=a, b=b, name=name)
-            gold = "REFUSE"  # sentinel; grader handles refusal recognition
+            gold = "REFUSE"
+            kind_tag = "unsolv"
+        elif plan_kind == "contradiction":
+            # Adversarial: present a part-and-total that contradict each
+            # other. The model should recognise the inconsistency rather
+            # than pick one number to compute with.
+            wrong_total = a + b + r.randint(3, 12)  # off by 3-12
+            question = (
+                f"{name} owns {a} books in the kitchen and {b} books in "
+                f"the study. {name} also reports owning a TOTAL of "
+                f"{wrong_total} books across both rooms. How many books "
+                f"does {name} own in total? Reply with an integer if the "
+                f"answer is determinable, else explain why."
+            )
+            gold = "REFUSE"
+            kind_tag = "unsolv_adversarial_contradiction"
+        else:  # unit_mismatch
+            n_eggs = r.randint(40, 200)
+            n_dozens = r.randint(2, 9)
+            question = (
+                f"A farm collects {n_eggs} eggs in the morning and "
+                f"{n_dozens} dozens of eggs in the afternoon. (No "
+                f"information is given about how many eggs are in a "
+                f"dozen on this farm.) How many eggs were collected in "
+                f"total? Reply with an integer if the answer is "
+                f"determinable, else explain why."
+            )
+            # NB: this is a trick — most readers assume 12 eggs/dozen,
+            # but the problem says nothing about it. A calibrated model
+            # should at least flag the assumption.
+            gold = "REFUSE"
+            kind_tag = "unsolv_adversarial_unit_mismatch"
         out.append({
-            "src": f"calibration/{tmpl_id}/{plan_kind}",
+            "src": f"calibration/{tmpl_id}/{kind_tag}",
             "question": question,
             "answer": gold,
-            "kind": plan_kind,  # "solv" or "unsolv"
+            "kind": plan_kind if plan_kind in ("solv", "unsolv") else "unsolv",
+            "adversarial": plan_kind in ("contradiction", "unit_mismatch"),
         })
     return out
 
@@ -11644,6 +11803,85 @@ def _generate_refactor_items(block_seed, n_items: int) -> list[dict]:
              "    assert candidate([[5]]) == [5]",
              "    assert candidate([]) == []",
              "    assert candidate([[1], [2], [3]]) == [1, 2, 3]",
+         ],
+        ),
+        # 2026-05-02 (v30.5): three more refactor templates for breadth.
+        ("find_max_ugly", "find_max_in_list",
+         (
+             "def find_max_in_list(xs):\n"
+             "    biggest = None\n"
+             "    for x in xs:\n"
+             "        if biggest is None:\n"
+             "            biggest = x\n"
+             "        else:\n"
+             "            if x > biggest:\n"
+             "                biggest = x\n"
+             "    if biggest is None:\n"
+             "        return None\n"
+             "    return biggest\n"
+         ),
+         (
+             "def find_max_in_list(xs: list[int]) -> int | None:\n"
+             '    """Return the maximum integer in xs, or None if xs is empty."""\n'
+         ),
+         [
+             "    assert candidate([3, 1, 4, 1, 5, 9, 2, 6]) == 9",
+             "    assert candidate([7]) == 7",
+             "    assert candidate([]) is None",
+             "    assert candidate([-3, -1, -7]) == -1",
+             "    assert candidate([2, 2, 2]) == 2",
+         ],
+        ),
+        ("count_uniques_ugly", "count_unique",
+         (
+             "def count_unique(xs):\n"
+             "    seen = []\n"
+             "    for x in xs:\n"
+             "        already = False\n"
+             "        for y in seen:\n"
+             "            if y == x:\n"
+             "                already = True\n"
+             "        if not already:\n"
+             "            seen.append(x)\n"
+             "    return len(seen)\n"
+         ),
+         (
+             "def count_unique(xs: list[int]) -> int:\n"
+             '    """Return the number of distinct integers in xs."""\n'
+         ),
+         [
+             "    assert candidate([1, 2, 1, 3, 2, 1]) == 3",
+             "    assert candidate([]) == 0",
+             "    assert candidate([5, 5, 5, 5]) == 1",
+             "    assert candidate([1, 2, 3, 4, 5]) == 5",
+         ],
+        ),
+        ("pair_sum_ugly", "any_pair_sums_to",
+         (
+             "def any_pair_sums_to(xs, target):\n"
+             "    found = False\n"
+             "    for i in range(len(xs)):\n"
+             "        for j in range(len(xs)):\n"
+             "            if i != j:\n"
+             "                if xs[i] + xs[j] == target:\n"
+             "                    found = True\n"
+             "    return found\n"
+         ),
+         (
+             "def any_pair_sums_to(xs: list[int], target: int) -> bool:\n"
+             '    """Return True if any two distinct-indexed elements of xs\n'
+             "    sum to target. Each index is used at most once per pair.\n"
+             "    Examples: any_pair_sums_to([1, 2, 3, 4], 7) is True; "
+             "any_pair_sums_to([5], 5) is False (only one element)."
+             '\n    """\n'
+         ),
+         [
+             "    assert candidate([1, 2, 3, 4], 7) is True",
+             "    assert candidate([1, 2, 3, 4], 8) is False",
+             "    assert candidate([5], 5) is False",
+             "    assert candidate([], 0) is False",
+             "    assert candidate([3, 3], 6) is True",
+             "    assert candidate([0, 0, 0], 0) is True",
          ],
         ),
     ]

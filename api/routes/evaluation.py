@@ -49,7 +49,7 @@ def _dq_reason_for_commitment(uid: int, hotkey: str | None, commitment: dict | N
 
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE (v30.2+) the king is selected cross-round from `state/composite_scores.json` by highest `composite.final` (= 0.7·worst_3_mean + 0.3·weighted; v28-and-earlier records still ranked by `composite.worst`). A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired. The composite axis surface includes group axes (code/math/reasoning/knowledge skill groups), super_teacher (incentivizes exceeding teacher on verifiable benches), and shadow axes (top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl).")
+         description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE (v30.2+) the king is selected cross-round from `state/composite_scores.json` by highest `composite.final` (= 0.7·worst_3_mean + 0.3·weighted; v28-and-earlier records still ranked by `composite.worst`). A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired. The composite axis surface includes group axes (code/math/reasoning/knowledge skill groups) and shadow axes (top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl).")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
@@ -119,9 +119,8 @@ def get_leaderboard():
                 "present_count": comp.get("present_count"),
                 "version": comp.get("version"),
                 "broken_axes": comp.get("broken_axes", []),
-                # v30.2 — surface the per-axis super_teacher lift +
-                # baseline_penalty so miners can see exactly why a
-                # given axis was docked or boosted.
+                # v30.2/v30.5 — surface the per-axis baseline_penalty so
+                # miners can see exactly why a given axis was docked.
                 "baseline_penalty": comp.get("baseline_penalty"),
                 "axes_raw": comp.get("axes_raw"),
             }
