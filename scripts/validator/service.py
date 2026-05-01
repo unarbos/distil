@@ -920,13 +920,43 @@ def post_round(
         old_kl = king_h2h_kl if king_h2h_kl is not None else king_kl
         winner_entry = next((row for row in h2h_results if row.get("uid") == winner_uid), {})
         winner_tt = winner_entry.get("t_test") if isinstance(winner_entry.get("t_test"), dict) else {}
-        # Composite-worst is the production ranking key (since v27); pull
-        # it from the winner's row + the previous king's row so the
-        # Discord post can lead with it instead of KL. Fall back to None
-        # (legacy headline) if either is missing.
-        winner_comp = winner_entry.get("composite") if isinstance(winner_entry.get("composite"), dict) else {}
+        # Composite for the announcement headline.
+        # 2026-05-01 (v30.4 patch v3): in single-eval mode the dethrone
+        # is decided cross-round from ``state.composite_scores`` (paired
+        # king re-eval in v30.2 means h2h_results carries this round's
+        # composite for the king + new challengers, but the cross-round
+        # composite is the canonical source). Falling back to it when
+        # the round-local row is empty stops the announcement headline
+        # from collapsing to the legacy ``KL:`` format every time —
+        # which is what robert131004 → halen214 just did despite the
+        # composite.final dethrone gate firing correctly.
+        winner_comp = (
+            winner_entry.get("composite")
+            if isinstance(winner_entry.get("composite"), dict)
+            else None
+        )
+        if not winner_comp:
+            cross_round_winner = (
+                getattr(state, "composite_scores", {}) or {}
+            ).get(str(winner_uid))
+            if isinstance(cross_round_winner, dict):
+                winner_comp = cross_round_winner
+        if not isinstance(winner_comp, dict):
+            winner_comp = {}
         old_king_entry = next((row for row in h2h_results if row.get("uid") == king_uid), {})
-        old_king_comp = old_king_entry.get("composite") if isinstance(old_king_entry.get("composite"), dict) else {}
+        old_king_comp = (
+            old_king_entry.get("composite")
+            if isinstance(old_king_entry.get("composite"), dict)
+            else None
+        )
+        if not old_king_comp:
+            cross_round_old = (
+                getattr(state, "composite_scores", {}) or {}
+            ).get(str(king_uid))
+            if isinstance(cross_round_old, dict):
+                old_king_comp = cross_round_old
+        if not isinstance(old_king_comp, dict):
+            old_king_comp = {}
         # Find the limiting axis (lowest-scoring axis) for the new king.
         winner_axes = winner_comp.get("axes") if isinstance(winner_comp.get("axes"), dict) else {}
         limiting_axis = None
