@@ -10954,15 +10954,20 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 gold = container_2
             # Match the LAST word of the gold ("kitchen drawer" → "drawer")
             # so two-word containers still grade right when the model
-            # answers with just the head noun.
-            gold_last = gold.split()[-1]
-            accept_patterns = [
-                re.compile(rf"\b{re.escape(gold)}\b", re.IGNORECASE),
-                re.compile(rf"\b{re.escape(gold_last)}\b", re.IGNORECASE),
-            ]
-            # But ALSO require the bad answer NOT to be more strongly
-            # implied — we accept the multi-word match only when the
-            # other container's head noun is not also present.
+            # answers with just the head noun. BUT only accept the head
+            # noun when the OTHER container's head noun is different —
+            # otherwise "drawer" alone is ambiguous (could mean either
+            # "sock drawer" or "kitchen drawer"). When the heads collide
+            # we require the model to emit the full discriminating
+            # container name.
+            other = container_2 if gold == container_1 else container_1
+            gold_last = gold.split()[-1].lower()
+            other_last = other.split()[-1].lower()
+            accept_patterns = [re.compile(rf"\b{re.escape(gold)}\b", re.IGNORECASE)]
+            if gold_last != other_last:
+                accept_patterns.append(
+                    re.compile(rf"\b{re.escape(gold_last)}\b", re.IGNORECASE)
+                )
             accept = accept_patterns
         elif subtype == "scalar_implicature":
             # All weak quantifiers pair with the strong quantifier
