@@ -80,6 +80,14 @@ KING_REGRESSION_FILE = "king_regression_streak.json"
 # rounds, this one tracks held-out evalscope regression vs Qwen 4B base.
 # See ``composite._compute_king_canary_regression``.
 KING_CANARY_FILE = "king_canary_streak.json"
+# 2026-05-01 (v30.4): top-N recent-kings payout history. Stored as a
+# list of UIDs with the MOST RECENT king at index 0. Each round's
+# weight-set call distributes 1.0 / min(5, N) emission to each
+# distinct UID. A UID that takes the crown but is later dethroned
+# stays in this list for up to 5 subsequent crown-changes — enough
+# that even one round of being king earns meaningful incentive.
+RECENT_KINGS_FILE = "recent_kings.json"
+RECENT_KINGS_MAX = 5
 # 2026-05-01 (v30.4): one-eval-per-registration enforcement. Maps
 # hotkey_str → {model, revision, evaluated_at_block, evaluated_at_ts,
 # composite_final}. Once a hotkey has its eval recorded here, ALL
@@ -163,6 +171,9 @@ class ValidatorState:
         # uid_str -> {"worst", "weighted", "axes", "model", "revision",
         #             "block", "ts", "n_axes"}.
         self.composite_scores: dict[str, dict] = {}
+        # 2026-05-01 (v30.4): rolling list of last 5 distinct king UIDs
+        # for the multi-king payout split. Most-recent at index 0.
+        self.recent_kings: list[int] = []
 
         # Head-to-head state
         self.h2h_latest: dict = {}
@@ -205,6 +216,11 @@ class ValidatorState:
         self.evaluated_uids = set(raw) if isinstance(raw, list) else set()
         raw_eh = _load_json(self._path(EVALUATED_HOTKEYS_FILE), {})
         self.evaluated_hotkeys = raw_eh if isinstance(raw_eh, dict) else {}
+        raw_rk = _load_json(self._path(RECENT_KINGS_FILE), [])
+        if isinstance(raw_rk, list):
+            self.recent_kings = [int(u) for u in raw_rk if isinstance(u, (int, str)) and str(u).lstrip("-").isdigit()]
+        else:
+            self.recent_kings = []
 
         raw_comp = _load_json(self._path(COMPOSITE_SCORES_FILE), {})
         self.composite_scores = raw_comp if isinstance(raw_comp, dict) else {}
@@ -246,6 +262,7 @@ class ValidatorState:
         atomic_json_write(self._path(DISQUALIFIED_FILE), self.dq_reasons, indent=2)
         atomic_json_write(self._path(EVALUATED_UIDS_FILE), list(self.evaluated_uids))
         atomic_json_write(self._path(EVALUATED_HOTKEYS_FILE), self.evaluated_hotkeys, indent=2)
+        atomic_json_write(self._path(RECENT_KINGS_FILE), list(self.recent_kings))
         atomic_json_write(self._path(UID_HOTKEY_MAP_FILE), self.uid_hotkey_map)
         atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
 

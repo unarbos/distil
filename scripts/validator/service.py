@@ -6,12 +6,14 @@ from pathlib import Path
 
 from eval.chain import (
     SetWeightsError,
+    build_recent_kings_weights,
     build_winner_take_all_weights,
     fetch_metagraph,
     get_validator_weight_target,
     parse_commitments,
     set_weights,
 )
+from eval.state import RECENT_KINGS_MAX
 from eval.dataset import format_prompt, sample_prompts_from_dataset
 from eval.private_pool import (
     DEFAULT_PRIVATE_FRACTION,
@@ -187,8 +189,55 @@ def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_ui
     )
     _safe_set_weights(
         subtensor, wallet, netuid, n_uids,
-        build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,
+        _build_emission_weights(state, n_uids, king_uid),
+        king_uid, state_dir,
     )
+
+
+def _build_emission_weights(state, n_uids: int, king_uid: int | None) -> list[float]:
+    """Return the emission-weight vector for the current crown.
+
+    2026-05-01 (v30.4): combines the LIVE king with up to 4 most-recent
+    distinct previous kings tracked in ``state.recent_kings``. Each
+    distinct UID gets ``1.0 / N`` emission where N is the number of
+    distinct kings (up to 5). Falls back to the legacy winner-takes-all
+    behaviour when ``state.recent_kings`` is empty (boot phase) or
+    ``MULTI_KING_PAYOUT_ENABLED=0`` is set in the env.
+
+    The live ``king_uid`` is always pushed to index 0 if present so the
+    current king is in the payout queue regardless of whether it has
+    been persisted yet for this round.
+    """
+    import os
+    if not bool(int(os.environ.get("MULTI_KING_PAYOUT_ENABLED", "1") or 1)):
+        if king_uid is None:
+            return [0.0] * n_uids
+        return build_winner_take_all_weights(n_uids, king_uid)
+    history = list(getattr(state, "recent_kings", []) or [])
+    if king_uid is not None:
+        # Ensure live king is at the front. Keep dedupe in
+        # build_recent_kings_weights so we don't double-pay.
+        if not history or history[0] != king_uid:
+            history = [king_uid] + history
+    if not history and king_uid is None:
+        return [0.0] * n_uids
+    return build_recent_kings_weights(n_uids, history, max_kings=RECENT_KINGS_MAX)
+
+
+def _record_king_change(state, new_king_uid: int) -> None:
+    """Push a new king to the front of ``state.recent_kings`` and
+    persist. Dedupes if the same UID re-takes the crown — moves it
+    back to the front rather than duplicating. Caps the queue at
+    RECENT_KINGS_MAX entries (default 5)."""
+    history = list(getattr(state, "recent_kings", []) or [])
+    history = [u for u in history if int(u) != int(new_king_uid)]
+    history.insert(0, int(new_king_uid))
+    history = history[:RECENT_KINGS_MAX]
+    state.recent_kings = history
+    try:
+        state.save()
+    except Exception:
+        pass
 
 
 def _persist_preliminary_results(results, models_to_eval, king_uid, state,
@@ -867,9 +916,20 @@ def apply_results_and_weights(
                 elif worst is not None:
                     winner_kl = float(worst)
     if winner_uid is not None:
+        # 2026-05-01 (v30.4): record the crown change in
+        # ``state.recent_kings`` BEFORE building weights so the new
+        # king appears in the multi-king payout queue. If the same
+        # UID re-takes the crown it gets refreshed (moved to front)
+        # rather than duplicated.
+        if king_uid is None or winner_uid != king_uid:
+            _record_king_change(state, winner_uid)
+        elif winner_uid not in (state.recent_kings or []):
+            # First crown for an existing king (boot phase). Add
+            # them to the history.
+            _record_king_change(state, winner_uid)
         _safe_set_weights(
             subtensor, wallet, netuid, n_uids,
-            build_winner_take_all_weights(n_uids, winner_uid),
+            _build_emission_weights(state, n_uids, winner_uid),
             winner_uid, state_dir,
         )
     else:
@@ -1107,7 +1167,8 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if king_uid is not None:
                     _safe_set_weights(
                         subtensor, wallet, netuid, n_uids,
-                        build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,
+                        _build_emission_weights(state, n_uids, king_uid),
+                        king_uid, state_dir,
                     )
                 state.save()
                 if once:
