@@ -8042,65 +8042,116 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
         question = ""
         gold = ""
         if kind == "shopping_budget":
+            # 2026-05-02 (v30.5): hardened. Was 4 ops (mul, mul, add, sub).
+            # Now 6-7 ops by adding (a) a third item type, (b) a percent
+            # discount on one item, (c) sales tax on the subtotal, (d) a
+            # tip the friend covers (so the model must NOT subtract it
+            # from the protagonist's wallet — adversarial inference).
             name = _realistic_name(r)
             friend = _realistic_name(r)
-            start_money = r.choice([40, 50, 60, 80, 100, 120])
+            start_money = r.choice([80, 100, 120, 150, 200, 250])
             n_items_a = r.randint(3, 8)
             price_a = r.choice([2, 3, 4, 5, 6, 7, 8])
             n_items_b = r.randint(2, 6)
             price_b = r.choice([3, 4, 5, 6, 8, 9, 10])
-            distractor = r.choice([7, 11, 13, 14])  # noise: friend's age etc.
+            n_items_c = r.randint(2, 5)
+            price_c = r.choice([4, 6, 8, 10, 12])
+            discount_pct = r.choice([10, 20, 25])  # applies to item_b only
+            tax_pct = r.choice([5, 8, 10])
+            tip_friend_covers = r.randint(3, 9)  # adversarial distractor
+            distractor = r.choice([7, 11, 13, 14])  # friend's age etc.
             shop = _synth_shop(r)
             item_a = _synth_item(r)
             item_b = _synth_item(r)
-            spent = n_items_a * price_a + n_items_b * price_b
+            item_c = _synth_item(r)
+            cost_a = n_items_a * price_a
+            cost_b_pre = n_items_b * price_b
+            cost_b_disc = cost_b_pre - cost_b_pre * discount_pct // 100
+            cost_c = n_items_c * price_c
+            subtotal = cost_a + cost_b_disc + cost_c
+            tax = subtotal * tax_pct // 100
+            spent = subtotal + tax  # tip is paid by friend (adversarial)
             gold_n = start_money - spent
             question = (
                 f"{name} goes to the {shop} with ${start_money}. "
                 f"Their friend {friend}, who is {distractor} years old, "
-                f"comes along but doesn't buy anything. "
-                f"{name} buys {n_items_a} {item_a} at ${price_a} each "
-                f"and {n_items_b} {item_b} at ${price_b} each. "
+                f"comes along. {name} buys {n_items_a} {item_a} at "
+                f"${price_a} each, {n_items_b} {item_b} at ${price_b} each "
+                f"(today the {item_b} are {discount_pct}% off the listed "
+                f"price), and {n_items_c} {item_c} at ${price_c} each. "
+                f"There is a {tax_pct}% sales tax on the discounted "
+                f"subtotal. {friend} also leaves a ${tip_friend_covers} "
+                f"tip from their own wallet (so {name} doesn't pay it). "
                 f"How many dollars does {name} have left after the visit?"
             )
             gold = str(gold_n)
         elif kind == "recipe_scale":
+            # Hardened: was 3 ops. Now 6 ops with multi-ingredient ratios,
+            # a unit conversion (cups → ounces), and a partial-batch
+            # rounding adversary.
             name = _realistic_name(r)
             base_servings = r.choice([4, 6, 8, 12])
-            target_servings = base_servings * r.choice([2, 3, 4])
+            target_servings = base_servings * r.choice([3, 4, 5])
             cups_per_base = r.choice([2, 3, 4, 5])
-            extra_topping = r.randint(2, 8)
-            distractor = r.choice([45, 60, 90])  # oven temp / time noise
-            cups_total = (target_servings // base_servings) * cups_per_base + extra_topping
-            gold_n = cups_total
+            sugar_per_base = r.choice([1, 2, 3])  # extra ingredient
+            butter_per_base = r.choice([2, 3, 4])
+            extra_topping_cups = r.randint(2, 8)
+            ounces_per_cup = 8  # unit conversion
+            distractor_temp = r.choice([45, 60, 90])
+            scale = target_servings // base_servings
+            cups_flour = scale * cups_per_base + extra_topping_cups
+            cups_sugar = scale * sugar_per_base
+            cups_butter = scale * butter_per_base
+            total_cups = cups_flour + cups_sugar + cups_butter
+            # Final answer in ounces
+            gold_n = total_cups * ounces_per_cup
             recipe = r.choice(["banana bread", "pancakes", "cornbread", "biscuits"])
             question = (
                 f"A {recipe} recipe makes {base_servings} servings and uses "
-                f"{cups_per_base} cups of flour. {name} wants to make "
-                f"{target_servings} servings for a school bake sale. "
-                f"They also need to add {extra_topping} extra cups of flour "
-                f"for a dusting on top. The oven is preheated to "
-                f"{distractor*5} degrees, but that doesn't change the recipe. "
-                f"How many total cups of flour does {name} need?"
+                f"{cups_per_base} cups of flour, {sugar_per_base} cups of "
+                f"sugar, and {butter_per_base} cups of butter. {name} wants "
+                f"to make {target_servings} servings for a school bake sale. "
+                f"They also need to add {extra_topping_cups} extra cups of "
+                f"flour for a dusting on top. The oven is preheated to "
+                f"{distractor_temp*5} degrees (this doesn't change the "
+                f"recipe). The store sells these ingredients by the ounce, "
+                f"and 1 cup equals {ounces_per_cup} ounces. How many TOTAL "
+                f"OUNCES of all three ingredients combined does {name} "
+                f"need?"
             )
             gold = str(gold_n)
         elif kind == "travel_distance":
+            # Hardened: was 4 ops. Now 7 ops with a 3-leg trip, a fuel
+            # consumption calculation overlaid on it, and a unit-converted
+            # final answer.
             name = _realistic_name(r)
             leg_a_speed = r.choice([40, 50, 60, 70])
             leg_a_hours = r.randint(2, 5)
-            stop_distance = r.randint(15, 40)
+            stop_a_distance = r.randint(15, 40)
             leg_b_speed = r.choice([45, 55, 65, 75])
             leg_b_hours = r.randint(2, 4)
-            distractor = r.choice([8, 12, 24])  # tank size, irrelevant
-            total = leg_a_speed * leg_a_hours + stop_distance + leg_b_speed * leg_b_hours
-            gold_n = total
+            stop_b_distance = r.randint(20, 50)
+            leg_c_speed = r.choice([50, 60, 70, 80])
+            leg_c_hours = r.randint(1, 4)
+            mpg = r.choice([20, 24, 28, 32])
+            tank_size = r.choice([10, 12, 15, 18])  # distractor
+            leg_a_dist = leg_a_speed * leg_a_hours
+            leg_b_dist = leg_b_speed * leg_b_hours
+            leg_c_dist = leg_c_speed * leg_c_hours
+            total_miles = leg_a_dist + stop_a_distance + leg_b_dist + stop_b_distance + leg_c_dist
+            # Final answer in gallons of fuel used (forces unit conversion)
+            gold_n = total_miles // mpg
             question = (
-                f"{name} drives east on the highway at {leg_a_speed} mph for "
-                f"{leg_a_hours} hours. They stop at a rest area, then drive "
-                f"another {stop_distance} miles north to pick up a friend. "
-                f"From there, they continue at {leg_b_speed} mph for "
-                f"{leg_b_hours} hours. The car holds {distractor} gallons of "
-                f"fuel. How many miles total has {name} driven?"
+                f"{name} drives east on the highway at {leg_a_speed} mph "
+                f"for {leg_a_hours} hours, stops at a rest area, then "
+                f"drives another {stop_a_distance} miles north to pick up "
+                f"a friend. From there they continue at {leg_b_speed} mph "
+                f"for {leg_b_hours} hours, take a second short detour of "
+                f"{stop_b_distance} miles east, then finish at {leg_c_speed} "
+                f"mph for {leg_c_hours} hours. The car gets {mpg} miles per "
+                f"gallon and the tank holds {tank_size} gallons. How many "
+                f"gallons of fuel did {name} use on the entire trip "
+                f"(rounded down to a whole gallon)?"
             )
             gold = str(gold_n)
         elif kind == "school_classroom":
@@ -8124,168 +8175,294 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "garden_orchard":
+            # Hardened: was 4 ops. Now 7 ops with 3 spoilage stages
+            # (frost, pests, transport) and a per-tree harvest variance.
             farmer = _realistic_name(r)
             n_rows = r.randint(4, 9)
             trees_per_row = r.randint(5, 12)
             apples_per_tree = r.choice([20, 25, 30, 40, 50])
-            spoiled_pct = r.choice([10, 20, 25])  # we use raw count: apples * pct/100
+            frost_pct = r.choice([10, 15, 20])
+            pest_pct = r.choice([5, 10, 15])  # second loss stage
             saved_for_market = r.randint(50, 200)
+            crates_capacity = r.choice([20, 25, 30])  # for transport
+            transport_loss_per_crate = r.randint(1, 4)
             apples_total = n_rows * trees_per_row * apples_per_tree
-            spoiled = apples_total * spoiled_pct // 100
-            gold_n = apples_total - spoiled - saved_for_market
+            after_frost = apples_total - apples_total * frost_pct // 100
+            after_pest = after_frost - after_frost * pest_pct // 100
+            after_market = after_pest - saved_for_market
+            n_crates = max(1, after_market // crates_capacity)
+            transport_loss = n_crates * transport_loss_per_crate
+            gold_n = after_market - transport_loss
             question = (
                 f"{farmer} runs an orchard with {n_rows} rows of apple trees. "
                 f"Each row has {trees_per_row} trees, and each tree produces "
-                f"{apples_per_tree} apples this season. {spoiled_pct}% of the "
-                f"apples are spoiled by frost, and {farmer} saves "
-                f"{saved_for_market} apples for the farmer's market next "
-                f"weekend. How many apples are left for {farmer} to sell to "
-                f"the local grocer?"
+                f"{apples_per_tree} apples this season. {frost_pct}% of all "
+                f"apples are lost to frost. After the frost, an additional "
+                f"{pest_pct}% of the SURVIVING apples are spoiled by pests. "
+                f"{farmer} saves {saved_for_market} apples for the farmer's "
+                f"market. The remaining apples are packed into crates that "
+                f"hold {crates_capacity} apples each, and during transport "
+                f"to the grocer, {transport_loss_per_crate} apples are "
+                f"crushed in each filled crate (any partial final crate has "
+                f"no transport loss). How many apples reach the grocer "
+                f"intact?"
             )
             gold = str(gold_n)
         elif kind == "bakery_orders":
+            # Hardened: was 4 ops. Now 6-7 ops with carryover stock,
+            # daily wholesale variation, and a price-per-loaf revenue
+            # calculation as the final answer.
             baker = _realistic_name(r)
-            n_days = r.randint(3, 6)
-            loaves_per_day = r.choice([24, 30, 36, 48, 60])
+            starting_stock = r.randint(20, 60)
+            n_days = r.randint(4, 7)
+            loaves_per_day = r.choice([30, 36, 48, 60, 72])
             wholesale_per_day = r.randint(8, 18)
-            walkin_total = r.randint(10, 35)
-            distractor = r.choice([5, 6, 7])  # number of staff
+            walkin_per_day = r.randint(10, 25)
+            staff_distractor = r.choice([5, 6, 7])
+            price_per_loaf = r.choice([4, 5, 6, 8])
+            wholesale_discount_pct = r.choice([20, 25, 30])
+            staff_count = staff_distractor
             produced = n_days * loaves_per_day
-            sold = n_days * wholesale_per_day + walkin_total
-            gold_n = produced - sold
+            wholesale_sold = n_days * wholesale_per_day
+            walkin_sold = n_days * walkin_per_day
+            wholesale_revenue = wholesale_sold * price_per_loaf * (100 - wholesale_discount_pct) // 100
+            walkin_revenue = walkin_sold * price_per_loaf
+            gold_n = wholesale_revenue + walkin_revenue
             question = (
-                f"Baker {baker} runs a small bakery with {distractor} staff. "
-                f"They bake {loaves_per_day} loaves of sourdough every day "
-                f"for {n_days} days straight. Each day they sell "
-                f"{wholesale_per_day} loaves to a wholesale partner, and over "
-                f"the {n_days} days they sell {walkin_total} loaves total to "
-                f"walk-in customers. How many loaves are left in storage at "
-                f"the end of the period?"
+                f"Baker {baker} runs a small bakery with {staff_count} "
+                f"staff and {starting_stock} loaves already in storage at "
+                f"the start of the week. They bake {loaves_per_day} loaves "
+                f"of sourdough every day for {n_days} days. Each day they "
+                f"sell {wholesale_per_day} loaves to a wholesale partner "
+                f"(wholesale price is {wholesale_discount_pct}% LESS than "
+                f"the retail price of ${price_per_loaf} per loaf) and "
+                f"{walkin_per_day} loaves to walk-in customers (at the full "
+                f"retail price). Production always meets demand from new "
+                f"baking, so the starting stock is irrelevant to revenue. "
+                f"How many dollars in TOTAL REVENUE did the bakery earn "
+                f"over the {n_days} days?"
             )
             gold = str(gold_n)
         elif kind == "library_books":
+            # Hardened: was 1 op. Now 5+ ops with multiple fee tiers and
+            # a replacement-cost calculation.
             librarian = _realistic_name(r)
-            n_borrowers = r.randint(8, 20)
+            n_borrowers = r.randint(10, 25)
             books_per_borrower = r.randint(2, 5)
-            late_returns = r.randint(3, 12)
-            fine_per_late = r.choice([2, 3, 5])
-            replacements_bought = r.randint(5, 15)
-            distractor = r.choice([12, 15, 18])  # opening hour noise
-            late_revenue = late_returns * fine_per_late
-            books_borrowed = n_borrowers * books_per_borrower
-            # Net books currently out: borrowed minus all that were returned (some late, some on time)
-            # simpler: how many fines collected = late_returns * fine_per_late
-            gold_n = late_revenue
+            late_returns = r.randint(5, 20)
+            fine_per_day = r.choice([1, 2])  # daily late fine
+            avg_days_late = r.randint(3, 10)
+            lost_books = r.randint(2, 8)
+            replacement_cost = r.choice([15, 18, 22, 25])
+            books_donated = r.randint(8, 20)
+            grant_received = r.choice([100, 150, 200])
+            distractor = r.choice([12, 15, 18])  # opening hour
+            late_fines = late_returns * fine_per_day * avg_days_late
+            replacement_revenue = lost_books * replacement_cost
+            net_revenue = late_fines + replacement_revenue + grant_received
+            # Final answer: net revenue (in dollars).
+            gold_n = net_revenue
             question = (
-                f"Librarian {librarian} runs a reading club. {n_borrowers} "
-                f"members each borrowed {books_per_borrower} books for the "
-                f"month. The library opens at {distractor}:00 each day. By "
-                f"the deadline, {late_returns} books were returned late. The "
-                f"library charges ${fine_per_late} per late book. They also "
-                f"used the fines to buy {replacements_bought} replacement "
-                f"books later. How many dollars in late fees did the library "
-                f"collect?"
+                f"Librarian {librarian} runs a reading club with "
+                f"{n_borrowers} members; each borrowed "
+                f"{books_per_borrower} books this month. The library opens "
+                f"at {distractor}:00 each day. By the deadline, "
+                f"{late_returns} books were returned late, on average "
+                f"{avg_days_late} days late, at a fine of ${fine_per_day} "
+                f"per book per day. {lost_books} books were never returned "
+                f"and the library charges the borrower ${replacement_cost} "
+                f"per lost book to replace it. The library also received a "
+                f"${grant_received} grant from the city this month and was "
+                f"donated {books_donated} new books from a patron (the "
+                f"donations are not income). What is the library's total "
+                f"revenue (in dollars) for the month?"
             )
             gold = str(gold_n)
         elif kind == "fundraiser":
+            # Hardened: was 4 ops. Now 6 ops with three donor tiers, a
+            # raffle revenue, and an admin fee deducted from the total.
             organizer = _realistic_name(r)
+            bronze_donors = r.randint(10, 30)
+            bronze_amount = r.choice([5, 10])
             silver_donors = r.randint(8, 25)
-            silver_amount = r.choice([10, 15, 20, 25])
+            silver_amount = r.choice([20, 25, 30])
             gold_donors = r.randint(3, 9)
-            gold_amount = r.choice([50, 75, 100, 150])
-            corporate_match = r.choice([100, 200, 300, 500])
-            distractor = r.choice([3, 5, 7])  # event hour noise
+            gold_amount = r.choice([75, 100, 150])
+            corporate_match_pct = r.choice([10, 25, 50])  # of all donations
+            raffle_tickets_sold = r.randint(40, 120)
+            raffle_price = r.choice([3, 5, 7])
+            admin_fee_pct = r.choice([5, 8, 10])
+            event_hour_distractor = r.choice([3, 5, 7])
+            bronze_total = bronze_donors * bronze_amount
             silver_total = silver_donors * silver_amount
             gold_total = gold_donors * gold_amount
-            gold_n = silver_total + gold_total + corporate_match
+            donations = bronze_total + silver_total + gold_total
+            corporate = donations * corporate_match_pct // 100
+            raffle = raffle_tickets_sold * raffle_price
+            gross = donations + corporate + raffle
+            admin_fee = gross * admin_fee_pct // 100
+            gold_n = gross - admin_fee
             question = (
-                f"{organizer} ran a {distractor}-hour charity fundraiser. "
-                f"{silver_donors} silver-tier donors gave ${silver_amount} "
-                f"each. {gold_donors} gold-tier donors gave ${gold_amount} "
-                f"each. A local company contributed an additional "
-                f"${corporate_match} as a flat corporate match. How many "
-                f"dollars did the fundraiser raise in total?"
+                f"{organizer} ran a {event_hour_distractor}-hour charity "
+                f"fundraiser. {bronze_donors} bronze-tier donors gave "
+                f"${bronze_amount} each, {silver_donors} silver-tier gave "
+                f"${silver_amount} each, and {gold_donors} gold-tier gave "
+                f"${gold_amount} each. A local company contributed a "
+                f"corporate match equal to {corporate_match_pct}% of total "
+                f"individual donations. The fundraiser also sold "
+                f"{raffle_tickets_sold} raffle tickets at ${raffle_price} "
+                f"each. The venue charges an {admin_fee_pct}% administrative "
+                f"fee on the GROSS amount raised (donations + match + "
+                f"raffle). How many dollars are NET-raised after the admin "
+                f"fee?"
             )
             gold = str(gold_n)
         elif kind == "trip_planning":
+            # Hardened: was 3 ops. Now 6 ops with per-day meal variation,
+            # transit cost split across travelers, and a tax on lodging.
             traveler = _realistic_name(r)
-            nights = r.randint(3, 8)
-            lodging_per_night = r.choice([60, 80, 90, 120, 150])
-            meals_per_day = r.choice([20, 30, 40])
-            transport = r.choice([80, 120, 150, 200])
-            distractor = r.choice([2, 4, 6])  # number of travelers? noise
-            lodging = nights * lodging_per_night
-            meals = nights * meals_per_day
-            gold_n = lodging + meals + transport
+            nights = r.randint(4, 9)
+            lodging_per_night = r.choice([80, 100, 120, 150, 200])
+            lodging_tax_pct = r.choice([8, 10, 12, 15])
+            breakfast_per_day = r.choice([10, 15, 20])
+            dinner_per_day = r.choice([25, 30, 40, 50])
+            transport_total = r.choice([200, 300, 400, 500])
+            companions = r.randint(2, 4)  # transport split among
+            ticket_distractor = r.choice([15, 25, 35])  # noise
+            lodging_pre_tax = nights * lodging_per_night
+            lodging_tax = lodging_pre_tax * lodging_tax_pct // 100
+            meals = nights * (breakfast_per_day + dinner_per_day)
+            transport_per_person = transport_total // (companions + 1)
+            gold_n = lodging_pre_tax + lodging_tax + meals + transport_per_person
             question = (
                 f"{traveler} is planning a {nights}-night trip with "
-                f"{distractor} other people, but they're each paying their "
-                f"own way. {traveler}'s lodging costs ${lodging_per_night} "
-                f"per night, meals cost ${meals_per_day} per day, and "
-                f"round-trip transport costs ${transport}. How many dollars "
-                f"will {traveler}'s share of the trip cost?"
+                f"{companions} other people. {traveler}'s lodging costs "
+                f"${lodging_per_night} per night plus a {lodging_tax_pct}% "
+                f"hotel tax (the tax applies only to {traveler}'s lodging, "
+                f"not anyone else's). Meals cost ${breakfast_per_day} per "
+                f"day for breakfast and ${dinner_per_day} per day for "
+                f"dinner (lunch is provided by the venue). Round-trip "
+                f"transport for the entire group costs ${transport_total}, "
+                f"split evenly among all {companions + 1} travelers (each "
+                f"pays an equal share, rounded down to the dollar). Tickets "
+                f"to a museum cost ${ticket_distractor} but are paid for "
+                f"separately. How many dollars total will {traveler}'s "
+                f"share of lodging + meals + transport cost?"
             )
             gold = str(gold_n)
         elif kind == "pets_animals":
+            # Hardened: was 3 ops. Now 6 ops with a feed-cost calculation,
+            # weekly egg sale revenue, and a per-chicken loss to predators.
             owner = _realistic_name(r)
-            n_chickens = r.randint(8, 25)
+            n_chickens_start = r.randint(15, 35)
             eggs_per_week_per_chicken = r.choice([4, 5, 6, 7])
-            n_weeks = r.randint(2, 6)
-            eggs_for_breakfast = r.randint(10, 25)
-            eggs_donated = r.randint(5, 18)
-            distractor = r.choice([12, 15, 18])  # coop dimension noise
-            total_eggs = n_chickens * eggs_per_week_per_chicken * n_weeks
-            gold_n = total_eggs - eggs_for_breakfast - eggs_donated
+            n_weeks = r.randint(3, 8)
+            chickens_lost_to_predator = r.randint(1, 4)  # mid-period
+            eggs_for_breakfast_per_week = r.randint(8, 18)
+            eggs_donated_total = r.randint(15, 35)
+            price_per_dozen = r.choice([3, 4, 5, 6])
+            feed_cost_per_week = r.choice([8, 12, 15])
+            coop_dim_distractor = r.choice([12, 15, 18])
+            chickens_avg = (n_chickens_start * 2 - chickens_lost_to_predator) // 2
+            total_eggs = chickens_avg * eggs_per_week_per_chicken * n_weeks
+            eggs_for_breakfast = eggs_for_breakfast_per_week * n_weeks
+            eggs_for_sale = total_eggs - eggs_for_breakfast - eggs_donated_total
+            dozens_for_sale = eggs_for_sale // 12
+            revenue = dozens_for_sale * price_per_dozen
+            feed_cost_total = feed_cost_per_week * n_weeks
+            gold_n = revenue - feed_cost_total
             question = (
-                f"{owner} keeps {n_chickens} chickens in a "
-                f"{distractor}-meter coop. Each chicken lays "
-                f"{eggs_per_week_per_chicken} eggs per week. Over "
-                f"{n_weeks} weeks, the family ate {eggs_for_breakfast} eggs "
-                f"for breakfast and donated {eggs_donated} eggs to a "
-                f"neighbor. How many eggs are left at the end of the "
-                f"{n_weeks} weeks?"
+                f"{owner} keeps {n_chickens_start} chickens in a "
+                f"{coop_dim_distractor}-meter coop. Each chicken lays "
+                f"{eggs_per_week_per_chicken} eggs per week. Halfway "
+                f"through the period, {chickens_lost_to_predator} chickens "
+                f"were lost to a predator (assume the average flock size "
+                f"over the period was the average of the starting and "
+                f"ending counts, and use that to compute total egg "
+                f"production). Over the full {n_weeks} weeks, the family "
+                f"ate {eggs_for_breakfast_per_week} eggs per week for "
+                f"breakfast and donated {eggs_donated_total} eggs total to "
+                f"a neighbor. The remaining eggs are sold by the dozen at "
+                f"${price_per_dozen} per dozen (any partial dozen is not "
+                f"sold). Feed costs ${feed_cost_per_week} per week. How "
+                f"many dollars in NET PROFIT (sales minus feed cost) does "
+                f"{owner} earn over the {n_weeks} weeks?"
             )
             gold = str(gold_n)
         elif kind == "sports_tournament":
+            # Hardened: was 3 ops. Now 6 ops with knockout-stage bonus,
+            # disciplinary penalty, and average-points-per-game.
             captain = _realistic_name(r)
-            n_games = r.randint(8, 20)
-            n_wins = r.randint(3, n_games - 2)
-            n_losses = n_games - n_wins
-            points_per_win = r.choice([2, 3])
-            points_per_loss = r.choice([0, 1])
-            bonus_pts = r.randint(2, 8)
-            distractor = r.choice([5, 6, 7])  # players on field noise
-            gold_n = n_wins * points_per_win + n_losses * points_per_loss + bonus_pts
+            n_games = r.randint(12, 24)
+            n_wins = r.randint(5, n_games - 3)
+            n_draws = r.randint(1, max(1, (n_games - n_wins) // 2))
+            n_losses = n_games - n_wins - n_draws
+            points_per_win = r.choice([3, 4])
+            points_per_draw = r.choice([1, 2])
+            points_per_loss = 0
+            bonus_per_clean_sheet = r.choice([1, 2])
+            n_clean_sheets = r.randint(2, max(2, n_wins - 1))
+            yellow_cards = r.randint(2, 8)
+            penalty_per_yellow = r.choice([1, 2])
+            playoff_qualified = r.random() < 0.5
+            playoff_bonus = r.choice([5, 8, 10]) if playoff_qualified else 0
+            distractor_players = r.choice([5, 6, 7])
+            base_points = n_wins * points_per_win + n_draws * points_per_draw + n_losses * points_per_loss
+            clean_sheet_bonus = n_clean_sheets * bonus_per_clean_sheet
+            penalty = yellow_cards * penalty_per_yellow
+            gold_n = base_points + clean_sheet_bonus - penalty + playoff_bonus
             sport = r.choice(["soccer", "hockey", "basketball", "rugby"])
             question = (
                 f"Captain {captain}'s {sport} team played {n_games} games "
-                f"with {distractor} players on the field at any time. They "
-                f"won {n_wins} games and lost {n_losses} games. Each win is "
-                f"worth {points_per_win} league points, each loss is worth "
-                f"{points_per_loss} consolation points, and the team got an "
-                f"extra {bonus_pts} bonus points for fair play. How many "
-                f"total league points did {captain}'s team end the season "
+                f"with {distractor_players} players on the field. They "
+                f"won {n_wins}, drew {n_draws}, and lost {n_losses}. A win "
+                f"is worth {points_per_win} league points, a draw worth "
+                f"{points_per_draw}, a loss worth {points_per_loss}. The "
+                f"team also kept a clean sheet (no goals conceded) in "
+                f"{n_clean_sheets} games and earns "
+                f"{bonus_per_clean_sheet} extra point per clean sheet. "
+                f"They received {yellow_cards} yellow cards across the "
+                f"season; each yellow card deducts "
+                f"{penalty_per_yellow} point. "
+                f"{'They qualified for the playoffs and received a flat ' + str(playoff_bonus) + '-point bonus.' if playoff_qualified else 'They did NOT qualify for the playoffs (no playoff bonus).'} "
+                f"How many total league points did the team end the season "
                 f"with?"
             )
             gold = str(gold_n)
         elif kind == "construction":
+            # Hardened: was 3 ops. Now 6 ops with mortar bags, 2-stage
+            # waste (delivery + cutting), and tool rental cost split
+            # across phases.
             contractor = _realistic_name(r)
-            n_walls = r.randint(3, 8)
-            bricks_per_wall = r.choice([80, 100, 120, 150, 200])
-            mortar_per_wall = r.choice([3, 4, 5, 6])  # bags
-            broken_bricks = r.randint(5, 25)
-            extra_safety = r.choice([20, 30, 50])
-            distractor = r.choice([8, 10, 12])  # ladder height noise
-            bricks_total = n_walls * bricks_per_wall + extra_safety
-            gold_n = bricks_total - broken_bricks
+            n_walls = r.randint(4, 10)
+            bricks_per_wall = r.choice([100, 120, 150, 180, 220])
+            mortar_per_wall = r.choice([3, 4, 5, 6])
+            mortar_bag_size = r.choice([10, 12, 15])  # walls per bag
+            broken_in_delivery = r.randint(8, 30)
+            cut_waste_per_wall = r.randint(2, 6)
+            extra_safety = r.choice([30, 50, 75])
+            ladder_distractor = r.choice([8, 10, 12])
+            bricks_needed = n_walls * bricks_per_wall + extra_safety
+            cut_waste_total = n_walls * cut_waste_per_wall
+            bricks_to_order = bricks_needed + broken_in_delivery + cut_waste_total
+            n_mortar_bags = (n_walls + mortar_bag_size - 1) // mortar_bag_size
+            # Final answer: total bricks to order
+            gold_n = bricks_to_order
             question = (
                 f"Contractor {contractor} is building {n_walls} brick walls "
-                f"using a {distractor}-foot ladder. Each wall needs "
-                f"{bricks_per_wall} bricks. {contractor} also orders "
-                f"{extra_safety} extra bricks as a safety margin. During "
-                f"delivery, {broken_bricks} bricks arrive broken and have "
-                f"to be discarded. How many usable bricks does {contractor} "
-                f"have to build the walls?"
+                f"using a {ladder_distractor}-foot ladder (irrelevant to "
+                f"the order). Each wall needs {bricks_per_wall} bricks "
+                f"to complete. The contractor wants to order an extra "
+                f"{extra_safety} bricks as an end-of-job safety margin. "
+                f"Historically, on a delivery this size, "
+                f"{broken_in_delivery} bricks arrive broken and need to be "
+                f"replaced. Cutting bricks to fit at corners always wastes "
+                f"about {cut_waste_per_wall} bricks per wall. (The crew "
+                f"will also need to order mortar — about {mortar_per_wall} "
+                f"bags per wall — but that is a separate purchase.) How "
+                f"many bricks should {contractor} order in TOTAL so that "
+                f"the safety margin still has all {extra_safety} bricks "
+                f"intact after delivery loss and cut waste?"
             )
             gold = str(gold_n)
         elif kind == "modular_linear":
@@ -8703,14 +8880,18 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
-    # 2026-05-01 (v30.4 patch v4): added 4 new code subtypes targeting
-    # weakness areas surfaced on held-out HumanEval —
-    #   - caesar_cipher       (string manipulation: char arithmetic)
-    #   - flatten_nested_list (recursion: variable-depth structure)
-    #   - closest_pair_sum    (search: O(n²) brute force OR sort-and-walk)
-    #   - run_length_decode   (string parsing: digit-grouping)
-    # All four match the humaneval-difficulty calibration target
-    # (~0.45-0.60 base-model pass-rate on a private smoke set).
+    # 2026-05-02 (v30.5): code-bench hardening pass.
+    # ─────────────────────────────────────────────
+    # 1. Hard-tier ratio bumped 70% → 90%. Legacy easy subtypes
+    #    saturated at ≥0.95 across all models (no signal); now they
+    #    take only 10% of the round budget as difficulty floor.
+    # 2. Three new LeetCode-medium subtypes added (all humaneval-distribution):
+    #    - longest_palindromic_substring (DP / center-expand)
+    #    - group_anagrams (hash table + canonicalisation)
+    #    - kth_largest (sorting / quickselect)
+    # 3. Per-subtype: more test inputs, larger arrays (5-15 items vs
+    #    earlier 2-7), explicit edge cases (empty, single, all-equal,
+    #    sorted-ascending, sorted-descending, negative-only).
     hard_kinds = [
         "coin_change_min", "merge_intervals", "rolling_max",
         "nested_paren_groups", "evaluate_postfix", "roman_to_int",
@@ -8719,13 +8900,14 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
         "compress_string", "two_sum_pairs",
         "caesar_cipher", "flatten_nested_list",
         "closest_pair_sum", "run_length_decode",
+        "longest_palindromic_substring", "group_anagrams", "kth_largest",
     ]
     legacy_kinds = [
         "transform_list", "aggregate_list", "string_predicate",
         "digit_sum", "window_sum", "pair_count", "run_length",
         "string_transform",
     ]
-    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_hard = max(1, (n_items * 90 + 50) // 100)
     n_legacy = max(0, n_items - n_hard)
     hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
     legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
@@ -9572,6 +9754,118 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
                 n = r.randint(2, 8)
                 xs = [r.randint(-12, 18) for _ in range(n)]
                 test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "longest_palindromic_substring":
+            entry_point = "longest_palindrome"
+
+            def _ref_lps(s):
+                if not s:
+                    return ""
+                best = ""
+                for i in range(len(s)):
+                    for L, R in [(i, i), (i, i + 1)]:
+                        while L >= 0 and R < len(s) and s[L] == s[R]:
+                            L -= 1
+                            R += 1
+                        sub = s[L + 1:R]
+                        if len(sub) > len(best):
+                            best = sub
+                return best
+            ref = _ref_lps
+            ex_in = "babad"
+            ex_out = _ref_lps(ex_in)
+            prompt = (
+                f"def longest_palindrome(s):\n"
+                f"    \"\"\"Return the longest palindromic substring of ``s``.\n\n"
+                f"    A palindrome reads the same forwards and backwards. If\n"
+                f"    multiple substrings of the maximum length exist, return\n"
+                f"    the FIRST one (leftmost). For empty input, return ''.\n\n"
+                f"    >>> longest_palindrome({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    >>> longest_palindrome('cbbd')\n"
+                f"    'bb'\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                "babad", "cbbd", "", "a", "aa", "abcba",
+                "abcdefg", "racecarxyz", "noon", "abccba",
+                "".join(r.choice("abcd") for _ in range(r.randint(8, 20))),
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "group_anagrams":
+            entry_point = "group_anagrams"
+
+            def _ref_ga(strs):
+                groups: dict = {}
+                for s in strs:
+                    key = "".join(sorted(s))
+                    groups.setdefault(key, []).append(s)
+                # Return sorted by first member of each group lexicographically;
+                # within a group, preserve original order.
+                return sorted(groups.values(), key=lambda g: g[0])
+            ref = _ref_ga
+            ex_in = ["eat", "tea", "tan", "ate", "nat", "bat"]
+            ex_out = _ref_ga(ex_in)
+            prompt = (
+                f"def group_anagrams(strs):\n"
+                f"    \"\"\"Group strings that are anagrams of each other.\n\n"
+                f"    Return a list of groups, where each group is a list of\n"
+                f"    strings that are anagrams of each other. The outer list\n"
+                f"    is sorted by the FIRST member of each group lexicographically.\n"
+                f"    Within each group, preserve the original input order.\n\n"
+                f"    >>> group_anagrams({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    >>> group_anagrams([])\n"
+                f"    []\n"
+                f"    \"\"\"\n"
+            )
+            words_pool = ["eat", "tea", "ate", "tan", "nat", "bat", "tab", "act",
+                          "cat", "tac", "rat", "art", "tar", "god", "dog"]
+            test_inputs = [
+                ["eat", "tea", "tan", "ate", "nat", "bat"],
+                [],
+                ["a"],
+                ["abc", "bca", "cab"],
+                r.sample(words_pool, r.randint(5, 10)),
+                ["xyz", "yzx", "zxy", "abc", "bca", "different"],
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "kth_largest":
+            k_choices = [1, 2, 3]
+            k = r.choice(k_choices)
+            entry_point = "kth_largest"
+
+            def _ref_kth(xs, kk=k):
+                if not xs or kk > len(xs) or kk < 1:
+                    return None
+                return sorted(xs, reverse=True)[kk - 1]
+            ref = _ref_kth
+            ex_in = [3, 2, 1, 5, 6, 4]
+            ex_out = _ref_kth(ex_in)
+            prompt = (
+                f"def kth_largest(xs):\n"
+                f"    \"\"\"Return the {k}{'st' if k==1 else 'nd' if k==2 else 'rd'}\n"
+                f"    largest element of ``xs``. Duplicates count separately\n"
+                f"    (so kth_largest([3,3,3,3]) for k=2 returns 3). If ``xs``\n"
+                f"    has fewer than {k} elements, return None.\n\n"
+                f"    >>> kth_largest({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                [3, 2, 1, 5, 6, 4],
+                [],
+                [1] if k == 1 else [1, 1],
+                [1, 1, 1, 1],
+                sorted([r.randint(-15, 30) for _ in range(r.randint(5, 12))]),
+                sorted([r.randint(-15, 30) for _ in range(r.randint(5, 12))], reverse=True),
+                [r.randint(-9, 9) for _ in range(r.randint(k, 15))],
+                [r.randint(-9, 9) for _ in range(r.randint(k, 15))],
+                [-5, -2, -10, -1, -3],
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
         elif kind == "run_length_decode":
             entry_point = "rle_decode"
             prompt = (
@@ -9626,6 +9920,7 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
         if kind in (
             "caesar_cipher", "flatten_nested_list",
             "closest_pair_sum", "run_length_decode",
+            "longest_palindromic_substring", "group_anagrams", "kth_largest",
         ):
             version_tag = "v30"
         elif kind in (
