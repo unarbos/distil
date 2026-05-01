@@ -337,13 +337,16 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         #      90+ min.
         #
         # Tune via VLLM_EVAL_GPU_UTIL.
-        # 2026-04-30 (v30.3.2): bumped default 0.65 → 0.85. The 0.65 floor
-        # was leaving ~28GB unused on H200 (140GB), starving the KV cache
-        # for the 35B teacher. With 0.85 we have 49GB for KV after the
-        # 70GB weights, which fits 24 concurrent 8k-token streams cleanly
-        # and stops vLLM from crashing mid-eval (root cause of the 100min
-        # round times leeroyjkin reported on 2026-04-29).
-        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.85")
+        # 2026-05-01 (v30.3.5): lowered default 0.85 → 0.78. The pod is
+        # co-tenant with the chat-king vLLM (~21 GiB at 0.15 util) AND
+        # a dead vLLM EngineCore leaks ~3 GiB for 10-30s on crash. At
+        # 0.85 the restart path hit "Free memory is less than desired
+        # GPU memory utilization (0.85, 118.83 GiB)" and bailed to HF
+        # for the rest of the round (root cause of the 4700s
+        # teacher_generation timings on 5/1 morning). 0.78 leaves ~10
+        # GiB of headroom; KV cache usage is <5% in practice so we
+        # aren't losing throughput.
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.78")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
@@ -503,6 +506,15 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     logger.info(f"Running eval ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on pod: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", ""), "TOKENIZERS_PARALLELISM": "false"}
+    # 2026-04-30: enable the Rust-based hf_transfer downloader on the pod.
+    # Saturates the network link (>500MB/s typical) instead of CPython's
+    # 50-100MB/s default. The package was just installed on the pod
+    # (see /home/distil/.secrets/distil.env note); enabling via env is
+    # all that's needed. Saves ~30s/round on student model downloads
+    # (10 students × ~8GB × 80MB/s = 1000s; with hf_transfer 10 × 8GB ×
+    # 500MB/s = 160s). Tunable via DISTIL_HF_TRANSFER=0 to disable.
+    if os.environ.get("DISTIL_HF_TRANSFER", "1") == "1":
+        eval_env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     # 2026-04-24 (distil-97, leeroyjkin): the heavy bench battery (Session 3
     # shadow axes: aime/mbpp/tool_use/self_consistency/arc/truthful/long_context)
     # adds ~6 min/student (~84 min/round for 14 students). Propagate the
