@@ -84,12 +84,50 @@ def _normalize_chat_payload(payload: dict) -> dict:
        leaving thinking on means small ``max_tokens`` budgets get eaten by
        the reasoning trace and ``content`` comes back null. Clients that
        want thinking can opt in via ``chat_template_kwargs``.
+    3. Sane anti-derail sampling defaults (2026-04-30): king models are
+       distilled 4B students, and post-distillation they often have
+       narrow-attractor failure modes — once a phrase template starts
+       repeating, the model will loop on it for the rest of the budget.
+       Reproduced on UID 85 (levikross127/131004_v1) with "list 50 cat
+       facts" at temp=1.0: facts 1–43 were coherent, then 44–50 looped
+       on "Cats Have a 20-Foot X Range / 300-Mile Y Range" with X/Y
+       randomly drawn from {Wind, Rain, Snow, Earth, Stone, Metal}.
+       At higher temperature the loop wanders into CJK/non-Latin
+       vocabulary, which is the multi-language/character "derailing"
+       miners are reporting on Discord.
+       Default ``repetition_penalty=1.05`` (mild — anything > 1.1 makes
+       the king sound robotic and hurts essay quality) and
+       ``frequency_penalty=0.3`` (suppresses re-use of recent tokens
+       without penalising domain vocabulary). Clients that need raw
+       probs can pass an explicit value.
     """
     payload = dict(payload)
     payload["model"] = CHAT_POD_SERVED_MODEL
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
+    # 2026-05-01 (v30.4): tighter anti-derail defaults after a Discord
+    # report from the operator that the chat king sometimes "starts
+    # talking in multiple languages and characters". Symptoms:
+    #   • Latin → CJK/Cyrillic mid-sentence (high non_ascii_frac)
+    #   • Verbatim phrase loops at ~50-token boundaries (repeats_50char>0)
+    # Both are classic 4B-distilled-student narrow-attractor failure
+    # modes, especially under defaults of temp=0.7, top_p=0.9, no
+    # presence/frequency penalty. Raised repetition_penalty 1.05 → 1.10
+    # (the "robotic" 1.15 break-point we found earlier still gives
+    # plenty of headroom), added presence_penalty 0.6 (suppresses
+    # repeated topics across the response), and capped temperature at
+    # 0.6 (still creative, but well below the Mamba/MoE chaos
+    # threshold the king's hybrid arch hits at temp ≥ 0.85). Clients
+    # that need the old behaviour can pass an explicit value.
+    payload.setdefault("repetition_penalty", 1.10)
+    payload.setdefault("frequency_penalty", 0.3)
+    payload.setdefault("presence_penalty", 0.6)
+    if "temperature" in payload:
+        try:
+            payload["temperature"] = min(float(payload["temperature"]), 0.85)
+        except (TypeError, ValueError):
+            pass
     return payload
 
 
@@ -162,6 +200,13 @@ def _sync_chat(payload, king_uid, king_model):
                 resp["thinking"] = thinking
             if "usage" in data:
                 resp["usage"] = data["usage"]
+            # Log the *normalized* payload (with anti-derail defaults
+            # applied) so derail audits show what the model actually
+            # received, not what the client supplied.
+            _log_chat_turn(
+                _normalize_chat_payload(payload),
+                content, king_uid, king_model, data,
+            )
             return resp
         return {"error": "unexpected response from chat server"}
     except json.JSONDecodeError:
@@ -207,6 +252,98 @@ def _stream_chat(payload, king_uid, king_model):
 
 _chat_restart_lock = threading.Lock()
 _last_chat_restart = 0.0
+
+
+# ── Chat turn logging ─────────────────────────────────────────────────────────
+# 2026-04-30: minimal request/response audit log so derail complaints can be
+# diagnosed after the fact. We log to a JSONL file under STATE_DIR with one
+# line per completed turn:
+#   { ts, king_uid, king_model, prompt_chars, response_chars,
+#     non_ascii_frac, top_repeated_50char_count, completion_tokens,
+#     temperature, top_p, repetition_penalty, frequency_penalty,
+#     prompt_preview (first 200 chars), response_preview (first 200 + last 200 chars) }
+# We deliberately do NOT log full conversations — privacy + disk space.
+# When a miner reports "the king derailed", grep this log for high
+# non_ascii_frac or non-zero repeated-substring counts.
+_CHAT_LOG_PATH = os.path.join(STATE_DIR, "chat_turns.jsonl")
+_chat_log_lock = threading.Lock()
+_CHAT_LOG_MAX_BYTES = 50 * 1024 * 1024  # 50MB rotation
+
+
+def _detect_repeated_substring(text: str, win: int = 50, step: int = 25) -> int:
+    """Cheap repetition heuristic: count how many ``win``-char windows
+    starting at multiples of ``step`` repeat in ``text``. Used as a
+    derail signal (>0 means at least one verbatim ~50-char repeat).
+    """
+    seen = set()
+    repeats = 0
+    if not text or len(text) < win * 2:
+        return 0
+    for i in range(0, len(text) - win, step):
+        s = text[i:i + win]
+        if s in seen:
+            repeats += 1
+        seen.add(s)
+    return repeats
+
+
+def _log_chat_turn(payload, response_text, king_uid, king_model, raw_data=None):
+    """Append a one-line JSON record of a completed chat turn.
+
+    Best-effort and non-blocking on errors — never let logging take down a
+    user-facing request.
+    """
+    try:
+        prompt_text = ""
+        for msg in (payload.get("messages") or []):
+            if isinstance(msg, dict):
+                c = msg.get("content")
+                if isinstance(c, str):
+                    prompt_text += c + "\n"
+        response_text = response_text or ""
+        non_ascii = sum(1 for c in response_text if ord(c) > 127)
+        non_ascii_frac = non_ascii / len(response_text) if response_text else 0.0
+        repeats = _detect_repeated_substring(response_text)
+        usage = (raw_data or {}).get("usage") or {}
+        rec = {
+            "ts": time.time(),
+            "king_uid": king_uid,
+            "king_model": king_model,
+            "prompt_chars": len(prompt_text),
+            "response_chars": len(response_text),
+            "non_ascii_frac": round(non_ascii_frac, 4),
+            "repeats_50char": repeats,
+            "completion_tokens": usage.get("completion_tokens"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "temperature": payload.get("temperature"),
+            "top_p": payload.get("top_p"),
+            "repetition_penalty": payload.get("repetition_penalty"),
+            "frequency_penalty": payload.get("frequency_penalty"),
+            "max_tokens": payload.get("max_tokens"),
+            "prompt_preview": prompt_text[-400:],
+            "response_head": response_text[:200],
+            "response_tail": response_text[-200:],
+        }
+        with _chat_log_lock:
+            try:
+                if (
+                    os.path.exists(_CHAT_LOG_PATH)
+                    and os.path.getsize(_CHAT_LOG_PATH) > _CHAT_LOG_MAX_BYTES
+                ):
+                    bak = _CHAT_LOG_PATH + ".1"
+                    if os.path.exists(bak):
+                        os.remove(bak)
+                    os.rename(_CHAT_LOG_PATH, bak)
+            except OSError:
+                pass
+            try:
+                with open(_CHAT_LOG_PATH, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except OSError:
+                pass
+    except Exception:
+        # Logging is strictly best-effort.
+        pass
 
 
 def _ensure_chat_server(king_model=None):
@@ -266,7 +403,13 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 8192)
+    # 2026-05-01 (v30.4): default cap reduced 8192 → 4096. Long
+    # generations on 4B distilled students drift into tail-mode
+    # repetition / language-switching the longer they run; capping at
+    # 4k keeps essay-length answers usable while sharply reducing
+    # the multi-language derail miners reported on Discord. Clients
+    # that need longer can opt-in via explicit max_tokens.
+    max_tokens = body.get("max_tokens", 4096)
     stream = body.get("stream", False)
 
     if not messages:
@@ -297,6 +440,13 @@ async def chat_with_king(request: Request):
     if king_uid is None:
         return {"error": "no king model available"}
 
+    # Anti-derail defaults — see _normalize_chat_payload docstring for rationale.
+    # 2026-04-30: client can override but we set a non-zero floor so the chat
+    # path never falls into the all-defaults vLLM behaviour where every
+    # repetition / frequency / presence penalty is 0.
+    body_rep = body.get("repetition_penalty")
+    body_freq = body.get("frequency_penalty")
+    body_pres = body.get("presence_penalty")
     try:
         pod_payload = {
             "messages": messages,
@@ -305,6 +455,12 @@ async def chat_with_king(request: Request):
             "top_p": top_p,
             "stream": stream,
         }
+        if isinstance(body_rep, (int, float)) and 1.0 <= body_rep <= 2.0:
+            pod_payload["repetition_penalty"] = body_rep
+        if isinstance(body_freq, (int, float)) and -2.0 <= body_freq <= 2.0:
+            pod_payload["frequency_penalty"] = body_freq
+        if isinstance(body_pres, (int, float)) and -2.0 <= body_pres <= 2.0:
+            pod_payload["presence_penalty"] = body_pres
 
         if stream:
             return _stream_chat(pod_payload, king_uid, king_model)

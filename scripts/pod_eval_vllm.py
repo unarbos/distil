@@ -14033,6 +14033,80 @@ def _teacher_cache_complete(model_name, revision=None):
     return True
 
 
+def _gpu_total_gb() -> float:
+    """Return GPU 0 total memory in GiB. Used to compute absolute headroom
+    for vLLM restart-after-crash without baking in H200 specifics."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            text=True, timeout=5,
+        ).strip()
+        return float(out) / 1024.0
+    except Exception:
+        return 140.0  # H200 fallback
+
+
+def _gpu_free_gb() -> float:
+    """Return GPU 0 free memory in GiB."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            text=True, timeout=5,
+        ).strip()
+        return float(out) / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _wait_for_gpu_memory_free(min_free_gb: float, timeout_s: int = 60) -> bool:
+    """Poll nvidia-smi until at least ``min_free_gb`` of GPU 0 memory is
+    free, or ``timeout_s`` elapses. Returns True if the threshold was met.
+
+    Used to gate vLLM restart after a crash: the dead EngineCore
+    subprocess takes 10-30s to actually release its KV-cache allocation
+    even after the parent API server has been killed. Without this
+    wait, vLLM startup fails with::
+
+        ValueError: Free memory on device cuda:0 (116.47/139.8 GiB) on
+        startup is less than desired GPU memory utilization (0.85,
+        118.83 GiB).
+    """
+    import time
+    deadline = time.time() + timeout_s
+    last_print = 0.0
+    while time.time() < deadline:
+        free = _gpu_free_gb()
+        now = time.time()
+        if free >= min_free_gb:
+            print(
+                f"  [vllm] GPU has {free:.1f} GiB free "
+                f"(needed {min_free_gb:.1f}); proceeding",
+                flush=True,
+            )
+            return True
+        if now - last_print > 5.0:
+            print(
+                f"  [vllm] waiting for GPU memory: free={free:.1f} GiB, "
+                f"need >={min_free_gb:.1f} GiB "
+                f"({int(deadline - now)}s left)",
+                flush=True,
+            )
+            last_print = now
+        time.sleep(2)
+    free = _gpu_free_gb()
+    print(
+        f"  [vllm] GPU memory wait timed out after {timeout_s}s "
+        f"(free={free:.1f} GiB, needed {min_free_gb:.1f}). "
+        f"Proceeding anyway — vLLM startup may still fail.",
+        flush=True,
+    )
+    return False
+
+
 def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=8192, revision=None, tensor_parallel_size=1, _attempt=1):
     """Start vLLM server via subprocess. Returns True on success. Retries once on crash."""
     ensure_disk_space(model_name, threshold=80)
@@ -14082,9 +14156,19 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
     max_num_seqs = int(os.environ.get("DISTIL_VLLM_MAX_NUM_SEQS", "32") or 32)
     # The default util is 0.65 (left over from earlier T4/A100 tests).
     # On H200 / multi-GPU pods we have headroom — bump the floor so the
-    # KV cache actually has room. Caller can still pass an explicit value.
+    # KV cache actually has room.
+    #
+    # 2026-05-01 (v30.3.5): lowered from 0.85 → 0.78. The pod is
+    # co-tenant with the chat-king vLLM (held at 0.15 = ~21 GiB on the
+    # H200) AND a dead EngineCore from a prior crash leaks 2-3 GiB for
+    # 10-30s before nvidia-smi reclaims it. At 0.85 util the restart
+    # path was hitting "Free memory ... is less than desired GPU
+    # memory utilization (0.85, 118.83 GiB)" and falling back to HF
+    # for the rest of the round. 0.78 leaves ~10 GiB of headroom and
+    # has not impacted KV-cache size in observed rounds (KV cache
+    # usage stays <5% during teacher gen).
     if gpu_memory_utilization is None or gpu_memory_utilization < 0.7:
-        gpu_memory_utilization = 0.85
+        gpu_memory_utilization = 0.78
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_name,
@@ -15163,8 +15247,26 @@ def main():
                             f"have results, {len(pending_idxs)} pending)",
                             flush=True,
                         )
+                        # 2026-05-01 (v30.3.5): the dead vLLM EngineCore
+                        # subprocess leaks ~3 GiB of GPU memory that
+                        # nvidia-smi takes 10-30s to actually reclaim.
+                        # Without waiting, the next vLLM startup hits
+                        # ``ValueError: Free memory on device cuda:0
+                        # (116.47/139.8 GiB) ... is less than desired
+                        # GPU memory utilization (0.85, 118.83 GiB)``
+                        # because the eval pod is co-tenant with the
+                        # chat-king vLLM (which holds ~21 GiB at
+                        # 0.15 util). Wait actively for memory to
+                        # come back, with a generous timeout.
                         stop_vllm_server()
-                        time.sleep(5)
+                        _wait_for_gpu_memory_free(
+                            min_free_gb=int(
+                                args.vllm_gpu_util
+                                * _gpu_total_gb()
+                                + 4
+                            ),
+                            timeout_s=60,
+                        )
                         if not start_vllm_server(
                             args.teacher, args.vllm_gpu_util,
                             args.vllm_max_model_len,

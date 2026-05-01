@@ -95,7 +95,12 @@ for hotkey, entries in revealed.items():
     elif isinstance(data_str, dict):
         parsed = data_str
     if parsed and isinstance(parsed, dict):
-        commits[str(hotkey)] = {"block": block, **parsed}
+        # 2026-05-01: parsed (miner-controlled) BEFORE chain values so
+        # chain ``block`` always wins. Mirrors the d2d6f28 fix in
+        # eval/chain.py — without this order, a miner can include
+        # ``\"block\": low_value`` in their commit JSON and the
+        # dashboard will show a fake earlier-commit timestamp.
+        commits[str(hotkey)] = {**parsed, "block": block}
     else:
         print(f"[commitments] unparseable for {hotkey}: {str(data_str)[:100]}", file=sys.stderr)
         commits[str(hotkey)] = {"block": block, "raw": str(data_str)}

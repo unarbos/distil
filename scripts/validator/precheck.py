@@ -329,6 +329,57 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     return is_copy, copy_uid, copy_model, original_uid, original_model, max_sim
 
 
+def _one_eval_per_registration_enabled() -> bool:
+    """Feature flag for the v30.4 one-eval-per-registration policy.
+
+    Default ON. Set ``ONE_EVAL_PER_REGISTRATION=0`` in distil.env to
+    disable for emergency rollback.
+    """
+    import os
+    return bool(int(os.environ.get("ONE_EVAL_PER_REGISTRATION", "1") or 1))
+
+
+def _check_registration_already_used(
+    hotkey: str, model_repo: str, revision: str,
+    state: ValidatorState,
+) -> tuple[bool, str | None]:
+    """Has this hotkey already used its one-eval-per-registration slot?
+
+    Returns ``(already_used, reason)``. ``already_used=True`` means the
+    incoming commit must be rejected. ``already_used=False`` means it's
+    safe to evaluate (either fresh hotkey or same-model replay).
+
+    Behaviour:
+      • Hotkey not in tracker → fresh registration → eligible.
+      • Hotkey in tracker, same (model, revision) → replay of the
+        already-evaluated commit. Eligible (no-op; downstream will
+        skip eval since it's in ``evaluated_uids``).
+      • Hotkey in tracker, different (model, revision) → recommit
+        spam. Reject.
+
+    The tracker is populated by ``state_manager`` after each successful
+    eval. Re-registration of a deregistered slot installs a brand new
+    hotkey on Bittensor (the old hotkey can't be re-used by the new
+    owner), so a fresh hotkey naturally bypasses this check.
+    """
+    if not hotkey or not _one_eval_per_registration_enabled():
+        return False, None
+    rec = (state.evaluated_hotkeys or {}).get(hotkey)
+    if not rec:
+        return False, None
+    prev_model = rec.get("model")
+    prev_revision = rec.get("revision", "main")
+    if prev_model == model_repo and prev_revision == revision:
+        return False, None
+    return True, (
+        f"one_eval_per_registration: hotkey {hotkey[:12]}… already "
+        f"evaluated {prev_model}@{prev_revision[:8]} at block "
+        f"{rec.get('evaluated_at_block')}; new commit "
+        f"{model_repo}@{revision[:8]} rejected. To get another eval, "
+        f"register a new hotkey on chain."
+    )
+
+
 def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: ValidatorState, max_params_b: float):
     valid_models = {}
     disqualified = set()
@@ -340,6 +391,22 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=this_commit_block):
             reason = get_dq_reason(uid, hotkey, state.dq_reasons, commit_block=this_commit_block)
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
+            disqualified.add(uid)
+            continue
+        # 2026-05-01 (v30.4): one-eval-per-registration policy. Reject
+        # any commit from a hotkey that has already used its eval slot
+        # on a different (model, revision). The commitment is permanent
+        # but the hotkey only gets one shot — to try again miners must
+        # register a new hotkey.
+        already_used, reason = _check_registration_already_used(
+            hotkey, model_repo, revision, state,
+        )
+        if already_used:
+            logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
+            disqualify(
+                hotkey, reason, state.dq_reasons,
+                commit_block=this_commit_block,
+            )
             disqualified.add(uid)
             continue
         if state.scores.get(str(uid), 0) > MAX_KL_THRESHOLD:

@@ -240,11 +240,44 @@ def merge_composite_scores(
         }
         state.composite_scores[uid_str] = record
         n_updated += 1
+        # 2026-05-01 (v30.4): one-eval-per-registration tracker.
+        # Mark this hotkey as having spent its eval slot so the next
+        # commit from the same hotkey gets rejected at precheck. The
+        # commit must have produced a real composite (we already
+        # filtered DQ + reference rows above), so this is a "real"
+        # eval that should consume the registration's one shot.
+        hotkey = info.get("hotkey") or ""
+        if hotkey:
+            if not isinstance(getattr(state, "evaluated_hotkeys", None), dict):
+                state.evaluated_hotkeys = {}
+            state.evaluated_hotkeys[hotkey] = {
+                "uid": int(uid),
+                "model": record["model"],
+                "revision": record["revision"],
+                "evaluated_at_block": record["block"],
+                "evaluated_at_ts": record["ts"],
+                "composite_final": record["final"],
+                "composite_worst": record["worst"],
+            }
     if n_updated:
         try:
             persist_composite_scores(state)
         except Exception as exc:
             logger.warning(f"single-eval: failed to persist composite_scores after merge (non-fatal): {exc}")
+        # Persist evaluated_hotkeys too so the policy survives validator
+        # restarts. Failure is non-fatal (in-memory state remains correct).
+        try:
+            from eval.state import EVALUATED_HOTKEYS_FILE, atomic_json_write
+            atomic_json_write(
+                state._path(EVALUATED_HOTKEYS_FILE),
+                state.evaluated_hotkeys,
+                indent=2,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"single-eval: failed to persist evaluated_hotkeys "
+                f"(non-fatal): {exc}"
+            )
     return n_updated
 
 
@@ -273,6 +306,70 @@ def _is_eligible_uid(
         (commitments or {}).get(uid, {}).get("block") or info.get("commit_block")
     )
     return not is_disqualified(uid, hotkey, dq_reasons, commit_block=commit_block)
+
+
+def _is_kingship_eligible(
+    state,
+    uid: int,
+    dq_reasons: dict,
+    uid_to_hotkey: dict | None,
+    commitments: dict | None,
+) -> bool:
+    """Return True iff this UID may hold the crown right now.
+
+    Strictly weaker filter than ``_is_eligible_uid`` — it does NOT
+    require the UID to be a participant in the current eval round.
+    Any UID with a stored composite, a current on-chain commitment,
+    and no active DQ is eligible.
+
+    Why: the 2026-04-27 ``models_to_eval``-only restriction was
+    introduced to prevent cross-round-sample drift from inflating
+    a stale UID's composite past the current king. With v30.2's
+    paired king re-eval (king is rerun on the SAME procedural
+    items as challengers every round) AND v30.4's per-axis
+    [0,1]-normalised aggregate, the cross-sample noise is bounded
+    enough that "highest stored composite wins" is the correct
+    semantics. The old restriction was making honest miners with
+    high prior composites (e.g. UID 16 final=0.6039) ineligible
+    even though king UID 95 final=0.5825 is measurably worse —
+    they were stuck waiting for a re-eval slot they could never
+    earn under one-eval-per-commit.
+
+    The eligibility filter requires:
+      • UID is on the current metagraph (we have an entry in
+        ``commitments`` keyed by this UID).
+      • The hotkey on chain matches the hotkey we evaluated under
+        (re-registration with a different hotkey at the same UID
+        invalidates the stored composite).
+      • The UID is not currently DQ'd.
+      • The UID isn't the reference baseline.
+    """
+    from eval.scoring import is_disqualified
+
+    if commitments is None or uid not in commitments:
+        return False
+    commit = commitments.get(uid) or {}
+    if commit.get("is_reference"):
+        return False
+    chain_hotkey = (uid_to_hotkey or {}).get(uid) or commit.get("hotkey", "")
+    if not chain_hotkey:
+        return False
+    # Hotkey-drift guard: composite was earned by a hotkey at this UID
+    # slot. If a different miner now holds the slot (UID was
+    # deregistered + re-registered), the stored composite is no longer
+    # earned by the current owner — they must commit + be evaluated
+    # under their own (model, revision) like everyone else.
+    composite_scores = getattr(state, "composite_scores", {}) or {}
+    rec = composite_scores.get(str(uid)) or {}
+    rec_model = rec.get("model")
+    if rec_model and commit.get("model") and rec_model != commit.get("model"):
+        return False
+    commit_block = commit.get("block") or rec.get("block")
+    if is_disqualified(
+        uid, chain_hotkey, dq_reasons, commit_block=commit_block,
+    ):
+        return False
+    return True
 
 
 # Records produced before the Arena v3 / v3.7 schema promotions carry
@@ -604,8 +701,18 @@ def select_king_by_composite(
                 uid = int(uid_str)
             except (TypeError, ValueError):
                 continue
-            if not _is_eligible_uid(
-                state, uid, valid_models, state.dq_reasons,
+            # 2026-05-01 (v30.4): kingship pool is now NETWORK-WIDE
+            # again. Any UID with a stored composite + active on-chain
+            # commitment + no DQ is eligible for the crown, regardless
+            # of whether they're in the current round's challenger
+            # pool. The 2026-04-27 round-participants-only restriction
+            # was preventing honest miners with high prior composites
+            # from being king (UID 16 final=0.6039 stuck while UID 95
+            # final=0.5825 wore the crown). Cross-round comparison is
+            # safe because per-axis scores are normalised to [0,1] and
+            # rounds use procedural prompts with bounded variance.
+            if not _is_kingship_eligible(
+                state, uid, state.dq_reasons,
                 uid_to_hotkey, commitments,
             ):
                 continue

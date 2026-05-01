@@ -80,6 +80,15 @@ KING_REGRESSION_FILE = "king_regression_streak.json"
 # rounds, this one tracks held-out evalscope regression vs Qwen 4B base.
 # See ``composite._compute_king_canary_regression``.
 KING_CANARY_FILE = "king_canary_streak.json"
+# 2026-05-01 (v30.4): one-eval-per-registration enforcement. Maps
+# hotkey_str → {model, revision, evaluated_at_block, evaluated_at_ts,
+# composite_final}. Once a hotkey has its eval recorded here, ALL
+# subsequent commits from that hotkey to a different (model, revision)
+# pair are rejected at precheck time. Prevents the recommit-spam vector
+# where one registration produces unlimited evaluations by re-uploading
+# slightly-mutated weights to the same hotkey. Re-registration with a
+# brand new hotkey resets eligibility (the new hotkey isn't in the map).
+EVALUATED_HOTKEYS_FILE = "evaluated_hotkeys.json"
 ANNOUNCEMENT_FILE = "announcement.json"
 MODEL_HASHES_FILE = "model_hashes.json"
 SCORE_HISTORY_FILE = "score_history.json"
@@ -142,6 +151,14 @@ class ValidatorState:
         self.failure_models: dict[str, str] = {}  # UID -> model_name at time of failure
         self.dq_reasons: dict[str, str] = {}
         self.evaluated_uids: set[str] = set()
+        # 2026-05-01 (v30.4): one-eval-per-registration tracker.
+        # Keyed by hotkey string (unique per registration on Bittensor —
+        # if a slot is deregistered and re-registered, the new owner
+        # picks a fresh hotkey, so a brand-new hotkey signals a fresh
+        # registration cycle eligible for an eval). Each entry records
+        # the (model, revision, block, ts, composite_final) of the one
+        # eval this registration is allowed.
+        self.evaluated_hotkeys: dict[str, dict] = {}
         # Canonical absolute composite per UID (one-eval-per-commitment).
         # uid_str -> {"worst", "weighted", "axes", "model", "revision",
         #             "block", "ts", "n_axes"}.
@@ -186,6 +203,8 @@ class ValidatorState:
         # evaluated_uids stored as list, loaded as set
         raw = _load_json(self._path(EVALUATED_UIDS_FILE), [])
         self.evaluated_uids = set(raw) if isinstance(raw, list) else set()
+        raw_eh = _load_json(self._path(EVALUATED_HOTKEYS_FILE), {})
+        self.evaluated_hotkeys = raw_eh if isinstance(raw_eh, dict) else {}
 
         raw_comp = _load_json(self._path(COMPOSITE_SCORES_FILE), {})
         self.composite_scores = raw_comp if isinstance(raw_comp, dict) else {}
@@ -226,6 +245,7 @@ class ValidatorState:
         atomic_json_write(self._path("failure_models.json"), self.failure_models, indent=2)
         atomic_json_write(self._path(DISQUALIFIED_FILE), self.dq_reasons, indent=2)
         atomic_json_write(self._path(EVALUATED_UIDS_FILE), list(self.evaluated_uids))
+        atomic_json_write(self._path(EVALUATED_HOTKEYS_FILE), self.evaluated_hotkeys, indent=2)
         atomic_json_write(self._path(UID_HOTKEY_MAP_FILE), self.uid_hotkey_map)
         atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
 
