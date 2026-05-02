@@ -2,6 +2,8 @@
 
 This document explains how to use `examples/distil_kl_train_prebuilt.py` in its current **online-only** form.
 
+For a **Kimi K2.6** teacher with a **Qwen3.x** student (different tokenizers) and optional **8-GPU sequential** scheduling, use [`distil_kl_train_kimi.py`](distil_kl_train_kimi.py) and see the **Training Guide** in the repo root [`README.md`](../README.md#training-guide).
+
 ## Commands
 
 `distil_kl_train_prebuilt.py` supports:

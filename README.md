@@ -177,7 +177,15 @@ These are *untrained baselines*. Models with KL > 2.0 are disqualified, but a lo
 
 ## Training Guide
 
-Want to train your own distilled model? Check out the community-contributed training script in [`examples/`](examples/).
+Want to train your own distilled model? Check out the community-contributed training scripts in [`examples/`](examples/).
+
+### Scripts
+
+| Script | Role |
+|--------|------|
+| [`examples/distil_kl_train.py`](examples/distil_kl_train.py) | Classic offline-style recipe; same tokenizer for teacher and student. |
+| [`examples/distil_kl_train_prebuilt.py`](examples/distil_kl_train_prebuilt.py) | Online teacher + streaming data; see [`examples/README_distil_kl_train_prebuilt.md`](examples/README_distil_kl_train_prebuilt.md). |
+| [`examples/distil_kl_train_kimi.py`](examples/distil_kl_train_kimi.py) | **Kimi K2.6 teacher** + **Qwen3.x student**: different tokenizers, optional **sequential GPU** schedule for big teachers on one 8-GPU node. |
 
 ### KL Distillation Training Script
 
@@ -186,12 +194,46 @@ Want to train your own distilled model? Check out the community-contributed trai
 
 The script [`examples/distil_kl_train.py`](examples/distil_kl_train.py) trains a student model to match the teacher's output distribution using forward KL divergence on raw text from `karpathy/climbmix-400b-shuffle`.
 
+### GPU span (multi-GPU models)
+
+Training flags **`--*_gpu`** and **`--*_gpu_count`** define a **GPU span**: a contiguous range of CUDA device indices, e.g. `--teacher_gpu 0 --teacher_gpu_count 8` → GPUs `0 … 7`. That span is passed to Hugging Face as the sharding pool for that model (`device_map="auto"` with per-GPU memory caps when more than one card is used).
+
 ### GPU Requirements
 
 - **Full teacher (Qwen3.5-35B-A3B unquantized):** 2× A100 80GB+ recommended (one for teacher, one for student)
 - **Local dev with smaller models:** 2× 24GB GPUs (e.g. RTX 3090/4090)
+- **Very large teacher (e.g. Kimi K2.6 sharded across 8×H200):** use [`distil_kl_train_kimi.py`](examples/distil_kl_train_kimi.py) with **`--sequential_gpu_pipeline`** so the teacher and student are **not** resident at the same time (see below). You can still give the student a multi-GPU span **after** the teacher burst (e.g. `--student_gpu 0 --student_gpu_count 8`); small students may not benefit much from 8-way sharding.
 
-### Usage
+### Kimi + Qwen (`distil_kl_train_kimi.py`)
+
+Defaults target **moonshotai/Kimi-K2.6** as teacher and a **Qwen3.6**-compatible student tokenizer. Cross-tokenizer KL uses aligned timesteps (offset mapping when available) and a top-`k` piece mapping for different vocabs; rebuild eval caches when you change teacher or student.
+
+**Build eval cache (pass Qwen student id if teacher tokenizer differs):**
+
+```bash
+python examples/distil_kl_train_kimi.py build_eval_cache_api \
+  --teacher moonshotai/Kimi-K2.6 \
+  --student Qwen/Qwen3.6-4B \
+  --teacher_gpu 0 --teacher_gpu_count 8 \
+  --eval_cache_path ./eval_cache_api.pt
+```
+
+**Train on a single 8-GPU box (sequential pipeline — teacher uses all GPUs, then unloads for student):**
+
+```bash
+python examples/distil_kl_train_kimi.py train \
+  --sequential_gpu_pipeline \
+  --teacher moonshotai/Kimi-K2.6 \
+  --student Qwen/Qwen3.6-4B \
+  --teacher_gpu 0 --teacher_gpu_count 8 \
+  --student_gpu 0 --student_gpu_count 1 \
+  --online_chunk_size 1 \
+  --output_dir ./distil-checkpoints
+```
+
+Relevant flags: **`--sequential_gpu_pipeline`**, **`--sequential_teacher_reload_each_microbatch`** (lower CPU peak of cached teacher logits, slower), **`--kd_top_k`**, **`--online_chunk_size`**, **`--samples_per_step`**. See the script docstring and `--help`.
+
+### Usage (`distil_kl_train.py`)
 
 **Standard training (2 GPUs — teacher + student):**
 ```bash
@@ -223,7 +265,7 @@ python examples/distil_kl_train.py \
 | `--save_every` | `500` | Checkpoint save interval |
 | `--no_wandb` | — | Disable W&B logging |
 
-See the script's docstring and `--help` for the full list of options.
+See each script's docstring and `--help` for the full list of options.
 
 ## Validator Guide
 
