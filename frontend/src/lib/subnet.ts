@@ -14,11 +14,24 @@ export const PENDING_TEACHER =
 // ``previousTeacher`` is the teacher we retired on the most recent swap.
 // Populated after the 2026-05-02 Qwen→Kimi cutover so the dashboard can
 // surface "Previously: Qwen3.6-35B-A3B" telemetry and miners understand
-// which era their commitment belongs to.
-export const PREVIOUS_TEACHER =
-  (subnetConfig as { previousTeacher?: typeof subnetConfig.teacher & {
-    retiredAt?: string;
-  } }).previousTeacher ?? null;
+// which era their commitment belongs to. The shape is a deliberate
+// subset of the current teacher shape (no studentArchAllowlist or
+// rolloutNotes — those only describe the live teacher) plus a
+// ``retiredAt`` timestamp; we cast via ``unknown`` so TS accepts the
+// narrower shape.
+export type RetiredTeacher = {
+  model: string;
+  architecture: string;
+  totalParams: number;
+  activeParams: number;
+  vocabSize: number;
+  configVocabSize: number;
+  maxStudentParams: number;
+  retiredAt?: string;
+};
+export const PREVIOUS_TEACHER: RetiredTeacher | null =
+  ((subnetConfig as unknown) as { previousTeacher?: RetiredTeacher })
+    .previousTeacher ?? null;
 export const VALIDATOR = subnetConfig.validator;
 export const API_SETTINGS = subnetConfig.api;
 export const NETUID = subnetConfig.netuid;
