@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+.flue-cache
+*.log
+# Override the parent .gitignore which ignores .env.* — we want users to see
+# the example.
+!.env.example

@@ -262,7 +262,17 @@ def exec_vllm():
         "--gpu-memory-utilization", str(gpu_util),
         "--enforce-eager",
         "--enable-auto-tool-choice",
-        "--tool-call-parser", "hermes",
+        # 2026-05-02 (v30.5): switched ``hermes`` → ``qwen3_xml``. The
+        # Qwen 3.5 / 3.6 family doesn't emit Hermes JSON tool calls;
+        # it emits ``<tool_call><function=name><parameter=k>v
+        # </parameter></function></tool_call>`` XML, which the
+        # Hermes parser can't extract. Result: a Flue / OpenAI Agents
+        # SDK / Vercel AI SDK client sees the XML as plaintext content
+        # and ``message.tool_calls`` comes back null. The
+        # ``qwen3_xml`` parser registered in vllm.tool_parsers.__init__
+        # ships with vLLM 0.19.x and matches the Qwen3-family format
+        # natively.
+        "--tool-call-parser", "qwen3_xml",
         "--reasoning-parser", "qwen3",
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
         "--skip-mm-profiling",
