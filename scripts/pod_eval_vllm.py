@@ -91,9 +91,19 @@ KL_CHUNK_SIZE = 128
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
+def _default_fp_vocab() -> int:
+    """Return the teacher's ``configVocabSize`` as the activation-fingerprint
+    vocab default. Falls back to Qwen3.5's 248320 if the subnet-config can't
+    be imported (e.g. this script running outside the validator venv).
+    """
+    try:
+        from eval.runtime import TEACHER_CONFIG_VOCAB_SIZE as _v
+        return int(_v)
+    except Exception:
+        return 248320
 ACTIVATION_FP_VOCAB_SIZE = int(
-    os.environ.get("ACTIVATION_FP_VOCAB_SIZE", "248320")
-)  # default matches Qwen3.5; override on teacher swap
+    os.environ.get("ACTIVATION_FP_VOCAB_SIZE") or _default_fp_vocab()
+)  # derives from subnet-config.json; override via env for testing
 
 # -- vLLM server --
 VLLM_PORT = 9100
@@ -15862,7 +15872,6 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
         # and is stable on Mamba per vLLM 0.19.1 release notes.
         "--enable-chunked-prefill",
         "--no-enable-log-requests",
-        "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
         # 2026-04-29 (v29.7): Qwen3.6+ ships with a vision encoder
         # (multimodal MoE). We only ever use the teacher for text-only
@@ -15874,6 +15883,18 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
         "--skip-mm-profiling",
     ]
+    # Teacher-family-specific reasoning parser. Qwen 3.x uses the ``qwen3``
+    # parser; Kimi K2.x has no dedicated reasoning parser in vLLM yet (its
+    # chat template emits tool tokens directly, no <think> blocks to
+    # strip), so we omit ``--reasoning-parser`` for Kimi teachers. If a
+    # future teacher needs a specific parser, plumb it through via env.
+    _parser_env = os.environ.get("DISTIL_VLLM_REASONING_PARSER")
+    if _parser_env and _parser_env not in ("", "none", "off"):
+        cmd.extend(["--reasoning-parser", _parser_env])
+    else:
+        _lc_model = (model_name or "").lower()
+        if ("qwen3" in _lc_model) and ("kimi" not in _lc_model) and ("deepseek" not in _lc_model):
+            cmd.extend(["--reasoning-parser", "qwen3"])
     if tensor_parallel_size and tensor_parallel_size > 1:
         cmd.extend(["--tensor-parallel-size", str(tensor_parallel_size)])
     if revision and revision != "main":
@@ -16596,7 +16617,15 @@ def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
 
 def main():
     parser = argparse.ArgumentParser(description="vLLM-accelerated SN97 evaluation v3")
-    parser.add_argument("--teacher", default="Qwen/Qwen3.5-35B-A3B")
+    # The teacher model is pulled from the runtime config so a teacher swap
+    # (Qwen → Kimi, etc.) doesn't require a code edit in this script. The
+    # ``--teacher`` CLI arg is preserved for ad-hoc overrides; passing
+    # nothing uses the live subnet-config value.
+    try:
+        from eval.runtime import TEACHER_MODEL as _DEFAULT_TEACHER
+    except Exception:
+        _DEFAULT_TEACHER = "Qwen/Qwen3.5-35B-A3B"  # legacy fallback
+    parser.add_argument("--teacher", default=_DEFAULT_TEACHER)
     parser.add_argument("--students", required=True, help="Comma-separated student models")
     parser.add_argument("--revisions", default=None, help="Comma-separated revisions matching --students order")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt texts")
