@@ -684,6 +684,82 @@ def _get_teacher_tokenizer():
     return _teacher_tokenizer
 
 
+_teacher_py_hashes_cache: Optional[dict[str, str]] = None
+
+
+def _get_teacher_py_hashes() -> dict[str, str]:
+    """Return a map of {filename: sha256} for every .py file shipped by the
+    current teacher model's HF repo.
+
+    Resolved lazily on first call; missing .py files return an empty dict
+    (strict mode: no student .py is allowed on the teacher that has none).
+    """
+    global _teacher_py_hashes_cache
+    if _teacher_py_hashes_cache is not None:
+        return _teacher_py_hashes_cache
+    hashes: dict[str, str] = {}
+    try:
+        teacher_info = model_info(TEACHER_MODEL, files_metadata=True)
+        for sibling in (teacher_info.siblings or []):
+            fname = getattr(sibling, "rfilename", "") or ""
+            if not fname.endswith(".py"):
+                continue
+            try:
+                path = hf_hub_download(repo_id=TEACHER_MODEL, filename=fname)
+                with open(path, "rb") as f:
+                    hashes[fname] = hashlib.sha256(f.read()).hexdigest()
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to hash teacher .py {fname}: {exc}"
+                )
+    except Exception as exc:
+        logger.warning(f"Failed to enumerate teacher .py files: {exc}")
+    _teacher_py_hashes_cache = hashes
+    return hashes
+
+
+def _filter_teacher_identical_py_files(
+    model_repo: str, revision: Optional[str], fnames: list[str],
+) -> list[str]:
+    """Return the subset of ``fnames`` that are NOT byte-identical to the
+    teacher's shipped version of the same filename.
+
+    A student .py file is considered safe if and only if:
+      1. A .py file with the same basename exists in the teacher's repo.
+      2. Its SHA256 matches the teacher's.
+
+    Any student .py file that fails either condition is returned as
+    unsafe (caller fails closed). This is how legitimate Kimi students
+    can bundle ``tokenization_kimi.py`` and ``tool_declaration_ts.py``
+    (copied verbatim from ``moonshotai/Kimi-K2.6``) without tripping
+    the custom-code guard, while a rogue ``tokenizer.py`` that
+    monkey-patches ``json.dump`` would still get rejected.
+    """
+    teacher_hashes = _get_teacher_py_hashes()
+    unsafe: list[str] = []
+    for fname in fnames:
+        base = fname.rsplit("/", 1)[-1]
+        teacher_hash = teacher_hashes.get(fname) or teacher_hashes.get(base)
+        if not teacher_hash:
+            unsafe.append(fname)
+            continue
+        try:
+            student_path = hf_hub_download(
+                repo_id=model_repo, filename=fname, revision=revision,
+            )
+            with open(student_path, "rb") as f:
+                student_hash = hashlib.sha256(f.read()).hexdigest()
+        except Exception as exc:
+            logger.warning(
+                f"Failed to hash student .py {model_repo}:{fname}: {exc}"
+            )
+            unsafe.append(fname)
+            continue
+        if student_hash != teacher_hash:
+            unsafe.append(fname)
+    return unsafe
+
+
 _teacher_chat_template_hash_cache: Optional[str] = None
 
 
@@ -876,12 +952,30 @@ def check_model_architecture(
                 if fname.endswith('.py') and fname != '__init__.py':
                     dangerous_files.append(fname)
             if dangerous_files:
-                return {
-                    "pass": False,
-                    "reason": f"SECURITY: Repo contains custom code files ({', '.join(dangerous_files)}). "
-                              f"Custom code is not allowed — students must use standard architectures only.",
-                    "params_b": 0,
-                }
+                # 2026-05-02 (Kimi K2.6 cutover): some teachers (Kimi K2.6)
+                # ship a custom tokenizer / processor / config as .py files
+                # which legitimate students need to copy verbatim to load
+                # the tokenizer. Allow .py files whose SHA256 is
+                # byte-identical to the teacher's copy — these carry no
+                # custom executable code beyond what the teacher itself
+                # ships (and hence is already trusted in this subnet's
+                # context). Any .py that DIFFERS from the teacher or
+                # isn't in the teacher's repo gets fail-closed.
+                surviving = _filter_teacher_identical_py_files(
+                    model_repo, revision, dangerous_files,
+                )
+                if surviving:
+                    return {
+                        "pass": False,
+                        "reason": (
+                            f"SECURITY: Repo contains custom code files ("
+                            f"{', '.join(surviving)}). Only .py files that are "
+                            f"byte-identical to {TEACHER_MODEL}'s own .py files "
+                            f"are allowed; anything else is custom code and is "
+                            f"not permitted."
+                        ),
+                        "params_b": 0,
+                    }
         except Exception as e:
             logger.warning(f"Could not check repo files for {model_repo}: {e}")
 
