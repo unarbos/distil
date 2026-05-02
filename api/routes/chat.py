@@ -108,16 +108,65 @@ def _normalize_chat_payload(payload: dict) -> dict:
     payload["chat_template_kwargs"] = kwargs
     # 2026-05-01 (v30.4 patch v3): chat.arbos.life is a transparent
     # window into the king's behaviour. We do NOT mask poor model
-    # quality. No sampling caps, no max_tokens caps, no derail
-    # truncation — clients see exactly what the model produces.
-    # If the king derails, the chat exposes it. The eval-side
-    # ``long_gen_coherence`` axis will dethrone broken kings.
+    # quality. No sampling caps, no derail truncation — clients see
+    # exactly what the model produces. If the king derails, the
+    # chat exposes it. The eval-side ``long_gen_coherence`` axis
+    # will dethrone broken kings.
     #
-    # The only normalisation we still do is rewriting ``model`` to
-    # the stable ``sn97-king`` served name (vLLM rejects anything
-    # else) and defaulting ``enable_thinking`` to False so reasoner
-    # models don't blow their token budget on a hidden trace before
-    # producing visible content.
+    # 2026-05-02 (v30.5 patch): the ONE exception is a
+    # ``max_tokens`` floor. Open-WebUI's default for the
+    # sn97-king model card is 1200, so user questions that
+    # need a long answer (Fermi math, multi-step proofs,
+    # essays) hit ``finish_reason=length`` mid-paragraph
+    # before the model has reached its natural stop token.
+    # We raise the floor to 24576 (3/4 of the chat pod's
+    # 32768 max-model-len) so a 4K-token prompt + reasonable
+    # answer always has room to terminate cleanly. Clients
+    # that want a tight cap can still pass an explicit value
+    # ≥ 24576; we never lower a client-supplied cap.
+    client_max_tokens = payload.get("max_tokens")
+    floor = 24576
+    if client_max_tokens is None or (
+        isinstance(client_max_tokens, (int, float))
+        and client_max_tokens < floor
+    ):
+        payload["max_tokens"] = floor
+    # 2026-05-02 (v30.5 patch): math-formatting system prompt.
+    # User report: Fermi-style math answers ("how many jelly beans
+    # fill the ocean") were rendering with raw red LaTeX in
+    # chat.arbos.life because the model emits a mix of (a) bare
+    # ``\text{Volume}=3.55\times10^{23}`` (no delimiter), (b)
+    # ``$$ ... $$`` block math, and (c) ``$...$`` inline math.
+    # Open-WebUI 0.8.12 KaTeX renders (c) reliably but stumbles on
+    # (b) when the closing ``$$`` is on the same line as text, and
+    # never renders (a) at all. The model is doing this because no
+    # system prompt told it to stay consistent.
+    #
+    # We inject a tiny formatting guide IFF the client did not
+    # provide its own system prompt. This is the smallest delta
+    # that fixes the user-visible "red LaTeX" without overriding
+    # custom system prompts (Open-WebUI lets users set per-chat
+    # system prompts; we never clobber those).
+    msgs = list(payload.get("messages") or [])
+    has_system = any(
+        (isinstance(m, dict) and m.get("role") == "system") for m in msgs
+    )
+    if not has_system:
+        formatting_guide = (
+            "You are a helpful, concise assistant. When you write math, "
+            "ALWAYS use LaTeX with consistent delimiters: ``$...$`` for "
+            "inline math (e.g., the speed $v=d/t$) and ``$$...$$`` on "
+            "their OWN lines for block math. Never emit bare LaTeX "
+            "commands (``\\text``, ``\\frac``, ``\\times``, "
+            "``\\approx``) outside of these delimiters. For simple "
+            "arithmetic prefer plain text (``2.36 × 10^22`` is fine) — "
+            "reserve LaTeX for multi-line derivations and equations "
+            "with fractions, integrals, or sums. Use Markdown for "
+            "headers, lists, and code blocks."
+        )
+        payload["messages"] = [
+            {"role": "system", "content": formatting_guide}
+        ] + msgs
     return payload
 
 

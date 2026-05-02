@@ -233,12 +233,23 @@ def exec_vllm():
     # most of the time. ``pod_eval.py`` claims ~0.90 of the H200 during
     # rounds, so a 0.90 chat slice would OOM the second vLLM to come up
     # (whichever loses the race). Default to a slim slice that comfortably
-    # fits a 4B model + KV cache (~18GB) and tune via env if a future king
-    # is bigger or the eval pod gets a smaller card. Same for max_model_len:
-    # chat.arbos.life rarely needs > 8K context, and the long ceiling kept
-    # forcing vLLM to pre-allocate KV cache it never used.
-    gpu_util = os.environ.get("CHAT_VLLM_GPU_UTIL", "0.15")
-    max_model_len = os.environ.get("CHAT_VLLM_MAX_MODEL_LEN", "8192")
+    # fits a 4B model + KV cache and tune via env if a future king is
+    # bigger or the eval pod gets a smaller card.
+    #
+    # 2026-05-02 (v30.5 patch): max_model_len 8192 → 32768. User-reported
+    # truncation: long math questions (multi-step word problems,
+    # Fermi-style "how many jelly beans fill the ocean") were producing
+    # answers that hit ``finish_reason=length`` mid-final-paragraph
+    # because (prompt ~600 tokens) + (long answer ~7500 tokens) clipped
+    # the 8192 cap. The Qwen3.5 king config exposes
+    # ``max_position_embeddings=262144`` and 24 of 32 layers are
+    # Mamba-style linear-attention (constant KV-cache cost regardless of
+    # sequence length); the dominant memory cost comes from the 8 full-
+    # attention layers. 32K context fits comfortably under
+    # ``gpu_memory_utilization=0.30``. If a future bigger king OOMs at
+    # 32K, drop CHAT_VLLM_MAX_MODEL_LEN via env and bump util.
+    gpu_util = os.environ.get("CHAT_VLLM_GPU_UTIL", "0.30")
+    max_model_len = os.environ.get("CHAT_VLLM_MAX_MODEL_LEN", "32768")
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", str(MODEL_DIR),

@@ -170,7 +170,16 @@ def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, st
         return False
 
 
-def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir):
+def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir, state):
+    """2026-05-02 (v30.5 hotfix): the multi-king payout refactor moved the
+    weights-vector builder behind ``_build_emission_weights(state, ...)``
+    but the call-site here was still passing the old (king_uid) signature
+    via the closure-name ``state``, which is undefined in this scope.
+    Result: NameError every epoch BEFORE the round even starts → the
+    validator catches the exception in run_validator's broad except and
+    sleeps the full tempo, so the round NEVER runs. Hot-fix: take state
+    explicitly so the call-site is the one passing it in. This is what
+    miners are seeing as "validator is idle / eval is stuck"."""
     if king_uid is None or validator_uid is None:
         return
     try:
@@ -1176,7 +1185,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir)
+            _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir, state)
 
             n_prompts = EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H
             logger.info(
