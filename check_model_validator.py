@@ -68,7 +68,7 @@ logging.basicConfig(
 logger = logging.getLogger("check_model")
 
 # ── Constants (must match validator) ────────────────────────────────────
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+TEACHER_MODEL = "Qwen/Qwen3.6-35B-A3B"
 TEACHER_TOTAL_PARAMS_B = 35.0
 MAX_PARAM_RATIO = 0.15  # ~5.25B max
 BASELINE_VOCAB_SIZE = 248320
