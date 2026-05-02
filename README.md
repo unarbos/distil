@@ -233,6 +233,19 @@ python examples/distil_kl_train_kimi.py train \
 
 Relevant flags: **`--sequential_gpu_pipeline`**, **`--sequential_teacher_reload_each_microbatch`** (lower CPU peak of cached teacher logits, slower), **`--kd_top_k`**, **`--online_chunk_size`**, **`--samples_per_step`**. See the script docstring and `--help`.
 
+**Kimi teacher + Moonshot student (same tokenizer as Kimi):** use **`--assume_same_tokenizer_as_teacher`** so one tokenizer (`--tokenizer_model` Hub id if set; otherwise **`--teacher`**) encodes both models; **`--student`** is only the LM weights Hub id. Avoids cross-tokenizer KL and skips `student_full_seq` in the eval cache. Pair with **`--sequential_gpu_pipeline`** if the teacher still needs all GPUs. *Note: SN97 on-chain rules currently target Qwen-shaped students and tokenizers; a pure Moonshot student is mainly for off-subnet or experimental training unless those requirements match your deployment.*
+
+```bash
+python examples/distil_kl_train_kimi.py train \
+  --assume_same_tokenizer_as_teacher \
+  --teacher moonshotai/Kimi-K2.6 \
+  --student moonshotai/<YOUR_MOONSHOT_STUDENT_REPO> \
+  --sequential_gpu_pipeline \
+  --teacher_gpu 0 --teacher_gpu_count 8 \
+  --student_gpu 0 --student_gpu_count 1 \
+  --output_dir ./distil-checkpoints-moonshot
+```
+
 ### Usage (`distil_kl_train.py`)
 
 **Standard training (2 GPUs — teacher + student):**

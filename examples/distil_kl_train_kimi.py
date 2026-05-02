@@ -22,6 +22,15 @@ Examples:
       --teacher_gpu 0 --teacher_gpu_count 8 \
       --student_gpu 0 --student_gpu_count 1 \
       --output_dir ./distil-checkpoints
+
+    # Moonshot teacher + smaller Moonshot student (same tokenizer as Kimi; no Qwen bridge)
+    python examples/distil_kl_train_kimi.py train \
+      --assume_same_tokenizer_as_teacher \
+      --teacher moonshotai/Kimi-K2.6 \
+      --student moonshotai/<SmallerMoonshot-Instruct> \
+      --teacher_gpu 0 --teacher_gpu_count 8 \
+      --student_gpu 0 --student_gpu_count 1 \
+      --output_dir ./distil-checkpoints-moonshot
 """
 
 import argparse
@@ -899,9 +908,9 @@ def _validate_loaded_eval_cache_meta(
             f"Eval cache teacher mismatch: cache={cached_teacher!r} current={args.teacher!r}. "
             "Use --rebuild_eval_cache."
         )
+    cached_student = str(cache_meta.get("student") or "").strip()
+    current_student = str(getattr(args, "student", "") or "").strip()
     if cache_meta.get("cross_tokenizer_kd"):
-        cached_student = str(cache_meta.get("student") or "").strip()
-        current_student = str(getattr(args, "student", "") or "").strip()
         if (
             cached_student
             and current_student
@@ -909,6 +918,26 @@ def _validate_loaded_eval_cache_meta(
         ):
             raise ValueError(
                 "Eval cache student mismatch under cross-tokenizer KD: "
+                f"cache={cached_student!r} current={current_student!r}. "
+                "Use --rebuild_eval_cache."
+            )
+    if "assume_same_tokenizer_as_teacher" in cache_meta:
+        if bool(cache_meta.get("assume_same_tokenizer_as_teacher")) != bool(
+            getattr(args, "assume_same_tokenizer_as_teacher", False)
+        ):
+            raise ValueError(
+                "Eval cache assume_same_tokenizer_as_teacher metadata mismatch vs current training flags. "
+                "Use --rebuild_eval_cache."
+            )
+        if (
+            bool(cache_meta.get("assume_same_tokenizer_as_teacher"))
+            and bool(getattr(args, "assume_same_tokenizer_as_teacher", False))
+            and cached_student
+            and current_student
+            and cached_student != current_student
+        ):
+            raise ValueError(
+                "Eval cache student mismatch (shared tokenizer / Moonshot family): "
                 f"cache={cached_student!r} current={current_student!r}. "
                 "Use --rebuild_eval_cache."
             )
@@ -1319,6 +1348,8 @@ class StreamingTokenStream:
         dataset_split: str = "train",
         dataset_skip_rows: int = 0,
         student_model: str | None = None,
+        assume_same_tokenizer_as_teacher: bool = False,
+        tokenizer_model: str | None = None,
     ):
         from transformers import AutoTokenizer
 
@@ -1328,7 +1359,20 @@ class StreamingTokenStream:
         self._student_model = (
             str(student_model).strip() if student_model else self._teacher_model
         )
-        self.dual_tokenizers = self._student_model != self._teacher_model
+        self._assume_same_tokenizer_as_teacher = bool(assume_same_tokenizer_as_teacher)
+        if tokenizer_model is not None:
+            hm = str(tokenizer_model).strip()
+            self._tokenizer_hub_ref = hm if hm else None
+        else:
+            self._tokenizer_hub_ref = None
+
+        repos_differ = self._student_model != self._teacher_model
+        self.dual_tokenizers = bool(repos_differ and not self._assume_same_tokenizer_as_teacher)
+        tokenizer_hub = (
+            (self._tokenizer_hub_ref if self._tokenizer_hub_ref else self._teacher_model)
+            if (self.dual_tokenizers is False)
+            else None
+        )
         self.dataset = dataset
         self.dataset_split = str(dataset_split)
         self.max_seq_len = int(max_seq_len)
@@ -1342,20 +1386,32 @@ class StreamingTokenStream:
             "kl_start_pos": None,
             "num_samples": 0,
         }
-        self.teacher_tokenizer = AutoTokenizer.from_pretrained(
-            self._teacher_model, trust_remote_code=True
-        )
-        if self.teacher_tokenizer.pad_token is None:
-            self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
         if self.dual_tokenizers:
+            self.teacher_tokenizer = AutoTokenizer.from_pretrained(
+                self._teacher_model, trust_remote_code=True
+            )
             self.student_tokenizer = AutoTokenizer.from_pretrained(
                 self._student_model, trust_remote_code=True
             )
-            if self.student_tokenizer.pad_token is None:
-                self.student_tokenizer.pad_token = self.student_tokenizer.eos_token
         else:
+            src = tokenizer_hub if tokenizer_hub else self._teacher_model
+            self.teacher_tokenizer = AutoTokenizer.from_pretrained(
+                src, trust_remote_code=True
+            )
             self.student_tokenizer = self.teacher_tokenizer
+        if self.teacher_tokenizer.pad_token is None:
+            self.teacher_tokenizer.pad_token = self.teacher_tokenizer.eos_token
+        if self.dual_tokenizers and self.student_tokenizer.pad_token is None:
+            self.student_tokenizer.pad_token = self.student_tokenizer.eos_token
         self.tokenizer = self.student_tokenizer
+        if self._assume_same_tokenizer_as_teacher and repos_differ:
+            src_h = tokenizer_hub if tokenizer_hub else self._teacher_model
+            log.info(
+                "Shared tokenizer: LM weights teacher=%s student=%s; tokenization/chat template from Hub %s",
+                self._teacher_model,
+                self._student_model,
+                src_h,
+            )
 
     def _tensorize_dual(self, item: dict) -> dict | None:
         truncate_kw = {"truncation": True, "max_length": self.max_seq_len}
@@ -1367,6 +1423,33 @@ class StreamingTokenStream:
         if duo is None:
             return None
         full_t, full_s, plc_t, plc_s = duo
+        if not self.dual_tokenizers:
+            text = full_t
+            plc = plc_t
+            ids, off = _encode_with_offsets_optional(
+                self.teacher_tokenizer, text, truncate_kw
+            )
+            ek_simple_flat = rt_kw.copy()
+            loss_s = _loss_start_token_from_prompt_chars_prompt_ids(
+                text,
+                off,
+                plc,
+                self.teacher_tokenizer,
+                ek_simple_flat,
+                int(ids.shape[0]),
+            )
+            ids_long = ids.to(dtype=torch.long)
+            if ids_long.numel() <= loss_s + 1:
+                return None
+            return {
+                "teacher_input_ids": ids_long.clone(),
+                "student_input_ids": ids_long.clone(),
+                "teacher_loss_start": int(loss_s),
+                "student_loss_start": int(loss_s),
+                "teacher_offsets": off,
+                "student_offsets": off,
+            }
+
         ids_t, off_t = _encode_with_offsets_optional(
             self.teacher_tokenizer, full_t, truncate_kw
         )
@@ -1406,7 +1489,9 @@ class StreamingTokenStream:
         if not text or len(text) < self.min_chars:
             return None
         ids_t = self.teacher_tokenizer(text, **rt_kw).input_ids.squeeze(0).to(torch.long)
-        ids_s = self.student_tokenizer(text, **rt_kw).input_ids.squeeze(0).to(torch.long)
+        ids_s = ids_t.clone() if not self.dual_tokenizers else self.student_tokenizer(
+            text, **rt_kw
+        ).input_ids.squeeze(0).to(torch.long)
         return {
             "teacher_input_ids": ids_t,
             "student_input_ids": ids_s,
@@ -1448,6 +1533,8 @@ class StreamingTokenStream:
             "teacher_model": self._teacher_model,
             "student_model": self._student_model,
             "dual_tokenizers": bool(self.dual_tokenizers),
+            "assume_same_tokenizer_as_teacher": bool(self._assume_same_tokenizer_as_teacher),
+            "tokenizer_hub_ref": self._tokenizer_hub_ref or "",
         }
 
     def load_state_dict(self, state: dict):
@@ -1488,6 +1575,21 @@ class StreamingTokenStream:
             raise ValueError(
                 f"Streaming resume student_model mismatch: checkpoint={state.get('student_model')} "
                 f"current={self._student_model}"
+            )
+        if "assume_same_tokenizer_as_teacher" in state and bool(
+            state.get("assume_same_tokenizer_as_teacher")
+        ) != bool(self._assume_same_tokenizer_as_teacher):
+            raise ValueError(
+                "Streaming resume assume_same_tokenizer_as_teacher mismatch: "
+                f"checkpoint={state.get('assume_same_tokenizer_as_teacher')} "
+                f"current={self._assume_same_tokenizer_as_teacher}"
+            )
+        ckpt_tokhub = str(state.get("tokenizer_hub_ref") or "")
+        cur_tokhub = str(self._tokenizer_hub_ref or "")
+        if ckpt_tokhub != cur_tokhub:
+            raise ValueError(
+                f"Streaming resume tokenizer_hub_ref mismatch: checkpoint={ckpt_tokhub!r} "
+                f"current={cur_tokhub!r}"
             )
         target = int(state.get("consumed", 0))
         if target < 0:
@@ -1539,7 +1641,9 @@ def build_eval_cache_api(args):
     if teacher_hf_tok.pad_token is None:
         teacher_hf_tok.pad_token = teacher_hf_tok.eos_token
     student_ref = getattr(args, "student", None) or args.teacher
-    cross = str(student_ref).strip() != str(args.teacher).strip()
+    assume_same = bool(getattr(args, "assume_same_tokenizer_as_teacher", False))
+    repos_differ = str(student_ref).strip() != str(args.teacher).strip()
+    cross = bool(repos_differ and not assume_same)
     student_hf_tok = None
     if cross:
         student_hf_tok = AutoTokenizer.from_pretrained(student_ref, trust_remote_code=True)
@@ -1558,7 +1662,8 @@ def build_eval_cache_api(args):
     )
     meta = {
         "teacher": args.teacher,
-        "student": str(student_ref) if cross else args.teacher,
+        "student": str(student_ref),
+        "assume_same_tokenizer_as_teacher": bool(assume_same),
         "cross_tokenizer_kd": bool(cross),
         "prompt_source_mode": "api",
         "eval_data_url": args.eval_data_url,
@@ -1635,6 +1740,12 @@ def train_online(args):
             args.dataset_split,
             args.dataset,
         )
+    if getattr(args, "tokenizer_model", None) and not getattr(
+        args, "assume_same_tokenizer_as_teacher", False
+    ):
+        log.warning(
+            "--tokenizer_model is ignored unless --assume_same_tokenizer_as_teacher is set."
+        )
     data = StreamingTokenStream(
         teacher_model=args.teacher,
         dataset=args.dataset,
@@ -1643,6 +1754,10 @@ def train_online(args):
         dataset_split=args.dataset_split,
         dataset_skip_rows=stream_skip_rows,
         student_model=args.student,
+        assume_same_tokenizer_as_teacher=bool(
+            getattr(args, "assume_same_tokenizer_as_teacher", False)
+        ),
+        tokenizer_model=getattr(args, "tokenizer_model", None),
     )
 
     manifest = data.manifest
@@ -1887,7 +2002,10 @@ def train_online(args):
             if cache_path:
                 meta = {
                     "teacher": args.teacher,
-                    "student": args.student if cross_tc else args.teacher,
+                    "student": str(args.student),
+                    "assume_same_tokenizer_as_teacher": bool(
+                        getattr(args, "assume_same_tokenizer_as_teacher", False)
+                    ),
                     "cross_tokenizer_kd": cross_tc,
                     "prompt_source_mode": "api" if args.eval_use_api_prompts else "dataset",
                     "eval_data_url": args.eval_data_url if args.eval_use_api_prompts else None,
@@ -2456,6 +2574,13 @@ def build_parser():
         default=MAX_SEQ_LEN,
         help="Truncate retokenized student eval sequences to this length.",
     )
+    p_eval_cache.add_argument(
+        "--assume_same_tokenizer_as_teacher",
+        action="store_true",
+        help=(
+            "Teacher and student share the Moonshot tokenizer; omit student_full_seq in the cache payload."
+        ),
+    )
     p_eval_cache.add_argument("--teacher_gpu", type=int, default=0)
     p_eval_cache.add_argument(
         "--teacher_gpu_count",
@@ -2509,6 +2634,23 @@ def build_parser():
         type=str,
         default=None,
         help="Optional Hub revision/branch for --student when downloading origin config/tokenizer files.",
+    )
+    p_train.add_argument(
+        "--assume_same_tokenizer_as_teacher",
+        action="store_true",
+        help=(
+            "Load a single tokenizer (from --tokenizer_model if set, else --teacher): use when the student "
+            "is another Moonshot repo with identical tokenizer+vocab as Kimi. Disables cross-tokenizer KL."
+        ),
+    )
+    p_train.add_argument(
+        "--tokenizer_model",
+        type=str,
+        default=None,
+        help=(
+            "HF repo id whose tokenizer/chat template weights we use when --assume_same_tokenizer_as_teacher is "
+            "set (defaults to --teacher)."
+        ),
     )
     p_train.add_argument("--teacher_gpu", type=int, default=0)
     p_train.add_argument("--student_gpu", type=int, default=1)
