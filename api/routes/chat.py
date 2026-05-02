@@ -106,28 +106,18 @@ def _normalize_chat_payload(payload: dict) -> dict:
     kwargs = dict(payload.get("chat_template_kwargs") or {})
     kwargs.setdefault("enable_thinking", False)
     payload["chat_template_kwargs"] = kwargs
-    # 2026-05-01 (v30.4): tighter anti-derail defaults after a Discord
-    # report from the operator that the chat king sometimes "starts
-    # talking in multiple languages and characters". Symptoms:
-    #   • Latin → CJK/Cyrillic mid-sentence (high non_ascii_frac)
-    #   • Verbatim phrase loops at ~50-token boundaries (repeats_50char>0)
-    # Both are classic 4B-distilled-student narrow-attractor failure
-    # modes, especially under defaults of temp=0.7, top_p=0.9, no
-    # presence/frequency penalty. Raised repetition_penalty 1.05 → 1.10
-    # (the "robotic" 1.15 break-point we found earlier still gives
-    # plenty of headroom), added presence_penalty 0.6 (suppresses
-    # repeated topics across the response), and capped temperature at
-    # 0.6 (still creative, but well below the Mamba/MoE chaos
-    # threshold the king's hybrid arch hits at temp ≥ 0.85). Clients
-    # that need the old behaviour can pass an explicit value.
-    payload.setdefault("repetition_penalty", 1.10)
-    payload.setdefault("frequency_penalty", 0.3)
-    payload.setdefault("presence_penalty", 0.6)
-    if "temperature" in payload:
-        try:
-            payload["temperature"] = min(float(payload["temperature"]), 0.85)
-        except (TypeError, ValueError):
-            pass
+    # 2026-05-01 (v30.4 patch v3): chat.arbos.life is a transparent
+    # window into the king's behaviour. We do NOT mask poor model
+    # quality. No sampling caps, no max_tokens caps, no derail
+    # truncation — clients see exactly what the model produces.
+    # If the king derails, the chat exposes it. The eval-side
+    # ``long_gen_coherence`` axis will dethrone broken kings.
+    #
+    # The only normalisation we still do is rewriting ``model`` to
+    # the stable ``sn97-king`` served name (vLLM rejects anything
+    # else) and defaulting ``enable_thinking`` to False so reasoner
+    # models don't blow their token budget on a hidden trace before
+    # producing visible content.
     return payload
 
 
@@ -161,6 +151,161 @@ def stream_remote_chat(payload: dict):
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+
+
+# ── Chat-side derail detection (REMOVED 2026-05-01) ───────────────────────────
+# Earlier in this session we added an aggressive proxy-side
+# truncator that hid the king's long-form derail from users.
+# That was the wrong call — chat.arbos.life is the operator's
+# transparent window into model quality and should NEVER mask
+# poor performance. The derail belongs in the eval, where it
+# will dethrone the broken king. Helpers below are kept (unused
+# by chat) as reference implementation for the eval-side
+# detector in scripts/pod_eval_vllm.py — both share the same
+# six-signal heuristic so signal tuning stays in sync.
+
+
+def _coherence_factor_chat(text: str) -> float:
+    """Six-signal statistical coherence detector — copy of the one in
+    pod_eval_vllm.py, kept here so the chat proxy can run it without
+    importing the eval module. See the original for full docstring.
+
+    Returns coherence in [0.05, 1.0]. 1.0 = clean prose. <0.3 = derail.
+    """
+    if not text:
+        return 1.0
+    text_len = len(text)
+    if text_len < 50:
+        return 1.0
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    non_ascii_frac = non_ascii / text_len
+    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 4.0))
+    seen = set()
+    repeats = 0
+    for i in range(0, text_len - 50, 25):
+        s = text[i:i + 50]
+        if s in seen:
+            repeats += 1
+        seen.add(s)
+    repeats_factor = max(0.0, 1.0 - min(1.0, repeats * 0.05))
+    words = text.split()
+    n_words = len(words)
+    if n_words == 0:
+        return 0.0
+    long_words = sum(1 for w in words if len(w) > 50)
+    word_list_factor = max(
+        0.0, 1.0 - min(1.0, (long_words / n_words) * 1.5),
+    )
+    word_lens = [len(w) for w in words[:1000]]
+    mean_word_len = sum(word_lens) / max(1, len(word_lens))
+    # 2026-05-01 (v30.4 patch v2): raised threshold 10 → 20. Academic
+    # prose ("Philosophical Inquiry into Artificial Intelligence") has
+    # 10-15 char words frequently and was scoring meaningful_factor
+    # ~0.6, false-positiving the truncator on legitimate long
+    # responses. The signal is meant to catch nonsense compound
+    # coinage ("jovialincarnacioappreciable", "boblynberry-vogesters")
+    # which has mean word length 50+ in single-word strings.
+    meaningful_factor = max(
+        0.0, 1.0 - max(0.0, (mean_word_len - 20.0) * 0.1),
+    )
+    punct_chars = sum(1 for c in text if c in ".,;:?!\"'()[]{}—–-")
+    punct_frac = punct_chars / max(1, text_len)
+    # 2026-05-01 (v30.4 patch v2): lowered floor 0.03 → 0.015 and
+    # raised the ≥400 chars gate to ≥600. Academic / multi-paragraph
+    # prose with markdown headers (asterisks, no terminal
+    # punctuation) was hitting a 1.5-2.5 percent punct rate and
+    # getting falsely penalized. Real word-list derail mode runs
+    # 0-0.5 percent punctuation across long stretches.
+    if text_len < 600:
+        punctuation_factor = 1.0
+    elif punct_frac >= 0.015:
+        punctuation_factor = 1.0
+    else:
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.015))
+    norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
+    norm_words = [
+        w for w in norm_words
+        if w and w.replace("-", "").isalpha()
+    ]
+    if len(norm_words) >= 150:
+        unique_frac = len(set(norm_words)) / len(norm_words)
+        if unique_frac < 0.85:
+            unique_word_factor = 1.0
+        else:
+            unique_word_factor = max(
+                0.0, 1.0 - (unique_frac - 0.85) / 0.10,
+            )
+    else:
+        unique_word_factor = 1.0
+    coh = (
+        non_ascii_factor * repeats_factor * word_list_factor
+        * meaningful_factor * punctuation_factor * unique_word_factor
+    )
+    return max(0.05, min(1.0, coh))
+
+
+def _truncate_at_derail(
+    text: str,
+    window: int = 800,
+    threshold: float = 0.5,
+) -> tuple[str, bool]:
+    """Find the last coherent prefix of ``text`` and truncate there.
+
+    Returns ``(truncated_text, was_truncated)``. The algorithm slides
+    a ``window``-char detector across the text in ``window // 2`` steps
+    and finds the FIRST window whose coherence drops below
+    ``threshold``. The cut is placed at the last sentence boundary
+    before the derail starts (period, question mark, exclamation
+    point, or newline), with a graceful "[truncated]" tail so the
+    user knows the rest was discarded.
+
+    The window is 800 chars so that BOTH the punctuation_factor (≥600
+    chars threshold) AND the unique_word_factor (≥150 words threshold)
+    are active in each detector pass. The previous 400-char window
+    let derail chunks slip past those signals.
+
+    Cheap O(N): each window's coherence is computed on an 800-char
+    slice and the loop stops at the first bad window. For a clean
+    coherent response the loop runs through every window once
+    (typical 5000 chars → ~12 windows × ~1ms each = ~12ms).
+    """
+    if not text or len(text) < window:
+        return text, False
+    text_len = len(text)
+    step = max(1, window // 2)
+    derail_start = None
+    for end in range(window, text_len + step, step):
+        end = min(end, text_len)
+        chunk = text[max(0, end - window):end]
+        if _coherence_factor_chat(chunk) < threshold:
+            derail_start = end - window
+            break
+    if derail_start is None:
+        return text, False
+    cutoff = max(0, derail_start)
+    sentence_breaks = ".?!"
+    paragraph_breaks = "\n"
+    for i in range(cutoff, max(0, cutoff - 600), -1):
+        if i < text_len and (
+            text[i] in paragraph_breaks
+            or (
+                text[i] in sentence_breaks
+                and (i + 1 >= text_len or text[i + 1] in " \n\t")
+            )
+        ):
+            return (
+                text[:i + 1]
+                + "\n\n"
+                + "_[Response truncated — the model began producing "
+                + "incoherent text past this point. This is a known "
+                + "failure mode of the current king on long generations; "
+                + "the next eval round should dethrone this model.]_"
+            ), True
+    return (
+        text[:cutoff]
+        + "\n\n"
+        + "_[Response truncated — incoherent text past this point.]_"
+    ), True
 
 
 # ── Chat helpers ──────────────────────────────────────────────────────────────
@@ -200,9 +345,8 @@ def _sync_chat(payload, king_uid, king_model):
                 resp["thinking"] = thinking
             if "usage" in data:
                 resp["usage"] = data["usage"]
-            # Log the *normalized* payload (with anti-derail defaults
-            # applied) so derail audits show what the model actually
-            # received, not what the client supplied.
+            # Log the chat turn for derail audits in chat_turns.jsonl
+            # (raw content, no truncation).
             _log_chat_turn(
                 _normalize_chat_payload(payload),
                 content, king_uid, king_model, data,
@@ -217,6 +361,11 @@ def _stream_chat(payload, king_uid, king_model):
     payload["stream"] = True
 
     def generate():
+        # 2026-05-01 (v30.4 patch v3): no proxy-side truncation. We
+        # forward every delta as-is and accumulate in ``acc`` only
+        # for the chat_turns.jsonl audit log at the end. Derail is
+        # caught by the eval, not hidden by the chat.
+        acc = ""
         try:
             for line in stream_remote_chat(payload):
                 line = line.strip()
@@ -228,16 +377,35 @@ def _stream_chat(payload, king_uid, king_model):
                     break
                 try:
                     parsed = json.loads(raw)
-                    parsed["king_uid"] = king_uid
-                    parsed["king_model"] = king_model
-                    yield f"data: {json.dumps(parsed)}\n\n"
                 except json.JSONDecodeError:
                     yield f"data: {raw}\n\n"
+                    continue
+                choices = parsed.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    msg = choices[0].get("message") or {}
+                    delta_content = (
+                        delta.get("content")
+                        or msg.get("content")
+                        or ""
+                    )
+                    if delta_content:
+                        acc += delta_content
+                parsed["king_uid"] = king_uid
+                parsed["king_model"] = king_model
+                yield f"data: {json.dumps(parsed)}\n\n"
         except Exception as e:
             err = str(e)
             if "ssh" in err.lower() or "root@" in err or ".ssh/" in err:
                 err = "chat server connection failed"
             yield f"data: {json.dumps({'error': err[:200]})}\n\n"
+        try:
+            _log_chat_turn(
+                _normalize_chat_payload(payload),
+                acc, king_uid, king_model, None,
+            )
+        except Exception:
+            pass
 
     return StreamingResponse(
         generate(),
@@ -403,13 +571,15 @@ async def chat_with_king(request: Request):
 
     body = await request.json()
     messages = body.get("messages", [])
-    # 2026-05-01 (v30.4): default cap reduced 8192 → 4096. Long
-    # generations on 4B distilled students drift into tail-mode
-    # repetition / language-switching the longer they run; capping at
-    # 4k keeps essay-length answers usable while sharply reducing
-    # the multi-language derail miners reported on Discord. Clients
-    # that need longer can opt-in via explicit max_tokens.
+    # 2026-05-01 (v30.4 patch v3): no masking. Default max_tokens is
+    # 4096 (a typical assistant default), bounded only by the model's
+    # context window (6144 hard cap = 8192 max_model_len minus prompt
+    # headroom). If the king derails, the chat exposes it.
     max_tokens = body.get("max_tokens", 4096)
+    try:
+        max_tokens = min(int(max_tokens), 6144)
+    except (TypeError, ValueError):
+        max_tokens = 4096
     stream = body.get("stream", False)
 
     if not messages:
@@ -428,7 +598,9 @@ async def chat_with_king(request: Request):
                 content={"error": "message content too long (max 10000 chars)"},
             )
     if not isinstance(max_tokens, (int, float)) or max_tokens < 1:
-        max_tokens = 8192
+        max_tokens = 4096
+    # 2026-05-01 (v30.4 patch v3): standard assistant defaults — no
+    # anti-derail bias. Chat exposes model behaviour as-is.
     temperature = body.get("temperature", 0.7)
     if not isinstance(temperature, (int, float)) or temperature < 0 or temperature > 2:
         temperature = 0.7
@@ -551,7 +723,9 @@ async def openai_chat_completions(request: Request):
         return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
 
     stream = body.get("stream", False)
-    # _normalize_chat_payload (called inside _curl_cmd) rewrites model + thinking.
+    # 2026-05-01 (v30.4 patch v3): no truncation. Pass through the
+    # model's response as-is. Chat is a transparent surface; if the
+    # king derails, we expose it.
     try:
         if stream:
             def generate():

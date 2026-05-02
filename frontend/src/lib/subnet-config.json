@@ -7,7 +7,19 @@
     "activeParams": 3000000000,
     "vocabSize": 248044,
     "configVocabSize": 248320,
-    "maxStudentParams": 7000000000
+    "maxStudentParams": 40000000000
+  },
+  "pendingTeacher": {
+    "model": "moonshot/Kimi-K2.6-Instruct",
+    "architecture": "kimi_k2_moe",
+    "totalParams": 1000000000000,
+    "activeParams": 32000000000,
+    "vocabSize": 163840,
+    "configVocabSize": 163840,
+    "maxStudentParams": 40000000000,
+    "rolloutDate": "2026-05-03",
+    "tokenizerPath": "pathA",
+    "rolloutNotes": "Pending teacher swap: Qwen3.6-35B-A3B \u2192 Kimi K2.6 (\u22481T total / \u224832B active per the K2.5 lineage). Cross-tokenizer Path A active (Qwen-tokenizer round-trip via eval/cross_tokenizer.py). Path B (Universal Logit Distillation native) deferred unless Path A shows >5pp regression on the held-out canary. 40B student cap is now active and applies to BOTH teachers. Live cutover happens after the 1-day miner-warning notice + a Stage-2 A/B pass on a separate experiment pod (see reports/2026-04-29-kimi-k2.6-stage2-runbook.md)."
   },
   "validator": {
     "maxKlThreshold": 2.0,

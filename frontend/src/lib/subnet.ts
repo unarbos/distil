@@ -2,6 +2,17 @@ import subnetConfig from "./subnet-config.json";
 
 export const SUBNET = subnetConfig;
 export const TEACHER = subnetConfig.teacher;
+// 2026-05-02 (v30.5): pendingTeacher is the teacher we plan to roll
+// to next (currently Kimi K2.6 staged for 2026-05-03). It is NOT yet
+// active — the validator continues running ``TEACHER`` until the
+// rolloutDate. UI can read this to show a "Coming soon" banner so
+// miners get the heads-up before the swap lands.
+export const PENDING_TEACHER =
+  (subnetConfig as { pendingTeacher?: typeof subnetConfig.teacher & {
+    rolloutDate?: string;
+    tokenizerPath?: string;
+    rolloutNotes?: string;
+  } }).pendingTeacher ?? null;
 export const VALIDATOR = subnetConfig.validator;
 export const API_SETTINGS = subnetConfig.api;
 export const NETUID = subnetConfig.netuid;

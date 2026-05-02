@@ -18,8 +18,15 @@ for _lib in ("paramiko", "paramiko.transport", "paramiko.sftp", "urllib3", "http
     logging.getLogger(_lib).setLevel(logging.WARNING)
 logging.getLogger("distillation.remote_validator").setLevel(logging.DEBUG)
 
+from eval.runtime import MAX_STUDENT_PARAMS
 from scripts.validator.config import NETUID
 from scripts.validator.service import run_validator
+
+# 2026-05-02 (v30.5): default max-params-b now reads from
+# subnet-config.json via eval.runtime.MAX_STUDENT_PARAMS so changes
+# to the config (40B cap, future Kimi K2.6 swap) automatically apply
+# without needing to update the systemd service args.
+_DEFAULT_MAX_PARAMS_B = MAX_STUDENT_PARAMS / 1e9
 
 
 @click.command()
@@ -31,7 +38,7 @@ from scripts.validator.service import run_validator
 @click.option("--lium-api-key", required=True, envvar="LIUM_API_KEY")
 @click.option("--lium-pod-name", default="distil-validator")
 @click.option("--state-dir", default="state")
-@click.option("--max-params-b", type=float, default=5.25)
+@click.option("--max-params-b", type=float, default=_DEFAULT_MAX_PARAMS_B)
 @click.option("--tempo", type=int, default=360, help="Seconds between epochs")
 @click.option("--once", is_flag=True, help="Run one epoch and exit (for testing)")
 @click.option("--use-vllm", is_flag=True, default=False, envvar="USE_VLLM",

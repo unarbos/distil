@@ -42,9 +42,10 @@ import click
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("distillation.miner")
 
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+TEACHER_MODEL = "Qwen/Qwen3.6-35B-A3B"
 TEACHER_TOTAL_PARAMS_B = 35.0
-MAX_PARAM_RATIO = 0.15  # ~5.25B max
+MAX_PARAM_RATIO = 1.15
+MAX_STUDENT_PARAMS_B_ABS = 40.0
 MIN_BITTENSOR_VERSION = "9.5.0"
 
 # ANSI colors

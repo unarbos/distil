@@ -91,6 +91,62 @@ def build_winner_take_all_weights(n_uids: int, winner_uid: int) -> list[float]:
     return weights
 
 
+def build_recent_kings_weights(
+    n_uids: int,
+    recent_kings: list[int],
+    max_kings: int = 5,
+) -> list[float]:
+    """Build a weight vector that splits emission across recent kings.
+
+    2026-05-01 (v30.4): replaces strict winner-takes-all on chain. The
+    most recent ``max_kings`` distinct king UIDs each receive an equal
+    share (1.0 / N for N ≤ ``max_kings``). When a UID has held the
+    crown more than once we keep only the MOST RECENT entry (it stays
+    in the payout queue once and is refreshed when re-crowned). When
+    fewer than ``max_kings`` distinct kings have ever been crowned
+    (boot phase, low-history validators), the available kings split
+    1.0 equally so no emission is wasted.
+
+    Rationale (Discord 2026-05-01): coffieex / svdeai07 / sebastian
+    pointed out that winner-takes-all amplifies leaderboard noise —
+    a 0.5 percent composite gap flips 100 percent of the emission.
+    Splitting across the last 5 distinct kings smooths this without
+    abandoning the king mechanic; a model that holds the crown for
+    even one round earns ongoing incentive.
+
+    Args:
+        n_uids: metagraph size
+        recent_kings: list of UIDs ordered MOST-RECENT FIRST (the
+            current king is at index 0)
+        max_kings: cap the split at this many UIDs (default 5)
+
+    Returns:
+        Length-``n_uids`` (or ``max(n_uids, last_king+1)``) list of
+        floats summing to 1.0.
+    """
+    seen: list[int] = []
+    for uid in recent_kings:
+        try:
+            uid_i = int(uid)
+        except (TypeError, ValueError):
+            continue
+        if uid_i < 0:
+            continue
+        if uid_i in seen:
+            continue
+        seen.append(uid_i)
+        if len(seen) >= max_kings:
+            break
+    if not seen:
+        return [0.0] * n_uids
+    weight_each = 1.0 / len(seen)
+    out_len = max(n_uids, max(seen) + 1)
+    weights = [0.0] * out_len
+    for uid in seen:
+        weights[uid] = weight_each
+    return weights
+
+
 def get_validator_weight_target(subtensor, netuid: int, validator_uid: int) -> int | None:
     """Return the validator's current highest-weight target UID, if any."""
 

@@ -246,6 +246,8 @@ def merge_composite_scores(
         # commit must have produced a real composite (we already
         # filtered DQ + reference rows above), so this is a "real"
         # eval that should consume the registration's one shot.
+        # 2026-05-01 (v30.4 patch): also persist coldkey for the
+        # Sybil-mitigation check on cross-hotkey re-eval attempts.
         hotkey = info.get("hotkey") or ""
         if hotkey:
             if not isinstance(getattr(state, "evaluated_hotkeys", None), dict):
@@ -254,6 +256,7 @@ def merge_composite_scores(
                 "uid": int(uid),
                 "model": record["model"],
                 "revision": record["revision"],
+                "coldkey": info.get("coldkey"),
                 "evaluated_at_block": record["block"],
                 "evaluated_at_ts": record["ts"],
                 "composite_final": record["final"],
@@ -701,18 +704,25 @@ def select_king_by_composite(
                 uid = int(uid_str)
             except (TypeError, ValueError):
                 continue
-            # 2026-05-01 (v30.4): kingship pool is now NETWORK-WIDE
-            # again. Any UID with a stored composite + active on-chain
-            # commitment + no DQ is eligible for the crown, regardless
-            # of whether they're in the current round's challenger
-            # pool. The 2026-04-27 round-participants-only restriction
-            # was preventing honest miners with high prior composites
-            # from being king (UID 16 final=0.6039 stuck while UID 95
-            # final=0.5825 wore the crown). Cross-round comparison is
-            # safe because per-axis scores are normalised to [0,1] and
-            # rounds use procedural prompts with bounded variance.
-            if not _is_kingship_eligible(
-                state, uid, state.dq_reasons,
+            # 2026-05-01 (v30.4 patch v3): kingship pool reverted to
+            # ROUND-PARTICIPANTS-ONLY after Discord pushback (coffieex,
+            # svdeai07, sebastian_020521 on 2026-05-01: "cross-round
+            # comparison isn't meaningful unless all models are
+            # evaluated on the same data — different data can skew
+            # the overall scores"). The 2026-05-01 morning change
+            # that made the kingship pool network-wide caused UIDs
+            # to take the crown despite never being in the round
+            # they "won" — coffieex screenshotted UID 6 winning
+            # against UID 225 even though only UID 225 was in the
+            # round head-to-head against UID 107. Reverting to
+            # round-participants-only restores apples-to-apples
+            # paired comparison; the multi-king payout (top-5 most
+            # recent kings each get 20 percent) addresses the
+            # original a_tensor concern (UIDs with high composite
+            # should still be rewarded) without abandoning paired
+            # comparison.
+            if not _is_eligible_uid(
+                state, uid, valid_models, state.dq_reasons,
                 uid_to_hotkey, commitments,
             ):
                 continue

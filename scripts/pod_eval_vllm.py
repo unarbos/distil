@@ -1142,8 +1142,30 @@ JUDGE_PROBE_MAX_TOKENS = int(os.environ.get("JUDGE_PROBE_MAX_TOKENS", "256"))
 # answers; nothing in the validator currently measures whether a model
 # can sustain a coherent multi-paragraph response, which is one of the
 # user-visible SOTA capabilities for assistant deployment.
-LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "4"))
-LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "1024"))
+# 2026-05-01 (v30.4 patch v3): bumped 4 → 8 prompts per round. With
+# only 4 prompts a derail on 1-2 of them only lowers coherence_factor
+# to ~0.5 (could still pass the 0.5 threshold). 8 prompts gives
+# tighter mean and exposes intermittent derailers (the king fails on
+# only some long-form prompts depending on topic). Doubles long-form
+# judge wall-clock per round (~30s → ~60s phase B), worth it.
+LONG_FORM_JUDGE_PER_ROUND = int(os.environ.get("LONG_FORM_JUDGE_PER_ROUND", "8"))
+# 2026-05-01 (v30.4 patch v2): raised 2048 → 6144 — essentially the
+# model's full usable context window minus prompt headroom. The
+# cap is asymmetric in cost:
+#   • Coherent models emit EOS at ~500-1000 tokens. Cost ≈ unchanged.
+#   • Derailed models never emit EOS and fill the full 6144 budget.
+#     They PAY for their derail in eval compute, which is exactly
+#     the right cost distribution.
+#   • Infinite-loop models hit the hard wall at 6144 instead of
+#     wasting an entire round budget.
+# The chat.arbos.life screenshot showed king UID 107 happily
+# generating word salad through 2000+ tokens even at temp=0.5,
+# so 2048 was still cutting most of the derail off. 6144 gives the
+# coherence detector a much longer signal window to work with —
+# a model that derails at 800 tokens scores ~0.05 across the
+# 5300-token derailed tail, vs maybe 0.4 on just the 1240-token
+# tail at the old 2048 cap.
+LONG_FORM_JUDGE_MAX_TOKENS = int(os.environ.get("LONG_FORM_JUDGE_MAX_TOKENS", "6144"))
 LONG_FORM_JUDGE_ENABLED = os.environ.get("LONG_FORM_JUDGE_PROBE", "1") != "0"
 LONG_FORM_JUDGE_IN_COMPOSITE = os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
 # Env gate: off by default would hide the shadow data, which defeats the
@@ -1235,6 +1257,40 @@ _LONG_FORM_JUDGE_TEMPLATES = (
     "Write a 350-500 word advice piece on {topic}. Open with a clear "
     "statement of the situation, give two-three concrete steps in the "
     "body, and close with a short summary.",
+    # ─────────────────────────────────────────────────────────────────
+    # 2026-05-01 (v30.4 patch v4): four longer-stretch coherence-stress
+    # templates that match common chat patterns where derailment shows
+    # up most often. These ask for 600-1000 words across 4-6 distinct
+    # sections so the model must maintain coherence well past the
+    # ~500-word threshold where small distilled models tend to break
+    # down. The dedicated long_gen_coherence axis treats output below
+    # ~0.30 coherence as a hard DQ; these templates SURFACE that
+    # failure mode every round, so a model that derails on chat users
+    # also derails on the eval and gets DQ'd accordingly.
+    "Write a comprehensive 600-900 word essay on {topic} structured "
+    "as four distinct sections: (1) a one-paragraph introduction "
+    "stating the central question, (2) two body paragraphs developing "
+    "the main argument, (3) one paragraph examining a counter-view, "
+    "(4) a closing paragraph synthesising the discussion. Use clear "
+    "topic sentences and natural transitions between sections.",
+    "Provide a step-by-step reasoning piece (700-1000 words, 5-6 "
+    "paragraphs) that walks through {topic} from first principles. "
+    "Open with definitions, then build up the core argument over "
+    "three body paragraphs (each making one distinct point with a "
+    "concrete example), then close with implications. Maintain a "
+    "consistent register and avoid restating the same point twice.",
+    "Write a 600-800 word narrative reflection on {topic}. Begin "
+    "with a specific scene (one paragraph), develop the central "
+    "tension over two body paragraphs, introduce a complicating "
+    "perspective in a fourth paragraph, and close with a takeaway. "
+    "Keep the voice consistent throughout and use natural prose "
+    "rather than bullet points.",
+    "Compose a Fermi-style estimation answer to a quantitative "
+    "question about {topic} in 500-700 words and 4-5 paragraphs. "
+    "State the question clearly, list assumptions in one paragraph, "
+    "show two-three estimation steps in separate paragraphs (with "
+    "intermediate numerical reasoning), and close with the final "
+    "estimate plus a sentence on how confident you are.",
 )
 
 # Topic phrases procedurally rotated. Mostly content-domain neutral so
@@ -1801,7 +1857,267 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
         mean = sum(valid) / len(valid)
         agg["mean_score"] = round(mean, 3)
         agg["normalized"] = round(max(0.0, min(1.0, (mean - 1.0) / 4.0)), 4)
+    # 2026-05-01 (v30.4 patch): coherence-derail penalty. Even with the
+    # rubric explicitly grading "1 = bad — refusal, gibberish", we
+    # observed king UID 107 score 0.875/1.0 on long_form_judge while
+    # producing this output on chat.arbos.life:
+    #   "...turret despizano buble sphere pete thinowy galactic
+    #    translation punkaster skewed sentinel abbe incense hang ersmus
+    #    lo ga dullwort mogsen drawler boblynberry-vogesters
+    #    hyperventilation whale weekstabbies paperfold..."
+    # The teacher's rubric is too lenient on long-form derail (or the
+    # rubric pass cuts off before the gibberish tail). Apply a
+    # statistical derail detector that NEVER lets a derailed response
+    # earn a high score — multiplies the rubric grade by a (0..1)
+    # coherence factor based on:
+    #   • non-ASCII fraction (penalises multilingual word salad)
+    #   • repeated 50-char windows (penalises loop attractors)
+    #   • word-list ratio (penalises glossary-mode degeneration —
+    #     dense single-word lines, no sentences)
+    #   • mean word length (penalises meaningless compound coinage
+    #     like "boblynberry-vogesters")
+    gen_tokens_list = collected.get("gen_tokens") or []
+    derail_factors = []
+    term_factors = []
+    for i, response in enumerate(responses):
+        if i >= len(scores) or scores[i] is None:
+            continue
+        coh = _coherence_factor(response or "")
+        # Natural-termination factor: did the model emit EOS before
+        # filling the budget? Models that fill max_tokens are either
+        # derailed or didn't know when to stop. Threshold at 95 percent
+        # of the budget — emitting EOS at e.g. 5800/6144 still counts
+        # as "natural termination" while filling 6144/6144 does not.
+        max_tokens = LONG_FORM_JUDGE_MAX_TOKENS
+        gen_len = (
+            int(gen_tokens_list[i])
+            if i < len(gen_tokens_list) and gen_tokens_list[i] is not None
+            else max_tokens
+        )
+        if max_tokens <= 0:
+            term = 1.0
+        elif gen_len < int(max_tokens * 0.95):
+            term = 1.0
+        elif gen_len >= max_tokens:
+            term = 0.5
+        else:
+            term = 1.0 - (gen_len - int(max_tokens * 0.95)) / max(1, int(max_tokens * 0.05)) * 0.5
+        term = max(0.5, min(1.0, term))
+        term_factors.append(term)
+        # Combined factor: coherence × termination. A coherent response
+        # that filled the budget gets 1.0 × 0.5 = 0.5 (mild penalty for
+        # not knowing when to stop). A derailed budget-filler gets
+        # 0.05 × 0.5 = 0.025 (compounded). A coherent response that
+        # emitted EOS naturally gets 1.0 × 1.0 = 1.0.
+        combined = coh * term
+        derail_factors.append(combined)
+        if i < len(agg["per_prompt"]):
+            agg["per_prompt"][i]["coherence"] = round(coh, 3)
+            agg["per_prompt"][i]["termination"] = round(term, 3)
+            agg["per_prompt"][i]["gen_tokens"] = gen_len
+    if derail_factors:
+        coh_mean = sum(derail_factors) / len(derail_factors)
+        agg["coherence_factor"] = round(coh_mean, 3)
+        if term_factors:
+            agg["termination_factor"] = round(
+                sum(term_factors) / len(term_factors), 3,
+            )
+        if agg.get("normalized") is not None:
+            penalised = agg["normalized"] * coh_mean
+            agg["normalized_pre_coherence"] = agg["normalized"]
+            agg["normalized"] = round(penalised, 4)
     return agg
+
+
+def _coherence_factor(text: str) -> float:
+    """Return a [0, 1] coherence factor for a long-form response.
+
+    1.0 = clean coherent prose (no derail signals).
+    0.0 = pure gibberish / word salad.
+
+    Detector signals (multiplied together):
+
+      * ``non_ascii_factor``  — 1 - clip(non_ascii_frac × 4, 0, 1).
+        At 0% non-ASCII this is 1.0; at ≥25% it's 0.0. Targets
+        the multilingual-word-salad failure mode (Latin → CJK /
+        Cyrillic mid-sentence).
+      * ``repeats_factor``    — 1 - clip(repeats_50char × 0.05, 0, 1).
+        ≥20 verbatim ~50-char repeats → 0. Targets the
+        loop-attractor failure mode.
+      * ``word_list_factor``  — 1 - clip(word_list_ratio × 1.5, 0, 1).
+        Word-list ratio is the fraction of "words" >50 chars long
+        OR newlines ÷ total tokens. Catches the glossary-mode
+        degeneration where the model emits dense single-word lines
+        without sentence structure.
+      * ``meaningful_factor`` — 1 - clip((mean_word_len - 10) × 0.2,
+        0, 1). Mean word length above ~10 chars indicates
+        meaningless compound coinage like "boblynberry-vogesters".
+      * ``punctuation_factor`` — derail mode where the model emits
+        a long run of single related words ("low puff breathe exhale
+        inhale swallow…") drops nearly all punctuation. Coherent
+        prose has 8-15 percent punctuation chars; word-list mode
+        has ≤1 percent. Penalises responses with <5 percent
+        punctuation in samples ≥200 chars.
+      * ``unique_word_factor`` — sentence-structure proxy. Coherent
+        prose recycles common function words ("the", "and", "of",
+        "to") so its unique-word fraction is ~0.45-0.65 on
+        passages of 50+ words. Word-list derail mode has
+        unique-word fraction ≥0.85 (every emitted word is a new
+        content word with no glue). Penalty kicks in at ≥0.80.
+
+    Soft floor at 0.05 so a true-but-imperfect response isn't
+    ground to zero by a single noisy signal.
+    """
+    if not text:
+        return 1.0
+    text_len = len(text)
+    if text_len < 50:
+        return 1.0
+    # 2026-05-01 (v30.4 patch v3): non-ASCII detection is now MUCH
+    # stricter. The chat.arbos.life screenshot showed ~10 percent
+    # non-ASCII chars (CJK + Cyrillic + Hebrew + Arabic words mixed
+    # into English prose) and still scored 0.6 with the old
+    # multiplier. That's a clear derail; should score <0.1. Multiplier
+    # raised 4× → 12×: at 8 percent non-ASCII the factor is now 0,
+    # at 4 percent it's 0.5. Coherent English-prompted responses
+    # should be 0 percent non-ASCII; even latex math symbols rarely
+    # exceed 1 percent.
+    non_ascii = sum(1 for c in text if ord(c) > 127)
+    non_ascii_frac = non_ascii / text_len
+    non_ascii_factor = max(0.0, 1.0 - min(1.0, non_ascii_frac * 12.0))
+    # CJK / Cyrillic / Arabic / Hebrew script-bleed: SPECIFIC counter
+    # for non-Latin script chars (excludes things like emoji + accents
+    # which are common in coherent multilingual prose). Catches the
+    # multi-language derail mode (chat screenshot showed Chinese,
+    # Korean, Cyrillic, Hebrew letters mixed in random places).
+    non_latin_script = sum(
+        1 for c in text
+        if (
+            0x0400 <= ord(c) <= 0x04FF or  # Cyrillic
+            0x0590 <= ord(c) <= 0x05FF or  # Hebrew
+            0x0600 <= ord(c) <= 0x06FF or  # Arabic
+            0x0900 <= ord(c) <= 0x097F or  # Devanagari
+            0x3040 <= ord(c) <= 0x309F or  # Hiragana
+            0x30A0 <= ord(c) <= 0x30FF or  # Katakana
+            0x3400 <= ord(c) <= 0x4DBF or  # CJK Ext A
+            0x4E00 <= ord(c) <= 0x9FFF or  # CJK Unified
+            0xAC00 <= ord(c) <= 0xD7AF     # Hangul
+        )
+    )
+    non_latin_frac = non_latin_script / text_len
+    # ANY non-Latin script in an English-prompted response is a
+    # strong derail signal. Even 1 percent (a single sentence's
+    # worth in a 5000-char response) flips this factor to 0.
+    if non_latin_frac >= 0.01:
+        non_latin_factor = 0.0
+    else:
+        non_latin_factor = max(0.0, 1.0 - non_latin_frac * 100.0)
+    seen = set()
+    repeats = 0
+    win = 50
+    step = 25
+    for i in range(0, text_len - win, step):
+        s = text[i:i + win]
+        if s in seen:
+            repeats += 1
+        seen.add(s)
+    repeats_factor = max(0.0, 1.0 - min(1.0, repeats * 0.05))
+    words = text.split()
+    n_words = len(words)
+    if n_words == 0:
+        return 0.0
+    long_words = sum(1 for w in words if len(w) > 50)
+    long_word_ratio = long_words / n_words
+    word_list_factor = max(0.0, 1.0 - min(1.0, long_word_ratio * 1.5))
+    word_lens = [len(w) for w in words[:1000]]
+    if word_lens:
+        mean_word_len = sum(word_lens) / len(word_lens)
+    else:
+        mean_word_len = 5.0
+    # 2026-05-01 (v30.4 patch v2): raised threshold 10 → 20 chars.
+    # Academic / technical prose has 10-15 char words frequently
+    # (e.g. "Philosophical Inquiry into Artificial Intelligence")
+    # without being derailed; the signal targets the >50-char
+    # nonsense-compound mode like "jovialincarnacioappreciable".
+    meaningful_factor = max(0.0, 1.0 - max(0.0, (mean_word_len - 20.0) * 0.1))
+    # Punctuation density. 2026-05-01 (v30.4 patch v2): lowered
+    # floor 0.03 → 0.015 and raised the gate ≥400 → ≥600. Markdown-
+    # formatted long-form prose (with headers, lists, and code
+    # snippets) runs at 1.5-2.5 percent. True word-list derail
+    # runs at 0-0.5 percent across long stretches.
+    punct_chars = sum(
+        1 for c in text if c in ".,;:?!\"'()[]{}—–-"
+    )
+    punct_frac = punct_chars / max(1, text_len)
+    if text_len < 600:
+        punctuation_factor = 1.0
+    elif punct_frac >= 0.015:
+        punctuation_factor = 1.0
+    else:
+        punctuation_factor = max(0.0, min(1.0, punct_frac / 0.015))
+    # Unique-word fraction. Lowercase + alpha-only. Only triggers on
+    # LONG samples (≥150 words) where natural prose has had a chance
+    # to recycle function words. Short coherent essays naturally
+    # have high unique-word fraction (they're packed with content).
+    norm_words = [w.strip(".,;:?!\"'()[]{}").lower() for w in words]
+    norm_words = [w for w in norm_words if w and w.replace("-", "").isalpha()]
+    if len(norm_words) >= 150:
+        unique_frac = len(set(norm_words)) / len(norm_words)
+        if unique_frac < 0.85:
+            unique_word_factor = 1.0
+        else:
+            # 0.85 → 1.0; 0.95 → 0.0. Word-list mode reaches >0.95.
+            unique_word_factor = max(
+                0.0, 1.0 - (unique_frac - 0.85) / 0.10
+            )
+    else:
+        unique_word_factor = 1.0
+    # 2026-05-01 (v30.4 patch v3): English stop-word ratio. Real
+    # English prose is 30-40 percent function words ("the", "and",
+    # "of", "to", "a", "in", "is", "that"). Word-list derail mode
+    # ("low puff breathe exhale inhale swallow chew bite lick taste
+    # smell hear see look watch...") has near-zero stop words because
+    # it's all content words. We measure the ratio on samples ≥80
+    # words. If ≥12 percent stop-words, full credit; if ≤2 percent,
+    # zero credit; linear in between. This is the killer signal for
+    # the word-list derail mode where every other detector signal
+    # leaves an opening.
+    if len(norm_words) >= 80:
+        _STOP_WORDS = {
+            "the", "and", "of", "to", "a", "in", "is", "that", "it",
+            "for", "on", "with", "as", "by", "this", "are", "or",
+            "be", "an", "at", "from", "but", "not", "have", "has",
+            "had", "was", "were", "we", "you", "they", "their", "its",
+            "his", "her", "she", "he", "i", "me", "my", "our", "us",
+            "would", "could", "should", "will", "can", "may", "if",
+            "then", "than", "so", "such", "no", "all", "more", "most",
+            "some", "any", "other", "these", "those", "there", "what",
+            "which", "who", "when", "where", "while", "about", "into",
+            "through", "between", "after", "before", "during",
+            "because", "however", "thus", "also", "yet", "though",
+            "do", "does", "did", "been", "being", "am",
+        }
+        stop_count = sum(1 for w in norm_words if w in _STOP_WORDS)
+        stop_ratio = stop_count / len(norm_words)
+        if stop_ratio >= 0.12:
+            stop_word_factor = 1.0
+        elif stop_ratio <= 0.02:
+            stop_word_factor = 0.0
+        else:
+            stop_word_factor = (stop_ratio - 0.02) / (0.12 - 0.02)
+    else:
+        stop_word_factor = 1.0
+    coherence = (
+        non_ascii_factor
+        * non_latin_factor
+        * repeats_factor
+        * word_list_factor
+        * meaningful_factor
+        * punctuation_factor
+        * unique_word_factor
+        * stop_word_factor
+    )
+    return max(0.05, min(1.0, coherence))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2702,6 +3018,92 @@ def _synthetic_names(rng: "random.Random", n: int) -> list[str]:
         seen.add(name)
         out.append(name)
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-05-01 (v30.4 patch v4): real-name / real-concrete-object pools
+# for axes where READABILITY of the prompt matters (theory-of-mind,
+# epistemic state tracking). Anti-memorisation is preserved because
+# the SCENARIO (combination of name1 + name2 + object + container1 +
+# container2 + which question type) is freshly drawn from block_seed
+# every round; even with 200 names × 60 objects × 30 containers ×
+# 30 containers × 2 question types = ~22B unique scenarios, which is
+# unmemorisable. The legacy ``_synthetic_*`` helpers stay in use for
+# axes where the answer depends on character-level features
+# (count_chars, count_vowels — those would leak prior knowledge if
+# fed real dictionary words).
+
+_REAL_FIRST_NAMES = (
+    "Alex", "Sam", "Jordan", "Taylor", "Casey", "Morgan", "Riley",
+    "Avery", "Quinn", "Reese", "Sage", "Drew", "Logan", "Parker",
+    "Harper", "Hunter", "Finley", "Skyler", "Rowan", "Eden",
+    "Kai", "Nico", "Aria", "Mira", "Ezra", "Iris", "Kira", "Luca",
+    "Maya", "Owen", "Naomi", "Theo", "Zoe", "Ari", "Beau", "Cleo",
+    "Daria", "Eli", "Felix", "Gemma", "Hugo", "Ivy", "Jules",
+    "Kit", "Leo", "Mira", "Noah", "Octavia", "Phoebe", "Reyna",
+    "Soren", "Tess", "Uma", "Vera", "Wren", "Xander", "Yael",
+    "Zara", "Asher", "Briar", "Clio", "Dax", "Elena", "Fox",
+    "Genevieve", "Holland", "Indigo", "Jasper", "Kira", "Lior",
+    "Marlo", "Nadia", "Orion", "Priya", "Quill", "Rafe", "Saoirse",
+    "Tobias", "Una", "Vesper", "Wendell", "Xiomara", "Yuki",
+    "Zev", "Adira", "Bryn", "Calix", "Dahlia", "Edwin", "Fiona",
+    "Galen", "Hadley", "Ines", "Jovan", "Kendra", "Lyle",
+    "Marisol", "Niko", "Ophelia", "Pierce", "Quincy", "Rosalind",
+    "Silas", "Talia", "Ulrich", "Vivienne", "Wesley", "Ximena",
+    "Yusuf", "Zelda", "Anders", "Beatrix", "Caspian", "Delphine",
+    "Emil", "Florence", "Grayson", "Hester", "Idris", "June",
+    "Klaus", "Lola", "Magnus", "Niamh", "Otis", "Petra", "Quentin",
+    "Ronan", "Sigrid", "Tarquin", "Ursula", "Viggo", "Winona",
+    "Yvette", "Zach", "Astrid", "Bram", "Calliope",
+)
+
+_REAL_OBJECTS = (
+    "key", "book", "pen", "watch", "ring", "coin", "ticket",
+    "letter", "passport", "phone", "wallet", "scarf", "umbrella",
+    "notebook", "diary", "lighter", "necklace", "bracelet",
+    "remote", "calculator", "stamp", "envelope", "bookmark",
+    "compass", "magnifying glass", "candle", "thimble", "marble",
+    "stopwatch", "memory card", "USB stick", "earring", "badge",
+    "medallion", "sketchbook", "fountain pen", "monocle",
+    "pocket knife", "deck of cards", "harmonica", "snow globe",
+    "music box", "locket", "brooch", "compass rose", "magnet",
+    "keycard", "library card", "fishing lure", "pocket watch",
+    "nameplate", "pin", "polaroid", "tape measure", "spool",
+    "thumb drive", "stylus", "hairpin", "matchbox", "domino",
+)
+
+_REAL_CONTAINERS = (
+    "drawer", "cabinet", "closet", "trunk", "chest",
+    "backpack", "briefcase", "purse", "tote bag",
+    "lunchbox", "shoebox", "jewelry box", "tin", "basket",
+    "filing cabinet", "wardrobe", "ottoman", "bookshelf",
+    "bedside table", "kitchen drawer", "desk drawer", "safe",
+    "locker", "glove compartment", "garage cabinet", "pantry",
+    "linen closet", "sock drawer", "spice rack", "tool chest",
+    "treasure chest", "pencil case", "tackle box", "hatbox",
+    "music box", "cookie jar", "vase", "flower pot", "saddlebag",
+)
+
+
+def _realistic_name(rng: "random.Random") -> str:
+    """Return a real-looking English first name. Used in axes where
+    readability is more valuable than character-level anti-leak."""
+    return rng.choice(_REAL_FIRST_NAMES)
+
+
+def _realistic_names(rng: "random.Random", n: int) -> list[str]:
+    """Return ``n`` distinct real-looking first names."""
+    pool = list(_REAL_FIRST_NAMES)
+    rng.shuffle(pool)
+    return pool[:n] if n <= len(pool) else (pool + pool[:n - len(pool)])
+
+
+def _realistic_object(rng: "random.Random") -> str:
+    return rng.choice(_REAL_OBJECTS)
+
+
+def _realistic_container(rng: "random.Random") -> str:
+    return rng.choice(_REAL_CONTAINERS)
 
 
 def _synthetic_org_topic(rng: "random.Random") -> str:
@@ -7600,83 +8002,160 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
     # scenario regardless of whether the shop is called "bakery" or
     # "Drenshire") so the procedural form is grading-equivalent to
     # the legacy lists.
+    # 2026-05-01 (v30.4 patch v4): real-vocabulary shop/item pools.
+    # Anti-memorisation is preserved by the procedural numeric params
+    # (start_money, prices, counts) which fully determine the gold
+    # answer; the surface names of shops and items are decorative
+    # and do not change what the model is asked to compute. Real
+    # vocabulary makes the prompts read like gsm8k items, which is
+    # the whole point of the v29 narrative rebalance.
+    _MATH_SHOPS = (
+        "bakery", "grocery store", "corner shop", "deli", "farmers' market",
+        "supermarket", "general store", "produce stand", "hardware store",
+        "stationery shop", "toy store", "bookstore", "candy shop",
+        "bike shop", "pet store", "florist", "café", "convenience store",
+        "thrift shop", "music store", "art supply store", "garden center",
+    )
+    _MATH_ITEMS = (
+        ("apple", "apples"), ("banana", "bananas"), ("orange", "oranges"),
+        ("muffin", "muffins"), ("cookie", "cookies"), ("loaf", "loaves"),
+        ("bagel", "bagels"), ("notebook", "notebooks"), ("pencil", "pencils"),
+        ("pen", "pens"), ("eraser", "erasers"), ("ruler", "rulers"),
+        ("balloon", "balloons"), ("ticket", "tickets"), ("toy car", "toy cars"),
+        ("postcard", "postcards"), ("stamp", "stamps"), ("comic book", "comic books"),
+        ("magazine", "magazines"), ("candle", "candles"), ("cupcake", "cupcakes"),
+        ("donut", "donuts"), ("scone", "scones"), ("tart", "tarts"),
+        ("paint brush", "paint brushes"), ("sketchpad", "sketchpads"),
+        ("water bottle", "water bottles"), ("backpack", "backpacks"),
+        ("tennis ball", "tennis balls"), ("badge", "badges"),
+        ("birthday card", "birthday cards"), ("postcard book", "postcard books"),
+    )
+
     def _synth_shop(rr):
-        # A procedural common-noun shop label.
-        return _synthetic_word(rr, 2) + rr.choice(["shop", "stand", "stall", "house"])
+        return rr.choice(_MATH_SHOPS)
+
     def _synth_item(rr):
-        # A procedural plural noun item label.
-        word = _synthetic_word(rr, 2)
-        # Pluralise: append "s" / "es" depending on terminal char.
-        return word + ("es" if word.endswith(("s", "x", "z", "ch", "sh")) else "s")
+        return rr.choice(_MATH_ITEMS)[1]  # plural form
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         question = ""
         gold = ""
         if kind == "shopping_budget":
-            name = _synthetic_name(r)
-            friend = _synthetic_name(r)
-            start_money = r.choice([40, 50, 60, 80, 100, 120])
+            # 2026-05-02 (v30.5): hardened. Was 4 ops (mul, mul, add, sub).
+            # Now 6-7 ops by adding (a) a third item type, (b) a percent
+            # discount on one item, (c) sales tax on the subtotal, (d) a
+            # tip the friend covers (so the model must NOT subtract it
+            # from the protagonist's wallet — adversarial inference).
+            name = _realistic_name(r)
+            friend = _realistic_name(r)
+            start_money = r.choice([80, 100, 120, 150, 200, 250])
             n_items_a = r.randint(3, 8)
             price_a = r.choice([2, 3, 4, 5, 6, 7, 8])
             n_items_b = r.randint(2, 6)
             price_b = r.choice([3, 4, 5, 6, 8, 9, 10])
-            distractor = r.choice([7, 11, 13, 14])  # noise: friend's age etc.
+            n_items_c = r.randint(2, 5)
+            price_c = r.choice([4, 6, 8, 10, 12])
+            discount_pct = r.choice([10, 20, 25])  # applies to item_b only
+            tax_pct = r.choice([5, 8, 10])
+            tip_friend_covers = r.randint(3, 9)  # adversarial distractor
+            distractor = r.choice([7, 11, 13, 14])  # friend's age etc.
             shop = _synth_shop(r)
             item_a = _synth_item(r)
             item_b = _synth_item(r)
-            spent = n_items_a * price_a + n_items_b * price_b
+            item_c = _synth_item(r)
+            cost_a = n_items_a * price_a
+            cost_b_pre = n_items_b * price_b
+            cost_b_disc = cost_b_pre - cost_b_pre * discount_pct // 100
+            cost_c = n_items_c * price_c
+            subtotal = cost_a + cost_b_disc + cost_c
+            tax = subtotal * tax_pct // 100
+            spent = subtotal + tax  # tip is paid by friend (adversarial)
             gold_n = start_money - spent
             question = (
                 f"{name} goes to the {shop} with ${start_money}. "
                 f"Their friend {friend}, who is {distractor} years old, "
-                f"comes along but doesn't buy anything. "
-                f"{name} buys {n_items_a} {item_a} at ${price_a} each "
-                f"and {n_items_b} {item_b} at ${price_b} each. "
+                f"comes along. {name} buys {n_items_a} {item_a} at "
+                f"${price_a} each, {n_items_b} {item_b} at ${price_b} each "
+                f"(today the {item_b} are {discount_pct}% off the listed "
+                f"price), and {n_items_c} {item_c} at ${price_c} each. "
+                f"There is a {tax_pct}% sales tax on the discounted "
+                f"subtotal. {friend} also leaves a ${tip_friend_covers} "
+                f"tip from their own wallet (so {name} doesn't pay it). "
                 f"How many dollars does {name} have left after the visit?"
             )
             gold = str(gold_n)
         elif kind == "recipe_scale":
-            name = _synthetic_name(r)
+            # Hardened: was 3 ops. Now 6 ops with multi-ingredient ratios,
+            # a unit conversion (cups → ounces), and a partial-batch
+            # rounding adversary.
+            name = _realistic_name(r)
             base_servings = r.choice([4, 6, 8, 12])
-            target_servings = base_servings * r.choice([2, 3, 4])
+            target_servings = base_servings * r.choice([3, 4, 5])
             cups_per_base = r.choice([2, 3, 4, 5])
-            extra_topping = r.randint(2, 8)
-            distractor = r.choice([45, 60, 90])  # oven temp / time noise
-            cups_total = (target_servings // base_servings) * cups_per_base + extra_topping
-            gold_n = cups_total
+            sugar_per_base = r.choice([1, 2, 3])  # extra ingredient
+            butter_per_base = r.choice([2, 3, 4])
+            extra_topping_cups = r.randint(2, 8)
+            ounces_per_cup = 8  # unit conversion
+            distractor_temp = r.choice([45, 60, 90])
+            scale = target_servings // base_servings
+            cups_flour = scale * cups_per_base + extra_topping_cups
+            cups_sugar = scale * sugar_per_base
+            cups_butter = scale * butter_per_base
+            total_cups = cups_flour + cups_sugar + cups_butter
+            # Final answer in ounces
+            gold_n = total_cups * ounces_per_cup
             recipe = r.choice(["banana bread", "pancakes", "cornbread", "biscuits"])
             question = (
                 f"A {recipe} recipe makes {base_servings} servings and uses "
-                f"{cups_per_base} cups of flour. {name} wants to make "
-                f"{target_servings} servings for a school bake sale. "
-                f"They also need to add {extra_topping} extra cups of flour "
-                f"for a dusting on top. The oven is preheated to "
-                f"{distractor*5} degrees, but that doesn't change the recipe. "
-                f"How many total cups of flour does {name} need?"
+                f"{cups_per_base} cups of flour, {sugar_per_base} cups of "
+                f"sugar, and {butter_per_base} cups of butter. {name} wants "
+                f"to make {target_servings} servings for a school bake sale. "
+                f"They also need to add {extra_topping_cups} extra cups of "
+                f"flour for a dusting on top. The oven is preheated to "
+                f"{distractor_temp*5} degrees (this doesn't change the "
+                f"recipe). The store sells these ingredients by the ounce, "
+                f"and 1 cup equals {ounces_per_cup} ounces. How many TOTAL "
+                f"OUNCES of all three ingredients combined does {name} "
+                f"need?"
             )
             gold = str(gold_n)
         elif kind == "travel_distance":
-            name = _synthetic_name(r)
+            # Hardened: was 4 ops. Now 7 ops with a 3-leg trip, a fuel
+            # consumption calculation overlaid on it, and a unit-converted
+            # final answer.
+            name = _realistic_name(r)
             leg_a_speed = r.choice([40, 50, 60, 70])
             leg_a_hours = r.randint(2, 5)
-            stop_distance = r.randint(15, 40)
+            stop_a_distance = r.randint(15, 40)
             leg_b_speed = r.choice([45, 55, 65, 75])
             leg_b_hours = r.randint(2, 4)
-            distractor = r.choice([8, 12, 24])  # tank size, irrelevant
-            total = leg_a_speed * leg_a_hours + stop_distance + leg_b_speed * leg_b_hours
-            gold_n = total
+            stop_b_distance = r.randint(20, 50)
+            leg_c_speed = r.choice([50, 60, 70, 80])
+            leg_c_hours = r.randint(1, 4)
+            mpg = r.choice([20, 24, 28, 32])
+            tank_size = r.choice([10, 12, 15, 18])  # distractor
+            leg_a_dist = leg_a_speed * leg_a_hours
+            leg_b_dist = leg_b_speed * leg_b_hours
+            leg_c_dist = leg_c_speed * leg_c_hours
+            total_miles = leg_a_dist + stop_a_distance + leg_b_dist + stop_b_distance + leg_c_dist
+            # Final answer in gallons of fuel used (forces unit conversion)
+            gold_n = total_miles // mpg
             question = (
-                f"{name} drives east on the highway at {leg_a_speed} mph for "
-                f"{leg_a_hours} hours. They stop at a rest area, then drive "
-                f"another {stop_distance} miles north to pick up a friend. "
-                f"From there, they continue at {leg_b_speed} mph for "
-                f"{leg_b_hours} hours. The car holds {distractor} gallons of "
-                f"fuel. How many miles total has {name} driven?"
+                f"{name} drives east on the highway at {leg_a_speed} mph "
+                f"for {leg_a_hours} hours, stops at a rest area, then "
+                f"drives another {stop_a_distance} miles north to pick up "
+                f"a friend. From there they continue at {leg_b_speed} mph "
+                f"for {leg_b_hours} hours, take a second short detour of "
+                f"{stop_b_distance} miles east, then finish at {leg_c_speed} "
+                f"mph for {leg_c_hours} hours. The car gets {mpg} miles per "
+                f"gallon and the tank holds {tank_size} gallons. How many "
+                f"gallons of fuel did {name} use on the entire trip "
+                f"(rounded down to a whole gallon)?"
             )
             gold = str(gold_n)
         elif kind == "school_classroom":
-            teacher = _synthetic_name(r)
+            teacher = _realistic_name(r)
             n_classes = r.randint(3, 6)
             students_per_class = r.choice([18, 22, 24, 28, 30])
             absent_per_class = r.randint(1, 4)
@@ -7696,168 +8175,294 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "garden_orchard":
-            farmer = _synthetic_name(r)
+            # Hardened: was 4 ops. Now 7 ops with 3 spoilage stages
+            # (frost, pests, transport) and a per-tree harvest variance.
+            farmer = _realistic_name(r)
             n_rows = r.randint(4, 9)
             trees_per_row = r.randint(5, 12)
             apples_per_tree = r.choice([20, 25, 30, 40, 50])
-            spoiled_pct = r.choice([10, 20, 25])  # we use raw count: apples * pct/100
+            frost_pct = r.choice([10, 15, 20])
+            pest_pct = r.choice([5, 10, 15])  # second loss stage
             saved_for_market = r.randint(50, 200)
+            crates_capacity = r.choice([20, 25, 30])  # for transport
+            transport_loss_per_crate = r.randint(1, 4)
             apples_total = n_rows * trees_per_row * apples_per_tree
-            spoiled = apples_total * spoiled_pct // 100
-            gold_n = apples_total - spoiled - saved_for_market
+            after_frost = apples_total - apples_total * frost_pct // 100
+            after_pest = after_frost - after_frost * pest_pct // 100
+            after_market = after_pest - saved_for_market
+            n_crates = max(1, after_market // crates_capacity)
+            transport_loss = n_crates * transport_loss_per_crate
+            gold_n = after_market - transport_loss
             question = (
                 f"{farmer} runs an orchard with {n_rows} rows of apple trees. "
                 f"Each row has {trees_per_row} trees, and each tree produces "
-                f"{apples_per_tree} apples this season. {spoiled_pct}% of the "
-                f"apples are spoiled by frost, and {farmer} saves "
-                f"{saved_for_market} apples for the farmer's market next "
-                f"weekend. How many apples are left for {farmer} to sell to "
-                f"the local grocer?"
+                f"{apples_per_tree} apples this season. {frost_pct}% of all "
+                f"apples are lost to frost. After the frost, an additional "
+                f"{pest_pct}% of the SURVIVING apples are spoiled by pests. "
+                f"{farmer} saves {saved_for_market} apples for the farmer's "
+                f"market. The remaining apples are packed into crates that "
+                f"hold {crates_capacity} apples each, and during transport "
+                f"to the grocer, {transport_loss_per_crate} apples are "
+                f"crushed in each filled crate (any partial final crate has "
+                f"no transport loss). How many apples reach the grocer "
+                f"intact?"
             )
             gold = str(gold_n)
         elif kind == "bakery_orders":
-            baker = _synthetic_name(r)
-            n_days = r.randint(3, 6)
-            loaves_per_day = r.choice([24, 30, 36, 48, 60])
+            # Hardened: was 4 ops. Now 6-7 ops with carryover stock,
+            # daily wholesale variation, and a price-per-loaf revenue
+            # calculation as the final answer.
+            baker = _realistic_name(r)
+            starting_stock = r.randint(20, 60)
+            n_days = r.randint(4, 7)
+            loaves_per_day = r.choice([30, 36, 48, 60, 72])
             wholesale_per_day = r.randint(8, 18)
-            walkin_total = r.randint(10, 35)
-            distractor = r.choice([5, 6, 7])  # number of staff
+            walkin_per_day = r.randint(10, 25)
+            staff_distractor = r.choice([5, 6, 7])
+            price_per_loaf = r.choice([4, 5, 6, 8])
+            wholesale_discount_pct = r.choice([20, 25, 30])
+            staff_count = staff_distractor
             produced = n_days * loaves_per_day
-            sold = n_days * wholesale_per_day + walkin_total
-            gold_n = produced - sold
+            wholesale_sold = n_days * wholesale_per_day
+            walkin_sold = n_days * walkin_per_day
+            wholesale_revenue = wholesale_sold * price_per_loaf * (100 - wholesale_discount_pct) // 100
+            walkin_revenue = walkin_sold * price_per_loaf
+            gold_n = wholesale_revenue + walkin_revenue
             question = (
-                f"Baker {baker} runs a small bakery with {distractor} staff. "
-                f"They bake {loaves_per_day} loaves of sourdough every day "
-                f"for {n_days} days straight. Each day they sell "
-                f"{wholesale_per_day} loaves to a wholesale partner, and over "
-                f"the {n_days} days they sell {walkin_total} loaves total to "
-                f"walk-in customers. How many loaves are left in storage at "
-                f"the end of the period?"
+                f"Baker {baker} runs a small bakery with {staff_count} "
+                f"staff and {starting_stock} loaves already in storage at "
+                f"the start of the week. They bake {loaves_per_day} loaves "
+                f"of sourdough every day for {n_days} days. Each day they "
+                f"sell {wholesale_per_day} loaves to a wholesale partner "
+                f"(wholesale price is {wholesale_discount_pct}% LESS than "
+                f"the retail price of ${price_per_loaf} per loaf) and "
+                f"{walkin_per_day} loaves to walk-in customers (at the full "
+                f"retail price). Production always meets demand from new "
+                f"baking, so the starting stock is irrelevant to revenue. "
+                f"How many dollars in TOTAL REVENUE did the bakery earn "
+                f"over the {n_days} days?"
             )
             gold = str(gold_n)
         elif kind == "library_books":
-            librarian = _synthetic_name(r)
-            n_borrowers = r.randint(8, 20)
+            # Hardened: was 1 op. Now 5+ ops with multiple fee tiers and
+            # a replacement-cost calculation.
+            librarian = _realistic_name(r)
+            n_borrowers = r.randint(10, 25)
             books_per_borrower = r.randint(2, 5)
-            late_returns = r.randint(3, 12)
-            fine_per_late = r.choice([2, 3, 5])
-            replacements_bought = r.randint(5, 15)
-            distractor = r.choice([12, 15, 18])  # opening hour noise
-            late_revenue = late_returns * fine_per_late
-            books_borrowed = n_borrowers * books_per_borrower
-            # Net books currently out: borrowed minus all that were returned (some late, some on time)
-            # simpler: how many fines collected = late_returns * fine_per_late
-            gold_n = late_revenue
+            late_returns = r.randint(5, 20)
+            fine_per_day = r.choice([1, 2])  # daily late fine
+            avg_days_late = r.randint(3, 10)
+            lost_books = r.randint(2, 8)
+            replacement_cost = r.choice([15, 18, 22, 25])
+            books_donated = r.randint(8, 20)
+            grant_received = r.choice([100, 150, 200])
+            distractor = r.choice([12, 15, 18])  # opening hour
+            late_fines = late_returns * fine_per_day * avg_days_late
+            replacement_revenue = lost_books * replacement_cost
+            net_revenue = late_fines + replacement_revenue + grant_received
+            # Final answer: net revenue (in dollars).
+            gold_n = net_revenue
             question = (
-                f"Librarian {librarian} runs a reading club. {n_borrowers} "
-                f"members each borrowed {books_per_borrower} books for the "
-                f"month. The library opens at {distractor}:00 each day. By "
-                f"the deadline, {late_returns} books were returned late. The "
-                f"library charges ${fine_per_late} per late book. They also "
-                f"used the fines to buy {replacements_bought} replacement "
-                f"books later. How many dollars in late fees did the library "
-                f"collect?"
+                f"Librarian {librarian} runs a reading club with "
+                f"{n_borrowers} members; each borrowed "
+                f"{books_per_borrower} books this month. The library opens "
+                f"at {distractor}:00 each day. By the deadline, "
+                f"{late_returns} books were returned late, on average "
+                f"{avg_days_late} days late, at a fine of ${fine_per_day} "
+                f"per book per day. {lost_books} books were never returned "
+                f"and the library charges the borrower ${replacement_cost} "
+                f"per lost book to replace it. The library also received a "
+                f"${grant_received} grant from the city this month and was "
+                f"donated {books_donated} new books from a patron (the "
+                f"donations are not income). What is the library's total "
+                f"revenue (in dollars) for the month?"
             )
             gold = str(gold_n)
         elif kind == "fundraiser":
-            organizer = _synthetic_name(r)
+            # Hardened: was 4 ops. Now 6 ops with three donor tiers, a
+            # raffle revenue, and an admin fee deducted from the total.
+            organizer = _realistic_name(r)
+            bronze_donors = r.randint(10, 30)
+            bronze_amount = r.choice([5, 10])
             silver_donors = r.randint(8, 25)
-            silver_amount = r.choice([10, 15, 20, 25])
+            silver_amount = r.choice([20, 25, 30])
             gold_donors = r.randint(3, 9)
-            gold_amount = r.choice([50, 75, 100, 150])
-            corporate_match = r.choice([100, 200, 300, 500])
-            distractor = r.choice([3, 5, 7])  # event hour noise
+            gold_amount = r.choice([75, 100, 150])
+            corporate_match_pct = r.choice([10, 25, 50])  # of all donations
+            raffle_tickets_sold = r.randint(40, 120)
+            raffle_price = r.choice([3, 5, 7])
+            admin_fee_pct = r.choice([5, 8, 10])
+            event_hour_distractor = r.choice([3, 5, 7])
+            bronze_total = bronze_donors * bronze_amount
             silver_total = silver_donors * silver_amount
             gold_total = gold_donors * gold_amount
-            gold_n = silver_total + gold_total + corporate_match
+            donations = bronze_total + silver_total + gold_total
+            corporate = donations * corporate_match_pct // 100
+            raffle = raffle_tickets_sold * raffle_price
+            gross = donations + corporate + raffle
+            admin_fee = gross * admin_fee_pct // 100
+            gold_n = gross - admin_fee
             question = (
-                f"{organizer} ran a {distractor}-hour charity fundraiser. "
-                f"{silver_donors} silver-tier donors gave ${silver_amount} "
-                f"each. {gold_donors} gold-tier donors gave ${gold_amount} "
-                f"each. A local company contributed an additional "
-                f"${corporate_match} as a flat corporate match. How many "
-                f"dollars did the fundraiser raise in total?"
+                f"{organizer} ran a {event_hour_distractor}-hour charity "
+                f"fundraiser. {bronze_donors} bronze-tier donors gave "
+                f"${bronze_amount} each, {silver_donors} silver-tier gave "
+                f"${silver_amount} each, and {gold_donors} gold-tier gave "
+                f"${gold_amount} each. A local company contributed a "
+                f"corporate match equal to {corporate_match_pct}% of total "
+                f"individual donations. The fundraiser also sold "
+                f"{raffle_tickets_sold} raffle tickets at ${raffle_price} "
+                f"each. The venue charges an {admin_fee_pct}% administrative "
+                f"fee on the GROSS amount raised (donations + match + "
+                f"raffle). How many dollars are NET-raised after the admin "
+                f"fee?"
             )
             gold = str(gold_n)
         elif kind == "trip_planning":
-            traveler = _synthetic_name(r)
-            nights = r.randint(3, 8)
-            lodging_per_night = r.choice([60, 80, 90, 120, 150])
-            meals_per_day = r.choice([20, 30, 40])
-            transport = r.choice([80, 120, 150, 200])
-            distractor = r.choice([2, 4, 6])  # number of travelers? noise
-            lodging = nights * lodging_per_night
-            meals = nights * meals_per_day
-            gold_n = lodging + meals + transport
+            # Hardened: was 3 ops. Now 6 ops with per-day meal variation,
+            # transit cost split across travelers, and a tax on lodging.
+            traveler = _realistic_name(r)
+            nights = r.randint(4, 9)
+            lodging_per_night = r.choice([80, 100, 120, 150, 200])
+            lodging_tax_pct = r.choice([8, 10, 12, 15])
+            breakfast_per_day = r.choice([10, 15, 20])
+            dinner_per_day = r.choice([25, 30, 40, 50])
+            transport_total = r.choice([200, 300, 400, 500])
+            companions = r.randint(2, 4)  # transport split among
+            ticket_distractor = r.choice([15, 25, 35])  # noise
+            lodging_pre_tax = nights * lodging_per_night
+            lodging_tax = lodging_pre_tax * lodging_tax_pct // 100
+            meals = nights * (breakfast_per_day + dinner_per_day)
+            transport_per_person = transport_total // (companions + 1)
+            gold_n = lodging_pre_tax + lodging_tax + meals + transport_per_person
             question = (
                 f"{traveler} is planning a {nights}-night trip with "
-                f"{distractor} other people, but they're each paying their "
-                f"own way. {traveler}'s lodging costs ${lodging_per_night} "
-                f"per night, meals cost ${meals_per_day} per day, and "
-                f"round-trip transport costs ${transport}. How many dollars "
-                f"will {traveler}'s share of the trip cost?"
+                f"{companions} other people. {traveler}'s lodging costs "
+                f"${lodging_per_night} per night plus a {lodging_tax_pct}% "
+                f"hotel tax (the tax applies only to {traveler}'s lodging, "
+                f"not anyone else's). Meals cost ${breakfast_per_day} per "
+                f"day for breakfast and ${dinner_per_day} per day for "
+                f"dinner (lunch is provided by the venue). Round-trip "
+                f"transport for the entire group costs ${transport_total}, "
+                f"split evenly among all {companions + 1} travelers (each "
+                f"pays an equal share, rounded down to the dollar). Tickets "
+                f"to a museum cost ${ticket_distractor} but are paid for "
+                f"separately. How many dollars total will {traveler}'s "
+                f"share of lodging + meals + transport cost?"
             )
             gold = str(gold_n)
         elif kind == "pets_animals":
-            owner = _synthetic_name(r)
-            n_chickens = r.randint(8, 25)
+            # Hardened: was 3 ops. Now 6 ops with a feed-cost calculation,
+            # weekly egg sale revenue, and a per-chicken loss to predators.
+            owner = _realistic_name(r)
+            n_chickens_start = r.randint(15, 35)
             eggs_per_week_per_chicken = r.choice([4, 5, 6, 7])
-            n_weeks = r.randint(2, 6)
-            eggs_for_breakfast = r.randint(10, 25)
-            eggs_donated = r.randint(5, 18)
-            distractor = r.choice([12, 15, 18])  # coop dimension noise
-            total_eggs = n_chickens * eggs_per_week_per_chicken * n_weeks
-            gold_n = total_eggs - eggs_for_breakfast - eggs_donated
+            n_weeks = r.randint(3, 8)
+            chickens_lost_to_predator = r.randint(1, 4)  # mid-period
+            eggs_for_breakfast_per_week = r.randint(8, 18)
+            eggs_donated_total = r.randint(15, 35)
+            price_per_dozen = r.choice([3, 4, 5, 6])
+            feed_cost_per_week = r.choice([8, 12, 15])
+            coop_dim_distractor = r.choice([12, 15, 18])
+            chickens_avg = (n_chickens_start * 2 - chickens_lost_to_predator) // 2
+            total_eggs = chickens_avg * eggs_per_week_per_chicken * n_weeks
+            eggs_for_breakfast = eggs_for_breakfast_per_week * n_weeks
+            eggs_for_sale = total_eggs - eggs_for_breakfast - eggs_donated_total
+            dozens_for_sale = eggs_for_sale // 12
+            revenue = dozens_for_sale * price_per_dozen
+            feed_cost_total = feed_cost_per_week * n_weeks
+            gold_n = revenue - feed_cost_total
             question = (
-                f"{owner} keeps {n_chickens} chickens in a "
-                f"{distractor}-meter coop. Each chicken lays "
-                f"{eggs_per_week_per_chicken} eggs per week. Over "
-                f"{n_weeks} weeks, the family ate {eggs_for_breakfast} eggs "
-                f"for breakfast and donated {eggs_donated} eggs to a "
-                f"neighbor. How many eggs are left at the end of the "
-                f"{n_weeks} weeks?"
+                f"{owner} keeps {n_chickens_start} chickens in a "
+                f"{coop_dim_distractor}-meter coop. Each chicken lays "
+                f"{eggs_per_week_per_chicken} eggs per week. Halfway "
+                f"through the period, {chickens_lost_to_predator} chickens "
+                f"were lost to a predator (assume the average flock size "
+                f"over the period was the average of the starting and "
+                f"ending counts, and use that to compute total egg "
+                f"production). Over the full {n_weeks} weeks, the family "
+                f"ate {eggs_for_breakfast_per_week} eggs per week for "
+                f"breakfast and donated {eggs_donated_total} eggs total to "
+                f"a neighbor. The remaining eggs are sold by the dozen at "
+                f"${price_per_dozen} per dozen (any partial dozen is not "
+                f"sold). Feed costs ${feed_cost_per_week} per week. How "
+                f"many dollars in NET PROFIT (sales minus feed cost) does "
+                f"{owner} earn over the {n_weeks} weeks?"
             )
             gold = str(gold_n)
         elif kind == "sports_tournament":
-            captain = _synthetic_name(r)
-            n_games = r.randint(8, 20)
-            n_wins = r.randint(3, n_games - 2)
-            n_losses = n_games - n_wins
-            points_per_win = r.choice([2, 3])
-            points_per_loss = r.choice([0, 1])
-            bonus_pts = r.randint(2, 8)
-            distractor = r.choice([5, 6, 7])  # players on field noise
-            gold_n = n_wins * points_per_win + n_losses * points_per_loss + bonus_pts
+            # Hardened: was 3 ops. Now 6 ops with knockout-stage bonus,
+            # disciplinary penalty, and average-points-per-game.
+            captain = _realistic_name(r)
+            n_games = r.randint(12, 24)
+            n_wins = r.randint(5, n_games - 3)
+            n_draws = r.randint(1, max(1, (n_games - n_wins) // 2))
+            n_losses = n_games - n_wins - n_draws
+            points_per_win = r.choice([3, 4])
+            points_per_draw = r.choice([1, 2])
+            points_per_loss = 0
+            bonus_per_clean_sheet = r.choice([1, 2])
+            n_clean_sheets = r.randint(2, max(2, n_wins - 1))
+            yellow_cards = r.randint(2, 8)
+            penalty_per_yellow = r.choice([1, 2])
+            playoff_qualified = r.random() < 0.5
+            playoff_bonus = r.choice([5, 8, 10]) if playoff_qualified else 0
+            distractor_players = r.choice([5, 6, 7])
+            base_points = n_wins * points_per_win + n_draws * points_per_draw + n_losses * points_per_loss
+            clean_sheet_bonus = n_clean_sheets * bonus_per_clean_sheet
+            penalty = yellow_cards * penalty_per_yellow
+            gold_n = base_points + clean_sheet_bonus - penalty + playoff_bonus
             sport = r.choice(["soccer", "hockey", "basketball", "rugby"])
             question = (
                 f"Captain {captain}'s {sport} team played {n_games} games "
-                f"with {distractor} players on the field at any time. They "
-                f"won {n_wins} games and lost {n_losses} games. Each win is "
-                f"worth {points_per_win} league points, each loss is worth "
-                f"{points_per_loss} consolation points, and the team got an "
-                f"extra {bonus_pts} bonus points for fair play. How many "
-                f"total league points did {captain}'s team end the season "
+                f"with {distractor_players} players on the field. They "
+                f"won {n_wins}, drew {n_draws}, and lost {n_losses}. A win "
+                f"is worth {points_per_win} league points, a draw worth "
+                f"{points_per_draw}, a loss worth {points_per_loss}. The "
+                f"team also kept a clean sheet (no goals conceded) in "
+                f"{n_clean_sheets} games and earns "
+                f"{bonus_per_clean_sheet} extra point per clean sheet. "
+                f"They received {yellow_cards} yellow cards across the "
+                f"season; each yellow card deducts "
+                f"{penalty_per_yellow} point. "
+                f"{'They qualified for the playoffs and received a flat ' + str(playoff_bonus) + '-point bonus.' if playoff_qualified else 'They did NOT qualify for the playoffs (no playoff bonus).'} "
+                f"How many total league points did the team end the season "
                 f"with?"
             )
             gold = str(gold_n)
         elif kind == "construction":
-            contractor = _synthetic_name(r)
-            n_walls = r.randint(3, 8)
-            bricks_per_wall = r.choice([80, 100, 120, 150, 200])
-            mortar_per_wall = r.choice([3, 4, 5, 6])  # bags
-            broken_bricks = r.randint(5, 25)
-            extra_safety = r.choice([20, 30, 50])
-            distractor = r.choice([8, 10, 12])  # ladder height noise
-            bricks_total = n_walls * bricks_per_wall + extra_safety
-            gold_n = bricks_total - broken_bricks
+            # Hardened: was 3 ops. Now 6 ops with mortar bags, 2-stage
+            # waste (delivery + cutting), and tool rental cost split
+            # across phases.
+            contractor = _realistic_name(r)
+            n_walls = r.randint(4, 10)
+            bricks_per_wall = r.choice([100, 120, 150, 180, 220])
+            mortar_per_wall = r.choice([3, 4, 5, 6])
+            mortar_bag_size = r.choice([10, 12, 15])  # walls per bag
+            broken_in_delivery = r.randint(8, 30)
+            cut_waste_per_wall = r.randint(2, 6)
+            extra_safety = r.choice([30, 50, 75])
+            ladder_distractor = r.choice([8, 10, 12])
+            bricks_needed = n_walls * bricks_per_wall + extra_safety
+            cut_waste_total = n_walls * cut_waste_per_wall
+            bricks_to_order = bricks_needed + broken_in_delivery + cut_waste_total
+            n_mortar_bags = (n_walls + mortar_bag_size - 1) // mortar_bag_size
+            # Final answer: total bricks to order
+            gold_n = bricks_to_order
             question = (
                 f"Contractor {contractor} is building {n_walls} brick walls "
-                f"using a {distractor}-foot ladder. Each wall needs "
-                f"{bricks_per_wall} bricks. {contractor} also orders "
-                f"{extra_safety} extra bricks as a safety margin. During "
-                f"delivery, {broken_bricks} bricks arrive broken and have "
-                f"to be discarded. How many usable bricks does {contractor} "
-                f"have to build the walls?"
+                f"using a {ladder_distractor}-foot ladder (irrelevant to "
+                f"the order). Each wall needs {bricks_per_wall} bricks "
+                f"to complete. The contractor wants to order an extra "
+                f"{extra_safety} bricks as an end-of-job safety margin. "
+                f"Historically, on a delivery this size, "
+                f"{broken_in_delivery} bricks arrive broken and need to be "
+                f"replaced. Cutting bricks to fit at corners always wastes "
+                f"about {cut_waste_per_wall} bricks per wall. (The crew "
+                f"will also need to order mortar — about {mortar_per_wall} "
+                f"bags per wall — but that is a separate purchase.) How "
+                f"many bricks should {contractor} order in TOTAL so that "
+                f"the safety margin still has all {extra_safety} bricks "
+                f"intact after delivery loss and cut waste?"
             )
             gold = str(gold_n)
         elif kind == "modular_linear":
@@ -7964,13 +8569,57 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
             )
             gold = str(gold_n)
         elif kind == "unit_conversion":
-            hours = r.randint(2, 14)
-            mins_per_hour = 60
-            extra_min = r.randint(0, 59)
-            gold_n = hours * mins_per_hour + extra_min
-            question = (
-                f"How many total minutes are in {hours} hours and {extra_min} minutes?"
-            )
+            # 2026-05-01 (v30.4 patch v4): make harder. Was 1 op
+            # (hours*60+min). Now 3 ops by chaining a unit conversion
+            # with a delta-calculation: "In a workout that lasts H
+            # hours M minutes, you sprint for S seconds out of every
+            # minute. How many total minutes do you spend sprinting?"
+            variant = r.choice(["clock", "speed_distance", "currency_change"])
+            if variant == "clock":
+                hours = r.randint(2, 14)
+                extra_min = r.randint(0, 59)
+                seconds_per_min = r.choice([15, 20, 30, 45])
+                # Total seconds spent active.
+                gold_n = (hours * 60 + extra_min) * seconds_per_min
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} works out for {hours} hours and {extra_min} "
+                    f"minutes total. During every minute, they spend "
+                    f"{seconds_per_min} seconds doing sprint intervals. "
+                    f"How many total seconds does {actor} spend on sprint "
+                    f"intervals?"
+                )
+            elif variant == "speed_distance":
+                speed_kph = r.choice([60, 72, 84, 96])
+                hours = r.randint(2, 5)
+                stop_minutes = r.randint(20, 50)
+                # Total kilometers driven (stops contribute 0 distance).
+                gold_n = speed_kph * hours
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} drives at a steady speed of {speed_kph} km/h "
+                    f"for exactly {hours} hours. In the middle of the "
+                    f"journey, they take a {stop_minutes}-minute break at a "
+                    f"rest stop (during which the car is parked and not "
+                    f"moving). How many total kilometers has {actor} "
+                    f"driven?"
+                )
+            else:  # currency_change
+                price_pounds = r.randint(8, 25)
+                price_pence = r.choice([0, 25, 50, 75, 99])
+                pence_per_pound = 100
+                paid_pounds = price_pounds + r.randint(2, 12)
+                # Change in pence.
+                amount_owed_pence = price_pounds * pence_per_pound + price_pence
+                paid_pence = paid_pounds * pence_per_pound
+                gold_n = paid_pence - amount_owed_pence
+                actor = _realistic_name(r)
+                question = (
+                    f"{actor} pays £{paid_pounds} for an item priced at "
+                    f"£{price_pounds}.{price_pence:02d}. How many pence in "
+                    f"change does {actor} receive? (1 pound = 100 pence; "
+                    f"give the answer as an integer.)"
+                )
             gold = str(gold_n)
         elif kind == "simultaneous":
             x = r.randint(-9, 12)
@@ -8100,80 +8749,138 @@ def _generate_math_items(block_seed, n_items: int) -> list[dict]:
 
 
 def _generate_aime_items(block_seed, n_items: int) -> list[dict]:
-    """Harder procedural math for the (renamed) ``aime_bench`` axis (v27).
+    """Harder procedural math for the (renamed) ``aime_bench`` axis.
 
-    Drops the public AIME pool entirely; instead generates olympiad-flavoured
-    multi-step problems whose answer is a positive integer 0-999 (matching
-    the AIME convention so existing answer extraction works). Each item
-    requires combining two operations (e.g. solve a quadratic AND apply a
-    modular constraint) so a 4B-class model with brittle reasoning fails
-    at ~70-90% on the reference, while a strong distillation reaches 30-50%.
+    2026-05-02 (v30.5): hardening pass.
+    - Original 5 kinds kept but with deeper params (e.g. exponents 7-19
+      → 13-31; CRT 2-coprime → 3-coprime).
+    - Two new kinds: ``coordinate_geometry`` (lattice / right-triangle
+      enumeration) and ``polynomial_root_sum`` (Vieta-style root sum).
+    - Olympiad problems whose answer is a positive integer 0-999
+      (matching the AIME convention so existing answer extraction
+      works). Each item requires combining 3-4 operations so a
+      4B-class model with brittle reasoning fails at ~70-85 % on the
+      reference, while a strong distillation reaches 25-45 %.
     """
     import random
     from math import gcd
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["aime"]) & 0xFFFFFFFF)
-    kinds = ["chained_modular", "diophantine", "factor_chain", "lcm_residue", "iterated_digit"]
+    kinds = [
+        "chained_modular", "diophantine", "factor_chain", "lcm_residue",
+        "iterated_digit", "coordinate_geometry", "polynomial_root_sum",
+    ]
     rng.shuffle(kinds)
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
         kind = kinds[i % len(kinds)]
         if kind == "chained_modular":
-            a = r.randint(2, 9)
-            b = r.randint(2, 9)
-            n = r.randint(7, 19)
-            mod = r.choice([97, 101, 103, 107, 109, 113])
-            val = pow(a, n, mod) * b % mod
+            # Hardened: exponents 7-19 → 13-31, plus a third operation
+            # so the chain is now 3-step (a^n * b + c) mod m.
+            a = r.randint(2, 11)
+            b = r.randint(2, 11)
+            c = r.randint(0, 50)
+            n = r.randint(13, 31)
+            mod = r.choice([97, 101, 103, 107, 109, 113, 127, 131, 137])
+            val = (pow(a, n, mod) * b + c) % mod
             gold = str(val)
             question = (
-                f"Compute the value of (({a}^{n}) * {b}) mod {mod}, where ^ "
-                f"denotes integer exponentiation. The final answer is a "
-                f"non-negative integer less than {mod}."
+                f"Compute the value of (({a}^{n}) * {b} + {c}) mod {mod}, "
+                f"where ^ denotes integer exponentiation. The final answer "
+                f"is a non-negative integer less than {mod}."
             )
         elif kind == "diophantine":
-            x = r.randint(2, 11)
-            y = r.randint(x, 13)
-            s = x + y
-            p = x * y
-            gold = str(x * x + y * y)
+            # Hardened: 2 unknowns → 3 unknowns. Pick x, y, z with
+            # bounded sums + products and ask for x^3 + y^3 + z^3.
+            x = r.randint(2, 9)
+            y = r.randint(x, 11)
+            z = r.randint(y, 13)
+            s = x + y + z
+            p_xy = x * y
+            p_yz = y * z
+            gold = str(x ** 3 + y ** 3 + z ** 3)
             question = (
-                f"Two positive integers x and y satisfy x + y = {s} and "
-                f"x * y = {p}, with 2 <= x <= y. Compute the integer x^2 + y^2."
+                f"Three positive integers x, y, z satisfy x + y + z = {s}, "
+                f"x * y = {p_xy}, and y * z = {p_yz}, with 2 <= x <= y <= z. "
+                f"Compute the integer x^3 + y^3 + z^3."
             )
         elif kind == "factor_chain":
-            primes = [3, 5, 7, 11, 13, 17, 19]
+            # Hardened: 3 primes → 4 primes; ask for ∏(p_i+1) instead of sum.
+            primes = [3, 5, 7, 11, 13, 17, 19, 23]
             r.shuffle(primes)
-            p1, p2, p3 = primes[0], primes[1], primes[2]
-            n_val = p1 * p2 * p3
-            extra = r.randint(0, 50)
-            gold = str(p1 + p2 + p3 + extra)
+            p1, p2, p3, p4 = primes[:4]
+            n_val = p1 * p2 * p3 * p4
+            mod = r.choice([100, 1000])
+            prod_inc = (p1 + 1) * (p2 + 1) * (p3 + 1) * (p4 + 1)
+            gold = str(prod_inc % mod)
             question = (
-                f"The integer {n_val} factors uniquely as a product of three "
-                f"distinct primes. Let s be the sum of those three primes. "
-                f"Compute s + {extra}."
+                f"The integer {n_val} factors uniquely as a product of four "
+                f"distinct primes. Let p_1 < p_2 < p_3 < p_4 be those four "
+                f"primes. Compute (p_1 + 1)(p_2 + 1)(p_3 + 1)(p_4 + 1) "
+                f"mod {mod}."
             )
         elif kind == "lcm_residue":
-            a = r.choice([6, 8, 10, 12, 14, 15])
-            b = r.choice([7, 9, 11, 13, 16])
-            while gcd(a, b) != 1:
-                b = r.choice([7, 9, 11, 13, 16, 17, 19])
-            modulus = a * b
+            # Hardened: CRT with 3 pairwise-coprime moduli (was 2).
+            a_pool = [3, 4, 5, 7, 8, 9, 11, 13]
+            r.shuffle(a_pool)
+            a = a_pool[0]
+            b = next((m for m in a_pool[1:] if gcd(m, a) == 1), 7)
+            c = next((m for m in a_pool[1:] if gcd(m, a) == 1 and gcd(m, b) == 1), 11)
+            modulus = a * b * c
             target = r.randint(2, modulus - 2)
             gold = str(target)
             question = (
-                f"Find the smallest positive integer x with x mod {a} = "
-                f"{target % a} and x mod {b} = {target % b}. The answer is "
-                f"a positive integer less than {modulus}."
+                f"Find the smallest positive integer x with "
+                f"x mod {a} = {target % a}, x mod {b} = {target % b}, "
+                f"and x mod {c} = {target % c}. The answer is a positive "
+                f"integer less than {modulus}."
             )
-        else:  # iterated_digit
+        elif kind == "iterated_digit":
+            # Hardened: 3 iterations → 5 iterations.
             seed_n = r.randint(50, 500)
             cur = seed_n
-            for _ in range(3):
+            for _ in range(5):
                 cur = sum(int(d) for d in str(cur)) * 7 + 3
-            gold = str(cur)
+            mod = 1000
+            gold = str(cur % mod)
             question = (
-                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at n_0 = "
-                f"{seed_n}, compute n_3 = f(f(f(n_0)))."
+                f"Define f(n) = 7 * (sum of digits of n) + 3. Starting at "
+                f"n_0 = {seed_n}, compute n_5 = f(f(f(f(f(n_0))))) mod 1000."
+            )
+        elif kind == "coordinate_geometry":
+            # Count lattice points (x, y) with 1 <= x <= a, 1 <= y <= b
+            # such that gcd(x, y) = 1. Cleanly procedural; the answer is
+            # the totient-style sum which a model has to actually
+            # enumerate (no closed form for arbitrary a, b).
+            a = r.randint(8, 18)
+            b = r.randint(8, 18)
+            count = 0
+            for x in range(1, a + 1):
+                for y in range(1, b + 1):
+                    if gcd(x, y) == 1:
+                        count += 1
+            gold = str(count)
+            question = (
+                f"Count the number of lattice points (x, y) with "
+                f"1 <= x <= {a} and 1 <= y <= {b} such that gcd(x, y) = 1. "
+                f"The final answer is a positive integer."
+            )
+        else:  # polynomial_root_sum
+            # Vieta's formulas on a procedural cubic: pick three integer
+            # roots, build the cubic, ask for the sum of squares of roots.
+            roots = sorted(r.sample(range(-9, 10), 3))
+            r1, r2, r3 = roots
+            # Coefficients: x^3 - (sum)x^2 + (pair-sum)x - (prod)
+            sum_r = r1 + r2 + r3
+            pair = r1 * r2 + r1 * r3 + r2 * r3
+            prod = r1 * r2 * r3
+            sum_sq = r1 ** 2 + r2 ** 2 + r3 ** 2
+            gold = str(sum_sq)
+            question = (
+                f"The cubic equation x^3 + ({-sum_r})x^2 + ({pair})x + "
+                f"({-prod}) = 0 has three integer roots. Compute the sum "
+                f"of the squares of the three roots (i.e. r_1^2 + r_2^2 + "
+                f"r_3^2). The final answer is a non-negative integer."
             )
         question = question + (
             "\n\nSolve carefully and end with '#### N' where N is the final integer answer."
@@ -8231,19 +8938,34 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["code"]) & 0xFFFFFFFF)
+    # 2026-05-02 (v30.5): code-bench hardening pass.
+    # ─────────────────────────────────────────────
+    # 1. Hard-tier ratio bumped 70% → 90%. Legacy easy subtypes
+    #    saturated at ≥0.95 across all models (no signal); now they
+    #    take only 10% of the round budget as difficulty floor.
+    # 2. Three new LeetCode-medium subtypes added (all humaneval-distribution):
+    #    - longest_palindromic_substring (DP / center-expand)
+    #    - group_anagrams (hash table + canonicalisation)
+    #    - kth_largest (sorting / quickselect)
+    # 3. Per-subtype: more test inputs, larger arrays (5-15 items vs
+    #    earlier 2-7), explicit edge cases (empty, single, all-equal,
+    #    sorted-ascending, sorted-descending, negative-only).
     hard_kinds = [
         "coin_change_min", "merge_intervals", "rolling_max",
         "nested_paren_groups", "evaluate_postfix", "roman_to_int",
         "binary_search_first", "unique_paths_grid", "longest_no_repeat",
         "validate_brackets", "sliding_window_min", "most_freq_elem",
         "compress_string", "two_sum_pairs",
+        "caesar_cipher", "flatten_nested_list",
+        "closest_pair_sum", "run_length_decode",
+        "longest_palindromic_substring", "group_anagrams", "kth_largest",
     ]
     legacy_kinds = [
         "transform_list", "aggregate_list", "string_predicate",
         "digit_sum", "window_sum", "pair_count", "run_length",
         "string_transform",
     ]
-    n_hard = max(1, (n_items * 70 + 50) // 100)
+    n_hard = max(1, (n_items * 90 + 50) // 100)
     n_legacy = max(0, n_items - n_hard)
     hard_pool = hard_kinds * ((n_hard // len(hard_kinds)) + 1)
     legacy_pool = legacy_kinds * ((n_legacy // len(legacy_kinds)) + 1)
@@ -8990,6 +9712,260 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             for _ in range(5):
                 xs = [r.randint(0, target) for _ in range(r.randint(0, 7))]
                 test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "caesar_cipher":
+            shift = r.randint(1, 25)
+            entry_point = "caesar_encrypt"
+
+            def _ref_caesar(s, k=shift):
+                out_chars = []
+                for c in s:
+                    if c.isupper():
+                        out_chars.append(chr((ord(c) - 65 + k) % 26 + 65))
+                    elif c.islower():
+                        out_chars.append(chr((ord(c) - 97 + k) % 26 + 97))
+                    else:
+                        out_chars.append(c)
+                return "".join(out_chars)
+            ref = _ref_caesar
+            ex_out = _ref_caesar("abc xyz")
+            prompt = (
+                f"def caesar_encrypt(s):\n"
+                f"    \"\"\"Return the caesar-cipher of ``s`` shifted by {shift}.\n\n"
+                f"    Each letter is shifted forward by {shift} positions in the\n"
+                f"    alphabet, wrapping around (so 'z' shifted by 1 becomes 'a').\n"
+                f"    Letter case is preserved. Non-letter characters are left\n"
+                f"    unchanged.\n\n"
+                f"    >>> caesar_encrypt('abc xyz')\n"
+                f"    {ex_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                "abc xyz", "Hello, World!", "ZZZ", "",
+                "".join(r.choice("abcdefghijklmnopqrstuvwxyz ABC")
+                        for _ in range(r.randint(3, 12))),
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "flatten_nested_list":
+            entry_point = "flatten"
+            prompt = (
+                "def flatten(xs):\n"
+                "    \"\"\"Recursively flatten a nested list of integers.\n\n"
+                "    Inputs may contain integers OR other lists (nested to any\n"
+                "    depth). Return a flat list of integers in their original\n"
+                "    left-to-right order.\n\n"
+                "    >>> flatten([1, [2, [3, 4], 5], 6])\n"
+                "    [1, 2, 3, 4, 5, 6]\n"
+                "    >>> flatten([])\n"
+                "    []\n"
+                "    \"\"\"\n"
+            )
+            def _ref_flat(xs):
+                out_l: list = []
+                for x in xs:
+                    if isinstance(x, list):
+                        out_l.extend(_ref_flat(x))
+                    else:
+                        out_l.append(x)
+                return out_l
+
+            def _gen_nested(rr, depth_left):
+                # Return either a leaf int or a nested list, randomly.
+                if depth_left == 0 or rr.random() < 0.4:
+                    return rr.randint(-9, 9)
+                length = rr.randint(0, 4)
+                return [_gen_nested(rr, depth_left - 1) for _ in range(length)]
+
+            test_inputs = []
+            for _ in range(5):
+                test_inputs.append([_gen_nested(r, r.randint(1, 4))
+                                    for _ in range(r.randint(0, 4))])
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti) if False else _ref_flat(ti)!r}")
+        elif kind == "closest_pair_sum":
+            target = r.randint(-15, 30)
+            entry_point = "closest_pair_sum"
+
+            def _ref_closest(xs, t=target):
+                best = None
+                best_pair = None
+                for i in range(len(xs)):
+                    for j in range(i + 1, len(xs)):
+                        diff = abs(xs[i] + xs[j] - t)
+                        if best is None or diff < best:
+                            best = diff
+                            best_pair = (i, j)
+                return best_pair
+            ref = _ref_closest
+            example_out = _ref_closest([1, 7, 3, 2])
+            prompt = (
+                f"def closest_pair_sum(xs):\n"
+                f"    \"\"\"Return the indices ``(i, j)`` with i < j whose sum\n"
+                f"    ``xs[i] + xs[j]`` is closest to {target}. If multiple pairs\n"
+                f"    are equally close, return the lexicographically smallest\n"
+                f"    (i, j) tuple. The list always has at least two elements.\n\n"
+                f"    >>> closest_pair_sum([1, 7, 3, 2])\n"
+                f"    {example_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            for _ in range(5):
+                n = r.randint(2, 8)
+                xs = [r.randint(-12, 18) for _ in range(n)]
+                test_lines.append(f"    assert candidate({xs!r}) == {ref(xs)!r}")
+        elif kind == "longest_palindromic_substring":
+            entry_point = "longest_palindrome"
+
+            def _ref_lps(s):
+                if not s:
+                    return ""
+                best = ""
+                for i in range(len(s)):
+                    for L, R in [(i, i), (i, i + 1)]:
+                        while L >= 0 and R < len(s) and s[L] == s[R]:
+                            L -= 1
+                            R += 1
+                        sub = s[L + 1:R]
+                        if len(sub) > len(best):
+                            best = sub
+                return best
+            ref = _ref_lps
+            ex_in = "babad"
+            ex_out = _ref_lps(ex_in)
+            prompt = (
+                f"def longest_palindrome(s):\n"
+                f"    \"\"\"Return the longest palindromic substring of ``s``.\n\n"
+                f"    A palindrome reads the same forwards and backwards. If\n"
+                f"    multiple substrings of the maximum length exist, return\n"
+                f"    the FIRST one (leftmost). For empty input, return ''.\n\n"
+                f"    >>> longest_palindrome({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    >>> longest_palindrome('cbbd')\n"
+                f"    'bb'\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                "babad", "cbbd", "", "a", "aa", "abcba",
+                "abcdefg", "racecarxyz", "noon", "abccba",
+                "".join(r.choice("abcd") for _ in range(r.randint(8, 20))),
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "group_anagrams":
+            entry_point = "group_anagrams"
+
+            def _ref_ga(strs):
+                groups: dict = {}
+                for s in strs:
+                    key = "".join(sorted(s))
+                    groups.setdefault(key, []).append(s)
+                # Return sorted by first member of each group lexicographically;
+                # within a group, preserve original order.
+                return sorted(groups.values(), key=lambda g: g[0])
+            ref = _ref_ga
+            ex_in = ["eat", "tea", "tan", "ate", "nat", "bat"]
+            ex_out = _ref_ga(ex_in)
+            prompt = (
+                f"def group_anagrams(strs):\n"
+                f"    \"\"\"Group strings that are anagrams of each other.\n\n"
+                f"    Return a list of groups, where each group is a list of\n"
+                f"    strings that are anagrams of each other. The outer list\n"
+                f"    is sorted by the FIRST member of each group lexicographically.\n"
+                f"    Within each group, preserve the original input order.\n\n"
+                f"    >>> group_anagrams({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    >>> group_anagrams([])\n"
+                f"    []\n"
+                f"    \"\"\"\n"
+            )
+            words_pool = ["eat", "tea", "ate", "tan", "nat", "bat", "tab", "act",
+                          "cat", "tac", "rat", "art", "tar", "god", "dog"]
+            test_inputs = [
+                ["eat", "tea", "tan", "ate", "nat", "bat"],
+                [],
+                ["a"],
+                ["abc", "bca", "cab"],
+                r.sample(words_pool, r.randint(5, 10)),
+                ["xyz", "yzx", "zxy", "abc", "bca", "different"],
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "kth_largest":
+            k_choices = [1, 2, 3]
+            k = r.choice(k_choices)
+            entry_point = "kth_largest"
+
+            def _ref_kth(xs, kk=k):
+                if not xs or kk > len(xs) or kk < 1:
+                    return None
+                return sorted(xs, reverse=True)[kk - 1]
+            ref = _ref_kth
+            ex_in = [3, 2, 1, 5, 6, 4]
+            ex_out = _ref_kth(ex_in)
+            prompt = (
+                f"def kth_largest(xs):\n"
+                f"    \"\"\"Return the {k}{'st' if k==1 else 'nd' if k==2 else 'rd'}\n"
+                f"    largest element of ``xs``. Duplicates count separately\n"
+                f"    (so kth_largest([3,3,3,3]) for k=2 returns 3). If ``xs``\n"
+                f"    has fewer than {k} elements, return None.\n\n"
+                f"    >>> kth_largest({ex_in!r})\n"
+                f"    {ex_out!r}\n"
+                f"    \"\"\"\n"
+            )
+            test_inputs = [
+                [3, 2, 1, 5, 6, 4],
+                [],
+                [1] if k == 1 else [1, 1],
+                [1, 1, 1, 1],
+                sorted([r.randint(-15, 30) for _ in range(r.randint(5, 12))]),
+                sorted([r.randint(-15, 30) for _ in range(r.randint(5, 12))], reverse=True),
+                [r.randint(-9, 9) for _ in range(r.randint(k, 15))],
+                [r.randint(-9, 9) for _ in range(r.randint(k, 15))],
+                [-5, -2, -10, -1, -3],
+            ]
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
+        elif kind == "run_length_decode":
+            entry_point = "rle_decode"
+            prompt = (
+                "def rle_decode(s):\n"
+                "    \"\"\"Decode a run-length-encoded string.\n\n"
+                "    The input is a string consisting of runs of (count)(char)\n"
+                "    where count is one OR more decimal digits. Each run\n"
+                "    expands to ``char`` repeated ``count`` times. Return the\n"
+                "    decoded string.\n\n"
+                "    >>> rle_decode('3a2b1c')\n"
+                "    'aaabbc'\n"
+                "    >>> rle_decode('12x')\n"
+                "    'xxxxxxxxxxxx'\n"
+                "    >>> rle_decode('')\n"
+                "    ''\n"
+                "    \"\"\"\n"
+            )
+            def _ref_rle(s):
+                out_s = []
+                i = 0
+                while i < len(s):
+                    j = i
+                    while j < len(s) and s[j].isdigit():
+                        j += 1
+                    if j == i or j >= len(s):
+                        # Malformed — but our test inputs are always well-formed.
+                        return ""
+                    count = int(s[i:j])
+                    char = s[j]
+                    out_s.append(char * count)
+                    i = j + 1
+                return "".join(out_s)
+            ref = _ref_rle
+            test_inputs = ["3a2b1c", "12x", "", "1a1b1c"]
+            for _ in range(2):
+                # Generate one well-formed random RLE string.
+                runs = []
+                for _ in range(r.randint(1, 4)):
+                    runs.append((r.randint(1, 9), r.choice("abcdef")))
+                test_inputs.append("".join(f"{n}{c}" for n, c in runs))
+            for ti in test_inputs:
+                test_lines.append(f"    assert candidate({ti!r}) == {ref(ti)!r}")
         else:
             entry_point = "noop"
             prompt = (
@@ -8999,13 +9975,22 @@ def _generate_code_items(block_seed, n_items: int) -> list[dict]:
             test_lines = ["    assert candidate() == 0"]
         # ─────────────────────────────────────────────────────────────────
         test_block = "def check(candidate):\n" + "\n".join(test_lines) + "\n"
-        version_tag = "v29" if kind in (
+        if kind in (
+            "caesar_cipher", "flatten_nested_list",
+            "closest_pair_sum", "run_length_decode",
+            "longest_palindromic_substring", "group_anagrams", "kth_largest",
+        ):
+            version_tag = "v30"
+        elif kind in (
             "coin_change_min", "merge_intervals", "rolling_max",
             "nested_paren_groups", "evaluate_postfix", "roman_to_int",
             "binary_search_first", "unique_paths_grid", "longest_no_repeat",
             "validate_brackets", "sliding_window_min", "most_freq_elem",
             "compress_string", "two_sum_pairs",
-        ) else "v27"
+        ):
+            version_tag = "v29"
+        else:
+            version_tag = "v27"
         out.append({
             "src": f"procedural_code/{kind}",
             "task_id": f"{version_tag}/{kind}/{i:02d}",
@@ -9068,11 +10053,19 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
     without breaking other behaviour).
     """
     import random
+    # 2026-05-02 (v30.5): added 4 more subtle bug kinds to push debug
+    # difficulty up. The new kinds are subtler than the original 8:
+    #   - mutable_default_arg: classic Python footgun (def f(xs=[]):)
+    #   - shallow_vs_deep_copy: list copy doesn't recurse into nested
+    #   - integer_division_drift: int / int when float is needed
+    #   - aliased_loop_var: late binding in closure / lambda
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["debug"]) & 0xFFFFFFFF)
     bug_kinds = [
         "off_by_one_range", "swap_subtract", "wrong_comparator",
         "wrong_init", "early_break", "wrong_index", "wrong_modulo",
         "missing_edge_case",
+        "mutable_default_arg", "shallow_vs_deep_copy",
+        "integer_division_drift", "aliased_loop_var",
     ]
     pool = (bug_kinds * ((n_items // len(bug_kinds)) + 1))[:n_items]
     rng.shuffle(pool)
@@ -9240,7 +10233,7 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
                 f"    assert candidate(0, modulus={mod}) == 0",
                 f"    assert candidate({mod-1}, modulus={mod}) == {2 * (mod-1)}",
             ]
-        else:  # missing_edge_case
+        elif kind == "missing_edge_case":
             entry = "first_or_default"
             buggy = (
                 "def first_or_default(arr, default=None):\n"
@@ -9260,6 +10253,111 @@ def _generate_debug_items(block_seed, n_items: int) -> list[dict]:
                 "    assert candidate([], default=-1) == -1",
                 "    assert candidate(['a']) == 'a'",
                 "    assert candidate([], default=[]) == []",
+            ]
+        elif kind == "mutable_default_arg":
+            entry = "append_to_history"
+            buggy = (
+                "def append_to_history(item, history=[]):\n"
+                '    """Append item to history (list); return updated history."""\n'
+                "    history.append(item)\n"
+                "    return history\n"
+            )
+            sig = (
+                "def append_to_history(item, history=None):\n"
+                '    """Append item to history and return it. If no history\n'
+                "    is given, start a FRESH new list (not a shared default).\n"
+                "    Each call with no history must start independent.\n"
+                "    Example: a = append_to_history(1); b = append_to_history(2);\n"
+                "    then a == [1] and b == [2] (NOT b == [1, 2])."
+                '\n    """\n'
+            )
+            tests = [
+                "    a = candidate(1); b = candidate(2)",
+                "    assert a == [1]",
+                "    assert b == [2]",
+                "    assert candidate(5, [3, 4]) == [3, 4, 5]",
+                "    assert candidate('x') == ['x']",
+            ]
+        elif kind == "shallow_vs_deep_copy":
+            entry = "duplicate_grid"
+            buggy = (
+                "def duplicate_grid(grid):\n"
+                '    """Return an independent copy of a 2D grid (list of lists)."""\n'
+                "    return list(grid)\n"
+            )
+            sig = (
+                "def duplicate_grid(grid: list) -> list:\n"
+                '    """Return an INDEPENDENT copy of a 2D grid (list of lists)\n'
+                "    such that mutating the returned copy does NOT affect the\n"
+                "    original. The grid is a list of integer lists.\n"
+                "    Example: g = [[1, 2], [3]]; d = duplicate_grid(g);\n"
+                "             d[0].append(99); g still equals [[1, 2], [3]]."
+                '\n    """\n'
+            )
+            tests = [
+                "    g = [[1, 2], [3, 4]]",
+                "    d = candidate(g)",
+                "    d[0].append(99)",
+                "    assert g == [[1, 2], [3, 4]]",
+                "    assert d == [[1, 2, 99], [3, 4]]",
+                "    g2 = [[5]]; d2 = candidate(g2); d2[0][0] = 7; assert g2 == [[5]]",
+            ]
+        elif kind == "integer_division_drift":
+            entry = "average_of"
+            buggy = (
+                "def average_of(xs):\n"
+                '    """Return the arithmetic mean of xs as a float."""\n'
+                "    if not xs: return 0.0\n"
+                "    total = 0\n"
+                "    for x in xs: total += x\n"
+                "    return total // len(xs)\n"
+            )
+            sig = (
+                "def average_of(xs: list) -> float:\n"
+                '    """Return the arithmetic mean of xs as a FLOAT (not an\n'
+                "    integer). Empty list returns 0.0.\n"
+                "    Example: average_of([1, 2, 3]) returns 2.0;\n"
+                "             average_of([1, 2, 4]) returns 2.333... (a float)."
+                '\n    """\n'
+            )
+            tests = [
+                "    assert abs(candidate([1, 2, 3]) - 2.0) < 1e-9",
+                "    assert abs(candidate([1, 2, 4]) - 7/3) < 1e-9",
+                "    assert candidate([]) == 0.0",
+                "    assert abs(candidate([5, 5, 5]) - 5.0) < 1e-9",
+                "    assert abs(candidate([2, 4, 6, 8]) - 5.0) < 1e-9",
+                "    assert isinstance(candidate([1, 2]), float)",
+            ]
+        else:  # aliased_loop_var
+            entry = "make_adders"
+            buggy = (
+                "def make_adders(ks):\n"
+                '    """Return list of fns where fn[i](x) returns x + ks[i]."""\n'
+                "    fns = []\n"
+                "    for k in ks:\n"
+                "        fns.append(lambda x: x + k)\n"
+                "    return fns\n"
+            )
+            sig = (
+                "def make_adders(ks: list) -> list:\n"
+                '    """Return a list of functions, where the i-th function\n'
+                "    takes x and returns x + ks[i]. The returned functions\n"
+                "    must each capture their own ks[i] independently — calling\n"
+                "    the first function should not be affected by later\n"
+                "    iterations of the loop.\n"
+                "    Example: fns = make_adders([1, 2, 5]);\n"
+                "             [f(10) for f in fns] returns [11, 12, 15]."
+                '\n    """\n'
+            )
+            tests = [
+                "    fns = candidate([1, 2, 5])",
+                "    assert [f(10) for f in fns] == [11, 12, 15]",
+                "    fns2 = candidate([7])",
+                "    assert fns2[0](100) == 107",
+                "    fns3 = candidate([])",
+                "    assert fns3 == []",
+                "    fns4 = candidate([0, 0])",
+                "    assert [f(5) for f in fns4] == [5, 5]",
             ]
 
         # The buggy version goes in the prompt as a comment block so it
@@ -9654,10 +10752,19 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
     per-item RNG-derived seeds. Numbers are calibrated to be in
     distinct ranges per topic so substring collisions don't sneak in.
     """
+    # 2026-05-02 (v30.5): hardened. Default n_cards 4 → 7, and added two
+    # 3-document synthesis kinds (``sum_three``, ``difference_three``)
+    # so ~30 % of items require retrieving and combining THREE values
+    # rather than two. The bigger card pool also means the
+    # confuser-rejection grader has more values to NOT match against,
+    # raising the bar against models that "mention all numbers".
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["multi_doc"]) & 0xFFFFFFFF)
-    qkinds = ["sum", "difference", "compare", "ratio"]
-    n_cards = max(2, BENCH_MULTI_DOC_N_CARDS)
+    qkinds = ["sum", "difference", "compare", "ratio",
+              "sum_three", "difference_three"]
+    # Default to 7 cards if env override not set; allow operator override.
+    _n_cards_default = max(BENCH_MULTI_DOC_N_CARDS, 7)
+    n_cards = max(3, _n_cards_default)
     out: list[dict] = []
     for i in range(n_items):
         r = random.Random(rng.randint(0, 2**31 - 1))
@@ -9745,13 +10852,46 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
                 f"and {b_topic}, which one has the LARGER value? Reply "
                 f"with the full name of the larger one."
             )
-        else:  # ratio (integer division to keep gold an integer)
+        elif kind == "ratio":
             larger, smaller = (a_val, b_val) if a_val >= b_val else (b_val, a_val)
             gold = str(larger // smaller)
             question = (
                 f"How many times larger (rounded down to integer) is the "
                 f"numeric attribute of {a_topic} compared to {b_topic}? "
                 f"If {a_topic} is smaller, swap the order. Reply with the integer only."
+            )
+        elif kind == "sum_three":
+            # 3-document synthesis: sum the values across three topics.
+            if n_cards < 3:
+                # Skip if not enough cards; should not happen with default 7.
+                continue
+            third_pool = [ci for ci in range(n_cards) if ci not in (a_idx, b_idx)]
+            c_idx = r.choice(third_pool)
+            c_topic = topics[c_idx]
+            c_val = values[c_idx]
+            gold = str(a_val + b_val + c_val)
+            question = (
+                f"Considering only {a_topic}, {b_topic}, and {c_topic}, "
+                f"what is the COMBINED total of the numeric attribute "
+                f"reported in their three documents? Reply with the "
+                f"integer only."
+            )
+        else:  # difference_three
+            # 3-document synthesis: max minus mid minus min.
+            if n_cards < 3:
+                continue
+            third_pool = [ci for ci in range(n_cards) if ci not in (a_idx, b_idx)]
+            c_idx = r.choice(third_pool)
+            c_topic = topics[c_idx]
+            c_val = values[c_idx]
+            three = sorted([(a_val, a_topic), (b_val, b_topic),
+                            (c_val, c_topic)], reverse=True)
+            gold = str(three[0][0] - three[1][0] - three[2][0])
+            question = (
+                f"Considering only {a_topic}, {b_topic}, and {c_topic}: "
+                f"take the LARGEST of the three numeric attributes, "
+                f"subtract the MIDDLE one, then subtract the SMALLEST. "
+                f"Reply with the integer only."
             )
         # Confusers: numeric values from cards NOT used in the gold.
         # These should not appear as standalone integers in the response.
@@ -9764,17 +10904,27 @@ def _generate_multi_doc_items(block_seed, n_items: int) -> list[dict]:
             # Add the LOSER as a confuser too — model must commit.
             loser_t = b_topic if a_val > b_val else a_topic
             confuser_answers.append(loser_t)
+        elif kind in ("sum_three", "difference_three"):
+            # Three-card kind: the third card's value is "involved", so
+            # only OTHER cards' values count as confusers.
+            involved = {a_idx, b_idx, c_idx}
+            confuser_answers = [
+                str(values[ci]) for ci in range(n_cards) if ci not in involved
+            ]
         else:
             confuser_answers = [
                 str(values[ci]) for ci in range(n_cards) if ci not in (a_idx, b_idx)
             ]
+        topics_for_record = [a_topic, b_topic]
+        if kind in ("sum_three", "difference_three"):
+            topics_for_record = [a_topic, b_topic, c_topic]
         out.append({
             "src": f"multi_doc_synthesis/{kind}",
             "context": document,
             "question": question,
             "answer": gold,
             "confuser_answers": confuser_answers,
-            "involved_topics": [a_topic, b_topic],
+            "involved_topics": topics_for_record,
             "kind": kind,
         })
     return out
@@ -10175,32 +11325,81 @@ def _generate_calibration_items(block_seed, n_items: int) -> list[dict]:
          "{b} books. How many books has {name} borrowed total? Reply with an integer.",
          lambda a, b: a + b),
     ]
+    # 2026-05-02 (v30.5): added two adversarial unsolvable kinds.
+    # Standard ``unsolv`` items are EASY to detect — the missing slot is
+    # obvious (e.g. "{name} owns books in the kitchen and {b} books..."
+    # — clearly missing a number). Adversarial unsolvables are MUCH
+    # harder:
+    #   - ``contradiction``: data is self-inconsistent (totals + parts
+    #     given disagree). A model that pattern-matches arithmetic
+    #     templates will compute the wrong answer; only a careful
+    #     reader notices the contradiction.
+    #   - ``unit_mismatch``: parts use incompatible units that aren't
+    #     convertible without an unstated rate (e.g. eggs + dozens
+    #     where the dozen-size isn't given). Confabulators will assume
+    #     12; calibrated models refuse.
+    # 30% of unsolvable items are adversarial; the rest stay as the
+    # easier "missing slot" form so the easy-floor remains in place.
     out: list[dict] = []
-    plan = (["solv"] * n_solv) + (["unsolv"] * n_unsolv)
+    plan_solv = ["solv"] * n_solv
+    n_adv = max(0, int(round(n_unsolv * 0.30)))
+    n_simple = n_unsolv - n_adv
+    plan = (
+        plan_solv
+        + ["unsolv"] * n_simple
+        + ["contradiction"] * (n_adv // 2 + n_adv % 2)
+        + ["unit_mismatch"] * (n_adv // 2)
+    )
     rng.shuffle(plan)
     for i, plan_kind in enumerate(plan):
         r = random.Random(rng.randint(0, 2**31 - 1))
         tmpl_id, solv_template, unsolv_template, gold_fn = r.choice(templates)
         a, b = r.randint(5, 60), r.randint(5, 60)
-        # v29.5: procedurally synthesise a fresh name per item; no
-        # static name pool to memorise.
-        name = _synthetic_name(r)
+        name = _realistic_name(r)
         if plan_kind == "solv":
             question = solv_template.format(a=a, b=b, name=name)
             gold = str(gold_fn(a, b))
-        else:
-            # Pass both a + b: each unsolv template omits ONE of the
-            # two slots and may legitimately reference the other (e.g.
-            # the orchard template keeps {a} but drops {b}, the books
-            # template keeps {b} but drops {a}). Passing both is safe
-            # because Python ignores extra kwargs in str.format.
+            kind_tag = "solv"
+        elif plan_kind == "unsolv":
             question = unsolv_template.format(a=a, b=b, name=name)
-            gold = "REFUSE"  # sentinel; grader handles refusal recognition
+            gold = "REFUSE"
+            kind_tag = "unsolv"
+        elif plan_kind == "contradiction":
+            # Adversarial: present a part-and-total that contradict each
+            # other. The model should recognise the inconsistency rather
+            # than pick one number to compute with.
+            wrong_total = a + b + r.randint(3, 12)  # off by 3-12
+            question = (
+                f"{name} owns {a} books in the kitchen and {b} books in "
+                f"the study. {name} also reports owning a TOTAL of "
+                f"{wrong_total} books across both rooms. How many books "
+                f"does {name} own in total? Reply with an integer if the "
+                f"answer is determinable, else explain why."
+            )
+            gold = "REFUSE"
+            kind_tag = "unsolv_adversarial_contradiction"
+        else:  # unit_mismatch
+            n_eggs = r.randint(40, 200)
+            n_dozens = r.randint(2, 9)
+            question = (
+                f"A farm collects {n_eggs} eggs in the morning and "
+                f"{n_dozens} dozens of eggs in the afternoon. (No "
+                f"information is given about how many eggs are in a "
+                f"dozen on this farm.) How many eggs were collected in "
+                f"total? Reply with an integer if the answer is "
+                f"determinable, else explain why."
+            )
+            # NB: this is a trick — most readers assume 12 eggs/dozen,
+            # but the problem says nothing about it. A calibrated model
+            # should at least flag the assumption.
+            gold = "REFUSE"
+            kind_tag = "unsolv_adversarial_unit_mismatch"
         out.append({
-            "src": f"calibration/{tmpl_id}/{plan_kind}",
+            "src": f"calibration/{tmpl_id}/{kind_tag}",
             "question": question,
             "answer": gold,
-            "kind": plan_kind,  # "solv" or "unsolv"
+            "kind": plan_kind if plan_kind in ("solv", "unsolv") else "unsolv",
+            "adversarial": plan_kind in ("contradiction", "unit_mismatch"),
         })
     return out
 
@@ -10284,15 +11483,20 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
 
         if subtype == "false_belief":
             # Actor X, actor Y, object, two containers.
-            names = _synthetic_names(r, 2)
+            # 2026-05-01 (v30.4 patch v4): real names + concrete objects
+            # so the prompt is readable. Anti-memorisation preserved
+            # because the (name1, name2, obj, container1, container2,
+            # question_type) combinatoric is ~22B unique scenarios per
+            # block_seed.
+            names = _realistic_names(r, 2)
             x_name, y_name = names[0], names[1]
-            obj = _synthetic_word(r, 2)
-            container_1 = _synthetic_word(r, 2)
-            container_2 = _synthetic_word(r, 2)
+            obj = _realistic_object(r)
+            container_1 = _realistic_container(r)
+            container_2 = _realistic_container(r)
             while container_2 == container_1:
-                container_2 = _synthetic_word(r, 2)
+                container_2 = _realistic_container(r)
             scenario = (
-                f"{x_name} places a {obj} inside the {container_1}. "
+                f"{x_name} places the {obj} inside the {container_1}. "
                 f"{x_name} then leaves the room. While {x_name} is "
                 f"away, {y_name} moves the {obj} from the {container_1} "
                 f"to the {container_2}. A few minutes later, "
@@ -10303,17 +11507,35 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 question = (
                     scenario +
                     f" Where will {x_name} look for the {obj} first? "
-                    f"Reply with the container name only."
+                    f"Reply with just the container name (one or two "
+                    f"words, no article)."
                 )
                 gold = container_1
             else:
                 question = (
                     scenario +
                     f" Where is the {obj} actually located now? "
-                    f"Reply with the container name only."
+                    f"Reply with just the container name (one or two "
+                    f"words, no article)."
                 )
                 gold = container_2
-            accept = _accept_word(gold)
+            # Match the LAST word of the gold ("kitchen drawer" → "drawer")
+            # so two-word containers still grade right when the model
+            # answers with just the head noun. BUT only accept the head
+            # noun when the OTHER container's head noun is different —
+            # otherwise "drawer" alone is ambiguous (could mean either
+            # "sock drawer" or "kitchen drawer"). When the heads collide
+            # we require the model to emit the full discriminating
+            # container name.
+            other = container_2 if gold == container_1 else container_1
+            gold_last = gold.split()[-1].lower()
+            other_last = other.split()[-1].lower()
+            accept_patterns = [re.compile(rf"\b{re.escape(gold)}\b", re.IGNORECASE)]
+            if gold_last != other_last:
+                accept_patterns.append(
+                    re.compile(rf"\b{re.escape(gold_last)}\b", re.IGNORECASE)
+                )
+            accept = accept_patterns
         elif subtype == "scalar_implicature":
             # All weak quantifiers pair with the strong quantifier
             # ``all`` rather than ``every`` because ``all`` takes the
@@ -10327,7 +11549,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 ("a few", "all"),
             ])
             # Build a domain scenario.
-            speaker = _synthetic_name(r)
+            speaker = _realistic_name(r)
             domain = r.choice([
                 ("students", "passed the exam"),
                 ("athletes", "finished the race"),
@@ -10365,7 +11587,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
         elif subtype == "epistemic_state_tracking":
             # Three actors A, B, C. Information X is initially known
             # only by A. A tells B. C is not told. Question: does C know?
-            names = _synthetic_names(r, 3)
+            names = _realistic_names(r, 3)
             a_name, b_name, c_name = names[0], names[1], names[2]
             secret = r.choice(["password", "address", "schedule",
                                "code", "answer", "destination"])
@@ -10405,7 +11627,7 @@ def _generate_pragmatic_items(block_seed, n_items: int) -> list[dict]:
                 "could_you", "would_you_please", "do_you_have",
                 "is_it_possible",
             ])
-            speaker = _synthetic_name(r)
+            speaker = _realistic_name(r)
             # Each action is given as a base-form (infinitive without
             # 'to') verb phrase so all four template phrasings remain
             # grammatical without requiring gerund conjugation.
@@ -10583,6 +11805,85 @@ def _generate_refactor_items(block_seed, n_items: int) -> list[dict]:
              "    assert candidate([[1], [2], [3]]) == [1, 2, 3]",
          ],
         ),
+        # 2026-05-02 (v30.5): three more refactor templates for breadth.
+        ("find_max_ugly", "find_max_in_list",
+         (
+             "def find_max_in_list(xs):\n"
+             "    biggest = None\n"
+             "    for x in xs:\n"
+             "        if biggest is None:\n"
+             "            biggest = x\n"
+             "        else:\n"
+             "            if x > biggest:\n"
+             "                biggest = x\n"
+             "    if biggest is None:\n"
+             "        return None\n"
+             "    return biggest\n"
+         ),
+         (
+             "def find_max_in_list(xs: list[int]) -> int | None:\n"
+             '    """Return the maximum integer in xs, or None if xs is empty."""\n'
+         ),
+         [
+             "    assert candidate([3, 1, 4, 1, 5, 9, 2, 6]) == 9",
+             "    assert candidate([7]) == 7",
+             "    assert candidate([]) is None",
+             "    assert candidate([-3, -1, -7]) == -1",
+             "    assert candidate([2, 2, 2]) == 2",
+         ],
+        ),
+        ("count_uniques_ugly", "count_unique",
+         (
+             "def count_unique(xs):\n"
+             "    seen = []\n"
+             "    for x in xs:\n"
+             "        already = False\n"
+             "        for y in seen:\n"
+             "            if y == x:\n"
+             "                already = True\n"
+             "        if not already:\n"
+             "            seen.append(x)\n"
+             "    return len(seen)\n"
+         ),
+         (
+             "def count_unique(xs: list[int]) -> int:\n"
+             '    """Return the number of distinct integers in xs."""\n'
+         ),
+         [
+             "    assert candidate([1, 2, 1, 3, 2, 1]) == 3",
+             "    assert candidate([]) == 0",
+             "    assert candidate([5, 5, 5, 5]) == 1",
+             "    assert candidate([1, 2, 3, 4, 5]) == 5",
+         ],
+        ),
+        ("pair_sum_ugly", "any_pair_sums_to",
+         (
+             "def any_pair_sums_to(xs, target):\n"
+             "    found = False\n"
+             "    for i in range(len(xs)):\n"
+             "        for j in range(len(xs)):\n"
+             "            if i != j:\n"
+             "                if xs[i] + xs[j] == target:\n"
+             "                    found = True\n"
+             "    return found\n"
+         ),
+         (
+             "def any_pair_sums_to(xs: list[int], target: int) -> bool:\n"
+             '    """Return True if any two distinct-indexed elements of xs\n'
+             "    sum to target. Each index is used at most once per pair.\n"
+             "    Examples: any_pair_sums_to([1, 2, 3, 4], 7) is True; "
+             "any_pair_sums_to([5], 5) is False (only one element)."
+             '\n    """\n'
+         ),
+         [
+             "    assert candidate([1, 2, 3, 4], 7) is True",
+             "    assert candidate([1, 2, 3, 4], 8) is False",
+             "    assert candidate([5], 5) is False",
+             "    assert candidate([], 0) is False",
+             "    assert candidate([3, 3], 6) is True",
+             "    assert candidate([0, 0, 0], 0) is True",
+         ],
+        ),
     ]
     out: list[dict] = []
     for i, kind in enumerate(pool):
@@ -10692,7 +11993,19 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
     """
     import random
     rng = random.Random((int(block_seed or 0) ^ _BENCH_STREAM["reasoning"]) & 0xFFFFFFFF)
-    hard_kinds = ["date_arithmetic", "web_of_lies", "navigate_steps", "tracking_objects"]
+    # 2026-05-01 (v30.4 patch v4): added 3 new reasoning subtypes —
+    # graph_shortest_path (SSSP on a 4-6 node weighted graph),
+    # graph_connectivity (is there a path A→B in a directed graph?),
+    # constraint_sat (small CSP / 3-actor scheduling).
+    # All three are weakness areas of distilled-only models per the
+    # held-out canary audit; the procedural rotation is hardcoded so
+    # memorisation stays impossible (each round samples fresh random
+    # graph topology + edge weights).
+    hard_kinds = [
+        "date_arithmetic", "web_of_lies", "navigate_steps",
+        "tracking_objects", "graph_shortest_path",
+        "graph_connectivity", "constraint_sat",
+    ]
     legacy_kinds = ["boolean_eval", "ordering", "deduction", "sequence_next",
                     "odd_one_out", "analogy_letter"]
     n_hard = max(1, (n_items * 70 + 50) // 100)
@@ -10882,13 +12195,18 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
                            "procedural_reasoning/analogy_letter"))
         # ── v29 hard tier (BBH-distribution-similar) ────────────────────
         elif kind == "date_arithmetic":
+            # 2026-05-02 (v30.5): expand year range to include leap years
+            # (2020, 2024, 2028) and bump delta range 7-95 → 30-450 days
+            # so a non-trivial fraction of items cross a leap-day or
+            # year boundary, exposing models that estimate via "30 days
+            # per month" shortcuts.
             from datetime import date, timedelta
-            year = r.choice([2023, 2024])
+            year = r.choice([2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028])
             month = r.randint(1, 12)
             day = r.randint(1, 28)
             d0 = date(year, month, day)
             direction = r.choice(["after", "before"])
-            delta = r.randint(7, 95)
+            delta = r.randint(30, 450)
             if direction == "after":
                 target = d0 + timedelta(days=delta)
             else:
@@ -10912,9 +12230,13 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/date_arithmetic"))
         elif kind == "web_of_lies":
-            n_chain = r.randint(3, 5)
-            people = _synthetic_names(r,
-                              n_chain)
+            # 2026-05-02 (v30.5): chain length 3-5 → 5-7 actors + real
+            # names. Hand-test confirms a 5+ actor chain is solvable but
+            # exposes any model that "guesses true if mostly true" —
+            # the parity flips are non-trivial. Real names also let
+            # the prompt read like a logic puzzle textbook item.
+            n_chain = r.randint(5, 7)
+            people = _realistic_names(r, n_chain)
             truth = [r.choice([True, False]) for _ in range(n_chain)]
             statements = []
             for i in range(1, n_chain):
@@ -10939,12 +12261,15 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/web_of_lies"))
         elif kind == "navigate_steps":
+            # 2026-05-02 (v30.5): step count 3-6 → 6-10 to deepen
+            # state-tracking demand. Each step requires updating
+            # heading + position; longer chains compound errors.
             cardinals = ["north", "east", "south", "west"]
             initial = r.choice(cardinals)
             heading_idx = cardinals.index(initial)
             x, y = 0, 0
             steps_log = []
-            for _ in range(r.randint(3, 6)):
+            for _ in range(r.randint(6, 10)):
                 kind2 = r.choice(["walk", "turn_left", "turn_right", "turn_around"])
                 if kind2 == "walk":
                     n = r.randint(1, 7)
@@ -10992,11 +12317,16 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/navigate_steps"))
         elif kind == "tracking_objects":
-            n = r.randint(3, 4)
-            people = _synthetic_names(r, n)
-            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange"], n)
+            # 2026-05-02 (v30.5): 3-4 actors → 4-6 actors, 2-4 swaps
+            # → 4-7 swaps. Larger swap chain forces the model to
+            # actually track each ball's location across more steps,
+            # not just guess by recency.
+            n = r.randint(4, 6)
+            people = _realistic_names(r, n)
+            colors = r.sample(["red", "blue", "green", "yellow", "purple", "orange",
+                               "white", "black"], n)
             holds = dict(zip(people, colors))
-            n_swaps = r.randint(2, 4)
+            n_swaps = r.randint(4, 7)
             ops = []
             for _ in range(n_swaps):
                 a, b = r.sample(people, 2)
@@ -11025,6 +12355,201 @@ def _generate_reasoning_items(block_seed, n_items: int) -> list[dict]:
             gold_idx = options.index(ans)
             out.append(_mc(qtext, options, gold_idx,
                            "procedural_reasoning/tracking_objects"))
+        elif kind == "graph_shortest_path":
+            # Single-source shortest-path on a small undirected weighted
+            # graph (4-6 nodes, 5-8 edges, weights 1-9). Generated by
+            # placing nodes at fixed labels (cities) and randomly
+            # connecting until both source and target are reachable.
+            # Solved with Dijkstra to compute the gold cost. The
+            # multiple-choice options include three distractors that
+            # differ from the gold by ±1, ±2, or use a slightly-longer
+            # sub-optimal path.
+            cities = ["Aria", "Brenn", "Clev", "Dorin", "Esia", "Fyrn"]
+            n_nodes = r.randint(4, 6)
+            nodes = cities[:n_nodes]
+            edges: list[tuple[str, str, int]] = []
+            # Random spanning tree first to guarantee connectivity.
+            shuf = list(nodes)
+            r.shuffle(shuf)
+            for i in range(1, len(shuf)):
+                a = shuf[i]
+                b = shuf[r.randint(0, i - 1)]
+                w = r.randint(1, 9)
+                edges.append((a, b, w))
+            # Add 1-3 extra random edges for choice variety.
+            for _ in range(r.randint(1, 3)):
+                a, b = r.sample(nodes, 2)
+                if any({a, b} == {x, y} for x, y, _ in edges):
+                    continue
+                edges.append((a, b, r.randint(1, 9)))
+            # Dijkstra.
+            adj: dict[str, list[tuple[str, int]]] = {n: [] for n in nodes}
+            for a, b, w in edges:
+                adj[a].append((b, w))
+                adj[b].append((a, w))
+            src, dst = r.sample(nodes, 2)
+            INF = 10 ** 9
+            dist = {n: INF for n in nodes}
+            dist[src] = 0
+            visited: set[str] = set()
+            while True:
+                cur = None
+                cur_d = INF
+                for n in nodes:
+                    if n not in visited and dist[n] < cur_d:
+                        cur, cur_d = n, dist[n]
+                if cur is None:
+                    break
+                visited.add(cur)
+                for nb, w in adj[cur]:
+                    if dist[cur] + w < dist[nb]:
+                        dist[nb] = dist[cur] + w
+            gold_cost = dist[dst]
+            edge_list = "; ".join(
+                f"{a}↔{b} (cost {w})" for a, b, w in edges
+            )
+            qtext = (
+                f"You have a network of cities connected by roads with "
+                f"the following costs: {edge_list}. What is the minimum "
+                f"total cost to travel from {src} to {dst}?"
+            )
+            opts_set: set[int] = {gold_cost}
+            for _ in range(8):
+                if len(opts_set) >= 4:
+                    break
+                delta = r.choice([-2, -1, 1, 2, 3, -3])
+                cand = max(1, gold_cost + delta)
+                opts_set.add(cand)
+            opts_int = sorted(opts_set)[:4]
+            while len(opts_int) < 4:
+                opts_int.append(opts_int[-1] + r.randint(1, 4))
+            opts_str = [str(o) for o in opts_int]
+            r.shuffle(opts_str)
+            gold_idx = opts_str.index(str(gold_cost))
+            out.append(_mc(qtext, opts_str, gold_idx,
+                           "procedural_reasoning/graph_shortest_path"))
+        elif kind == "graph_connectivity":
+            # Directed reachability. Generate a small DAG with N nodes
+            # and ~N*1.5 edges. Question: "Can A reach B?" where the
+            # answer is split ~50/50 yes/no by sometimes asking about
+            # an unreachable pair.
+            nodes_pool = ["Hub", "Node", "Vertex", "Point",
+                          "Station", "Center", "Spot", "Plot"]
+            n = r.randint(4, 6)
+            nodes = [f"{nodes_pool[i]}_{i + 1}" for i in range(n)]
+            edges: list[tuple[str, str]] = []
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if r.random() < 0.45:
+                        edges.append((nodes[i], nodes[j]))
+            # Reachability via BFS.
+            adj: dict[str, list[str]] = {n0: [] for n0 in nodes}
+            for a, b in edges:
+                adj[a].append(b)
+            src = r.choice(nodes)
+            dst_candidates = [n0 for n0 in nodes if n0 != src]
+            r.shuffle(dst_candidates)
+            # Compute reachable set from src.
+            reachable: set[str] = {src}
+            stack = [src]
+            while stack:
+                cur = stack.pop()
+                for nb in adj[cur]:
+                    if nb not in reachable:
+                        reachable.add(nb)
+                        stack.append(nb)
+            # Pick dst to balance yes/no roughly 50/50 if possible.
+            dst = None
+            want_yes = r.random() < 0.5
+            for cand in dst_candidates:
+                if want_yes and cand in reachable:
+                    dst = cand
+                    break
+                if not want_yes and cand not in reachable:
+                    dst = cand
+                    break
+            if dst is None:
+                dst = dst_candidates[0]
+            gold_yes = dst in reachable
+            edge_str = ", ".join(f"{a}→{b}" for a, b in edges)
+            qtext = (
+                f"In a directed network with edges: {edge_str}. "
+                f"Is there a directed path from {src} to {dst} "
+                f"(following edges in the direction shown)?"
+            )
+            options = ["yes", "no", "only sometimes", "cannot be determined"]
+            r.shuffle(options)
+            gold_idx = options.index("yes" if gold_yes else "no")
+            out.append(_mc(qtext, options, gold_idx,
+                           "procedural_reasoning/graph_connectivity"))
+        elif kind == "constraint_sat":
+            # 3-actor scheduling CSP. Three people, three time slots
+            # (morning / afternoon / evening), and three constraints
+            # like "X cannot be at slot S", "Y must be before Z", etc.
+            # Question: which person is in which slot? Solved by brute
+            # force over the 3! = 6 permutations.
+            people = _realistic_names(r, 3)
+            slots = ["morning", "afternoon", "evening"]
+            slot_order = {s: i for i, s in enumerate(slots)}
+            from itertools import permutations as _perm
+            # Generate random constraints; loop until exactly one
+            # permutation satisfies them all.
+            for _ in range(20):
+                cons_text: list[str] = []
+                cons_fns = []
+                # Constraint type 1: X cannot be at slot S.
+                ban_p = r.choice(people)
+                ban_s = r.choice(slots)
+                cons_text.append(f"{ban_p} cannot be in the {ban_s} slot.")
+                cons_fns.append(lambda perm, p=ban_p, s=ban_s: perm[people.index(p)] != s)
+                # Constraint type 2: Y is in an earlier slot than Z.
+                y, z = r.sample(people, 2)
+                cons_text.append(f"{y} is in an earlier slot than {z}.")
+                cons_fns.append(lambda perm, y=y, z=z: slot_order[perm[people.index(y)]] < slot_order[perm[people.index(z)]])
+                # Constraint type 3: third person is in slot Q.
+                rest = [p for p in people if p not in (y, z)]
+                if rest:
+                    other_p = rest[0]
+                    other_s = r.choice([s for s in slots if s != ban_s])
+                    cons_text.append(f"{other_p} is in the {other_s} slot.")
+                    cons_fns.append(lambda perm, p=other_p, s=other_s: perm[people.index(p)] == s)
+                solutions: list[tuple] = []
+                for perm in _perm(slots):
+                    if all(fn(perm) for fn in cons_fns):
+                        solutions.append(perm)
+                if len(solutions) == 1:
+                    perm = solutions[0]
+                    target_person = r.choice(people)
+                    answer_slot = perm[people.index(target_person)]
+                    constraints = " ".join(cons_text)
+                    qtext = (
+                        f"Three people ({', '.join(people)}) need to be "
+                        f"assigned to three time slots (morning, "
+                        f"afternoon, evening), each person in exactly "
+                        f"one slot. Constraints: {constraints} Which "
+                        f"slot is {target_person} assigned to?"
+                    )
+                    options = list(slots)
+                    r.shuffle(options)
+                    gold_idx = options.index(answer_slot)
+                    out.append(_mc(qtext, options, gold_idx,
+                                   "procedural_reasoning/constraint_sat"))
+                    break
+            else:
+                # Fallback: no unique solution found in 20 tries —
+                # default to a deterministic example.
+                qtext = (
+                    f"Three people ({', '.join(people)}) need slots "
+                    f"morning/afternoon/evening, one each. Constraints: "
+                    f"{people[0]} is in the morning. {people[1]} is "
+                    f"earlier than {people[2]}. Which slot is "
+                    f"{people[2]} assigned to?"
+                )
+                options = list(slots)
+                r.shuffle(options)
+                gold_idx = options.index("evening")
+                out.append(_mc(qtext, options, gold_idx,
+                               "procedural_reasoning/constraint_sat"))
     return out
 
 
@@ -11061,38 +12586,76 @@ def _generate_mc_items(block_seed, n_items: int, *, max_letter: str = "D") -> li
         gold = ""
         category = "general"
         if kind == "arithmetic_mc":
-            arith_kind = r.choice(["multi_op", "percent", "fraction", "exponent"])
+            # 2026-05-02 (v30.5): harder. Was 4 sub-kinds (multi_op,
+            # percent, fraction, exponent), distractors at ±3-25.
+            # Now 6 sub-kinds adding chained_percent (compound) and
+            # weighted_avg, and distractors are tighter (±1-7) so
+            # near-correct answers don't count for free.
+            arith_kind = r.choice([
+                "multi_op", "percent", "fraction", "exponent",
+                "chained_percent", "weighted_avg",
+            ])
             if arith_kind == "multi_op":
                 a, b, c = r.randint(15, 90), r.randint(15, 90), r.randint(2, 19)
                 offset = r.randint(1, 99)
-                ans = (a + b) * c - offset
-                question = f"Compute ({a} + {b}) * {c} - {offset}."
+                d = r.randint(2, 9)
+                ans = ((a + b) * c - offset) // d
+                question = f"Compute (({a} + {b}) * {c} - {offset}) // {d} (integer division)."
             elif arith_kind == "percent":
-                base = r.choice([120, 150, 200, 240, 300, 400, 500])
-                pct = r.choice([15, 18, 22, 35, 45, 55, 65, 75])
+                base = r.choice([240, 300, 350, 420, 500, 640, 720, 800])
+                pct = r.choice([12, 17, 23, 27, 33, 41, 47, 58, 67])
                 ans = base * pct // 100
-                question = f"What is {pct}% of {base}? (Answer is an integer.)"
+                question = f"What is {pct}% of {base}? (Round down to an integer.)"
             elif arith_kind == "fraction":
                 num = r.randint(2, 9)
-                denom = r.choice([4, 5, 6, 8, 10])
-                whole = r.choice([60, 72, 80, 90, 120, 180])
+                denom = r.choice([3, 4, 5, 6, 7, 8, 9, 11])
+                whole = r.choice([60, 72, 84, 90, 120, 180, 252, 360])
                 while whole % denom != 0:
                     whole += 1
                 ans = (whole // denom) * num
                 question = f"Compute {num}/{denom} of {whole}."
-            else:  # exponent
-                base = r.randint(2, 6)
-                power = r.randint(3, 5)
-                add = r.randint(7, 41)
-                ans = base ** power + add
-                question = f"Compute {base}^{power} + {add}."
-            distractors = {ans + r.choice([-7, -3, 3, 7]),
-                           ans + r.randint(10, 25),
-                           ans - r.randint(10, 25)}
-            distractors.discard(ans)
-            distractors = list(distractors)[:3]
+            elif arith_kind == "exponent":
+                base = r.randint(2, 7)
+                power = r.randint(3, 6)
+                add = r.randint(7, 99)
+                mul = r.randint(2, 5)
+                ans = (base ** power + add) * mul
+                question = f"Compute ({base}^{power} + {add}) * {mul}."
+            elif arith_kind == "chained_percent":
+                base = r.choice([200, 300, 500, 800, 1000])
+                pct1 = r.choice([10, 20, 25, 30])
+                pct2 = r.choice([10, 15, 20, 25])
+                # Increase by pct1, then decrease by pct2.
+                after_inc = base + base * pct1 // 100
+                ans = after_inc - after_inc * pct2 // 100
+                question = (
+                    f"A value of {base} is increased by {pct1}%, then the "
+                    f"NEW value is decreased by {pct2}%. What is the final "
+                    f"integer value?"
+                )
+            else:  # weighted_avg
+                w1 = r.randint(2, 7)
+                v1 = r.randint(20, 80)
+                w2 = r.randint(3, 9)
+                v2 = r.randint(20, 80)
+                w3 = r.randint(2, 6)
+                v3 = r.randint(20, 80)
+                ans = (w1 * v1 + w2 * v2 + w3 * v3) // (w1 + w2 + w3)
+                question = (
+                    f"Compute the weighted average of {v1}, {v2}, and {v3} "
+                    f"with weights {w1}, {w2}, and {w3} respectively. "
+                    f"(Round down to an integer.)"
+                )
+            # Tighter distractors (±1-7) so near-correct answers don't pass.
+            distractors_set = set()
+            for off in r.sample([-1, 1, -2, 2, -3, 3, -5, 5, -7, 7], 6):
+                if ans + off != ans:
+                    distractors_set.add(ans + off)
+                if len(distractors_set) >= 3:
+                    break
+            distractors = list(distractors_set)[:3]
             while len(distractors) < 3:
-                distractors.append(ans + r.randint(30, 80))
+                distractors.append(ans + r.randint(8, 15))
             opts = [str(ans)] + [str(d) for d in distractors]
             r.shuffle(opts)
             gold = str(ans)
@@ -11323,14 +12886,26 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
         "title_format",
         "bullet_list",
     ]
-    # v29: ~30 % compound items. We replace `compound` placeholders in
-    # the per-item loop below with two stacked constraints (chosen from
-    # a curated whitelist of non-conflicting pairs).
-    n_compound = max(0, (n_items * 30 + 50) // 100)
-    n_single = n_items - n_compound
+    # 2026-05-02 (v30.5): hardening. Was 30% compound (2-stack), now
+    # 60% compound split: 35% compound2 (2-stack) + 25% compound3
+    # (3-stack). Single-constraint tier drops to 40%. Held-out IFEval
+    # pass-rate already saturated at 0.85+ on v29; the 3-stack tier
+    # matches IFEval's "very compound" tail (4 % of items in the
+    # public set are 4-stack, but they're rare; 3-stack at 25 % is
+    # appropriately aggressive for a tightening pass).
+    n_compound3 = max(0, (n_items * 25 + 50) // 100)
+    n_compound2 = max(0, (n_items * 35 + 50) // 100)
+    n_single = max(1, n_items - n_compound2 - n_compound3)
+    # Re-balance if rounding cost us items
+    extra = n_items - (n_single + n_compound2 + n_compound3)
+    n_compound2 += extra
     single_pool = (kinds * ((n_single // len(kinds)) + 1))[:n_single]
     rng.shuffle(single_pool)
-    item_kinds = single_pool + ["compound"] * n_compound
+    item_kinds = (
+        single_pool
+        + ["compound"] * n_compound2
+        + ["compound3"] * n_compound3
+    )
     rng.shuffle(item_kinds)
     kinds = item_kinds  # consumed below as kinds[i % len(kinds)]
     rng.shuffle(kinds)
@@ -11545,6 +13120,94 @@ def _generate_ifeval_items(block_seed, n_items: int) -> list[dict]:
             instruction_ids = ii_a + ii_b
             kwargs_list = kk_a + kk_b
             kind = f"compound:{a}+{b}"
+        elif kind == "compound3":
+            # 2026-05-02 (v30.5): 3-stack compound. Curated triples
+            # of non-conflicting constraints across distinct verifier
+            # families (length / case / format / keyword / phrase) so
+            # no two constraints fight each other. The model must
+            # satisfy ALL three for the item to grade as ``ok``.
+            triple_options = [
+                ("min_words", "include_keyword", "ends_with_phrase"),
+                ("max_words", "no_comma", "all_lowercase"),
+                ("exact_sentences", "include_keyword", "title_format"),
+                ("min_words", "forbid_keyword", "ends_with_phrase"),
+                ("bullet_list", "include_keyword", "no_comma"),
+                ("title_format", "exact_sentences", "include_keyword"),
+                ("all_lowercase", "include_keyword", "no_comma"),
+                ("min_words", "all_lowercase", "ends_with_phrase"),
+                ("bullet_list", "min_words", "ends_with_phrase"),
+                ("title_format", "exact_sentences", "ends_with_phrase"),
+            ]
+            a, b, c = r.choice(triple_options)
+
+            def _build3(k_local: str):
+                ii: list[str] = []
+                kk: list[dict] = []
+                pp: str = ""
+                if k_local == "min_words":
+                    n_w = r.choice([40, 60, 80])
+                    pp = f"contain at least {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at least"}]
+                elif k_local == "max_words":
+                    n_w = r.choice([25, 35, 50])
+                    pp = f"contain no more than {n_w} words"
+                    ii = ["length_constraints:number_words"]
+                    kk = [{"num_words": n_w, "relation": "at most"}]
+                elif k_local == "exact_sentences":
+                    n_s = r.choice([3, 4, 5])
+                    pp = f"contain exactly {n_s} sentences"
+                    ii = ["length_constraints:number_sentences"]
+                    kk = [{"num_sentences": n_s, "relation": "exactly"}]
+                elif k_local == "all_lowercase":
+                    pp = "use only lowercase letters"
+                    ii = ["change_case:english_lowercase"]
+                    kk = [{}]
+                elif k_local == "no_comma":
+                    pp = "contain no commas"
+                    ii = ["punctuation:no_comma"]
+                    kk = [{}]
+                elif k_local == "ends_with_phrase":
+                    phrase = r.choice([
+                        "Is there anything else I can help with?",
+                        "Thank you for reading.",
+                        "End of report.",
+                    ])
+                    pp = f"end with the exact phrase {phrase!r}"
+                    ii = ["startend:end_checker"]
+                    kk = [{"end_phrase": phrase}]
+                elif k_local == "include_keyword":
+                    n_k = r.randint(2, 4)
+                    pp = f"include the word {keyword!r} at least {n_k} times"
+                    ii = ["keywords:frequency"]
+                    kk = [{"keyword": keyword, "relation": "at least", "frequency": n_k}]
+                elif k_local == "forbid_keyword":
+                    forbidden = r.choice([n_ for n_ in nouns if n_ != keyword])
+                    pp = f"never use the word {forbidden!r}"
+                    ii = ["keywords:forbidden_words"]
+                    kk = [{"forbidden_words": [forbidden]}]
+                elif k_local == "bullet_list":
+                    n_b = r.randint(3, 5)
+                    pp = f"include exactly {n_b} markdown bullet points (lines starting with `* ` or `- `)"
+                    ii = ["detectable_format:number_bullet_lists"]
+                    kk = [{"num_bullets": n_b}]
+                elif k_local == "title_format":
+                    pp = "begin with a title wrapped in double angle brackets like ``<<Title Goes Here>>`` on the first line"
+                    ii = ["detectable_format:title"]
+                    kk = [{}]
+                return ii, kk, pp
+
+            ii_a, kk_a, pp_a = _build3(a)
+            ii_b, kk_b, pp_b = _build3(b)
+            ii_c, kk_c, pp_c = _build3(c)
+            prompt = (
+                f"Write a short response about {topic}. Your response must "
+                f"satisfy ALL of the following constraints simultaneously: "
+                f"(1) {pp_a}; (2) {pp_b}; (3) {pp_c}."
+            )
+            instruction_ids = ii_a + ii_b + ii_c
+            kwargs_list = kk_a + kk_b + kk_c
+            kind = f"compound3:{a}+{b}+{c}"
         out.append({
             "src": f"procedural_ifeval/{kind}",
             "prompt": prompt,

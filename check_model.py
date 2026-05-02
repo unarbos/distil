@@ -43,8 +43,13 @@ logger = logging.getLogger("check_model")
 
 # ── Constants (must match validator) ────────────────────────────────────
 TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+# 2026-05-02 (v30.5): student cap bumped 7B → 40B. Cap is now an
+# absolute floor (40B) rather than a fixed ratio of the teacher, so
+# it stays applicable through the upcoming Kimi K2.6 teacher swap
+# (~1T total / ~32B active) without needing a recomputation.
 TEACHER_TOTAL_PARAMS_B = 35.0
-MAX_PARAM_RATIO = 0.15  # ~5.25B max
+MAX_PARAM_RATIO = 1.15  # ratio kept for legacy callers; absolute cap dominates
+MAX_STUDENT_PARAMS_B_ABS = 40.0  # hard ceiling, regardless of teacher size
 BASELINE_VOCAB_SIZE = 248320
 MIN_MODEL_BYTES = 500_000_000     # 500MB minimum
 MAX_STUDENT_VRAM_GB = 20.0        # Real 4B ≈ 8-10GB
@@ -99,7 +104,7 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
     """
     from huggingface_hub import model_info as hf_model_info, hf_hub_download, repo_info
 
-    max_params_b = TEACHER_TOTAL_PARAMS_B * MAX_PARAM_RATIO
+    max_params_b = MAX_STUDENT_PARAMS_B_ABS
     max_model_bytes = max_params_b * 2.2e9
 
     failures = []

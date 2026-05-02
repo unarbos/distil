@@ -10,11 +10,34 @@ from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
 from eval.state import ValidatorState, log_event
 from scripts.validator.composite import (
+    LONG_FORM_DERAIL_DQ_ENABLED,
+    LONG_FORM_DERAIL_DQ_RATIO,
+    LONG_FORM_DERAIL_DQ_THRESHOLD,
     _resolve_king_rkl,
     annotate_h2h_with_composite,
     compute_composite,
 )
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, EPSILON, MAX_KL_THRESHOLD, PAIRED_TEST_ALPHA
+
+
+class _LongFormDerailDQConfig:
+    """Light shim so the inline DQ check can read the live composite-side
+    constants without importing them inside a hot loop."""
+
+    @property
+    def ENABLED(self) -> bool:
+        return LONG_FORM_DERAIL_DQ_ENABLED
+
+    @property
+    def THRESHOLD(self) -> float:
+        return LONG_FORM_DERAIL_DQ_THRESHOLD
+
+    @property
+    def RATIO(self) -> float:
+        return LONG_FORM_DERAIL_DQ_RATIO
+
+
+_LF_DQ = _LongFormDerailDQConfig()
 from scripts.validator.precheck import check_activation_fingerprint
 from scripts.validator.single_eval import (
     is_single_eval_mode,
@@ -732,6 +755,71 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
             state.evaluated_uids.add(str(uid))
             continue
+        # 2026-05-01 (v30.4 patch v3): hard-DQ on long-form derail.
+        # If the long_form_judge probe found that >50 percent of the
+        # round's responses scored below 0.3 coherence (statistical
+        # detector — non-ASCII salad, word-list mode, compound
+        # gibberish, no stop words), the model is permanently DQ'd.
+        # Soft-weight degradation alone wasn't dethroning broken kings
+        # because their bench scores compensated. Word-salad output
+        # is not a partial failure; the model can't sustain coherent
+        # generation, which is core to assistant deployment.
+        if (
+            uid != king_uid
+            and getattr(_LF_DQ, "ENABLED", True)
+        ):
+            lf = student_result.get("long_form_judge_probe") or {}
+            per_prompt = lf.get("per_prompt") or []
+            if per_prompt:
+                derailed = sum(
+                    1 for r in per_prompt
+                    if isinstance(r, dict)
+                    and isinstance(r.get("coherence"), (int, float))
+                    and r["coherence"] < _LF_DQ.THRESHOLD
+                )
+                ratio = derailed / len(per_prompt)
+                if ratio > _LF_DQ.RATIO:
+                    coh_factor = lf.get("coherence_factor")
+                    sample_tail = ""
+                    for r in per_prompt:
+                        if (
+                            isinstance(r, dict)
+                            and isinstance(r.get("coherence"), (int, float))
+                            and r["coherence"] < _LF_DQ.THRESHOLD
+                            and r.get("response_preview")
+                        ):
+                            sample_tail = r["response_preview"][-120:]
+                            break
+                    reason = (
+                        f"long_form_incoherence: {derailed}/"
+                        f"{len(per_prompt)} long-form responses derailed "
+                        f"(coherence<{_LF_DQ.THRESHOLD:.2f}; aggregate "
+                        f"factor={coh_factor}). Model cannot sustain "
+                        f"coherent generation past ~500 tokens — produces "
+                        f"word salad / multilingual mode / glossary "
+                        f"loops. Sample tail: …{sample_tail!r}. To get "
+                        f"another eval, register a new hotkey on chain "
+                        f"with a model that doesn't derail."
+                    )
+                    logger.info(f"UID {uid} ({model_name}): {reason}")
+                    log_event(
+                        f"UID {uid} ({model_name}) DQ: long_form_incoherence "
+                        f"({derailed}/{len(per_prompt)} derailed)",
+                        level="warning", state_dir=str(state.state_dir),
+                    )
+                    hotkey = models_to_eval.get(uid, {}).get(
+                        "hotkey", uid_to_hotkey.get(uid, str(uid)),
+                    )
+                    commit_block = models_to_eval.get(uid, {}).get(
+                        "commit_block",
+                    )
+                    disqualify(
+                        hotkey, reason, state.dq_reasons,
+                        commit_block=commit_block,
+                    )
+                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    state.evaluated_uids.add(str(uid))
+                    continue
         speed_flag = student_result.get("speed_flag")
         if speed_flag:
             logger.warning(f"UID {uid} ({model_name}): ⚠️ {speed_flag}")

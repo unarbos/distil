@@ -6,12 +6,14 @@ from pathlib import Path
 
 from eval.chain import (
     SetWeightsError,
+    build_recent_kings_weights,
     build_winner_take_all_weights,
     fetch_metagraph,
     get_validator_weight_target,
     parse_commitments,
     set_weights,
 )
+from eval.state import RECENT_KINGS_MAX
 from eval.dataset import format_prompt, sample_prompts_from_dataset
 from eval.private_pool import (
     DEFAULT_PRIVATE_FRACTION,
@@ -187,8 +189,55 @@ def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_ui
     )
     _safe_set_weights(
         subtensor, wallet, netuid, n_uids,
-        build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,
+        _build_emission_weights(state, n_uids, king_uid),
+        king_uid, state_dir,
     )
+
+
+def _build_emission_weights(state, n_uids: int, king_uid: int | None) -> list[float]:
+    """Return the emission-weight vector for the current crown.
+
+    2026-05-01 (v30.4): combines the LIVE king with up to 4 most-recent
+    distinct previous kings tracked in ``state.recent_kings``. Each
+    distinct UID gets ``1.0 / N`` emission where N is the number of
+    distinct kings (up to 5). Falls back to the legacy winner-takes-all
+    behaviour when ``state.recent_kings`` is empty (boot phase) or
+    ``MULTI_KING_PAYOUT_ENABLED=0`` is set in the env.
+
+    The live ``king_uid`` is always pushed to index 0 if present so the
+    current king is in the payout queue regardless of whether it has
+    been persisted yet for this round.
+    """
+    import os
+    if not bool(int(os.environ.get("MULTI_KING_PAYOUT_ENABLED", "1") or 1)):
+        if king_uid is None:
+            return [0.0] * n_uids
+        return build_winner_take_all_weights(n_uids, king_uid)
+    history = list(getattr(state, "recent_kings", []) or [])
+    if king_uid is not None:
+        # Ensure live king is at the front. Keep dedupe in
+        # build_recent_kings_weights so we don't double-pay.
+        if not history or history[0] != king_uid:
+            history = [king_uid] + history
+    if not history and king_uid is None:
+        return [0.0] * n_uids
+    return build_recent_kings_weights(n_uids, history, max_kings=RECENT_KINGS_MAX)
+
+
+def _record_king_change(state, new_king_uid: int) -> None:
+    """Push a new king to the front of ``state.recent_kings`` and
+    persist. Dedupes if the same UID re-takes the crown — moves it
+    back to the front rather than duplicating. Caps the queue at
+    RECENT_KINGS_MAX entries (default 5)."""
+    history = list(getattr(state, "recent_kings", []) or [])
+    history = [u for u in history if int(u) != int(new_king_uid)]
+    history.insert(0, int(new_king_uid))
+    history = history[:RECENT_KINGS_MAX]
+    state.recent_kings = history
+    try:
+        state.save()
+    except Exception:
+        pass
 
 
 def _persist_preliminary_results(results, models_to_eval, king_uid, state,
@@ -867,9 +916,20 @@ def apply_results_and_weights(
                 elif worst is not None:
                     winner_kl = float(worst)
     if winner_uid is not None:
+        # 2026-05-01 (v30.4): record the crown change in
+        # ``state.recent_kings`` BEFORE building weights so the new
+        # king appears in the multi-king payout queue. If the same
+        # UID re-takes the crown it gets refreshed (moved to front)
+        # rather than duplicated.
+        if king_uid is None or winner_uid != king_uid:
+            _record_king_change(state, winner_uid)
+        elif winner_uid not in (state.recent_kings or []):
+            # First crown for an existing king (boot phase). Add
+            # them to the history.
+            _record_king_change(state, winner_uid)
         _safe_set_weights(
             subtensor, wallet, netuid, n_uids,
-            build_winner_take_all_weights(n_uids, winner_uid),
+            _build_emission_weights(state, n_uids, winner_uid),
             winner_uid, state_dir,
         )
     else:
@@ -920,13 +980,43 @@ def post_round(
         old_kl = king_h2h_kl if king_h2h_kl is not None else king_kl
         winner_entry = next((row for row in h2h_results if row.get("uid") == winner_uid), {})
         winner_tt = winner_entry.get("t_test") if isinstance(winner_entry.get("t_test"), dict) else {}
-        # Composite-worst is the production ranking key (since v27); pull
-        # it from the winner's row + the previous king's row so the
-        # Discord post can lead with it instead of KL. Fall back to None
-        # (legacy headline) if either is missing.
-        winner_comp = winner_entry.get("composite") if isinstance(winner_entry.get("composite"), dict) else {}
+        # Composite for the announcement headline.
+        # 2026-05-01 (v30.4 patch v3): in single-eval mode the dethrone
+        # is decided cross-round from ``state.composite_scores`` (paired
+        # king re-eval in v30.2 means h2h_results carries this round's
+        # composite for the king + new challengers, but the cross-round
+        # composite is the canonical source). Falling back to it when
+        # the round-local row is empty stops the announcement headline
+        # from collapsing to the legacy ``KL:`` format every time —
+        # which is what robert131004 → halen214 just did despite the
+        # composite.final dethrone gate firing correctly.
+        winner_comp = (
+            winner_entry.get("composite")
+            if isinstance(winner_entry.get("composite"), dict)
+            else None
+        )
+        if not winner_comp:
+            cross_round_winner = (
+                getattr(state, "composite_scores", {}) or {}
+            ).get(str(winner_uid))
+            if isinstance(cross_round_winner, dict):
+                winner_comp = cross_round_winner
+        if not isinstance(winner_comp, dict):
+            winner_comp = {}
         old_king_entry = next((row for row in h2h_results if row.get("uid") == king_uid), {})
-        old_king_comp = old_king_entry.get("composite") if isinstance(old_king_entry.get("composite"), dict) else {}
+        old_king_comp = (
+            old_king_entry.get("composite")
+            if isinstance(old_king_entry.get("composite"), dict)
+            else None
+        )
+        if not old_king_comp:
+            cross_round_old = (
+                getattr(state, "composite_scores", {}) or {}
+            ).get(str(king_uid))
+            if isinstance(cross_round_old, dict):
+                old_king_comp = cross_round_old
+        if not isinstance(old_king_comp, dict):
+            old_king_comp = {}
         # Find the limiting axis (lowest-scoring axis) for the new king.
         winner_axes = winner_comp.get("axes") if isinstance(winner_comp.get("axes"), dict) else {}
         limiting_axis = None
@@ -1077,7 +1167,8 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 if king_uid is not None:
                     _safe_set_weights(
                         subtensor, wallet, netuid, n_uids,
-                        build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,
+                        _build_emission_weights(state, n_uids, king_uid),
+                        king_uid, state_dir,
                     )
                 state.save()
                 if once:

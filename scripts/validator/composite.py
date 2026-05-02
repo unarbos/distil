@@ -224,14 +224,25 @@ BENCH_AXIS_WEIGHTS = {
 #   shadow axes (kl_is etc.) 0.02 → 0.05 each
 BENCH_GROUP_AXIS_WEIGHTS = {
     "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.20")),
-    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.18")),
-    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.12")),
-    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.07")),
-    # v30.2 — super_teacher axis: rewards exceeding teacher on
-    # verifiable benches. Conservative initial weight 0.10 so it
-    # contributes to ranking without overwhelming the teacher-similarity
-    # axes during the transition while miners learn the new incentive.
-    "super_teacher":         float(os.environ.get("SUPER_TEACHER_WEIGHT", "0.10")),
+    "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.20")),
+    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.14")),
+    "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.10")),
+    # 2026-05-02 (v30.5): super_teacher axis REMOVED.
+    # Rationale: the axis was conceptually wrong for distillation — by
+    # construction, a student matching the teacher's distribution
+    # (which is what KL/RKL/top_k_overlap reward) cannot exceed the
+    # teacher on the same skill surface. Empirically every trained
+    # miner sat at exactly 0.00 on this axis since launch, which
+    # (a) ruined the radar-chart visualisation by anchoring one spoke
+    # at zero, and (b) wasted 10% composite weight that should be
+    # rewarding actual capability.
+    # The 0.10 weight is redistributed: math +0.02, reasoning +0.02,
+    # knowledge +0.03, leaving room for the bigger student cap (40B)
+    # to express more capability on the existing axes.
+    # ``_axis_super_teacher`` is kept as a private helper for legacy
+    # composite records that still reference it, but the weight is 0
+    # so it never contributes to the live composite ranking.
+    "super_teacher":         float(os.environ.get("SUPER_TEACHER_WEIGHT", "0.0")),
 }
 
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
@@ -427,9 +438,48 @@ WORST_3_MEAN_K = int(os.environ.get("WORST_3_MEAN_K", "3"))
 # floor convention. Operators bumping ``LONG_FORM_JUDGE_PER_ROUND`` on
 # the eval side can raise this floor accordingly.
 LONG_FORM_JUDGE_MIN_VALID = int(os.environ.get("LONG_FORM_JUDGE_MIN_VALID", "2"))
-LONG_FORM_JUDGE_AXIS_WEIGHT = float(os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.05"))
+# 2026-05-01 (v30.4 patch v3): long-form weights raised to make
+# long-generation coherence dominant. The chat.arbos.life screenshots
+# show kings still producing pure multilingual word salad past 800
+# tokens; the only way that's compatible with composite ≥0.55 is if
+# long-form axes are too small a slice of the composite. Bumping
+# both the rubric-graded ``long_form_judge`` AND the pure-statistical
+# ``long_gen_coherence`` so:
+#   • combined long-form weight = 0.25 (was 0.09)
+#   • a derailed king (coh ~0.05) loses ~0.20 on weighted
+#   • coh = 0.05 lands as a worst-3 axis pulling worst_3_mean toward 0
+#   • on composite.final = 0.7·worst_3_mean + 0.3·weighted, that's
+#     ~0.15 hit on final — ample to flip the dethrone gate
+# The pure-statistical axis can't be cheated by rubric leniency.
+LONG_FORM_JUDGE_AXIS_WEIGHT = float(
+    os.environ.get("LONG_FORM_JUDGE_WEIGHT", "0.10")
+)
+LONG_GEN_COHERENCE_AXIS_WEIGHT = float(
+    os.environ.get("LONG_GEN_COHERENCE_WEIGHT", "0.15")
+)
+LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE = bool(
+    int(os.environ.get("LONG_GEN_COHERENCE_IN_COMPOSITE", "1") or 1)
+)
 LONG_FORM_JUDGE_AXIS_IN_COMPOSITE = (
     os.environ.get("LONG_FORM_JUDGE_IN_COMPOSITE", "1") != "0"
+)
+# 2026-05-01 (v30.4 patch v3): hard-DQ floor on long-form coherence.
+# When >LONG_FORM_DERAIL_DQ_RATIO of the round's responses score below
+# LONG_FORM_DERAIL_DQ_THRESHOLD coherence, the model is permanently
+# DQ'd at this commit-block. Soft-weight degradation alone wasn't
+# enough — we kept seeing kings retain at composite ≥0.5 because
+# their bench scores compensated for the coherence hit. Hard DQ is
+# justified because long-form word salad is not a partial failure;
+# the model cannot sustain coherent generation, which is a core
+# deployment capability. Re-eval requires a fresh hotkey.
+LONG_FORM_DERAIL_DQ_RATIO = float(
+    os.environ.get("LONG_FORM_DERAIL_DQ_RATIO", "0.5")
+)
+LONG_FORM_DERAIL_DQ_THRESHOLD = float(
+    os.environ.get("LONG_FORM_DERAIL_DQ_THRESHOLD", "0.30")
+)
+LONG_FORM_DERAIL_DQ_ENABLED = bool(
+    int(os.environ.get("LONG_FORM_DERAIL_DQ_ENABLED", "1") or 1)
 )
 
 # Per-axis minimum valid-item count below which the axis drops as
@@ -997,6 +1047,13 @@ def _axis_long_form_judge(student: dict) -> float | None:
     capabilities. A model that aces all the bench axes but cannot
     write a 400-word coherent essay is missing a real capability,
     and this axis penalises that gap.
+
+    v30.4 (2026-05-01): the per-prompt teacher rubric grade is
+    multiplied by a six-signal statistical coherence factor in
+    ``long_form_judge_teacher_score`` BEFORE this aggregation
+    runs, so a derailed response (multilingual word salad,
+    long-compound coinage, word-list attractor) cannot earn a
+    high rubric grade even if the teacher was lenient.
     """
     lf = student.get("long_form_judge_probe") or {}
     if not lf:
@@ -1007,6 +1064,45 @@ def _axis_long_form_judge(student: dict) -> float | None:
     if (lf.get("n_valid") or 0) < LONG_FORM_JUDGE_MIN_VALID:
         return None
     return max(0.0, min(1.0, float(norm)))
+
+
+def _axis_long_gen_coherence(student: dict) -> float | None:
+    """v30.4 — long-form-generation coherence axis (zero teacher involvement).
+
+    Returns the mean per-prompt coherence factor from the long-form
+    judge probe, in [0, 1]. This is a PURE statistical signal:
+    no teacher rubric, no chat-template considerations, just six
+    surface signals on the 2048-token response.
+
+    The signal is exactly the multiplier already applied to the
+    ``long_form_judge`` axis grade. Exposing it as a separate axis
+    means:
+
+      * The composite directly penalises derail even if a miner
+        learns to game the teacher rubric to score 5/5 on a
+        derailed response.
+      * Operators can grep ``axes.long_gen_coherence`` on the
+        dashboard to find the broken-at-length kings (the
+        chat.arbos.life derail screenshot from king UID 107 on
+        2026-05-01 would have surfaced as 0.05 here while
+        ``long_form_judge`` was still 0.875).
+      * The chat-king proxy can ALSO read this axis to decide
+        whether to throttle a model with hard sampling caps vs
+        let it speak freely.
+
+    Returns ``None`` when the long-form probe didn't run or
+    aggregated zero coherence factors (e.g. all responses errored
+    before scoring).
+    """
+    lf = student.get("long_form_judge_probe") or {}
+    if not lf:
+        return None
+    coh = lf.get("coherence_factor")
+    if coh is None:
+        return None
+    if (lf.get("n_valid") or 0) < LONG_FORM_JUDGE_MIN_VALID:
+        return None
+    return max(0.0, min(1.0, float(coh)))
 
 
 def _axis_chat_turns_probe(student: dict) -> float | None:
@@ -1499,6 +1595,7 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "degeneracy": _axis_degeneracy(student),
         "judge_probe": _axis_judge_probe(student),
         "long_form_judge": _axis_long_form_judge(student),
+        "long_gen_coherence": _axis_long_gen_coherence(student),
         "chat_turns_probe": _axis_chat_turns_probe(student),
         "math_bench": _axis_math_bench(student),
         "code_bench": _axis_code_bench(student),
@@ -1790,6 +1887,11 @@ def compute_composite(student: dict, king_kl: float | None = None,
         effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
     if LONG_FORM_JUDGE_AXIS_IN_COMPOSITE and LONG_FORM_JUDGE_AXIS_WEIGHT > 0:
         effective_weights["long_form_judge"] = LONG_FORM_JUDGE_AXIS_WEIGHT
+    if (
+        LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE
+        and LONG_GEN_COHERENCE_AXIS_WEIGHT > 0
+    ):
+        effective_weights["long_gen_coherence"] = LONG_GEN_COHERENCE_AXIS_WEIGHT
     # ``ranked`` = axes used by ``worst()``: drops broken axes so the
     # min is not artificially floored by an axis the eval setup itself
     # can't pass (the dethrone gate degenerates to 0=0=0 otherwise).

@@ -23,15 +23,16 @@ import sys
 from typing import Optional
 
 # ── Constants ──────────────────────────────────────────────────────────
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+TEACHER_MODEL = "Qwen/Qwen3.6-35B-A3B"
 TEACHER_TOTAL_PARAMS_B = 35.0
-MAX_PARAM_RATIO = 0.15
-MAX_PARAMS_B = TEACHER_TOTAL_PARAMS_B * MAX_PARAM_RATIO  # 5.25B
+MAX_PARAM_RATIO = 1.15
+MAX_STUDENT_PARAMS_B_ABS = 40.0
+MAX_PARAMS_B = MAX_STUDENT_PARAMS_B_ABS  # absolute 40B cap (v30.5)
 BASELINE_VOCAB_SIZE = 248320
 REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
 MIN_BITTENSOR_VERSION = "9.5.0"
 MIN_MODEL_BYTES = 500_000_000  # 500MB
-MAX_MODEL_BYTES = MAX_PARAMS_B * 2.2e9  # ~11.55 GB
+MAX_MODEL_BYTES = MAX_PARAMS_B * 2.2e9  # ~88 GB at 40B params
 
 TOKENIZER_TEST_STRINGS = [
     "The quick brown fox jumps over the lazy dog.",
@@ -256,7 +257,7 @@ def check_param_count(results: CheckResults, model_repo: str, revision: str = No
                 results.add("Parameter count", False,
                              f"{params_b:.2f}B params > {MAX_PARAMS_B}B max",
                              f"Your model is too large. Max allowed: {MAX_PARAMS_B}B total params "
-                             f"({MAX_PARAM_RATIO * 100:.0f}% of teacher's {TEACHER_TOTAL_PARAMS_B}B).")
+                             f"(absolute cap, independent of teacher size).")
                 return params_b
             results.add("Parameter count", True,
                          f"{params_b:.2f}B / {MAX_PARAMS_B}B max")
