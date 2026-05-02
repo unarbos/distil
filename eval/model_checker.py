@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Optional
 
 from huggingface_hub import hf_hub_download, model_info as _raw_model_info
-from eval.runtime import STATE_DIR as RUNTIME_STATE_DIR, TEACHER_CONFIG_VOCAB_SIZE, TEACHER_MODEL
+from eval.runtime import (
+    STATE_DIR as RUNTIME_STATE_DIR,
+    STUDENT_ARCH_ALLOWLIST,
+    STUDENT_ARCH_NAMES,
+    STUDENT_MODEL_TYPES,
+    TEACHER_CONFIG_VOCAB_SIZE,
+    TEACHER_MODEL,
+)
 
 logger = logging.getLogger("distillation.model_checker")
 
@@ -601,13 +608,53 @@ TOKENIZER_TEST_STRINGS = [
 _teacher_tokenizer = None
 
 
+def is_allowed_student_arch(
+    model_type: str | None,
+    archs: list[str] | None,
+) -> tuple[bool, str]:
+    """Check a (model_type, architectures) pair against the teacher-specified
+    allowlist in ``subnet-config.json::teacher.studentArchAllowlist``.
+
+    Returns (ok, matched_entry) where matched_entry is a short label for
+    logging. The allowlist is consulted in this order:
+      1. Exact (model_type, architecture) pair match — strongest.
+      2. model_type alone matches a listed entry — accepted with a
+         softer label for observability (covers e.g. text-only students
+         that advertise the same model_type but a different architectures
+         entry, such as a DeepseekV3ForCausalLM student with a custom
+         model_type).
+      3. Architecture alone matches (permissive; catches students that
+         advertise a plain DeepseekV3ForCausalLM and a deepseek_v3
+         model_type).
+    """
+    archs = list(archs or [])
+    mt = model_type or ""
+    if not STUDENT_ARCH_ALLOWLIST and not STUDENT_ARCH_NAMES:
+        return True, "no_allowlist_configured"
+    for entry in STUDENT_ARCH_ALLOWLIST:
+        if not isinstance(entry, dict):
+            continue
+        e_mt = entry.get("model_type")
+        e_arch = entry.get("architecture")
+        if e_mt and e_arch and mt == e_mt and e_arch in archs:
+            return True, f"pair:{e_mt}/{e_arch}"
+    if mt and mt in STUDENT_MODEL_TYPES:
+        return True, f"model_type:{mt}"
+    for a in archs:
+        if a in STUDENT_ARCH_NAMES:
+            return True, f"architecture:{a}"
+    return False, f"not_in_allowlist:{mt}:{','.join(archs) if archs else 'none'}"
+
+
 def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
     """Soft check for whether a student repo is natively vLLM-compatible.
 
-    This does NOT gate evaluation yet. It is used to surface whether a model was
-    saved in the base Qwen3.5 wrapper format (`Qwen3_5ForConditionalGeneration`)
-    instead of the extracted text-only format (`Qwen3_5ForCausalLM`), which needs
-    serving-time reconstruction.
+    Returns (vllm_native, reason_label). A student architecture present in
+    ``STUDENT_ARCH_ALLOWLIST`` is considered vLLM-native because the allowlist
+    is curated to only include archs the current vLLM pins support at serving
+    time. The ``preprocessor_config.json`` presence check is preserved for
+    the chat-king wrapper, which may need to stub it for vision-wrapped
+    configs.
     """
     model_type = config.get("model_type")
     archs = config.get("architectures") or []
@@ -621,13 +668,10 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
         except Exception:
             pass
 
-    if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
-        # preprocessor_config.json is nice-to-have (for full vLLM vision pipeline)
-        # but not required — chat_server.py copies it from base model at serving time
-        suffix = "native_qwen3_5_wrapper" if preproc_present else "native_qwen3_5_wrapper_no_preproc"
-        return True, suffix
-    if model_type == "qwen3_5_text" and "Qwen3_5ForCausalLM" in archs:
-        return False, "text_only_qwen3_5_checkpoint"
+    ok, label = is_allowed_student_arch(model_type, archs)
+    if ok:
+        suffix = "no_preproc" if not preproc_present else "with_preproc"
+        return True, f"{label}:{suffix}"
     return False, f"unsupported_or_unknown:{model_type}:{','.join(archs) if archs else 'none'}"
 
 
@@ -638,6 +682,51 @@ def _get_teacher_tokenizer():
         from transformers import AutoTokenizer
         _teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
     return _teacher_tokenizer
+
+
+_teacher_chat_template_hash_cache: Optional[str] = None
+
+
+def _teacher_chat_template_hash() -> str:
+    """Return the SHA256 of the teacher's canonical chat template.
+
+    Resolved lazily the first time we need to compare a student's template
+    against the teacher. Checks ``tokenizer_config.json::chat_template`` first
+    (the common location) and falls back to a standalone ``chat_template.jinja``
+    file. If neither is present we return a sentinel that intentionally
+    won't match anything, which fails closed on templates.
+    """
+    global _teacher_chat_template_hash_cache
+    if _teacher_chat_template_hash_cache is not None:
+        return _teacher_chat_template_hash_cache
+    template = ""
+    try:
+        cfg_path = hf_hub_download(repo_id=TEACHER_MODEL, filename="tokenizer_config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        tmpl = cfg.get("chat_template", "")
+        if isinstance(tmpl, list):
+            tmpl = json.dumps(tmpl)
+        template = tmpl or ""
+    except Exception as exc:
+        logger.warning(f"Teacher tokenizer_config fetch failed: {exc}")
+    if not template:
+        try:
+            jinja_path = hf_hub_download(repo_id=TEACHER_MODEL, filename="chat_template.jinja")
+            with open(jinja_path) as f:
+                template = f.read()
+        except Exception:
+            template = ""
+    if not template:
+        logger.warning(
+            f"Teacher {TEACHER_MODEL} has no chat_template; "
+            "using sentinel that no student can match."
+        )
+        _teacher_chat_template_hash_cache = "__NO_TEMPLATE_PRESENT__"
+        return _teacher_chat_template_hash_cache
+    h = hashlib.sha256(template.encode()).hexdigest()
+    _teacher_chat_template_hash_cache = h
+    return h
 
 
 def _is_transient_error(exc: Exception) -> bool:
@@ -979,10 +1068,14 @@ def check_model_architecture(
                     "vocab_size": vocab_size,
                 }
 
-        # 8. Verify chat_template matches the official Qwen template
-        # Prevents exploits via modified chat templates and blocks derivative models
-        # that copy templates from other miners (e.g., slowsnake copying caseus's watermarked template)
-        REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        # 8. Verify chat_template matches the teacher's template exactly.
+        # Prevents exploits via modified chat templates and blocks derivative
+        # models that copy watermarked templates from other miners. Reference
+        # hash is computed dynamically from the current teacher so a
+        # teacher-swap doesn't require a code change here; students that
+        # shipped the old teacher's template will arch-DQ on the cutover
+        # (which is the intended behaviour).
+        REFERENCE_TEMPLATE_HASH = _teacher_chat_template_hash()
         try:
             import hashlib
             tok_config_path = hf_hub_download(
@@ -1013,14 +1106,15 @@ def check_model_architecture(
                 template_hash = hashlib.sha256(cleaned.encode()).hexdigest()
 
                 if template_hash != REFERENCE_TEMPLATE_HASH:
-                    # Also check the raw template (without stripping comments)
                     raw_hash = hashlib.sha256(student_template.encode()).hexdigest()
                     if raw_hash != REFERENCE_TEMPLATE_HASH:
                         return {
                             "pass": False,
-                            "reason": f"Chat template modified from reference Qwen template. "
-                                      f"Students must use the original Qwen3.5 chat template unmodified. "
-                                      f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)",
+                            "reason": (
+                                f"Chat template does not match the teacher's canonical template. "
+                                f"Students must use the {TEACHER_MODEL} chat template unmodified. "
+                                f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)"
+                            ),
                             "params_b": total_params_b,
                             "vocab_size": vocab_size,
                         }
@@ -1040,18 +1134,24 @@ def check_model_architecture(
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
 
-        # Enforce vLLM-native architecture
+        # Enforce an architecture from the subnet-config allowlist.
         if not vllm_compatible:
+            allowed_pairs = ", ".join(
+                f"{e.get('model_type','?')}/{e.get('architecture','?')}"
+                for e in STUDENT_ARCH_ALLOWLIST
+                if isinstance(e, dict)
+            ) or "(empty — subnet-config missing studentArchAllowlist)"
             return {
                 "pass": False,
                 "reason": (
-                    f"Model must use Qwen3_5ForConditionalGeneration architecture "
-                    f"(model_type=qwen3_5) to be vLLM-compatible. "
+                    f"Model architecture is not in the subnet allowlist. "
                     f"Found: {','.join(config.get('architectures', []))} "
                     f"(model_type={config.get('model_type', 'unknown')}). "
-                    f"Fix: edit config.json on HuggingFace — change architectures to "
-                    f"[\"Qwen3_5ForConditionalGeneration\"] and model_type to \"qwen3_5\". "
-                    f"No weight changes needed."
+                    f"Allowed pairs (model_type/architecture): {allowed_pairs}. "
+                    f"Fix: edit config.json on HuggingFace to use one of the "
+                    f"allowed architectures (typically {TEACHER_MODEL}'s "
+                    f"text-inner DeepseekV3ForCausalLM). No weight changes "
+                    f"needed for a config-only fix."
                 ),
                 "params_b": total_params_b,
                 "vllm_compatible": False,
