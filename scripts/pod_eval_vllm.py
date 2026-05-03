@@ -253,6 +253,7 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # trust_remote_code=False, preserving the security boundary against
     # arbitrary modeling.py shipped by miners.
     student_needs_remote_code = False
+    student_needs_eager_attn = False
     if not is_teacher:
         try:
             _cfg_kwargs = {}
@@ -266,6 +267,24 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                 "KimiK25ForConditionalGeneration" in _archs
                 or _model_type in ("kimi_k25", "kimi_k2")
             )
+            # 2026-05-03 (Kimi K2.6 cutover): DeepSeek-V3 / Kimi-family
+            # students use Multi-head Latent Attention (signalled by
+            # kv_lora_rank). cuDNN's SDPA fused backend has no execution
+            # plan for MLA's compressed-KV shapes, so the finetunability
+            # probe's forward pass dies with
+            # "cudnn_frontend Error: No valid execution plans built" and
+            # the student is wrongly DQ'd as anti-finetune. Forcing
+            # attn_implementation="eager" (math kernels) bypasses cuDNN
+            # entirely. This was already on for repo-name-detected Kimi
+            # models; we extend it to any MLA-style config.
+            _kv_lora = getattr(_peek_cfg, "kv_lora_rank", None)
+            student_needs_eager_attn = (
+                _model_type in ("deepseek_v3", "deepseek_v2", "kimi_k25", "kimi_k2")
+                or "DeepseekV3ForCausalLM" in _archs
+                or "DeepseekV2ForCausalLM" in _archs
+                or "KimiK25ForConditionalGeneration" in _archs
+                or (_kv_lora is not None and int(_kv_lora) > 0)
+            )
         except Exception as _peek_err:
             # If we can't even read config without TRC, the precheck must
             # have already let it through, so allow remote code on Kimi-style
@@ -274,6 +293,10 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
             student_needs_remote_code = (
                 "kimi-k2" in lname or "kimi_k2" in lname or "kimi-k25" in lname
             )
+            # In the safety-net path we also default to eager: the failure
+            # mode (cuDNN MLA crash) is harder to diagnose than the very
+            # small perf cost of eager.
+            student_needs_eager_attn = True
     trust_rc = is_teacher or student_needs_remote_code
     kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=trust_rc)
     if revision and revision != "main":
@@ -294,16 +317,16 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # to from_pretrained so the vision tower init never attempts FA2.
     lname = (name or "").lower()
     # 2026-05-03: Kimi-family detection used to gate the eager-attention
-    # workaround; we extend it to also fire for any student whose declared
-    # architecture is KimiK25ForConditionalGeneration even if the HF repo
-    # name doesn't contain the "kimi" substring (most miner students don't
-    # name their repo with "kimi"). student_needs_remote_code was set
-    # above based on the peeked config and exactly captures that.
+    # workaround; we extend it to fire for any student whose declared
+    # architecture / model_type is in the MLA family (DeepSeek-V3 / Kimi).
+    # Most miner students don't have "kimi" in the repo name; their config
+    # tells the truth, and student_needs_eager_attn captures that above.
     is_kimi_family = (
         ("moonshotai" in lname and "kimi" in lname)
         or "kimi-k2" in lname
         or "kimi_k2" in lname
         or student_needs_remote_code
+        or student_needs_eager_attn
     )
     max_retries = 3
     for attempt in range(max_retries):
