@@ -40,6 +40,8 @@ import shutil
 import json
 import logging
 import os
+import sys
+import traceback
 import random
 import re
 import time
@@ -296,16 +298,178 @@ def _first_param_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
-def _purge_cuda_model_hold(reason: str, model: torch.nn.Module | None) -> None:
-    """Drop refs to a CUDA-resident HF model shard and try to reclaim VRAM."""
-    if model is None:
-        return
-    log.info("Releasing CUDA memory (%s)...", reason)
-    del model
+def _clear_exc_traceback_frames() -> None:
+    """Drop locals captured on ``sys.exc_info()`` traceback frames.
+
+    During ``try/finally``, an exception keeps frames (e.g. ``_prepare_eval_cache``)
+    alive with ``teacher_eval`` still referenced by parameter locals — CUDA weights stay
+    resident until frames are cleared.
+    """
+    tb_root = sys.exc_info()[2]
+
+    def _walk_clear_tb(tb):
+        walk = tb
+        while walk is not None:
+            try:
+                walk.tb_frame.clear()
+            except RuntimeError:
+                pass
+            walk = walk.tb_next
+
+    _walk_clear_tb(tb_root)
+    cf = getattr(traceback, "clear_frames", None)
+    if callable(cf) and tb_root is not None:
+        try:
+            cf(tb_root)
+        except Exception:
+            pass
+
+    seen_exc: set[int] = set()
+
+    def _strip_exc_refs(exc: BaseException | None) -> None:
+        if exc is None:
+            return
+        eid = id(exc)
+        if eid in seen_exc:
+            return
+        seen_exc.add(eid)
+        et = getattr(exc, "__traceback__", None)
+        if et is not None:
+            _walk_clear_tb(et)
+            try:
+                exc.__traceback__ = None
+            except Exception:
+                pass
+        _strip_exc_refs(getattr(exc, "__cause__", None))
+        _strip_exc_refs(getattr(exc, "__context__", None))
+
+    _strip_exc_refs(sys.exc_info()[1])
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    return "out of memory" in msg
+
+
+def _purge_cuda_model_hold(reason: str) -> None:
+    """Gc + synchronize all CUDA devices + ``empty_cache``.
+
+    Must be invoked **after** the caller clears every remaining strong ref to discarded
+    models (``model = None``). Deleting only a function parameter inside a helper does **not**
+    drop the caller's reference, so pooling before that would reclaim nothing.
+    """
+    log.info("Reclaiming CUDA memory (%s)...", reason)
+    _clear_exc_traceback_frames()
+    gc.collect()
     gc.collect()
     if torch.cuda.is_available():
+        for dev in range(torch.cuda.device_count()):
+            try:
+                torch.cuda.synchronize(device=dev)
+            except Exception:
+                pass
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        ipc = getattr(torch.cuda, "ipc_collect", None)
+        if callable(ipc):
+            try:
+                ipc()
+            except Exception:
+                pass
+
+
+def _scale_teacher_max_memory_decompress_headroom(
+    base_max_memory: dict | None,
+    teacher_gpus: list[int],
+    *,
+    frac: float | None = None,
+) -> dict | None:
+    """Scale every listed teacher GPU's HF ``max_memory`` cap to leave VRAM for decompress temps.
+
+    Compressed Kimi can briefly need tens of GiB beyond static parameter placement during the
+    first forwards; capping each device below ~90% of theoretical headroom avoids shard+decompress
+    fighting for the last blocks on the same GPU.
+    """
+    import re
+
+    if base_max_memory is None or len(teacher_gpus) < 2:
+        return base_max_memory
+    if frac is None:
+        frac = float(os.environ.get("DISTIL_TEACHER_DECOMPRESS_GPU_FRAC", "0.78"))
+    frac = min(1.0, max(0.2, float(frac)))
+    out = dict(base_max_memory)
+    touched = False
+    for idx in teacher_gpus:
+        if idx not in out:
+            continue
+        cap = out[idx]
+        if not isinstance(cap, str):
+            continue
+        m = re.match(r"^(\d+)\s*GiB$", cap.strip(), re.I)
+        if not m:
+            continue
+        old_gib = int(m.group(1))
+        new_gib = max(8, int(old_gib * frac))
+        if new_gib != old_gib:
+            touched = True
+        out[idx] = f"{new_gib}GiB"
+    if touched:
+        log.info(
+            "Teacher max_memory headroom: scaled per-GPU caps by %.0f%% (env DISTIL_TEACHER_DECOMPRESS_GPU_FRAC).",
+            frac * 100,
+        )
+    return out
+
+
+def _eval_teacher_relaxed_max_memory(
+    base_max_memory: dict | None,
+    teacher_gpus: list[int],
+    *,
+    primary_frac: float | None = None,
+) -> dict | None:
+    """Further ease pressure on ``teacher_gpus[0]`` (HF often stacks bookkeeping / large modules there)."""
+    import re
+
+    if primary_frac is None:
+        primary_frac = float(os.environ.get("DISTIL_EVAL_TEACHER_PRIMARY_FRAC", "0.42"))
+
+    if base_max_memory is None or len(teacher_gpus) < 2:
+        return base_max_memory
+    key = teacher_gpus[0]
+    if key not in base_max_memory:
+        return base_max_memory
+    out = dict(base_max_memory)
+    cap = base_max_memory[key]
+    if not isinstance(cap, str):
+        return base_max_memory
+    m = re.match(r"^(\d+)\s*GiB$", cap.strip(), re.I)
+    if not m:
+        return base_max_memory
+    frac = float(primary_frac)
+    frac = min(1.0, max(0.05, frac))
+    old_gib = int(m.group(1))
+    new_gib = max(8, int(old_gib * frac))
+    out[key] = f"{new_gib}GiB"
+    log.info(
+        "Teacher primary GPU skew: GPU %s max_memory %sGiB → %sGiB (factor %.2f; DISTIL_EVAL_TEACHER_PRIMARY_FRAC).",
+        key,
+        old_gib,
+        new_gib,
+        primary_frac,
+    )
+    return out
+
+
+def _teacher_max_memory_for_compressed_bursts(
+    base_max_memory: dict | None,
+    teacher_gpus: list[int],
+) -> dict | None:
+    """Stack per-GPU headroom + primary skew for teacher loads that hit compressed-tensors decompress."""
+    if base_max_memory is None:
+        return None
+    mm = _scale_teacher_max_memory_decompress_headroom(base_max_memory, teacher_gpus)
+    return _eval_teacher_relaxed_max_memory(mm, teacher_gpus)
 
 
 def _instantiate_causal_lm(
@@ -964,7 +1128,7 @@ def _prepare_eval_cache(
                     do_sample=True,
                     temperature=0.7,
                     top_p=0.9,
-                    use_cache=True,
+                    use_cache=False,
                 )
             t_logits = teacher_eval(full_seq).logits.float()
             t_cont = t_logits[:, prompt_len - 1 : -1, :]
@@ -1818,7 +1982,9 @@ def build_eval_cache_api(args):
         "attn_implementation": TEACHER_ATTN_IMPLEMENTATION,
     }
     if teacher_max_memory is not None:
-        teacher_load_kwargs["max_memory"] = teacher_max_memory
+        teacher_load_kwargs["max_memory"] = _teacher_max_memory_for_compressed_bursts(
+            teacher_max_memory, teacher_gpus
+        )
     teacher_eval = _instantiate_causal_lm(
         args.teacher, teacher_load_kwargs, train=False, freeze_all=True
     )
@@ -1835,16 +2001,23 @@ def build_eval_cache_api(args):
         if student_hf_tok.pad_token is None:
             student_hf_tok.pad_token = student_hf_tok.eos_token
 
-    cache = _prepare_eval_cache(
-        teacher_eval=teacher_eval,
-        teacher_tokenizer=teacher_hf_tok,
-        prompts=prompts,
-        max_new_tokens=max_new_tokens,
-        seed=eval_seed,
-        cross_tokenizer=cross,
-        student_tokenizer=student_hf_tok if cross else None,
-        max_student_seq=int(args.max_student_seq),
-    )
+    try:
+        cache = _prepare_eval_cache(
+            teacher_eval=teacher_eval,
+            teacher_tokenizer=teacher_hf_tok,
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+            seed=eval_seed,
+            cross_tokenizer=cross,
+            student_tokenizer=student_hf_tok if cross else None,
+            max_student_seq=int(args.max_student_seq),
+        )
+    finally:
+        if teacher_eval is not None:
+            _api_t_drop = teacher_eval
+            teacher_eval = None
+            del _api_t_drop
+            _purge_cuda_model_hold("teacher LM (build_eval_cache_api)")
     meta = {
         "teacher": args.teacher,
         "student": str(student_ref),
@@ -1981,7 +2154,12 @@ def train_online(args):
         "attn_implementation": TEACHER_ATTN_IMPLEMENTATION,
     }
     if teacher_max_memory is not None:
-        teacher_load_kwargs["max_memory"] = teacher_max_memory
+        if sequential:
+            teacher_load_kwargs["max_memory"] = _teacher_max_memory_for_compressed_bursts(
+                teacher_max_memory, teacher_gpus
+            )
+        else:
+            teacher_load_kwargs["max_memory"] = teacher_max_memory
 
     if not sequential:
         log.info("Loading teacher (%s) on GPUs %s...", args.teacher, teacher_gpus)
@@ -1998,7 +2176,7 @@ def train_online(args):
     else:
         log.info(
             "Sequential pipeline: omitting resident teacher LM (e.g. 8×GPU Kimi shard). "
-            "Teacher forwards run in bursts with full VRAM, then unload before student."
+            "Teacher forwards run in bursts (max_memory leaves decompress headroom), then unload before student."
         )
 
     student_source = str(resume_dir) if resume_dir else args.student
@@ -2088,10 +2266,12 @@ def train_online(args):
     teacher_eval = None
     king_eval = None
     eval_cache = []
+    periodic_eval_ok = False
     _vacuum_student_for_teacher_eval = False
     _student_reload_opt_state: dict | None = None
     _student_reload_sched_state: dict | None = None
     if args.eval_every_steps > 0:
+        periodic_eval_ok = True
         king_start_gpu = args.king_gpu if args.king_gpu is not None else args.teacher_gpu
         king_gpus = _gpu_span(king_start_gpu, args.king_gpu_count, "king")
         king_device_map, king_max_memory = _device_map_and_memory(king_gpus)
@@ -2168,8 +2348,10 @@ def train_online(args):
                     )
                     _student_reload_opt_state = optimizer.state_dict()
                     _student_reload_sched_state = scheduler.state_dict()
-                    _purge_cuda_model_hold("student (VRAM for teacher eval cache)", student)
+                    _stu_drop = student
                     student = None
+                    del _stu_drop
+                    _purge_cuda_model_hold("student freed for teacher eval cache")
                     _vacuum_student_for_teacher_eval = True
                 log.info("Loading teacher LM for eval cache build / metrics (release after cache)...")
                 teacher_eval_kwargs = {
@@ -2179,7 +2361,9 @@ def train_online(args):
                     "attn_implementation": TEACHER_ATTN_IMPLEMENTATION,
                 }
                 if teacher_max_memory is not None:
-                    teacher_eval_kwargs["max_memory"] = teacher_max_memory
+                    teacher_eval_kwargs["max_memory"] = _teacher_max_memory_for_compressed_bursts(
+                        teacher_max_memory, teacher_gpus
+                    )
                 try:
                     teacher_eval = _instantiate_causal_lm(
                         args.teacher, teacher_eval_kwargs, train=False, freeze_all=True
@@ -2262,11 +2446,26 @@ def train_online(args):
                     }
                     _save_eval_cache_payload(cache_path, eval_cache, eval_prompts, meta)
                     log.info("Saved eval cache to %s", cache_path)
+            except Exception as cache_exc:
+                if _is_cuda_oom(cache_exc):
+                    periodic_eval_ok = False
+                    eval_cache = []
+                    log.warning(
+                        "Teacher eval-cache generation CUDA-OOM (%s). Continuing training without periodic "
+                        "king eval for this run. Options: prebuilt --eval_cache_path, lower "
+                        "--eval_max_new_tokens, lower env DISTIL_TEACHER_DECOMPRESS_GPU_FRAC or "
+                        "DISTIL_EVAL_TEACHER_PRIMARY_FRAC, or build cache on beefier hardware.",
+                        cache_exc,
+                    )
+                else:
+                    raise
             finally:
                 # Ephemeral teacher copy (sequential trainer or parallel without resident teacher).
                 if teacher_eval is not None and teacher_eval is not teacher:
-                    _purge_cuda_model_hold("teacher LM (eval cache build only)", teacher_eval)
+                    _tee_drop = teacher_eval
                     teacher_eval = None
+                    del _tee_drop
+                    _purge_cuda_model_hold("teacher LM (eval cache build only)")
                 if _vacuum_student_for_teacher_eval and student is None:
                     log.info("Reloading student (%s) on GPUs %s...", student_source, student_gpus)
                     student = _instantiate_causal_lm(
@@ -2285,11 +2484,16 @@ def train_online(args):
                     if _student_reload_sched_state is not None:
                         scheduler.load_state_dict(_student_reload_sched_state)
         log.info("Prepared eval cache for %s prompts", len(eval_cache))
-        log.info(
-            "Periodic king eval configured: %s prompts every %s steps",
-            len(eval_prompts),
-            args.eval_every_steps,
-        )
+        if periodic_eval_ok:
+            log.info(
+                "Periodic king eval configured: %s prompts every %s steps",
+                len(eval_prompts),
+                args.eval_every_steps,
+            )
+        elif args.eval_every_steps > 0:
+            log.info(
+                "Periodic king eval disabled (eval cache unavailable); training KL continues.",
+            )
 
     sdev = _first_param_device(student)
     tdev = _first_param_device(teacher) if teacher is not None else None
@@ -2400,10 +2604,12 @@ def train_online(args):
         # --- GPU scheduling: resident teacher || sequential fused bursts (8×GPU teacher, then student).
         if sequential:
             if king_eval is not None:
-                _purge_cuda_model_hold(
-                    "king (sequential: free devices for fused teacher LM pass)", king_eval
-                )
+                _king_drop = king_eval
                 king_eval = None
+                del _king_drop
+                _purge_cuda_model_hold(
+                    "king freed (sequential: devices for fused teacher LM pass)",
+                )
 
             blobs_cpu: list[torch.Tensor] = []
             reload_teacher_micro = getattr(
@@ -2430,18 +2636,20 @@ def train_online(args):
                         args.teacher, teacher_load_kwargs, train=False, freeze_all=True
                     )
                     blobs_cpu.append(_teacher_fwd_sub_to_cpu(sub_m, teacher_lm_pulse))
-                    _purge_cuda_model_hold(
-                        "teacher LM (micro-batch pulse)", teacher_lm_pulse
-                    )
+                    _tlm_drop = teacher_lm_pulse
+                    teacher_lm_pulse = None
+                    del _tlm_drop
+                    _purge_cuda_model_hold("teacher LM (micro-batch pulse)")
             else:
                 teacher_lm_pulse = _instantiate_causal_lm(
                     args.teacher, teacher_load_kwargs, train=False, freeze_all=True
                 )
                 for sub_m in chunk_batches:
                     blobs_cpu.append(_teacher_fwd_sub_to_cpu(sub_m, teacher_lm_pulse))
-                _purge_cuda_model_hold(
-                    "teacher LM (one fused pulse / train step)", teacher_lm_pulse
-                )
+                _tlm_pulse_drop = teacher_lm_pulse
+                teacher_lm_pulse = None
+                del _tlm_pulse_drop
+                _purge_cuda_model_hold("teacher LM (one fused pulse / train step)")
 
             assert len(blobs_cpu) == len(chunk_batches)
 
@@ -2600,7 +2808,7 @@ def train_online(args):
                 step=global_step,
             )
 
-        if args.eval_every_steps > 0 and (
+        if periodic_eval_ok and args.eval_every_steps > 0 and (
             global_step == 1 or global_step % args.eval_every_steps == 0
         ):
             eval_t0 = time.time()
@@ -2622,8 +2830,10 @@ def train_online(args):
                 kd_top_k=int(args.kd_top_k),
             )
             if sequential and king_eval is not None:
-                _purge_cuda_model_hold("king after periodic eval (sequential)", king_eval)
+                _king_ev_drop = king_eval
                 king_eval = None
+                del _king_ev_drop
+                _purge_cuda_model_hold("king after periodic eval (sequential)")
             eval_stats = _summary_stats(eval_scores)
             king_stats = _summary_stats(king_scores)
             lr_scale = lr / max(args.lr, 1e-12)
