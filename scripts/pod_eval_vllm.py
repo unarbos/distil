@@ -16027,12 +16027,48 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
     if revision and revision != "main":
         cmd.extend(["--revision", revision])
 
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): keep the previous attempt's
+    # vllm_teacher.log alongside the new one so we can see the *actual* root
+    # cause across attempts. Each attempt overwrites the live log; without
+    # this rotation the first attempt's traceback was lost as soon as
+    # attempt 2 truncated the file, leaving only the wrapper traceback in
+    # the eval_output.log tail and no way to see what the engine core
+    # actually died from.
+    try:
+        prev = Path("/tmp/vllm_teacher.log")
+        if prev.exists() and prev.stat().st_size > 0:
+            shutil.copy2(prev, f"/tmp/vllm_teacher.attempt{_attempt - 1 if _attempt > 1 else 0}.log")
+    except Exception:
+        pass
     log_f = open("/tmp/vllm_teacher.log", "w")
     env = os.environ.copy()
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
     if offline_ok:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): vLLM 0.20.0 ships a
+    # vendored ``vllm.third_party.deep_gemm`` whose Python files import OK
+    # (so ``has_deep_gemm()`` returns True) but whose compiled CUDA kernels
+    # are not actually loadable, leaving ``_get_mk_alignment_for_contiguous_layout_impl``
+    # set to None. Combined with the kernel_warmup gate
+    # ``do_deep_gemm_warmup = VLLM_USE_DEEP_GEMM and is_deep_gemm_supported()``
+    # — which short-circuits to True because the vendored module satisfies
+    # ``has_deep_gemm()`` — every Kimi-family worker hits ``_missing()`` in
+    # ``_fp8_linear_may_use_deep_gemm`` and dies with
+    # ``RuntimeError: DeepGEMM backend is not available or outdated`` during
+    # ``compile_or_warm_up_model``. All 8 TP workers die at the same time;
+    # APIServer reports the wrapper as ``Engine core initialization failed.
+    # Failed core proc(s): {}`` with no further detail. Setting the env vars
+    # below disables every DeepGEMM code path (warmup + runtime + E8M0)
+    # so vLLM falls back to Marlin/Triton kernels, which work for our
+    # quantised Kimi K2.6 teacher (it's W4A16 compressed-tensors / Marlin
+    # MoE, not FP8 — so we lose nothing by disabling the FP8 deep_gemm
+    # path). Re-evaluate after vLLM ships a fix or after we install a
+    # working external ``deep_gemm`` build.
+    env["VLLM_USE_DEEP_GEMM"] = "0"
+    env["VLLM_MOE_USE_DEEP_GEMM"] = "0"
+    env["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+    env["VLLM_DEEP_GEMM_WARMUP"] = "skip"
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid, env=env)
     Path("/tmp/vllm_teacher.pid").write_text(str(proc.pid))
     print(f"[vllm] PID: {proc.pid}", flush=True)
