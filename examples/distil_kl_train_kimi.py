@@ -54,6 +54,21 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 
+
+def _patch_transformers_hub_remote_imports() -> None:
+    """Transformers v5 removed ``is_torch_fx_available``; Hub DeepSeek/Moonlight code still imports it."""
+    import transformers.utils.import_utils as _import_utils
+
+    if not hasattr(_import_utils, "is_torch_fx_available"):
+
+        def is_torch_fx_available() -> bool:
+            return True
+
+        _import_utils.is_torch_fx_available = is_torch_fx_available  # type: ignore[attr-defined]
+
+
+_patch_transformers_hub_remote_imports()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
