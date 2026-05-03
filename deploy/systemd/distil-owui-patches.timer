@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic re-application of Open-WebUI runtime patches
+Documentation=file:///opt/distil/repo/scripts/chat_pod/patch_owui_pyodide_dispatch.py
+
+[Timer]
+# Run shortly after boot so the open-webui container has time to start.
+OnBootSec=2min
+# Re-apply every 5 minutes; idempotent. Catches container restarts /
+# image upgrades that wipe the patched JS layer.
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=distil-owui-patches.service
+
+[Install]
+WantedBy=timers.target

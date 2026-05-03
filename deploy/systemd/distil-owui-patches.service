@@ -1,0 +1,17 @@
+[Unit]
+Description=Re-apply Open-WebUI runtime patches (idempotent)
+Documentation=file:///opt/distil/repo/scripts/chat_pod/patch_owui_pyodide_dispatch.py
+After=docker.service network-online.target
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# Apply our chat.arbos.life patches inside the open-webui container. The
+# script is idempotent — already-patched is a no-op. Runs as root because
+# we need to docker-exec into the container.
+ExecStart=/usr/bin/python3 /opt/distil/repo/scripts/chat_pod/patch_owui_pyodide_dispatch.py
+TimeoutStartSec=60
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target
