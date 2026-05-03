@@ -241,7 +241,41 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                 or ("kimi-k2" in lname or "kimi_k2" in lname)
                 or ("deepseek-v3" in lname or "deepseek_v3" in lname)
             )
-    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+    # 2026-05-03 (Kimi K2.6 cutover): students that declare a Kimi-family
+    # arch in config.architectures (and therefore passed arch-allowlist
+    # precheck) need trust_remote_code=True for the AutoModel loader.
+    # transformers 5.7 has DeepseekV3 natively (no remote code needed) but
+    # KimiK25ForConditionalGeneration is not upstream yet, so loading it
+    # without trust_remote_code raises and the student is wrongly DQ'd
+    # at "load_failed". The arch precheck has already verified the model
+    # type matches the allowlist; we authorise remote code for those
+    # specific arches only. Non-Kimi students still load with
+    # trust_remote_code=False, preserving the security boundary against
+    # arbitrary modeling.py shipped by miners.
+    student_needs_remote_code = False
+    if not is_teacher:
+        try:
+            _cfg_kwargs = {}
+            if revision and revision != "main":
+                _cfg_kwargs["revision"] = revision
+            from transformers import AutoConfig as _ACfg
+            _peek_cfg = _ACfg.from_pretrained(name, trust_remote_code=False, **_cfg_kwargs)
+            _archs = getattr(_peek_cfg, "architectures", None) or []
+            _model_type = getattr(_peek_cfg, "model_type", "")
+            student_needs_remote_code = (
+                "KimiK25ForConditionalGeneration" in _archs
+                or _model_type in ("kimi_k25", "kimi_k2")
+            )
+        except Exception as _peek_err:
+            # If we can't even read config without TRC, the precheck must
+            # have already let it through, so allow remote code on Kimi-style
+            # repo names as a safety net rather than blocking eval.
+            lname = (name or "").lower()
+            student_needs_remote_code = (
+                "kimi-k2" in lname or "kimi_k2" in lname or "kimi-k25" in lname
+            )
+    trust_rc = is_teacher or student_needs_remote_code
+    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=trust_rc)
     if revision and revision != "main":
         kwargs["revision"] = revision
         print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
@@ -259,10 +293,17 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # (vision_config, text_config, etc.), then pass the patched config
     # to from_pretrained so the vision tower init never attempts FA2.
     lname = (name or "").lower()
+    # 2026-05-03: Kimi-family detection used to gate the eager-attention
+    # workaround; we extend it to also fire for any student whose declared
+    # architecture is KimiK25ForConditionalGeneration even if the HF repo
+    # name doesn't contain the "kimi" substring (most miner students don't
+    # name their repo with "kimi"). student_needs_remote_code was set
+    # above based on the peeked config and exactly captures that.
     is_kimi_family = (
         ("moonshotai" in lname and "kimi" in lname)
         or "kimi-k2" in lname
         or "kimi_k2" in lname
+        or student_needs_remote_code
     )
     max_retries = 3
     for attempt in range(max_retries):
@@ -17670,8 +17711,15 @@ def main():
                 clean_model_cache(student_name, args.teacher)
                 continue
 
-            # VRAM fraud check
-            MAX_STUDENT_VRAM_GB = 20.0
+            # 2026-05-03 (Kimi K2.6 cutover): VRAM fraud cap recalibrated for
+            # 33B-param Kimi students. Previous 20GB cap was sized for 7B
+            # Qwen students (~14GB bf16). 33B bf16 weights = 66GB exactly;
+            # plus a small headroom for embedding tables / activation
+            # scratch on a freshly-loaded model. A genuinely fraudulent
+            # student (claiming 33B but loading 50B+) blows past 100GB and
+            # is still caught. Reference: subnet-config.json
+            # teacher.maxStudentParams = 33,000,000,000 → 66 GiB at bf16.
+            MAX_STUDENT_VRAM_GB = 75.0
             if not is_king and student_vram_gb > MAX_STUDENT_VRAM_GB:
                 msg = f"FRAUD: student VRAM delta {student_vram_gb:.1f}GB > {MAX_STUDENT_VRAM_GB}GB"
                 print(f"  ⚠️ {msg}", flush=True)
