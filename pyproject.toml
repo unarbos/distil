@@ -21,7 +21,7 @@ dependencies = [
     "safetensors",
     "starlette",
     "torch",
-    "transformers",
+    "transformers>=4.46,<5",
     "uvicorn",
 ]
 

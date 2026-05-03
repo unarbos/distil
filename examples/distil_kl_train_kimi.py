@@ -35,6 +35,7 @@ Examples:
 
 import argparse
 import gc
+import inspect
 import shutil
 import json
 import logging
@@ -68,7 +69,115 @@ def _patch_transformers_hub_remote_imports() -> None:
         _import_utils.is_torch_fx_available = is_torch_fx_available  # type: ignore[attr-defined]
 
 
+_PRETRAINED_TIE_WEIGHTS_ORIG = None
+
+
+def _hub_compat_dispatch_tie_weights(model, missing_keys=None, recompute_mapping=True, **kwargs):
+    """
+    Call the defining class's ``tie_weights`` with only kwargs it accepts (Hub Kimi defines ``tie_weights(self)``).
+    Must not replace ``PreTrainedModel.tie_weights``: subclasses resolve ``self.tie_weights`` to their own method,
+    so Transformers' ``init_weights`` / ``_finalize_model_loading`` are patched to call this instead.
+    """
+    import transformers.modeling_utils as _modeling_utils
+
+    ptm = _modeling_utils.PreTrainedModel
+    orig = _PRETRAINED_TIE_WEIGHTS_ORIG
+    assert orig is not None
+    for cls in type(model).__mro__:
+        if cls is ptm:
+            return orig(
+                model,
+                missing_keys=missing_keys,
+                recompute_mapping=recompute_mapping,
+                **kwargs,
+            )
+        if "tie_weights" not in cls.__dict__:
+            continue
+        fn = cls.__dict__["tie_weights"]
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return fn(
+                model,
+                missing_keys=missing_keys,
+                recompute_mapping=recompute_mapping,
+                **kwargs,
+            )
+        call_kw: dict = {}
+        if "missing_keys" in params:
+            call_kw["missing_keys"] = missing_keys
+        if "recompute_mapping" in params:
+            call_kw["recompute_mapping"] = recompute_mapping
+        for key, val in kwargs.items():
+            if key in params:
+                call_kw[key] = val
+        return fn(model, **call_kw)
+
+    return orig(
+        model,
+        missing_keys=missing_keys,
+        recompute_mapping=recompute_mapping,
+        **kwargs,
+    )
+
+
+def _patch_transformers_hub_tie_weights_compat() -> None:
+    """
+    Transformers v5 calls ``tie_weights(recompute_mapping=...)`` from ``init_weights`` and
+    ``tie_weights(missing_keys=..., recompute_mapping=...)`` from ``_finalize_model_loading``.
+    Hub Kimi overrides ``tie_weights`` with a no-arg signature; patching ``PreTrainedModel.tie_weights`` does not
+    intercept ``self.tie_weights`` on instances, so we patch those call sites and use ``_hub_compat_dispatch_tie_weights``.
+    """
+    import transformers.modeling_utils as _modeling_utils
+
+    global _PRETRAINED_TIE_WEIGHTS_ORIG
+
+    ptm = _modeling_utils.PreTrainedModel
+    if getattr(ptm, "_distil_kl_hub_tie_dispatch_patched", False):
+        return
+
+    # Transformers v4.x: ``init_weights`` calls ``self.tie_weights()`` with no kwargs and there is no
+    # ``_finalize_model_loading`` hook. Hub Kimi ``tie_weights(self)`` is compatible; skip patching so we do not
+    # replace stock ``init_weights`` (which would drop ``prune_heads`` / ``_init_weights`` guards).
+    finalize_raw = ptm.__dict__.get("_finalize_model_loading")
+    if finalize_raw is None:
+        ptm._distil_kl_hub_tie_dispatch_patched = True  # type: ignore[attr-defined]
+        return
+
+    import types
+
+    _PRETRAINED_TIE_WEIGHTS_ORIG = ptm.__dict__["tie_weights"]
+
+    def init_weights(self) -> None:
+        if _modeling_utils.get_torch_context_manager_or_global_device() != torch.device("meta"):
+            self.initialize_weights()
+        _hub_compat_dispatch_tie_weights(self, recompute_mapping=False)
+
+    _orig_finalize = finalize_raw.__func__ if hasattr(finalize_raw, "__func__") else finalize_raw
+
+    def _finalize_model_loading(model, load_config, loading_info):
+        def _instance_tie_weights(self, missing_keys=None, recompute_mapping=False, **kw):
+            return _hub_compat_dispatch_tie_weights(
+                self,
+                missing_keys=missing_keys,
+                recompute_mapping=recompute_mapping,
+                **kw,
+            )
+
+        model.tie_weights = types.MethodType(_instance_tie_weights, model)
+        try:
+            return _orig_finalize(model, load_config, loading_info)
+        finally:
+            if hasattr(model, "tie_weights"):
+                delattr(model, "tie_weights")
+
+    ptm.init_weights = init_weights  # type: ignore[method-assign]
+    ptm._finalize_model_loading = staticmethod(_finalize_model_loading)  # type: ignore[method-assign]
+    ptm._distil_kl_hub_tie_dispatch_patched = True  # type: ignore[attr-defined]
+
+
 _patch_transformers_hub_remote_imports()
+_patch_transformers_hub_tie_weights_compat()
 
 
 def _normalize_deepseek_hub_rope_config(config) -> None:
@@ -116,6 +225,22 @@ SAMPLES_PER_STEP = 100
 SAVE_EVERY = 500
 MIN_CHARS = 2560
 DEFAULT_EVAL_DATA_URL = "https://distil.arbos.life/api/eval-data"
+
+# moonshotai/Kimi-K2.6: Hub vision tower rejects Flash Attention 2; Transformers may enable FA2 by default.
+TEACHER_ATTN_IMPLEMENTATION = "eager"
+
+
+def _patch_kimi_hub_vision_attn(config) -> None:
+    """
+    KimiK25VisionConfig defaults ``_attn_implementation`` to ``flash_attention_2``; that value is copied
+    into ``VisionTowerConfig`` and breaks ``MoonViT3dPretrainedModel`` init. Top-level ``attn_implementation=``
+    on ``from_pretrained`` does not override this nested field.
+    """
+    if config is None or getattr(config, "model_type", None) != "kimi_k25":
+        return
+    vc = getattr(config, "vision_config", None)
+    if vc is not None and hasattr(vc, "_attn_implementation"):
+        vc._attn_implementation = TEACHER_ATTN_IMPLEMENTATION
 
 
 def _require_positive(name: str, value: int):
@@ -203,6 +328,7 @@ def _instantiate_causal_lm(
                 cfg_kw["revision"] = rev
             cfg = AutoConfig.from_pretrained(model_ref, **cfg_kw)
         _normalize_deepseek_hub_rope_config(cfg)
+        _patch_kimi_hub_vision_attn(cfg)
         kw["config"] = cfg
 
     lm = AutoModelForCausalLM.from_pretrained(model_ref, **kw)
@@ -1677,7 +1803,7 @@ class StreamingTokenStream:
 
 
 def build_eval_cache_api(args):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     teacher_gpus = _gpu_span(args.teacher_gpu, args.teacher_gpu_count, "teacher")
     teacher_device_map, teacher_max_memory = _device_map_and_memory(teacher_gpus)
@@ -1704,11 +1830,13 @@ def build_eval_cache_api(args):
         "dtype": torch.bfloat16,
         "device_map": teacher_device_map,
         "trust_remote_code": True,
+        "attn_implementation": TEACHER_ATTN_IMPLEMENTATION,
     }
     if teacher_max_memory is not None:
         teacher_load_kwargs["max_memory"] = teacher_max_memory
-    teacher_eval = AutoModelForCausalLM.from_pretrained(args.teacher, **teacher_load_kwargs)
-    teacher_eval.eval()
+    teacher_eval = _instantiate_causal_lm(
+        args.teacher, teacher_load_kwargs, train=False, freeze_all=True
+    )
     teacher_hf_tok = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
     if teacher_hf_tok.pad_token is None:
         teacher_hf_tok.pad_token = teacher_hf_tok.eos_token
@@ -1865,6 +1993,7 @@ def train_online(args):
         "dtype": torch.bfloat16,
         "device_map": teacher_device_map,
         "trust_remote_code": True,
+        "attn_implementation": TEACHER_ATTN_IMPLEMENTATION,
     }
     if teacher_max_memory is not None:
         teacher_load_kwargs["max_memory"] = teacher_max_memory
@@ -2049,11 +2178,12 @@ def train_online(args):
                     "dtype": torch.bfloat16,
                     "device_map": teacher_device_map,
                     "trust_remote_code": True,
+                    "attn_implementation": TEACHER_ATTN_IMPLEMENTATION,
                 }
                 if teacher_max_memory is not None:
                     teacher_eval_kwargs["max_memory"] = teacher_max_memory
-                teacher_eval = AutoModelForCausalLM.from_pretrained(
-                    args.teacher, **teacher_eval_kwargs
+                teacher_eval = _instantiate_causal_lm(
+                    args.teacher, teacher_eval_kwargs, train=False, freeze_all=True
                 )
         king_load_kwargs = {
             "revision": args.king_revision,
