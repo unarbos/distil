@@ -11,7 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE = "http://127.0.0.1:3710"
-POD_NAME = "distil-eval"
+# Eval pod name. Validator's systemd unit sets DISTIL_LIUM_POD_NAME via the
+# kimi-cutover drop-in; we honour that here so the bot's pod-snapshot reads
+# from whichever pod is actually running the current eval. Falls back to the
+# legacy distil-eval pod for safety.
+POD_NAME = os.environ.get("DISTIL_LIUM_POD_NAME") or os.environ.get(
+    "LIUM_POD_NAME"
+) or "distil-kimi-cutover"
+POD_NAME_FALLBACKS = ("distil-eval",)
 POD_SSH_KEY = "/root/.ssh/id_ed25519"
 LIUM_ENV_FILE = "/home/distil/.secrets/distil.env"
 WORKSPACE = Path("/root/.openclaw/agents/sn97-bot/workspace")
@@ -66,6 +73,12 @@ ALLOWED_CODE_FILES = [
     "setup.py",
     "REWRITE_PLAN.md",
     "SESSION_MEMORY.md",
+    # 2026-05-03: subnet-config.json is the *live source of truth* for
+    # teacher / maxStudentParams / vocabSize / arch allowlist. POLICY.md
+    # tells the bot to cross-check against this file before answering
+    # "what is the cap?" — without it the bot was falling back to stale
+    # POLICY.md prose and parroting "7B/Qwen3" after the Kimi cutover.
+    "frontend/src/lib/subnet-config.json",
 ]
 ALLOWED_CODE_DIRS = [
     "distillation",
@@ -292,13 +305,16 @@ def pod_ssh_info():
     try:
         from lium import Config, Lium
         cfg = Config(api_key=key, ssh_key_path=Path(POD_SSH_KEY))
-        for p in Lium(config=cfg).ps():
-            if POD_NAME in p.name:
-                ssh = getattr(p, "ssh_cmd", None) or ""
-                m = re.search(r"ssh\s+(\S+)@(\S+)\s+-p\s+(\d+)", ssh)
-                if m:
-                    return {"user": m.group(1), "host": m.group(2), "port": m.group(3),
-                            "status": getattr(p, "status", "?"), "name": p.name}
+        pods = list(Lium(config=cfg).ps())
+        candidates = [POD_NAME, *POD_NAME_FALLBACKS]
+        for want in candidates:
+            for p in pods:
+                if want in p.name:
+                    ssh = getattr(p, "ssh_cmd", None) or ""
+                    m = re.search(r"ssh\s+(\S+)@(\S+)\s+-p\s+(\d+)", ssh)
+                    if m:
+                        return {"user": m.group(1), "host": m.group(2), "port": m.group(3),
+                                "status": getattr(p, "status", "?"), "name": p.name}
     except Exception as e:
         return {"_error": str(e)[:160]}
     return None
@@ -332,7 +348,9 @@ def pod_live_info(ssh):
             "  [ -f ${RD}eval_done.marker ] && echo present || echo absent; "
             "fi; "
             "echo ---NVIDIA---; "
-            "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu --format=csv,noheader 2>/dev/null | head -4; "
+            "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null; "
+            "echo ---NVIDIA_COUNT---; "
+            "nvidia-smi --list-gpus 2>/dev/null | wc -l; "
             "echo ---DISK---; "
             "df -h /home 2>/dev/null | tail -1; "
             "echo ---VLLM_PROCS---; "
@@ -387,9 +405,31 @@ def parse_pod_live(raw):
     m = re.search(r"---DONE_MARKER---\n(present|absent)", raw)
     if m:
         out["done_marker"] = m.group(1)
-    m = re.search(r"---NVIDIA---\n([^\n]+)", raw)
+    nv = re.search(r"---NVIDIA---\n(.*?)(?=\n---|\Z)", raw, re.DOTALL)
+    if nv:
+        gpu_lines = [ln.strip() for ln in nv.group(1).splitlines() if ln.strip()]
+        out["gpus"] = gpu_lines  # full list for debugging
+        if gpu_lines:
+            # Summarise as e.g. "8x NVIDIA H200 (12345/143771 MiB used, 0% util)"
+            first = gpu_lines[0]
+            try:
+                parts = [p.strip() for p in first.split(",")]
+                # parts: index, name, memory.used [MiB], memory.total [MiB], util %
+                name = parts[1] if len(parts) > 1 else "?"
+                mem_u = parts[2] if len(parts) > 2 else "?"
+                mem_t = parts[3] if len(parts) > 3 else "?"
+                util = parts[4] if len(parts) > 4 else "?"
+                count = len(gpu_lines)
+                prefix = f"{count}× " if count > 1 else ""
+                out["gpu"] = f"{prefix}{name} ({mem_u} / {mem_t} used, util {util})"
+            except Exception:
+                out["gpu"] = first
+    m = re.search(r"---NVIDIA_COUNT---\n(\d+)", raw)
     if m:
-        out["gpu"] = m.group(1).strip()
+        try:
+            out["gpu_count"] = int(m.group(1))
+        except Exception:
+            pass
     m = re.search(r"---DISK---\n([^\n]+)", raw)
     if m:
         out["disk"] = m.group(1).strip()

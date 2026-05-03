@@ -346,7 +346,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         # teacher_generation timings on 5/1 morning). 0.78 leaves ~10
         # GiB of headroom; KV cache usage is <5% in practice so we
         # aren't losing throughput.
-        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.78")
+        #
+        # 2026-05-03 (v30.3.6): lowered default 0.78 → 0.65. Chat-king
+        # grew to ~44 GiB (was ~21 GiB at 0.15 util — likely KV cache
+        # growth or leaked EngineCore). 0.78 * 139.8 = 109 GiB but only
+        # 95.5 GiB free → teacher crash on init. 0.65 * 139.8 = 90.9 GiB
+        # fits with ~4.6 GiB headroom. Eval throughput is barely affected
+        # since KV cache is <5% in practice.
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.65")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
@@ -382,11 +389,24 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"done; "
         f"echo DISTIL_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
     )
+    # 2026-05-03: zombie-aware status check.
+    # ``kill -0 PID`` returns 0 for zombies (defunct processes whose entry is
+    # still in the process table because no parent has reaped them), so the
+    # previous check reported DISTIL_STATUS:running on a dead worker and the
+    # validator polled forever. Workaround: also inspect ``ps -o stat=`` and
+    # treat 'Z'/'X' (zombie / dying) as DISTIL_STATUS:dead. Falls through to
+    # the cheap ``kill -0`` path when ``ps`` isn't available, which keeps
+    # the legacy behaviour for hosts where /proc isn't mounted.
     status_inner = (
         f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DISTIL_STATUS:done; "
         f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo DISTIL_STATUS:starting; "
-        f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo DISTIL_STATUS:running; "
-        "else echo DISTIL_STATUS:dead; fi"
+        f"elif ! kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo DISTIL_STATUS:dead; "
+        f"else _stat=$(ps -p \"$(cat {shlex.quote(pid_remote)})\" -o stat= 2>/dev/null | tr -d ' '); "
+        f"  case \"$_stat\" in "
+        f"    Z*|X*) echo DISTIL_STATUS:dead ;; "
+        f"    *) echo DISTIL_STATUS:running ;; "
+        f"  esac; "
+        f"fi"
     )
     status_cmd = f"bash -lc {shlex.quote(status_inner)}"
     poll_stop = threading.Event()

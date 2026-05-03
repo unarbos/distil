@@ -91,6 +91,12 @@ KL_CHUNK_SIZE = 128
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
+
+# Module-level teacher name. Populated once by main() after parsing
+# --teacher so helpers like load_model() can decide whether to enable
+# trust_remote_code without re-parsing args every call. Empty string
+# means "not yet set"; downstream code falls back to env / heuristic.
+TEACHER_NAME = ""
 def _default_fp_vocab() -> int:
     """Return the teacher's ``configVocabSize`` as the activation-fingerprint
     vocab default. Falls back to Qwen3.5's 248320 if the subnet-config can't
@@ -205,21 +211,156 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # rather than hardcoding "Qwen3.5". Falls back to the legacy
     # Qwen-substring check if the import fails (e.g. running the script
     # outside the validator venv).
+    # Detect "is this the teacher?" via several fallbacks so HF inference
+    # still works after a teacher swap, even on the pod where the local
+    # ``eval.runtime`` package isn't importable. Order:
+    #   1. Module-level TEACHER_NAME (set by main() once args are parsed)
+    #   2. eval.runtime import (works inside the validator venv)
+    #   3. Substring heuristic covering Qwen + Kimi + DeepSeek families
+    is_teacher = False
     try:
-        from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
-        is_teacher = (name == _TEACHER_NAME) or (
-            "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
-        )
+        global TEACHER_NAME  # noqa: PLW0603
+        if TEACHER_NAME:
+            is_teacher = (name == TEACHER_NAME) or (
+                "/" in name and "/" in TEACHER_NAME and
+                name.split("/")[-1] == TEACHER_NAME.split("/")[-1]
+            )
     except Exception:
-        is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
-    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
+        pass
+    if not is_teacher:
+        try:
+            from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
+            is_teacher = (name == _TEACHER_NAME) or (
+                "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
+            )
+        except Exception:
+            lname = name.lower()
+            is_teacher = (
+                ("qwen" in lname and ("35b" in lname or "3.5" in lname or "3.6" in lname))
+                or ("moonshotai" in lname and "kimi" in lname)
+                or ("kimi-k2" in lname or "kimi_k2" in lname)
+                or ("deepseek-v3" in lname or "deepseek_v3" in lname)
+            )
+    # 2026-05-03 (Kimi K2.6 cutover): students that declare a Kimi-family
+    # arch in config.architectures (and therefore passed arch-allowlist
+    # precheck) need trust_remote_code=True for the AutoModel loader.
+    # transformers 5.7 has DeepseekV3 natively (no remote code needed) but
+    # KimiK25ForConditionalGeneration is not upstream yet, so loading it
+    # without trust_remote_code raises and the student is wrongly DQ'd
+    # at "load_failed". The arch precheck has already verified the model
+    # type matches the allowlist; we authorise remote code for those
+    # specific arches only. Non-Kimi students still load with
+    # trust_remote_code=False, preserving the security boundary against
+    # arbitrary modeling.py shipped by miners.
+    student_needs_remote_code = False
+    student_needs_eager_attn = False
+    if not is_teacher:
+        try:
+            _cfg_kwargs = {}
+            if revision and revision != "main":
+                _cfg_kwargs["revision"] = revision
+            from transformers import AutoConfig as _ACfg
+            _peek_cfg = _ACfg.from_pretrained(name, trust_remote_code=False, **_cfg_kwargs)
+            _archs = getattr(_peek_cfg, "architectures", None) or []
+            _model_type = getattr(_peek_cfg, "model_type", "")
+            student_needs_remote_code = (
+                "KimiK25ForConditionalGeneration" in _archs
+                or _model_type in ("kimi_k25", "kimi_k2")
+            )
+            # 2026-05-03 (Kimi K2.6 cutover): DeepSeek-V3 / Kimi-family
+            # students use Multi-head Latent Attention (signalled by
+            # kv_lora_rank). cuDNN's SDPA fused backend has no execution
+            # plan for MLA's compressed-KV shapes, so the finetunability
+            # probe's forward pass dies with
+            # "cudnn_frontend Error: No valid execution plans built" and
+            # the student is wrongly DQ'd as anti-finetune. Forcing
+            # attn_implementation="eager" (math kernels) bypasses cuDNN
+            # entirely. This was already on for repo-name-detected Kimi
+            # models; we extend it to any MLA-style config.
+            _kv_lora = getattr(_peek_cfg, "kv_lora_rank", None)
+            student_needs_eager_attn = (
+                _model_type in ("deepseek_v3", "deepseek_v2", "kimi_k25", "kimi_k2")
+                or "DeepseekV3ForCausalLM" in _archs
+                or "DeepseekV2ForCausalLM" in _archs
+                or "KimiK25ForConditionalGeneration" in _archs
+                or (_kv_lora is not None and int(_kv_lora) > 0)
+            )
+        except Exception as _peek_err:
+            # If we can't even read config without TRC, the precheck must
+            # have already let it through, so allow remote code on Kimi-style
+            # repo names as a safety net rather than blocking eval.
+            lname = (name or "").lower()
+            student_needs_remote_code = (
+                "kimi-k2" in lname or "kimi_k2" in lname or "kimi-k25" in lname
+            )
+            # In the safety-net path we also default to eager: the failure
+            # mode (cuDNN MLA crash) is harder to diagnose than the very
+            # small perf cost of eager.
+            student_needs_eager_attn = True
+    trust_rc = is_teacher or student_needs_remote_code
+    kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=trust_rc)
     if revision and revision != "main":
         kwargs["revision"] = revision
         print(f"  [model] Pinning to revision {revision[:12]}", flush=True)
 
+    # 2026-05-03 (Kimi K2.6 cutover): KimiK25ForConditionalGeneration's
+    # vision tower (MoonViT3dPretrainedModel) does not support
+    # flash_attention_2. transformers>=5.0 raises ValueError at __init__
+    # time (not load time) when any sub-module of the wrapper is missing
+    # FA2 support. Passing attn_implementation="eager" to from_pretrained
+    # only sets it on the *top-level* config; the Kimi model constructs
+    # MoonViT3dPretrainedModel(vt_config) with a separate config object
+    # that still defaults to FA2 on FA2-capable hardware.
+    #
+    # Fix: load the config first, force eager on ALL nested sub-configs
+    # (vision_config, text_config, etc.), then pass the patched config
+    # to from_pretrained so the vision tower init never attempts FA2.
+    lname = (name or "").lower()
+    # 2026-05-03: Kimi-family detection used to gate the eager-attention
+    # workaround; we extend it to fire for any student whose declared
+    # architecture / model_type is in the MLA family (DeepSeek-V3 / Kimi).
+    # Most miner students don't have "kimi" in the repo name; their config
+    # tells the truth, and student_needs_eager_attn captures that above.
+    is_kimi_family = (
+        ("moonshotai" in lname and "kimi" in lname)
+        or "kimi-k2" in lname
+        or "kimi_k2" in lname
+        or student_needs_remote_code
+        or student_needs_eager_attn
+    )
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            if is_kimi_family:
+                from transformers import AutoConfig
+                _cfg_kwargs = {"trust_remote_code": True}
+                if "revision" in kwargs:
+                    _cfg_kwargs["revision"] = kwargs["revision"]
+                config = AutoConfig.from_pretrained(
+                    name, attn_implementation="eager", **_cfg_kwargs
+                )
+                # Propagate eager to all nested sub-configs so
+                # MoonViT3dPretrainedModel.__init__ doesn't dispatch FA2.
+                def _force_eager(cfg):
+                    for attr in (
+                        "_attn_implementation",
+                        "_attn_implementation_internal",
+                        "_attn_implementation_autoset",
+                    ):
+                        try:
+                            setattr(cfg, attr, "eager")
+                        except Exception:
+                            pass
+                    for key in list(vars(cfg)):
+                        child = getattr(cfg, key, None)
+                        if child is not None and hasattr(child, "_attn_implementation"):
+                            _force_eager(child)
+                _force_eager(config)
+                m = AutoModelForCausalLM.from_pretrained(
+                    name, config=config, attn_implementation="eager", **kwargs
+                )
+                print(f"  [model] Loaded with eager (Kimi-family: FA2/SDPA not supported by vision tower)", flush=True)
+                return m
             try:
                 m = AutoModelForCausalLM.from_pretrained(name, attn_implementation="flash_attention_2", **kwargs)
                 print(f"  [model] Loaded with flash_attention_2", flush=True)
@@ -15619,8 +15760,42 @@ def _stub_missing_preprocessor_config(model_name, revision=None):
     # one for them.
     if "vision_config" not in cfg:
         return
-    # Minimal Qwen2-VL-shape image processor config. Values aren't used
-    # at inference because mm is disabled via --limit-mm-per-prompt.
+
+    model_type = (cfg.get("model_type") or "").lower()
+
+    # Kimi K2.5/K2.6 family: vLLM's kimi_k25 model integration accesses
+    # ``image_processor.media_tokens_calculator`` at engine init. The
+    # generic Qwen2-VL stub silently produces a Qwen2VLImageProcessor
+    # which lacks that attribute and crashes the engine with
+    #   AttributeError: 'Qwen2VLImageProcessor' object has no attribute
+    #   'media_tokens_calculator'
+    # Kimi K2.6 ships its own image processor class
+    # (``KimiK25VisionProcessor`` in ``kimi_k25_vision_processing.py``)
+    # that does have that attribute. Stub a config that points
+    # transformers + trust_remote_code at THAT class instead.
+    if model_type in {"kimi_k25", "kimi_k2"}:
+        stub = {
+            "image_processor_type": "KimiK25VisionProcessor",
+            "processor_class": "KimiK25Processor",
+            "auto_map": {
+                "AutoImageProcessor": "kimi_k25_vision_processing.KimiK25VisionProcessor",
+                "AutoProcessor": "kimi_k25_processor.KimiK25Processor",
+            },
+        }
+        try:
+            pp_path.write_text(_json.dumps(stub, indent=2))
+            print(
+                f"[vllm] Stubbed Kimi-aware preprocessor_config.json at {pp_path} "
+                f"(image_processor_type=KimiK25VisionProcessor)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[vllm] Failed to write Kimi preprocessor stub: {e}", flush=True)
+        return
+
+    # Default: minimal Qwen2-VL-shape image processor config. Values
+    # aren't used at inference because mm is disabled via
+    # --limit-mm-per-prompt.
     stub = {
         "image_processor_type": "Qwen2VLImageProcessor",
         "min_pixels": 3136,
@@ -15840,8 +16015,11 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
     # for the rest of the round. 0.78 leaves ~10 GiB of headroom and
     # has not impacted KV-cache size in observed rounds (KV cache
     # usage stays <5% during teacher gen).
-    if gpu_memory_utilization is None or gpu_memory_utilization < 0.7:
-        gpu_memory_utilization = 0.78
+    #
+    # 2026-05-03 (v30.3.6): lowered 0.78 → 0.65. Chat-king grew to
+    # ~44 GiB; 0.78 * 139.8 = 109 GiB > 95.5 GiB free → crash.
+    if gpu_memory_utilization is None or gpu_memory_utilization < 0.5:
+        gpu_memory_utilization = 0.65
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", model_name,
@@ -15883,6 +16061,19 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
         "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
         "--skip-mm-profiling",
     ]
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): vLLM 0.20.0's Kimi
+    # multimodal wrapper crashes during encoder-budget profiling on
+    # transformers >=5.0 because Kimi's bundled processor can't be loaded
+    # (preprocessor_config falls back to Qwen2VLImageProcessor which
+    # lacks Kimi-specific attrs). ``--enforce-eager`` skips the cuda-graph
+    # capture path that triggers some of that profiling, and combined
+    # with the in-place patches in eval/pod.py:ensure_dependencies()
+    # (``_distil_mm_tolerant`` + ``_distil_dummy_mm_tolerant``) lets
+    # Kimi K2.6 boot under vLLM. Harmless on text-only teachers (Qwen3.5
+    # / DeepSeek V3) — eager mode is ~5% slower than cuda-graph but our
+    # round wall-clock budget already absorbs that.
+    if "kimi" in (model_name or "").lower():
+        cmd.append("--enforce-eager")
     # Teacher-family-specific reasoning parser. Qwen 3.x uses the ``qwen3``
     # parser; Kimi K2.x has no dedicated reasoning parser in vLLM yet (its
     # chat template emits tool tokens directly, no <think> blocks to
@@ -15900,12 +16091,48 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=819
     if revision and revision != "main":
         cmd.extend(["--revision", revision])
 
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): keep the previous attempt's
+    # vllm_teacher.log alongside the new one so we can see the *actual* root
+    # cause across attempts. Each attempt overwrites the live log; without
+    # this rotation the first attempt's traceback was lost as soon as
+    # attempt 2 truncated the file, leaving only the wrapper traceback in
+    # the eval_output.log tail and no way to see what the engine core
+    # actually died from.
+    try:
+        prev = Path("/tmp/vllm_teacher.log")
+        if prev.exists() and prev.stat().st_size > 0:
+            shutil.copy2(prev, f"/tmp/vllm_teacher.attempt{_attempt - 1 if _attempt > 1 else 0}.log")
+    except Exception:
+        pass
     log_f = open("/tmp/vllm_teacher.log", "w")
     env = os.environ.copy()
     env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
     if offline_ok:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
+    # 2026-05-03 (Kimi K2.6 cutover follow-up): vLLM 0.20.0 ships a
+    # vendored ``vllm.third_party.deep_gemm`` whose Python files import OK
+    # (so ``has_deep_gemm()`` returns True) but whose compiled CUDA kernels
+    # are not actually loadable, leaving ``_get_mk_alignment_for_contiguous_layout_impl``
+    # set to None. Combined with the kernel_warmup gate
+    # ``do_deep_gemm_warmup = VLLM_USE_DEEP_GEMM and is_deep_gemm_supported()``
+    # — which short-circuits to True because the vendored module satisfies
+    # ``has_deep_gemm()`` — every Kimi-family worker hits ``_missing()`` in
+    # ``_fp8_linear_may_use_deep_gemm`` and dies with
+    # ``RuntimeError: DeepGEMM backend is not available or outdated`` during
+    # ``compile_or_warm_up_model``. All 8 TP workers die at the same time;
+    # APIServer reports the wrapper as ``Engine core initialization failed.
+    # Failed core proc(s): {}`` with no further detail. Setting the env vars
+    # below disables every DeepGEMM code path (warmup + runtime + E8M0)
+    # so vLLM falls back to Marlin/Triton kernels, which work for our
+    # quantised Kimi K2.6 teacher (it's W4A16 compressed-tensors / Marlin
+    # MoE, not FP8 — so we lose nothing by disabling the FP8 deep_gemm
+    # path). Re-evaluate after vLLM ships a fix or after we install a
+    # working external ``deep_gemm`` build.
+    env["VLLM_USE_DEEP_GEMM"] = "0"
+    env["VLLM_MOE_USE_DEEP_GEMM"] = "0"
+    env["VLLM_USE_DEEP_GEMM_E8M0"] = "0"
+    env["VLLM_DEEP_GEMM_WARMUP"] = "skip"
     proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, preexec_fn=os.setsid, env=env)
     Path("/tmp/vllm_teacher.pid").write_text(str(proc.pid))
     print(f"[vllm] PID: {proc.pid}", flush=True)
@@ -16654,6 +16881,11 @@ def main():
     parser.add_argument("--max-prompt-len", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max-params-b", type=float, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Make the resolved teacher name visible to helpers (load_model,
+    # vLLM stub builders) without re-parsing CLI args.
+    global TEACHER_NAME  # noqa: PLW0603
+    TEACHER_NAME = args.teacher or ""
 
     set_capability_block_seed(args.block_seed)
     set_on_policy_rkl_block_seed(args.block_seed)
@@ -17502,8 +17734,15 @@ def main():
                 clean_model_cache(student_name, args.teacher)
                 continue
 
-            # VRAM fraud check
-            MAX_STUDENT_VRAM_GB = 20.0
+            # 2026-05-03 (Kimi K2.6 cutover): VRAM fraud cap recalibrated for
+            # 33B-param Kimi students. Previous 20GB cap was sized for 7B
+            # Qwen students (~14GB bf16). 33B bf16 weights = 66GB exactly;
+            # plus a small headroom for embedding tables / activation
+            # scratch on a freshly-loaded model. A genuinely fraudulent
+            # student (claiming 33B but loading 50B+) blows past 100GB and
+            # is still caught. Reference: subnet-config.json
+            # teacher.maxStudentParams = 33,000,000,000 → 66 GiB at bf16.
+            MAX_STUDENT_VRAM_GB = 75.0
             if not is_king and student_vram_gb > MAX_STUDENT_VRAM_GB:
                 msg = f"FRAUD: student VRAM delta {student_vram_gb:.1f}GB > {MAX_STUDENT_VRAM_GB}GB"
                 print(f"  ⚠️ {msg}", flush=True)
