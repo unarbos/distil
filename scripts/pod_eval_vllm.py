@@ -91,6 +91,12 @@ KL_CHUNK_SIZE = 128
 ACTIVATION_FP_SEED = 42
 ACTIVATION_FP_N_INPUTS = 5
 ACTIVATION_FP_SEQ_LEN = 64
+
+# Module-level teacher name. Populated once by main() after parsing
+# --teacher so helpers like load_model() can decide whether to enable
+# trust_remote_code without re-parsing args every call. Empty string
+# means "not yet set"; downstream code falls back to env / heuristic.
+TEACHER_NAME = ""
 def _default_fp_vocab() -> int:
     """Return the teacher's ``configVocabSize`` as the activation-fingerprint
     vocab default. Falls back to Qwen3.5's 248320 if the subnet-config can't
@@ -205,13 +211,36 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     # rather than hardcoding "Qwen3.5". Falls back to the legacy
     # Qwen-substring check if the import fails (e.g. running the script
     # outside the validator venv).
+    # Detect "is this the teacher?" via several fallbacks so HF inference
+    # still works after a teacher swap, even on the pod where the local
+    # ``eval.runtime`` package isn't importable. Order:
+    #   1. Module-level TEACHER_NAME (set by main() once args are parsed)
+    #   2. eval.runtime import (works inside the validator venv)
+    #   3. Substring heuristic covering Qwen + Kimi + DeepSeek families
+    is_teacher = False
     try:
-        from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
-        is_teacher = (name == _TEACHER_NAME) or (
-            "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
-        )
+        global TEACHER_NAME  # noqa: PLW0603
+        if TEACHER_NAME:
+            is_teacher = (name == TEACHER_NAME) or (
+                "/" in name and "/" in TEACHER_NAME and
+                name.split("/")[-1] == TEACHER_NAME.split("/")[-1]
+            )
     except Exception:
-        is_teacher = "Qwen" in name and ("35B" in name or "3.5" in name)
+        pass
+    if not is_teacher:
+        try:
+            from eval.runtime import TEACHER_MODEL as _TEACHER_NAME
+            is_teacher = (name == _TEACHER_NAME) or (
+                "/" in name and name.split("/")[-1] == _TEACHER_NAME.split("/")[-1]
+            )
+        except Exception:
+            lname = name.lower()
+            is_teacher = (
+                ("qwen" in lname and ("35b" in lname or "3.5" in lname or "3.6" in lname))
+                or ("moonshotai" in lname and "kimi" in lname)
+                or ("kimi-k2" in lname or "kimi_k2" in lname)
+                or ("deepseek-v3" in lname or "deepseek_v3" in lname)
+            )
     kwargs = dict(dtype=dtype, device_map=device, trust_remote_code=is_teacher)
     if revision and revision != "main":
         kwargs["revision"] = revision
@@ -16691,6 +16720,11 @@ def main():
     parser.add_argument("--max-prompt-len", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max-params-b", type=float, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Make the resolved teacher name visible to helpers (load_model,
+    # vLLM stub builders) without re-parsing CLI args.
+    global TEACHER_NAME  # noqa: PLW0603
+    TEACHER_NAME = args.teacher or ""
 
     set_capability_block_seed(args.block_seed)
     set_on_policy_rkl_block_seed(args.block_seed)
