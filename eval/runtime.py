@@ -38,6 +38,25 @@ TEACHER_ACTIVE_PARAMS = TEACHER["activeParams"]
 TEACHER_ARCHITECTURE = TEACHER["architecture"]
 MAX_STUDENT_PARAMS = TEACHER["maxStudentParams"]
 
+# Architecture allowlist for miner submissions. Consumers (eval/model_checker.py,
+# scripts/validator/precheck.py, scripts/chat_pod/chat_server.py) should treat
+# this as the single source of truth — never hardcode a model_type or
+# architectures string in a second place.
+# Format: list of {"model_type": str, "architecture": str} pairs. Matching is
+# OR across entries (any pair with model_type AND that architecture in the
+# config.json ``architectures`` array = allowed). A bare list of strings is
+# accepted as shorthand for architecture-only matching (model_type ignored).
+STUDENT_ARCH_ALLOWLIST: list[dict] = list(TEACHER.get("studentArchAllowlist") or [])
+# Flattened helper: set of allowed ``architectures`` strings. Precheck's cheap
+# path only inspects ``architectures``; the full checker also compares
+# ``model_type``.
+STUDENT_ARCH_NAMES: set[str] = {
+    entry["architecture"] for entry in STUDENT_ARCH_ALLOWLIST if isinstance(entry, dict) and entry.get("architecture")
+}
+STUDENT_MODEL_TYPES: set[str] = {
+    entry["model_type"] for entry in STUDENT_ARCH_ALLOWLIST if isinstance(entry, dict) and entry.get("model_type")
+}
+
 MAX_KL_THRESHOLD = VALIDATOR["maxKlThreshold"]
 # 2026-04-25 17:00 UTC: env-override added so we can shorten teacher generation
 # without redeploying. Subnet config baseline is 8192 but mean teacher length

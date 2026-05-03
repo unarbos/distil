@@ -5,19 +5,21 @@ King chat server bootstrapper — runs on the chat-bench pod.
 Starts an OpenAI-compatible vLLM server for the current king model so
 chat.arbos.life can talk to it via the SSH tunnel on port 8100.
 
-The subnet's miners publish models in a few different shapes:
-  1. A flat text-only config.json with architectures=["Qwen3_5ForCausalLM"].
-  2. A Qwen3_5ForConditionalGeneration wrapper with nested text_config but no
-     top-level vision_config (e.g. text-only distillation students that reuse
-     the base Qwen3.5-4B VL architecture without actually training visual
-     layers — tom9491/distil-32 is this shape).
-  3. A full VL model with both text_config and vision_config.
+Two supported student families, selected automatically from config.json:
 
-vLLM only registers Qwen3_5ForConditionalGeneration (the VL wrapper), so the
-bootstrap *always* produces a wrapper on disk. When the miner didn't ship
-visual weights, we graft them in from Qwen/Qwen3.5-4B (the undistilled base) so
-vLLM's weight loader sees a complete checkpoint; the vision branch is unused
-for text chat but the shapes have to match what the config declares.
+  (A) Qwen3.5 / Qwen3.6 family (``Qwen3_5ForCausalLM`` or
+      ``Qwen3_5ForConditionalGeneration``). Legacy path — was the only
+      supported family before the Kimi K2.6 teacher swap. Requires the
+      Qwen3_5ForConditionalGeneration VL wrapper and graft-in of base
+      Qwen3.5-4B visual weights so vLLM's weight loader sees a complete
+      checkpoint. Kept for backward compatibility so the current Qwen
+      king keeps serving while miners migrate to Kimi-family arch.
+
+  (B) Kimi K2.6 family — text-only ``DeepseekV3ForCausalLM`` (inner text
+      model of the Kimi K2.6 wrapper) or the full
+      ``KimiK25ForConditionalGeneration`` wrapper. vLLM 0.19+ supports
+      both natively with ``--trust-remote-code``; no config rewrite or
+      weight grafting needed. We just download-and-serve.
 
 Usage:
     python3 chat_server.py <hf_repo>[:revision] [port]
@@ -38,8 +40,37 @@ else:
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8100
 
 MODEL_DIR = Path("/root/king-model")
+# Legacy Qwen wrapper base — only used if the downloaded model is a
+# Qwen3.5/3.6 family student that needs visual-weight grafting.
 BASE_MODEL = "Qwen/Qwen3.5-4B"
 SERVED_NAME = "sn97-king"
+
+
+def _detect_arch_family() -> str:
+    """Inspect the downloaded config.json and return the arch family.
+
+    Returns one of ``"qwen35"``, ``"kimi_k2"`` (text-only), ``"kimi_k25"``
+    (vision wrapper), or ``"unknown"``.
+    """
+    config_path = MODEL_DIR / "config.json"
+    if not config_path.exists():
+        return "unknown"
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except Exception:
+        return "unknown"
+    archs = cfg.get("architectures") or []
+    mt = cfg.get("model_type", "")
+    if "KimiK25ForConditionalGeneration" in archs or mt == "kimi_k25":
+        return "kimi_k25"
+    if "DeepseekV3ForCausalLM" in archs and mt in ("kimi_k2", "deepseek_v3"):
+        return "kimi_k2"
+    if mt == "kimi_k2" or mt == "deepseek_v3":
+        return "kimi_k2"
+    if any(a.startswith("Qwen3_5") for a in archs) or mt.startswith("qwen3_5"):
+        return "qwen35"
+    return "unknown"
 
 
 def log(msg: str):
@@ -233,23 +264,11 @@ def exec_vllm():
     # most of the time. ``pod_eval.py`` claims ~0.90 of the H200 during
     # rounds, so a 0.90 chat slice would OOM the second vLLM to come up
     # (whichever loses the race). Default to a slim slice that comfortably
-    # fits a 4B model + KV cache and tune via env if a future king is
+    # fits a 4B-class model + KV cache and tune via env if a future king is
     # bigger or the eval pod gets a smaller card.
-    #
-    # 2026-05-02 (v30.5 patch): max_model_len 8192 → 32768. User-reported
-    # truncation: long math questions (multi-step word problems,
-    # Fermi-style "how many jelly beans fill the ocean") were producing
-    # answers that hit ``finish_reason=length`` mid-final-paragraph
-    # because (prompt ~600 tokens) + (long answer ~7500 tokens) clipped
-    # the 8192 cap. The Qwen3.5 king config exposes
-    # ``max_position_embeddings=262144`` and 24 of 32 layers are
-    # Mamba-style linear-attention (constant KV-cache cost regardless of
-    # sequence length); the dominant memory cost comes from the 8 full-
-    # attention layers. 32K context fits comfortably under
-    # ``gpu_memory_utilization=0.30``. If a future bigger king OOMs at
-    # 32K, drop CHAT_VLLM_MAX_MODEL_LEN via env and bump util.
     gpu_util = os.environ.get("CHAT_VLLM_GPU_UTIL", "0.30")
     max_model_len = os.environ.get("CHAT_VLLM_MAX_MODEL_LEN", "32768")
+    family = _detect_arch_family()
     cmd = [
         "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model", str(MODEL_DIR),
@@ -262,12 +281,37 @@ def exec_vllm():
         "--gpu-memory-utilization", str(gpu_util),
         "--enforce-eager",
         "--enable-auto-tool-choice",
-        "--tool-call-parser", "hermes",
-        "--reasoning-parser", "qwen3",
-        "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
-        "--skip-mm-profiling",
     ]
-    log(f"exec vLLM (gpu_util={gpu_util}, max_model_len={max_model_len})")
+    if family == "qwen35":
+        # Qwen 3.5 / 3.6 emit ``<tool_call><function=name><parameter=k>v
+        # </parameter></function></tool_call>`` XML — the ``qwen3_xml``
+        # parser ships with vLLM 0.19+ and matches the family natively.
+        cmd += [
+            "--tool-call-parser", "qwen3_xml",
+            "--reasoning-parser", "qwen3",
+            "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
+            "--skip-mm-profiling",
+        ]
+    elif family == "kimi_k25":
+        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text chat,
+        # use the Kimi-native tool-call tokens (``<|tool_calls_section_begin|>``
+        # ... ``<|tool_call_begin|>``). vLLM doesn't ship a dedicated
+        # kimi tool parser yet, so leave ``--tool-call-parser`` off and let
+        # the model emit raw tokens; clients that parse structured tool
+        # calls on the Kimi chat template will still work.
+        cmd += [
+            "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
+            "--skip-mm-profiling",
+        ]
+    elif family == "kimi_k2":
+        # Text-only DeepSeek V3 inner of Kimi K2 — vanilla causal LM path.
+        # No tool parser flag so clients parse Kimi tool tokens directly.
+        pass
+    else:
+        # Unknown architecture — pass no family-specific flags; vLLM may
+        # succeed on simple architectures (Llama-family) without them.
+        log(f"warning: unknown architecture family, falling back to minimal vLLM args")
+    log(f"exec vLLM (family={family}, gpu_util={gpu_util}, max_model_len={max_model_len})")
     os.execvp(cmd[0], cmd)
 
 
@@ -275,6 +319,15 @@ if __name__ == "__main__":
     rev_suffix = f"@{MODEL_REVISION}" if MODEL_REVISION else ""
     log(f"bootstrapping model={MODEL_NAME}{rev_suffix} port={PORT}")
     download_model()
-    patch_config_and_tokenizer()
-    inject_visual_weights()
+    family = _detect_arch_family()
+    log(f"detected arch family: {family}")
+    if family == "qwen35":
+        # Legacy Qwen students: run the VL-wrapper dance so vLLM sees the
+        # full config + visual weights.
+        patch_config_and_tokenizer()
+        inject_visual_weights()
+    else:
+        # Kimi-family and unknown: download-and-serve. vLLM loads the
+        # model's own config.json / tokenizer directly.
+        log(f"skipping Qwen-specific patch + visual-weight grafting for family={family}")
     exec_vllm()

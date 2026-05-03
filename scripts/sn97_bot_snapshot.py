@@ -37,6 +37,16 @@ ALLOWED_STATE_FILES = [
     "private_pool_commit.json",
     "model_hashes.json",
     "score_history.json",
+    # 2026-05-02 (v30.5 hotfix): expose the live multi-king queue and
+    # the dethronement history so the bot can answer "who are the
+    # recent kings?" without web_fetch'ing /api/king-history (which
+    # the openclaw web_fetch sandbox has been 404'ing because LLMs
+    # keep hallucinating ``/api/king/history`` (slash) instead of
+    # the real ``/api/king-history`` (hyphen)). On 2026-05-02 the
+    # bot spent 6 minutes flailing on a "list 5 recent kings"
+    # question because it was looking for these files in the mirror.
+    "recent_kings.json",
+    "composite_scores.json",
 ]
 ALLOWED_STATE_DIRS = ["benchmarks"]
 
@@ -695,6 +705,27 @@ elif miners_out:
         f"sn97_bot_snapshot: degraded miners snapshot "
         f"(count={miners_count}, errors={miners_errors}) — keeping existing miners.json"
     )
+
+# 2026-05-02 (v30.5 hotfix): pre-materialize the king-history endpoint
+# so the bot can answer "list recent kings" without web_fetch. The
+# openclaw sandbox blocks loopback and the LLM kept hallucinating
+# ``/api/king/history`` (slash) instead of the real
+# ``/api/king-history`` (hyphen), so it 404'd repeatedly. The mirrored
+# file is dethronement records (one entry per king change) — combine
+# with ``recent_kings.json`` (just the UID queue) to render a "who
+# are the recent kings?" answer with timestamps, p-values, and
+# margins. Truncate to last 50 entries to keep size sane.
+king_history_payload = get("/api/king-history", timeout=8)
+if isinstance(king_history_payload, list) and king_history_payload:
+    truncated = king_history_payload[:50]
+    (MIRROR_STATE / "king_history.json").write_text(json.dumps({
+        "generated_at": now_iso,
+        "endpoint": "/api/king-history",
+        "n_total": len(king_history_payload),
+        "n_returned": len(truncated),
+        "history": truncated,
+    }, indent=2, default=str))
+    state_count += 1
 
 manifest = [
     "# Mirror Manifest",

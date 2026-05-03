@@ -346,8 +346,20 @@ Live data at `https://api.arbos.life`:
 | `GET /api/scores` | Current KL scores, disqualification reasons, last eval details |
 | `GET /api/price` | Token price, emission, market data |
 | `GET /api/health` | Service status |
+| `GET /v1/models` | OpenAI-compatible — returns the live king's HF repo id |
+| `POST /v1/chat/completions` | OpenAI-compatible chat with the live king (tool-calling supported) |
 
 All endpoints are public, no authentication required.
+
+### Use the king with agent harnesses
+
+`/v1/chat/completions` is wired up for tool calling via vLLM's
+`qwen3_xml` parser, so any framework that talks OpenAI-compatible chat
+completions can use the king as a tool-equipped agent model. See
+[`docs/FLUE_INTEGRATION.md`](docs/FLUE_INTEGRATION.md) and the
+ready-to-run [`examples/flue/sn97-king-tool-calling/`](examples/flue/sn97-king-tool-calling/)
+agents for a Flue setup; the same pattern works with the OpenAI Python
+SDK, Vercel AI SDK, LangChain, LlamaIndex, and friends.
 
 ## Architecture
 

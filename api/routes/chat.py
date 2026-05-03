@@ -19,7 +19,7 @@ from config import (
     CHAT_SERVER_SCRIPT,
     STATE_DIR,
 )
-from helpers.rate_limit import _chat_rate_limiter
+from helpers.rate_limit import _chat_rate_limiter, _openai_api_rate_limiter
 from helpers.sanitize import _safe_json_load
 from helpers.ssh import _ssh_exec, SshExecError
 from state_store import h2h_latest, read_cache, uid_hotkey_map
@@ -754,9 +754,18 @@ def openai_models():
 
 @router.post("/v1/chat/completions")
 async def openai_chat_completions(request: Request):
-    """OpenAI-compatible chat completions endpoint. Proxies to the king model."""
+    """OpenAI-compatible chat completions endpoint. Proxies to the king model.
+
+    2026-05-02 (v30.5): this endpoint is the entry point for agent
+    harnesses (Flue, OpenAI Agents SDK, Vercel AI SDK, LangChain, …)
+    that loop the king for many tool-calling rounds. We use a
+    dedicated, more generous rate limiter (``_openai_api_rate_limiter``,
+    240/min) instead of the strict ``_chat_rate_limiter`` (10/min)
+    that throttles direct browser-driven chat. See
+    ``examples/flue/sn97-king-tool-calling/`` for a working integration.
+    """
     client_ip = request.client.host if request.client else "unknown"
-    if not _chat_rate_limiter.is_allowed(client_ip):
+    if not _openai_api_rate_limiter.is_allowed(client_ip):
         return JSONResponse(
             status_code=429,
             content={"error": {"message": "rate limit exceeded", "type": "rate_limit_error"}},

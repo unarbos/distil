@@ -1,0 +1,28 @@
+{
+  "name": "sn97-king-tool-calling",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Flue (https://flueframework.com) agents that use the SN97 king model from chat.arbos.life with tool calling.",
+  "scripts": {
+    "postinstall": "node scripts/install-king-model.mjs",
+    "register-king": "node scripts/install-king-model.mjs",
+    "dev": "flue dev --target node --env .env",
+    "run:chat": "flue run king-chat --target node --id demo --env .env --payload '{\"message\": \"What is Bittensor SN97? Answer in one sentence.\"}'",
+    "run:weather": "flue run king-weather --target node --id demo --env .env --payload '{\"city\": \"San Francisco\"}'",
+    "run:research": "flue run king-research --target node --id demo --env .env --payload '{\"topic\": \"How does Bittensor SN97 prevent Goodhart-style overfitting?\"}'",
+    "build": "flue build --target node"
+  },
+  "dependencies": {
+    "@flue/cli": "^0.3.6",
+    "@flue/sdk": "^0.3.6",
+    "@mariozechner/pi-ai": "^0.72.1",
+    "valibot": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20.10.0"
+  }
+}

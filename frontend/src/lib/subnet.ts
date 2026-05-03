@@ -2,17 +2,36 @@ import subnetConfig from "./subnet-config.json";
 
 export const SUBNET = subnetConfig;
 export const TEACHER = subnetConfig.teacher;
-// 2026-05-02 (v30.5): pendingTeacher is the teacher we plan to roll
-// to next (currently Kimi K2.6 staged for 2026-05-03). It is NOT yet
-// active — the validator continues running ``TEACHER`` until the
-// rolloutDate. UI can read this to show a "Coming soon" banner so
-// miners get the heads-up before the swap lands.
+// ``pendingTeacher`` (if present) is a future teacher staged for a swap;
+// the current config has the swap already live so this is typically null.
+// Kept in the shape so callers don't have to special-case.
 export const PENDING_TEACHER =
   (subnetConfig as { pendingTeacher?: typeof subnetConfig.teacher & {
     rolloutDate?: string;
     tokenizerPath?: string;
     rolloutNotes?: string;
   } }).pendingTeacher ?? null;
+// ``previousTeacher`` is the teacher we retired on the most recent swap.
+// Populated after the 2026-05-02 Qwen→Kimi cutover so the dashboard can
+// surface "Previously: Qwen3.6-35B-A3B" telemetry and miners understand
+// which era their commitment belongs to. The shape is a deliberate
+// subset of the current teacher shape (no studentArchAllowlist or
+// rolloutNotes — those only describe the live teacher) plus a
+// ``retiredAt`` timestamp; we cast via ``unknown`` so TS accepts the
+// narrower shape.
+export type RetiredTeacher = {
+  model: string;
+  architecture: string;
+  totalParams: number;
+  activeParams: number;
+  vocabSize: number;
+  configVocabSize: number;
+  maxStudentParams: number;
+  retiredAt?: string;
+};
+export const PREVIOUS_TEACHER: RetiredTeacher | null =
+  ((subnetConfig as unknown) as { previousTeacher?: RetiredTeacher })
+    .previousTeacher ?? null;
 export const VALIDATOR = subnetConfig.validator;
 export const API_SETTINGS = subnetConfig.api;
 export const NETUID = subnetConfig.netuid;

@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import Optional
 
 from huggingface_hub import hf_hub_download, model_info as _raw_model_info
-from eval.runtime import STATE_DIR as RUNTIME_STATE_DIR, TEACHER_CONFIG_VOCAB_SIZE, TEACHER_MODEL
+from eval.runtime import (
+    STATE_DIR as RUNTIME_STATE_DIR,
+    STUDENT_ARCH_ALLOWLIST,
+    STUDENT_ARCH_NAMES,
+    STUDENT_MODEL_TYPES,
+    TEACHER_CONFIG_VOCAB_SIZE,
+    TEACHER_MODEL,
+)
 
 logger = logging.getLogger("distillation.model_checker")
 
@@ -619,13 +626,53 @@ TOKENIZER_TEST_STRINGS = [
 _teacher_tokenizer = None
 
 
+def is_allowed_student_arch(
+    model_type: str | None,
+    archs: list[str] | None,
+) -> tuple[bool, str]:
+    """Check a (model_type, architectures) pair against the teacher-specified
+    allowlist in ``subnet-config.json::teacher.studentArchAllowlist``.
+
+    Returns (ok, matched_entry) where matched_entry is a short label for
+    logging. The allowlist is consulted in this order:
+      1. Exact (model_type, architecture) pair match — strongest.
+      2. model_type alone matches a listed entry — accepted with a
+         softer label for observability (covers e.g. text-only students
+         that advertise the same model_type but a different architectures
+         entry, such as a DeepseekV3ForCausalLM student with a custom
+         model_type).
+      3. Architecture alone matches (permissive; catches students that
+         advertise a plain DeepseekV3ForCausalLM and a deepseek_v3
+         model_type).
+    """
+    archs = list(archs or [])
+    mt = model_type or ""
+    if not STUDENT_ARCH_ALLOWLIST and not STUDENT_ARCH_NAMES:
+        return True, "no_allowlist_configured"
+    for entry in STUDENT_ARCH_ALLOWLIST:
+        if not isinstance(entry, dict):
+            continue
+        e_mt = entry.get("model_type")
+        e_arch = entry.get("architecture")
+        if e_mt and e_arch and mt == e_mt and e_arch in archs:
+            return True, f"pair:{e_mt}/{e_arch}"
+    if mt and mt in STUDENT_MODEL_TYPES:
+        return True, f"model_type:{mt}"
+    for a in archs:
+        if a in STUDENT_ARCH_NAMES:
+            return True, f"architecture:{a}"
+    return False, f"not_in_allowlist:{mt}:{','.join(archs) if archs else 'none'}"
+
+
 def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
     """Soft check for whether a student repo is natively vLLM-compatible.
 
-    This does NOT gate evaluation yet. It is used to surface whether a model was
-    saved in the base Qwen3.5 wrapper format (`Qwen3_5ForConditionalGeneration`)
-    instead of the extracted text-only format (`Qwen3_5ForCausalLM`), which needs
-    serving-time reconstruction.
+    Returns (vllm_native, reason_label). A student architecture present in
+    ``STUDENT_ARCH_ALLOWLIST`` is considered vLLM-native because the allowlist
+    is curated to only include archs the current vLLM pins support at serving
+    time. The ``preprocessor_config.json`` presence check is preserved for
+    the chat-king wrapper, which may need to stub it for vision-wrapped
+    configs.
     """
     model_type = config.get("model_type")
     archs = config.get("architectures") or []
@@ -639,13 +686,10 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
         except Exception:
             pass
 
-    if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
-        # preprocessor_config.json is nice-to-have (for full vLLM vision pipeline)
-        # but not required — chat_server.py copies it from base model at serving time
-        suffix = "native_qwen3_5_wrapper" if preproc_present else "native_qwen3_5_wrapper_no_preproc"
-        return True, suffix
-    if model_type == "qwen3_5_text" and "Qwen3_5ForCausalLM" in archs:
-        return False, "text_only_qwen3_5_checkpoint"
+    ok, label = is_allowed_student_arch(model_type, archs)
+    if ok:
+        suffix = "no_preproc" if not preproc_present else "with_preproc"
+        return True, f"{label}:{suffix}"
     return False, f"unsupported_or_unknown:{model_type}:{','.join(archs) if archs else 'none'}"
 
 
@@ -658,6 +702,127 @@ def _get_teacher_tokenizer():
     return _teacher_tokenizer
 
 
+_teacher_py_hashes_cache: Optional[dict[str, str]] = None
+
+
+def _get_teacher_py_hashes() -> dict[str, str]:
+    """Return a map of {filename: sha256} for every .py file shipped by the
+    current teacher model's HF repo.
+
+    Resolved lazily on first call; missing .py files return an empty dict
+    (strict mode: no student .py is allowed on the teacher that has none).
+    """
+    global _teacher_py_hashes_cache
+    if _teacher_py_hashes_cache is not None:
+        return _teacher_py_hashes_cache
+    hashes: dict[str, str] = {}
+    try:
+        teacher_info = model_info(TEACHER_MODEL, files_metadata=True)
+        for sibling in (teacher_info.siblings or []):
+            fname = getattr(sibling, "rfilename", "") or ""
+            if not fname.endswith(".py"):
+                continue
+            try:
+                path = hf_hub_download(repo_id=TEACHER_MODEL, filename=fname)
+                with open(path, "rb") as f:
+                    hashes[fname] = hashlib.sha256(f.read()).hexdigest()
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to hash teacher .py {fname}: {exc}"
+                )
+    except Exception as exc:
+        logger.warning(f"Failed to enumerate teacher .py files: {exc}")
+    _teacher_py_hashes_cache = hashes
+    return hashes
+
+
+def _filter_teacher_identical_py_files(
+    model_repo: str, revision: Optional[str], fnames: list[str],
+) -> list[str]:
+    """Return the subset of ``fnames`` that are NOT byte-identical to the
+    teacher's shipped version of the same filename.
+
+    A student .py file is considered safe if and only if:
+      1. A .py file with the same basename exists in the teacher's repo.
+      2. Its SHA256 matches the teacher's.
+
+    Any student .py file that fails either condition is returned as
+    unsafe (caller fails closed). This is how legitimate Kimi students
+    can bundle ``tokenization_kimi.py`` and ``tool_declaration_ts.py``
+    (copied verbatim from ``moonshotai/Kimi-K2.6``) without tripping
+    the custom-code guard, while a rogue ``tokenizer.py`` that
+    monkey-patches ``json.dump`` would still get rejected.
+    """
+    teacher_hashes = _get_teacher_py_hashes()
+    unsafe: list[str] = []
+    for fname in fnames:
+        base = fname.rsplit("/", 1)[-1]
+        teacher_hash = teacher_hashes.get(fname) or teacher_hashes.get(base)
+        if not teacher_hash:
+            unsafe.append(fname)
+            continue
+        try:
+            student_path = hf_hub_download(
+                repo_id=model_repo, filename=fname, revision=revision,
+            )
+            with open(student_path, "rb") as f:
+                student_hash = hashlib.sha256(f.read()).hexdigest()
+        except Exception as exc:
+            logger.warning(
+                f"Failed to hash student .py {model_repo}:{fname}: {exc}"
+            )
+            unsafe.append(fname)
+            continue
+        if student_hash != teacher_hash:
+            unsafe.append(fname)
+    return unsafe
+
+
+_teacher_chat_template_hash_cache: Optional[str] = None
+
+
+def _teacher_chat_template_hash() -> str:
+    """Return the SHA256 of the teacher's canonical chat template.
+
+    Resolved lazily the first time we need to compare a student's template
+    against the teacher. Checks ``tokenizer_config.json::chat_template`` first
+    (the common location) and falls back to a standalone ``chat_template.jinja``
+    file. If neither is present we return a sentinel that intentionally
+    won't match anything, which fails closed on templates.
+    """
+    global _teacher_chat_template_hash_cache
+    if _teacher_chat_template_hash_cache is not None:
+        return _teacher_chat_template_hash_cache
+    template = ""
+    try:
+        cfg_path = hf_hub_download(repo_id=TEACHER_MODEL, filename="tokenizer_config.json")
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        tmpl = cfg.get("chat_template", "")
+        if isinstance(tmpl, list):
+            tmpl = json.dumps(tmpl)
+        template = tmpl or ""
+    except Exception as exc:
+        logger.warning(f"Teacher tokenizer_config fetch failed: {exc}")
+    if not template:
+        try:
+            jinja_path = hf_hub_download(repo_id=TEACHER_MODEL, filename="chat_template.jinja")
+            with open(jinja_path) as f:
+                template = f.read()
+        except Exception:
+            template = ""
+    if not template:
+        logger.warning(
+            f"Teacher {TEACHER_MODEL} has no chat_template; "
+            "using sentinel that no student can match."
+        )
+        _teacher_chat_template_hash_cache = "__NO_TEMPLATE_PRESENT__"
+        return _teacher_chat_template_hash_cache
+    h = hashlib.sha256(template.encode()).hexdigest()
+    _teacher_chat_template_hash_cache = h
+    return h
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """Check if an exception is a transient network error that should not DQ."""
     err_str = str(exc).lower()
@@ -668,51 +833,118 @@ def _is_transient_error(exc: Exception) -> bool:
     ])
 
 
+_TOKENIZER_ARTIFACT_NAMES = (
+    "tokenizer.json",      # HuggingFace fast tokenizer
+    "tokenizer.model",     # SentencePiece
+    "tiktoken.model",      # tiktoken (Kimi, GPT family)
+    "vocab.json",          # GPT2 BPE
+    "merges.txt",          # GPT2 BPE
+    "added_tokens.json",   # added/special tokens
+    "special_tokens_map.json",
+    "bpe.codes",           # sentencepiece variant
+)
+
+
+def _teacher_tokenizer_artifact_hashes() -> dict[str, str]:
+    """Return SHA256 of every tokenizer-artifact file the teacher actually
+    ships. Only names in ``_TOKENIZER_ARTIFACT_NAMES`` that exist on the
+    teacher repo are included; callers should treat the returned set as
+    the required set for students.
+    """
+    hashes: dict[str, str] = {}
+    try:
+        from huggingface_hub import list_repo_files as _list
+        teacher_files = set(_list(TEACHER_MODEL))
+    except Exception as exc:
+        logger.warning(f"Failed to list teacher files: {exc}")
+        teacher_files = set()
+    for name in _TOKENIZER_ARTIFACT_NAMES:
+        if name not in teacher_files:
+            continue
+        try:
+            p = hf_hub_download(repo_id=TEACHER_MODEL, filename=name)
+            with open(p, "rb") as f:
+                hashes[name] = hashlib.sha256(f.read()).hexdigest()
+        except Exception as exc:
+            logger.warning(f"Failed to hash teacher {name}: {exc}")
+    return hashes
+
+
 def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     """
     Byte-for-byte verification of tokenizer files against the teacher model.
 
-    Checks:
-    1. tokenizer.json: SHA256 must exactly match the teacher's tokenizer.json.
-       This file contains the full vocabulary, merges, and added_tokens.
-    2. tokenizer_config.json: all fields except chat_template must match.
-       (chat_template is checked separately by the template hash check.)
+    Detects which tokenizer artifacts the teacher actually ships
+    (``tokenizer.json``, ``tiktoken.model``, ``tokenizer.model``, BPE
+    ``vocab.json`` + ``merges.txt``, etc.) and requires each of them to
+    be byte-identical in the student's repo. Kimi K2.6 for example ships
+    ``tiktoken.model`` + ``tokenization_kimi.py`` but NOT ``tokenizer.json``;
+    Qwen ships ``tokenizer.json``. The function adapts automatically.
 
-    Returns dict with:
-      match: bool
-      reason: str (if not matching)
+    Also verifies ``tokenizer_config.json`` (excluding chat_template, which
+    is checked separately) to catch configuration drift.
+
+    Returns dict with ``match: bool`` and ``reason: str`` (if not matching).
     """
-    # Download teacher tokenizer.json
-    teacher_tok_json_path = hf_hub_download(
-        repo_id=TEACHER_MODEL, filename="tokenizer.json"
-    )
-    with open(teacher_tok_json_path, "rb") as f:
-        teacher_tok_hash = hashlib.sha256(f.read()).hexdigest()
-
-    # Download student tokenizer.json
-    student_tok_json_path = hf_hub_download(
-        repo_id=model_repo, filename="tokenizer.json", revision=revision
-    )
-    with open(student_tok_json_path, "rb") as f:
-        student_tok_hash = hashlib.sha256(f.read()).hexdigest()
-
-    if student_tok_hash != teacher_tok_hash:
+    teacher_hashes = _teacher_tokenizer_artifact_hashes()
+    if not teacher_hashes:
         return {
             "match": False,
             "reason": (
-                f"tokenizer.json mismatch: student hash {student_tok_hash[:16]}... "
-                f"!= teacher hash {teacher_tok_hash[:16]}... "
-                f"(vocab/merges/added_tokens differ from {TEACHER_MODEL})"
+                f"Teacher {TEACHER_MODEL} ships no recognised tokenizer "
+                f"artifact — cannot perform byte-match verification."
             ),
         }
+    for fname, teacher_hash in teacher_hashes.items():
+        try:
+            student_path = hf_hub_download(
+                repo_id=model_repo, filename=fname, revision=revision,
+            )
+        except Exception as exc:
+            if _is_transient_error(exc):
+                return {
+                    "match": True,
+                    "transient": True,
+                    "reason": f"transient fetching student {fname}: {exc}",
+                }
+            return {
+                "match": False,
+                "reason": (
+                    f"Missing required tokenizer artifact "
+                    f"'{fname}' on student — teacher ships it, student doesn't."
+                ),
+            }
+        with open(student_path, "rb") as f:
+            student_hash = hashlib.sha256(f.read()).hexdigest()
+        if student_hash != teacher_hash:
+            return {
+                "match": False,
+                "reason": (
+                    f"{fname} mismatch: student hash {student_hash[:16]}... "
+                    f"!= teacher hash {teacher_hash[:16]}... "
+                    f"(tokenizer differs from {TEACHER_MODEL})"
+                ),
+            }
 
     # Check tokenizer_config.json (excluding chat_template)
-    teacher_cfg_path = hf_hub_download(
-        repo_id=TEACHER_MODEL, filename="tokenizer_config.json"
-    )
-    student_cfg_path = hf_hub_download(
-        repo_id=model_repo, filename="tokenizer_config.json", revision=revision
-    )
+    try:
+        teacher_cfg_path = hf_hub_download(
+            repo_id=TEACHER_MODEL, filename="tokenizer_config.json",
+        )
+        student_cfg_path = hf_hub_download(
+            repo_id=model_repo, filename="tokenizer_config.json", revision=revision,
+        )
+    except Exception as exc:
+        if _is_transient_error(exc):
+            return {
+                "match": True,
+                "transient": True,
+                "reason": f"transient fetching tokenizer_config.json: {exc}",
+            }
+        # If neither has a tokenizer_config, pass — some Kimi forks might omit.
+        if "404" in str(exc) or "not found" in str(exc).lower():
+            return {"match": True}
+        return {"match": False, "reason": f"tokenizer_config.json fetch failed: {exc}"}
 
     with open(teacher_cfg_path) as f:
         teacher_cfg = json.load(f)
@@ -724,7 +956,6 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     student_cfg.pop("chat_template", None)
 
     if teacher_cfg != student_cfg:
-        # Find the differing keys for a clear error message
         diff_keys = []
         all_keys = set(teacher_cfg.keys()) | set(student_cfg.keys())
         for k in sorted(all_keys):
@@ -744,23 +975,44 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
 def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     """
     Verify that a model's tokenizer produces identical token IDs as the teacher.
-    
-    Downloads the student tokenizer and encodes fixed test strings.
-    If any encoding differs, the tokenizer is incompatible.
+
+    When the teacher ships ``tokenizer.json`` (Qwen-family), we load both via
+    the ``tokenizers`` library and compare encoding IDs on a fixed test set.
+    When the teacher uses a tiktoken-style tokenizer (Kimi K2.6 ships
+    ``tiktoken.model`` + ``tokenization_kimi.py``) there is no standard
+    ``tokenizer.json`` to load — instead we rely on the byte-match check in
+    ``verify_tokenizer_files`` (which has already been called upstream) to
+    guarantee identical behaviour and short-circuit here with ``match: True``.
+
+    Explicit bypass via ``SKIP_TOKENIZER_ENCODING_CHECK=1`` for emergency
+    operators (not recommended).
     """
-    from transformers import AutoTokenizer
+    if os.environ.get("SKIP_TOKENIZER_ENCODING_CHECK") == "1":
+        return {"match": True}
 
     from tokenizers import Tokenizer as RawTokenizer
     from huggingface_hub import hf_hub_download as _hf_dl
 
-    # Load tokenizer.json directly via the `tokenizers` library.
-    # This bypasses AutoTokenizer class resolution issues (e.g., TokenizersBackend)
-    # while still verifying identical encoding behavior.
-    teacher_path = _hf_dl(TEACHER_MODEL, "tokenizer.json")
-    teacher_tok = RawTokenizer.from_file(teacher_path)
+    try:
+        from huggingface_hub import list_repo_files as _list
+        teacher_files = set(_list(TEACHER_MODEL))
+    except Exception:
+        teacher_files = set()
 
-    student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
-    student_tok = RawTokenizer.from_file(student_path)
+    if "tokenizer.json" not in teacher_files:
+        # tiktoken / sentencepiece path — the byte-match verification
+        # upstream already proved student == teacher on the artifact file(s).
+        return {"match": True}
+
+    try:
+        teacher_path = _hf_dl(TEACHER_MODEL, "tokenizer.json")
+        teacher_tok = RawTokenizer.from_file(teacher_path)
+        student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
+        student_tok = RawTokenizer.from_file(student_path)
+    except Exception as exc:
+        if _is_transient_error(exc):
+            return {"match": True, "transient": True, "reason": str(exc)}
+        return {"match": False, "reason": f"tokenizer.json load failed: {exc}"}
 
     for test_str in TOKENIZER_TEST_STRINGS:
         teacher_ids = teacher_tok.encode(test_str).ids
@@ -805,12 +1057,30 @@ def check_model_architecture(
                 if fname.endswith('.py') and fname != '__init__.py':
                     dangerous_files.append(fname)
             if dangerous_files:
-                return {
-                    "pass": False,
-                    "reason": f"SECURITY: Repo contains custom code files ({', '.join(dangerous_files)}). "
-                              f"Custom code is not allowed — students must use standard architectures only.",
-                    "params_b": 0,
-                }
+                # 2026-05-02 (Kimi K2.6 cutover): some teachers (Kimi K2.6)
+                # ship a custom tokenizer / processor / config as .py files
+                # which legitimate students need to copy verbatim to load
+                # the tokenizer. Allow .py files whose SHA256 is
+                # byte-identical to the teacher's copy — these carry no
+                # custom executable code beyond what the teacher itself
+                # ships (and hence is already trusted in this subnet's
+                # context). Any .py that DIFFERS from the teacher or
+                # isn't in the teacher's repo gets fail-closed.
+                surviving = _filter_teacher_identical_py_files(
+                    model_repo, revision, dangerous_files,
+                )
+                if surviving:
+                    return {
+                        "pass": False,
+                        "reason": (
+                            f"SECURITY: Repo contains custom code files ("
+                            f"{', '.join(surviving)}). Only .py files that are "
+                            f"byte-identical to {TEACHER_MODEL}'s own .py files "
+                            f"are allowed; anything else is custom code and is "
+                            f"not permitted."
+                        ),
+                        "params_b": 0,
+                    }
         except Exception as e:
             logger.warning(f"Could not check repo files for {model_repo}: {e}")
 
@@ -997,10 +1267,14 @@ def check_model_architecture(
                     "vocab_size": vocab_size,
                 }
 
-        # 8. Verify chat_template matches the official Qwen template
-        # Prevents exploits via modified chat templates and blocks derivative models
-        # that copy templates from other miners (e.g., slowsnake copying caseus's watermarked template)
-        REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        # 8. Verify chat_template matches the teacher's template exactly.
+        # Prevents exploits via modified chat templates and blocks derivative
+        # models that copy watermarked templates from other miners. Reference
+        # hash is computed dynamically from the current teacher so a
+        # teacher-swap doesn't require a code change here; students that
+        # shipped the old teacher's template will arch-DQ on the cutover
+        # (which is the intended behaviour).
+        REFERENCE_TEMPLATE_HASH = _teacher_chat_template_hash()
         try:
             import hashlib
             tok_config_path = hf_hub_download(
@@ -1031,14 +1305,15 @@ def check_model_architecture(
                 template_hash = hashlib.sha256(cleaned.encode()).hexdigest()
 
                 if template_hash != REFERENCE_TEMPLATE_HASH:
-                    # Also check the raw template (without stripping comments)
                     raw_hash = hashlib.sha256(student_template.encode()).hexdigest()
                     if raw_hash != REFERENCE_TEMPLATE_HASH:
                         return {
                             "pass": False,
-                            "reason": f"Chat template modified from reference Qwen template. "
-                                      f"Students must use the original Qwen3.5 chat template unmodified. "
-                                      f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)",
+                            "reason": (
+                                f"Chat template does not match the teacher's canonical template. "
+                                f"Students must use the {TEACHER_MODEL} chat template unmodified. "
+                                f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)"
+                            ),
                             "params_b": total_params_b,
                             "vocab_size": vocab_size,
                         }
@@ -1058,18 +1333,24 @@ def check_model_architecture(
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
 
-        # Enforce vLLM-native architecture
+        # Enforce an architecture from the subnet-config allowlist.
         if not vllm_compatible:
+            allowed_pairs = ", ".join(
+                f"{e.get('model_type','?')}/{e.get('architecture','?')}"
+                for e in STUDENT_ARCH_ALLOWLIST
+                if isinstance(e, dict)
+            ) or "(empty — subnet-config missing studentArchAllowlist)"
             return {
                 "pass": False,
                 "reason": (
-                    f"Model must use Qwen3_5ForConditionalGeneration architecture "
-                    f"(model_type=qwen3_5) to be vLLM-compatible. "
+                    f"Model architecture is not in the subnet allowlist. "
                     f"Found: {','.join(config.get('architectures', []))} "
                     f"(model_type={config.get('model_type', 'unknown')}). "
-                    f"Fix: edit config.json on HuggingFace — change architectures to "
-                    f"[\"Qwen3_5ForConditionalGeneration\"] and model_type to \"qwen3_5\". "
-                    f"No weight changes needed."
+                    f"Allowed pairs (model_type/architecture): {allowed_pairs}. "
+                    f"Fix: edit config.json on HuggingFace to use one of the "
+                    f"allowed architectures (typically {TEACHER_MODEL}'s "
+                    f"text-inner DeepseekV3ForCausalLM). No weight changes "
+                    f"needed for a config-only fix."
                 ),
                 "params_b": total_params_b,
                 "vllm_compatible": False,

@@ -10,10 +10,12 @@ from eval.model_checker import (
     check_model_architecture,
     compute_content_hash,
     compute_model_hash,
+    is_allowed_student_arch,
     register_content_hash,
     register_model_hash,
     verify_model_integrity,
 )
+from eval.runtime import STUDENT_ARCH_ALLOWLIST
 from eval.scoring import (
     disqualify,
     get_dq_reason,
@@ -465,12 +467,24 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     cfg = _json.load(handle)
                 archs = cfg.get("architectures", [])
                 mtype = cfg.get("model_type", "")
-                if mtype != "qwen3_5" or "Qwen3_5ForConditionalGeneration" not in archs:
-                    logger.info(f"UID {uid} ({model_repo}): FAIL — wrong architecture ({mtype}/{','.join(archs)})")
+                allowed, label = is_allowed_student_arch(mtype, archs)
+                if not allowed:
+                    allowed_pairs = ", ".join(
+                        f"{e.get('model_type','?')}/{e.get('architecture','?')}"
+                        for e in STUDENT_ARCH_ALLOWLIST if isinstance(e, dict)
+                    ) or "(empty)"
+                    logger.info(
+                        f"UID {uid} ({model_repo}): FAIL — arch not in allowlist "
+                        f"({mtype}/{','.join(archs)}); allowed: {allowed_pairs}"
+                    )
                     record_failure(uid, state.failures, state.failure_models, f"{model_repo}@{revision}")
                     disqualify(
                         hotkey,
-                        f"arch: Must use Qwen3_5ForConditionalGeneration (found {','.join(archs)}, model_type={mtype}). Fix: edit config.json on HuggingFace.",
+                        (
+                            f"arch: Not in allowlist (found {','.join(archs)}, "
+                            f"model_type={mtype}; allowed pairs: {allowed_pairs}). "
+                            f"Fix: edit config.json on HuggingFace."
+                        ),
                         state.dq_reasons,
                         commit_block=this_commit_block,
                     )

@@ -37,7 +37,11 @@ CLIMBMIX_TEXT_FIELD = "text"
 DEFAULT_MIN_CHARS = 200
 DEFAULT_MAX_CHARS = 4000
 
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+try:
+    from eval.runtime import TEACHER_MODEL as _RUNTIME_TEACHER
+    TEACHER_MODEL = _RUNTIME_TEACHER
+except Exception:
+    TEACHER_MODEL = "moonshotai/Kimi-K2.6"  # fallback if runtime import fails
 
 
 class Colors:

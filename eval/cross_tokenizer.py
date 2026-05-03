@@ -1,35 +1,24 @@
-"""Cross-tokenizer round-trip helper for the Stage-2 Kimi K2.6 teacher swap.
+"""Cross-tokenizer round-trip helper.
 
-Path A from the [Kimi K2.6 runbook](../reports/2026-04-29-kimi-k2.6-stage2-runbook.md):
-re-tokenize Kimi K2.6 generations through the Qwen tokenizer so the
-existing student-side eval pipeline (KL, RKL, top-K overlap, IS-KL,
-EOPD, on-policy RKL, capability) operates entirely in the Qwen 248,320
-vocab. Lossy where token alignment is imperfect (different BPE
-schemes); telemetry surfaces a per-prompt drift score so we can
-quantify the loss.
+Originally authored for the Stage-2 Kimi K2.6 teacher swap (teacher emits
+Kimi tokens; student evals ran in the Qwen 248,320 vocab, so a Path-A
+round-trip through the Qwen tokenizer was required). After the 2026-05-02
+hard cutover, teacher AND student both use the Kimi tokenizer (vocab
+163,840), so the tokenizer spaces coincide and the round-trip is a no-op.
+``path_a_required()`` returns False in that case and callers should skip
+the re-tokenization step entirely — it's both wasted work and introduces
+unnecessary drift on the hotter top-K axis.
 
-This module does NOT do cross-tokenizer logit distillation (Path B,
-Universal Logit Distillation / ALM, NeurIPS 2025). Path B is
-implemented in a separate ``eval/cross_tokenizer_alm.py`` shipped
-when the Stage-2 experiment passes Path A but fails capacity-gap
-gates.
+Path A (this module) is still shipped for two reasons:
 
-Usage flow during the experiment:
+  1. Rollback path if the cutover reverts and we return to a
+     heterogeneous-tokenizer setup.
+  2. Future teachers that don't share the student tokenizer can still
+     use this as a scaffold.
 
-  1. Kimi K2.6 vLLM server returns its native-tokenizer continuations
-     for each prompt (via ``--max-logprobs 128``).
-  2. ``decode_with_kimi_tokenizer`` converts Kimi token IDs → text.
-  3. ``retokenize_to_qwen`` converts text → Qwen token IDs.
-  4. ``align_logprobs_qwen_to_kimi`` maps Kimi's top-128 logprobs onto
-     the closest Qwen-vocab tokens, with a drift score per position
-     for telemetry.
-  5. Returned record has the same shape as a Qwen-teacher cache, so
-     downstream eval code is unchanged.
-
-Engineering status: scaffolding (this module). Real Kimi tokenizer
-integration lands when we provision a multi-GPU pod and pull the K2.6
-weights. Until then this module's smoke tests verify the round-trip
-shape with a Qwen-tokenizer mock.
+Path B (Universal Logit Distillation / ALM, NeurIPS 2025) lives in
+``eval/cross_tokenizer_alm.py`` and is only needed when Path A's
+mean drift exceeds the 0.10 Tier-1 gate.
 """
 from __future__ import annotations
 
@@ -37,6 +26,42 @@ import logging
 from typing import Any
 
 logger = logging.getLogger("distillation.cross_tokenizer")
+
+
+def path_a_required(teacher_architecture: str | None = None,
+                    student_architecture: str | None = None) -> bool:
+    """Decide whether the caller needs to run Path A round-trip at all.
+
+    Returns ``False`` when the teacher and student share the same
+    tokenizer (no re-tokenization needed). Default behaviour consults
+    ``eval.runtime.TEACHER_ARCHITECTURE`` when both arguments are left
+    unset and compares to the student's ``model_type``.
+
+    The comparison is deliberately architecture-family based (model_type
+    prefix) rather than exact equality, so that Kimi K2.6 wrapper
+    (``kimi_k25``) and text-inner (``kimi_k2``) both share tokenizer
+    space with the student (they do — both are the Kimi BPE).
+    """
+    if teacher_architecture is None:
+        try:
+            from eval.runtime import TEACHER_ARCHITECTURE as _t
+            teacher_architecture = _t
+        except Exception:
+            teacher_architecture = ""
+    ta = (teacher_architecture or "").lower()
+    sa = (student_architecture or "").lower()
+    # Kimi-family (K2 / K25 / DeepSeek-V3 inner) all share the Kimi BPE.
+    kimi_family = {"kimi_k2", "kimi_k25", "deepseek_v3"}
+
+    def _family(arch: str) -> str:
+        if arch in kimi_family or arch.startswith("kimi_") or arch.startswith("deepseek_v3"):
+            return "kimi"
+        if arch.startswith("qwen3"):
+            return "qwen"
+        return arch or "unknown"
+    t_fam = _family(ta)
+    s_fam = _family(sa) if sa else t_fam
+    return t_fam != s_fam
 
 
 def decode_with_kimi_tokenizer(token_ids: list[int], kimi_tokenizer) -> str:
