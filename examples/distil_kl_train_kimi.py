@@ -44,6 +44,7 @@ import re
 import time
 import math
 import statistics
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +69,31 @@ def _patch_transformers_hub_remote_imports() -> None:
 
 
 _patch_transformers_hub_remote_imports()
+
+
+def _normalize_deepseek_hub_rope_config(config) -> None:
+    """
+    Transformers v5 normalizes RoPE into ``rope_parameters`` (often ``{}`` or ``rope_type`` only).
+    Moonlight / Hub ``modeling_deepseek`` still uses ``config.rope_scaling['type']`` and treats any
+    non-``None`` dict as an active scaling spec.
+    """
+    if config is None or getattr(config, "model_type", None) != "deepseek_v3":
+        return
+    rp = getattr(config, "rope_parameters", None)
+    if rp is None:
+        return
+    if not isinstance(rp, dict):
+        return
+    if not rp:
+        config.rope_parameters = None
+        return
+    rope_type = rp.get("rope_type") or rp.get("type")
+    if rope_type in (None, "default"):
+        config.rope_parameters = None
+        return
+    if "type" not in rp and "rope_type" in rp:
+        rp["type"] = rp["rope_type"]
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,9 +191,21 @@ def _instantiate_causal_lm(
     freeze_all: bool,
 ) -> torch.nn.Module:
     """Load HF causal LM once (online train / sequential swap). Caller owns lifetime."""
-    from transformers import AutoModelForCausalLM
+    from transformers import AutoConfig, AutoModelForCausalLM
 
-    lm = AutoModelForCausalLM.from_pretrained(model_ref, **load_kwargs)
+    kw = dict(load_kwargs)
+    if kw.get("trust_remote_code"):
+        cfg = kw.get("config")
+        if cfg is None:
+            cfg_kw: dict = {"trust_remote_code": True}
+            rev = kw.get("revision")
+            if rev is not None:
+                cfg_kw["revision"] = rev
+            cfg = AutoConfig.from_pretrained(model_ref, **cfg_kw)
+        _normalize_deepseek_hub_rope_config(cfg)
+        kw["config"] = cfg
+
+    lm = AutoModelForCausalLM.from_pretrained(model_ref, **kw)
     if freeze_all:
         lm.eval()
         for p in lm.parameters():
@@ -848,14 +886,33 @@ def _prepare_eval_cache(
     return cache
 
 
+class EvalDataNotAvailable(RuntimeError):
+    """Public ``/api/eval-data`` returned HTTP 404 (validator has not published a bundle yet)."""
+
+
 def _fetch_eval_data_bundle(eval_data_url: str) -> dict:
     req = urllib.request.Request(
         eval_data_url,
         headers={"User-Agent": "distil_kl_train_prebuilt/1.0"},
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=120.0) as resp:
-        raw = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=120.0) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise EvalDataNotAvailable(
+                f"No eval_data JSON at {eval_data_url!r} (HTTP 404). "
+                "The validator has not published a round to public state yet, or the URL is wrong."
+            ) from e
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:400]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"eval_data request failed: HTTP {e.code} {e.reason!r} for {eval_data_url!r}. {detail}"
+        ) from e
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object from {eval_data_url}")
@@ -1839,8 +1896,9 @@ def train_online(args):
     }
     if student_max_memory is not None:
         student_load_kwargs["max_memory"] = student_max_memory
-    student = AutoModelForCausalLM.from_pretrained(student_source, **student_load_kwargs)
-    student.train()
+    student = _instantiate_causal_lm(
+        student_source, student_load_kwargs, train=True, freeze_all=False
+    )
     student_in_dev = _first_param_device(student)
     log.info(
         f"  Student: {sum(p.numel() for p in student.parameters()):,} params, "
@@ -1934,8 +1992,26 @@ def train_online(args):
                 cache_meta.get("eval_seed"),
             )
         else:
-            if args.eval_use_api_prompts:
-                bundle = _fetch_eval_data_bundle(args.eval_data_url)
+            eval_prompts_from_api = bool(args.eval_use_api_prompts)
+            bundle: dict | None = None
+            if eval_prompts_from_api:
+                try:
+                    bundle = _fetch_eval_data_bundle(args.eval_data_url)
+                except EvalDataNotAvailable:
+                    hint = ""
+                    if cache_path is not None:
+                        hint = (
+                            f" Put a valid cache at {cache_path.resolve()} or wait until {args.eval_data_url!r} "
+                            "returns JSON, then rebuild."
+                        )
+                    log.warning(
+                        "eval_data API has no bundle yet (HTTP 404). Falling back to local dataset prompts "
+                        "(--eval_use_dataset_prompts behavior).%s",
+                        hint,
+                    )
+                    eval_prompts_from_api = False
+
+            if eval_prompts_from_api and bundle is not None:
                 eval_prompts = _extract_eval_prompts_from_bundle(bundle, args.eval_prompts)
                 eval_tokens = int(bundle.get("max_new_tokens") or args.eval_max_new_tokens)
                 eval_seed = int(bundle.get("block_seed") or args.eval_seed)
@@ -2022,11 +2098,11 @@ def train_online(args):
                         getattr(args, "assume_same_tokenizer_as_teacher", False)
                     ),
                     "cross_tokenizer_kd": cross_tc,
-                    "prompt_source_mode": "api" if args.eval_use_api_prompts else "dataset",
-                    "eval_data_url": args.eval_data_url if args.eval_use_api_prompts else None,
-                    "eval_dataset": None if args.eval_use_api_prompts else args.eval_dataset,
-                    "eval_block_number": None if args.eval_use_api_prompts else args.eval_block_number,
-                    "eval_block_hash": None if args.eval_use_api_prompts else (args.eval_block_hash or None),
+                    "prompt_source_mode": "api" if eval_prompts_from_api else "dataset",
+                    "eval_data_url": args.eval_data_url if eval_prompts_from_api else None,
+                    "eval_dataset": None if eval_prompts_from_api else args.eval_dataset,
+                    "eval_block_number": None if eval_prompts_from_api else args.eval_block_number,
+                    "eval_block_hash": None if eval_prompts_from_api else (args.eval_block_hash or None),
                     "eval_prompts": len(eval_prompts),
                     "max_new_tokens": eval_tokens,
                     "eval_seed": eval_seed,
