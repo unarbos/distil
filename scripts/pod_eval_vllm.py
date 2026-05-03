@@ -197,6 +197,70 @@ def ensure_disk_space(teacher_name, threshold=85):
 # §4  Model Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _inject_kimi_pyfiles_from_teacher(student_name, student_revision=None):
+    """Copy teacher's modelling .py files into the student's snapshot dir.
+
+    Used when a student declares a Kimi-family auto_map (configuration_deepseek
+    / configuration_kimi_k25 / modeling_*) in config.json but didn't ship the
+    referenced .py files. Without this fix, AutoConfig.from_pretrained with
+    trust_remote_code=True dies with "does not appear to have a file named X".
+
+    Safe-by-construction: we only copy files that already exist in the teacher's
+    own HF cache snapshot, which is the same code we trust on the teacher path.
+    Student's own .py files (if present) are never overwritten.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+        teacher_repo = TEACHER_NAME or "moonshotai/Kimi-K2.6"
+        # Locate teacher snapshot dir from cache
+        cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+        teacher_cache = cache_root / f"models--{teacher_repo.replace('/', '--')}" / "snapshots"
+        if not teacher_cache.exists():
+            return
+        teacher_snap = max(teacher_cache.glob("*"), key=lambda p: p.stat().st_mtime, default=None)
+        if teacher_snap is None or not teacher_snap.is_dir():
+            return
+        # Locate student snapshot dir; ensure it's downloaded first
+        student_cache_root = cache_root / f"models--{student_name.replace('/', '--')}" / "snapshots"
+        if not student_cache_root.exists():
+            try:
+                snapshot_download(
+                    student_name,
+                    revision=student_revision,
+                    allow_patterns=["config.json", "*.py", "tokenizer*", "*.json"],
+                )
+            except Exception:
+                pass
+        # If still missing, give up
+        if not student_cache_root.exists():
+            return
+        snaps = [p for p in student_cache_root.glob("*") if p.is_dir()]
+        if not snaps:
+            return
+        student_snap = max(snaps, key=lambda p: p.stat().st_mtime)
+        copied = []
+        # Walk teacher snapshot for .py files; copy any missing from student.
+        for py_file in teacher_snap.glob("*.py"):
+            target = student_snap / py_file.name
+            if target.exists():
+                continue
+            try:
+                # Resolve symlink to real blob
+                real_src = py_file.resolve()
+                shutil.copy2(real_src, target)
+                copied.append(py_file.name)
+            except Exception as _e:
+                continue
+        if copied:
+            print(f"  [pyfiles] {student_name}: injected {len(copied)} .py from teacher: {copied[:3]}{'...' if len(copied) > 3 else ''}", flush=True)
+    except Exception as _e:
+        # Never let this helper block loading.
+        try:
+            print(f"  [pyfiles] {student_name}: inject failed (non-fatal): {_e}", flush=True)
+        except Exception:
+            pass
+
+
 def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
     """Load a HuggingFace model for inference.
 
@@ -333,12 +397,52 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
         try:
             if is_kimi_family:
                 from transformers import AutoConfig
-                _cfg_kwargs = {"trust_remote_code": True}
+                # 2026-05-03 (Kimi K2.6 student loader fix): trust_remote_code
+                # only when the arch is the multimodal Kimi K2.5 wrapper,
+                # which transformers can't construct natively. Most miner
+                # students declare model_type=deepseek_v3 / arch
+                # DeepseekV3ForCausalLM, which IS upstream in transformers
+                # 5.7. Forcing TRC=True for those students follows the
+                # config's auto_map → tries to import their (missing)
+                # configuration_deepseek.py and dies with
+                # "does not appear to have a file named configuration_deepseek.py".
+                # For text-only DeepSeek-V3 students we mirror trust_rc
+                # (False unless they actually need remote code) so transformers
+                # uses the built-in DeepseekV3Config / DeepseekV3ForCausalLM.
+                _cfg_kwargs = {"trust_remote_code": trust_rc}
                 if "revision" in kwargs:
                     _cfg_kwargs["revision"] = kwargs["revision"]
-                config = AutoConfig.from_pretrained(
-                    name, attn_implementation="eager", **_cfg_kwargs
-                )
+                try:
+                    config = AutoConfig.from_pretrained(
+                        name, attn_implementation="eager", **_cfg_kwargs
+                    )
+                except Exception as _cfg_err:
+                    # Fallback: if the no-TRC path fails (e.g. exotic
+                    # model_type that transformers doesn't recognise but
+                    # the arch precheck approved), retry with TRC=True
+                    # AFTER injecting any missing .py modules from the
+                    # teacher cache. This covers students who declare a
+                    # Kimi-family auto_map but didn't ship the matching
+                    # modeling/config files.
+                    _err_str = str(_cfg_err)
+                    if (
+                        ("does not appear to have a file named" in _err_str
+                         or "is not a valid Python identifier" in _err_str
+                         or "Could not import" in _err_str)
+                        and not trust_rc
+                    ):
+                        _inject_kimi_pyfiles_from_teacher(name, kwargs.get("revision"))
+                        _cfg_kwargs_retry = {"trust_remote_code": True}
+                        if "revision" in kwargs:
+                            _cfg_kwargs_retry["revision"] = kwargs["revision"]
+                        config = AutoConfig.from_pretrained(
+                            name, attn_implementation="eager", **_cfg_kwargs_retry
+                        )
+                        kwargs = dict(kwargs)
+                        kwargs["trust_remote_code"] = True
+                        print(f"  [model] {name}: injected teacher .py files (no-TRC config load failed: {_err_str[:80]})", flush=True)
+                    else:
+                        raise
                 # Propagate eager to all nested sub-configs so
                 # MoonViT3dPretrainedModel.__init__ doesn't dispatch FA2.
                 def _force_eager(cfg):
