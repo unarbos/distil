@@ -213,6 +213,218 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+def _env_flag_true(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_CT_UNPACK_PATCHED_SENTINEL = "_distil_kl_unpack_via_cpu_installed"
+_CT_PACK_DECOMP_CPU_SENTINEL = "_distil_kl_packed_decompress_cpu_staging"
+_CT_MODEL_DECOMP_GC_SENTINEL = "_distil_kl_model_decompress_gc"
+
+
+def _quant_method_slug_from_config_quantization(cfg_q) -> str | None:
+    if cfg_q is None:
+        return None
+    m = getattr(cfg_q, "quant_method", None)
+    if m is None and isinstance(cfg_q, dict):
+        m = cfg_q.get("quant_method")
+    if m is None:
+        return None
+    return str(getattr(m, "value", m)).strip().lower()
+
+
+def _config_uses_hf_compressed_tensors(cfg) -> bool:
+    return _quant_method_slug_from_config_quantization(getattr(cfg, "quantization_config", None)) == (
+        "compressed-tensors"
+    )
+
+
+def _ensure_compressed_tensors_unpack_on_cpu_when_cuda_packed() -> None:
+    """Avoid GPU peaks during HF ``compressed_tensors`` int32 unpacking on nearly full GPUs.
+
+    ``infer_auto_device_map`` sizes quantized checkpoints by packed footprints; unpacking allocates
+    int32 workspaces on CUDA that can overlap existing dense-parameter pressure and spill OOM even
+    when under ``max_memory`` caps. Optionally route unpack work through CPU RAM (typically cheap
+    versus total bf16 model memory); disable via ``DISTIL_CT_UNPACK_ON_CPU=0``.
+    """
+    if not _env_flag_true("DISTIL_CT_UNPACK_ON_CPU", default=True):
+        return
+    import compressed_tensors.compressors.pack_quantized.helpers as _ct_hp
+
+    if getattr(_ct_hp, _CT_UNPACK_PATCHED_SENTINEL, False):
+        return
+
+    _orig_unpack = _ct_hp.unpack_from_int32
+
+    def _unpack_via_cpu_then_device(
+        value: torch.Tensor,
+        num_bits: int,
+        shape,
+        packed_dim=1,
+    ) -> torch.Tensor:
+        if value.device.type != "cuda":
+            return _orig_unpack(value, num_bits, shape, packed_dim)
+        unpacked_cpu = _orig_unpack(value.detach().cpu(), num_bits, shape, packed_dim)
+        return unpacked_cpu.to(value.device, non_blocking=False)
+
+    _ct_hp.unpack_from_int32 = _unpack_via_cpu_then_device  # type: ignore[assignment]
+    # ``pack_quantized.base`` binds ``unpack_from_int32`` at import time; patching only ``helpers``
+    # leaves ``PackedQuantizationCompressor.decompress`` calling the stale CUDA implementation.
+    import compressed_tensors.compressors.pack_quantized.base as _ct_base
+
+    _ct_base.unpack_from_int32 = _unpack_via_cpu_then_device  # type: ignore[assignment]
+    setattr(_ct_hp, _CT_UNPACK_PATCHED_SENTINEL, True)
+    log.info(
+        "Compressed-tensors CUDA unpack patched: int32 unpacking runs on CPU then copies back "
+        "(helpers + pack_quantized.base; disable with DISTIL_CT_UNPACK_ON_CPU=0)."
+    )
+
+
+def _ensure_packed_quant_decompress_cpu_staging_for_cuda_modules() -> None:
+    """Run pack-quant ``decompress`` math on CPU when ``weight_packed`` lives on CUDA.
+
+    Int8 unpack alone is insufficient: ``dequantize`` allocates the full fp/bf weight on the
+    same device as ``x_q``; with GPUs already full of shard parameters, that allocation OOMs.
+    Staging keeps packed→int8→float on CPU and copies only the final ``weight`` tensor to CUDA.
+    Disable with ``DISTIL_CT_DEQUANT_ON_CPU=0``.
+    """
+    if not _env_flag_true("DISTIL_CT_DEQUANT_ON_CPU", default=True):
+        return
+    import compressed_tensors.compressors.pack_quantized.base as _ct_pb
+    from compressed_tensors.compressors.pack_quantized.base import PACK_ZP_STRATS
+    from compressed_tensors.quantization.lifecycle.forward import dequantize
+
+    cls = _ct_pb.PackedQuantizationCompressor
+    if getattr(cls, _CT_PACK_DECOMP_CPU_SENTINEL, False):
+        return
+
+    _orig_decompress = cls.decompress.__func__
+
+    @classmethod
+    def _decompress_cpu_staged(cls, state_dict, scheme):
+        sd = state_dict.copy()
+        if "weight_packed" not in sd:
+            return _orig_decompress(cls, state_dict, scheme)
+        packed_probe = sd["weight_packed"]
+        if packed_probe.device.type != "cuda":
+            return _orig_decompress(cls, state_dict, scheme)
+
+        target_dev = packed_probe.device
+        packed = sd.pop("weight_packed")
+        scale = sd.get("weight_scale")
+        zero_point = sd.get("weight_zero_point", None)
+        g_idx = sd.get("weight_g_idx", None)
+        _osh = sd.get("weight_shape")
+        if isinstance(_osh, torch.Tensor):
+            original_shape = torch.Size(int(x) for x in _osh.detach().cpu().reshape(-1).tolist())
+        else:
+            original_shape = torch.Size(_osh) if _osh is not None else torch.Size([])
+        weights = scheme.weights
+
+        packed_cpu = packed.cpu()
+        scale_cpu = scale.cpu() if scale is not None else None
+        g_idx_cpu = g_idx.cpu() if g_idx is not None else None
+        zp_unpacked_cpu = None
+        if not weights.symmetric and weights.strategy in PACK_ZP_STRATS:
+            assert zero_point is not None, "Asymmetric quant requires zero-point values"
+            assert scale_cpu is not None
+            zp_cpu = zero_point.cpu()
+            original_zp_shape = torch.Size(
+                (*tuple(original_shape[:-1]), int(scale_cpu.shape[-1]))
+            )
+            zp_unpacked_cpu = _ct_pb.unpack_from_int32(
+                zp_cpu, weights.num_bits, original_zp_shape, packed_dim=0
+            )
+            sd["weight_zero_point"] = zp_unpacked_cpu.to(target_dev, non_blocking=False)
+
+        unpacked_cpu = _ct_pb.unpack_from_int32(
+            packed_cpu, weights.num_bits, original_shape, packed_dim=1
+        )
+        w_cpu = dequantize(
+            x_q=unpacked_cpu,
+            scale=scale_cpu,
+            zero_point=zp_unpacked_cpu,
+            g_idx=g_idx_cpu,
+        )
+        sd["weight"] = w_cpu.to(target_dev, dtype=w_cpu.dtype, non_blocking=False)
+        return sd
+
+    cls.decompress = _decompress_cpu_staged  # type: ignore[assignment]
+    setattr(cls, _CT_PACK_DECOMP_CPU_SENTINEL, True)
+    log.info(
+        "Packed-quant decompress: bf16 staging on CPU for CUDA shards "
+        "(disable with DISTIL_CT_DEQUANT_ON_CPU=0)."
+    )
+
+
+def _ensure_model_compressor_decompress_periodic_cuda_empty_cache() -> None:
+    """Flush CUDA allocator periodically during bulk decompress (fragmentation relief)."""
+    every = int(os.environ.get("DISTIL_CT_DECOMPRESS_EMPTY_CACHE_EVERY", "128"))
+    if every <= 0:
+        return
+    from tqdm import tqdm
+
+    from compressed_tensors.compressors.base import decompress_module
+    from compressed_tensors.compressors.model_compressors.model_compressor import ModelCompressor
+    from compressed_tensors.quantization.utils.helpers import is_module_quantized
+
+    if getattr(ModelCompressor, _CT_MODEL_DECOMP_GC_SENTINEL, False):
+        return
+
+    _orig_dm = ModelCompressor.decompress_model
+
+    def _decompress_model_flush(self, model: torch.nn.Module) -> None:
+        modules = model.named_modules(remove_duplicate=True)
+        for i, (_, module) in enumerate(tqdm(list(modules), desc="Decompressing model")):
+            if is_module_quantized(module):
+                decompress_module(module, self.force_compression_format)
+            if i > 0 and i % every == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if self.quantization_config is not None:
+            from compressed_tensors.quantization import QuantizationStatus
+
+            self.quantization_config.quantization_status = QuantizationStatus.DECOMPRESSED
+        self.remove_decompression_hook(model)
+
+    ModelCompressor.decompress_model = _decompress_model_flush  # type: ignore[assignment]
+    setattr(ModelCompressor, _CT_MODEL_DECOMP_GC_SENTINEL, True)
+    log.info(
+        "ModelCompressor.decompress_model: CUDA empty_cache every %s modules "
+        "(0=off via DISTIL_CT_DECOMPRESS_EMPTY_CACHE_EVERY).",
+        every,
+    )
+
+
+def _maybe_apply_hf_compressed_tensors_load_mitigations(model_ref: str, cfg, kw: dict) -> None:
+    """Merge Hub quantization with safer ``run_compressed=False`` defaults for distillation forwards."""
+    del model_ref  # reserved for diagnostics
+    if not _config_uses_hf_compressed_tensors(cfg):
+        return
+    _ensure_compressed_tensors_unpack_on_cpu_when_cuda_packed()
+    _ensure_packed_quant_decompress_cpu_staging_for_cuda_modules()
+    _ensure_model_compressor_decompress_periodic_cuda_empty_cache()
+    if kw.get("quantization_config") is not None:
+        return
+    if _env_flag_true("DISTIL_CT_RUN_COMPRESSED", default=False):
+        log.info(
+            "DISTIL_CT_RUN_COMPRESSED=1: keeping Hub default compressed execution (lazy GPU decompress)."
+        )
+        return
+    from transformers.utils.quantization_config import CompressedTensorsConfig
+
+    kw["quantization_config"] = CompressedTensorsConfig(run_compressed=False)
+    log.info(
+        "compressed-tensors teacher: quantization_config(run_compressed=False) merged into Hub config "
+        "(decompress at load vs first forward hook; override with quantization_config kwarg or "
+        "DISTIL_CT_RUN_COMPRESSED=1)."
+    )
+
+
 # Defaults: Kimi K2.6 teacher with Qwen3.6-compatible student vocab (subnet SN97 rollout).
 TEACHER_MODEL = "moonshotai/Kimi-K2.6"
 STUDENT_MODEL = "Qwen/Qwen3.6-4B"
@@ -396,7 +608,9 @@ def _scale_teacher_max_memory_decompress_headroom(
     if base_max_memory is None or len(teacher_gpus) < 2:
         return base_max_memory
     if frac is None:
-        frac = float(os.environ.get("DISTIL_TEACHER_DECOMPRESS_GPU_FRAC", "0.78"))
+        # Default was 0.78; packed Kimi weights under-report VRAM in Accelerate's planner vs bf16
+        # after ``compressed_tensors`` decompress, so we bias lower unless overridden.
+        frac = float(os.environ.get("DISTIL_TEACHER_DECOMPRESS_GPU_FRAC", "0.70"))
     frac = min(1.0, max(0.2, float(frac)))
     out = dict(base_max_memory)
     touched = False
@@ -419,6 +633,41 @@ def _scale_teacher_max_memory_decompress_headroom(
             "Teacher max_memory headroom: scaled per-GPU caps by %.0f%% (env DISTIL_TEACHER_DECOMPRESS_GPU_FRAC).",
             frac * 100,
         )
+    return out
+
+
+def _scale_max_memory_cuda_gib_caps_uniform(
+    base_max_memory: dict | None,
+    gpu_indices: list[int],
+    factor: float,
+    *,
+    log_msg: str,
+) -> dict | None:
+    """Multiply each CUDA device's ``'NNNGiB'`` cap by ``factor`` (shrink placements)."""
+    import re
+
+    if base_max_memory is None:
+        return None
+    frac = float(factor)
+    frac = min(1.0, max(0.1, frac))
+    out = dict(base_max_memory)
+    touched = False
+    for idx in gpu_indices:
+        if idx not in out:
+            continue
+        cap = out[idx]
+        if not isinstance(cap, str):
+            continue
+        m = re.match(r"^(\d+)\s*GiB$", cap.strip(), re.I)
+        if not m:
+            continue
+        old_gib = int(m.group(1))
+        new_gib = max(8, int(old_gib * frac))
+        if new_gib != old_gib:
+            touched = True
+        out[idx] = f"{new_gib}GiB"
+    if touched:
+        log.info("%s", log_msg)
     return out
 
 
@@ -465,11 +714,40 @@ def _teacher_max_memory_for_compressed_bursts(
     base_max_memory: dict | None,
     teacher_gpus: list[int],
 ) -> dict | None:
-    """Stack per-GPU headroom + primary skew for teacher loads that hit compressed-tensors decompress."""
+    """Scale ``max_memory`` so each teacher GPU keeps room for compressed-tensors decompress bursts.
+
+    We no longer apply asymmetric primary-GPU shrinking by default: capping only GPU 0 pushes overflow
+    layers onto GPU 1+, which then sit at the per-device cap with no slack and OOM during on-the-fly
+    unpack (see ``compressed_tensors`` decompress hooks). Opt back in with env
+    ``DISTIL_COMPRESSED_TEACHER_PRIMARY_SKEW=1`` (uses ``DISTIL_EVAL_TEACHER_PRIMARY_FRAC``).
+
+    Uses ``DISTIL_TEACHER_DECOMPRESS_GPU_FRAC`` plus ``DISTIL_TEACHER_PACKED_PLACEMENT_FUDGE``: Accelerate's
+    auto map sizes packed/meta params smaller than bf16 tensors after decompress, so we tighten CUDA caps twice.
+    """
     if base_max_memory is None:
         return None
     mm = _scale_teacher_max_memory_decompress_headroom(base_max_memory, teacher_gpus)
-    return _eval_teacher_relaxed_max_memory(mm, teacher_gpus)
+    # HF/Accelerate balances using parameter sizes on meta; packed checkpoints look smaller than
+    # post-decompress bf16 resident memory, so GPUs still fill and ``unpack_from_int32`` OOMs.
+    packed_fudge = float(os.environ.get("DISTIL_TEACHER_PACKED_PLACEMENT_FUDGE", "0.80"))
+    mm = _scale_max_memory_cuda_gib_caps_uniform(
+        mm,
+        teacher_gpus,
+        packed_fudge,
+        log_msg=(
+            "Teacher max_memory: extra ×%.0f%% shrink for packed-weight placement vs decompress "
+            "(env DISTIL_TEACHER_PACKED_PLACEMENT_FUDGE)."
+            % (packed_fudge * 100)
+        ),
+    )
+    skew = os.environ.get("DISTIL_COMPRESSED_TEACHER_PRIMARY_SKEW", "").strip().lower()
+    if skew in {"1", "true", "yes", "on"}:
+        log.info(
+            "Compressed-teacher primary-GPU skew enabled (DISTIL_COMPRESSED_TEACHER_PRIMARY_SKEW; "
+            "see DISTIL_EVAL_TEACHER_PRIMARY_FRAC)."
+        )
+        return _eval_teacher_relaxed_max_memory(mm, teacher_gpus)
+    return mm
 
 
 def _instantiate_causal_lm(
@@ -494,6 +772,7 @@ def _instantiate_causal_lm(
         _normalize_deepseek_hub_rope_config(cfg)
         _patch_kimi_hub_vision_attn(cfg)
         kw["config"] = cfg
+        _maybe_apply_hf_compressed_tensors_load_mitigations(model_ref, cfg, kw)
 
     lm = AutoModelForCausalLM.from_pretrained(model_ref, **kw)
     if freeze_all:
@@ -2368,28 +2647,54 @@ def train_online(args):
                     teacher_eval = _instantiate_causal_lm(
                         args.teacher, teacher_eval_kwargs, train=False, freeze_all=True
                     )
-                except Exception:
+                except Exception as exc:
+                    # Eval-cache / king-metrics teacher is optional. Training still uses sequential
+                    # teacher pulses per step once that path can load the LM.
+                    teacher_eval = None
+                    periodic_eval_ok = False
+                    log.warning(
+                        "Teacher LM load for eval/king-metrics failed (%s: %s). "
+                        "Disabling periodic king eval for this run; KL steps may still run if sequential "
+                        "teacher loads succeed.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    _clear_exc_traceback_frames()
+                    try:
+                        del exc
+                    except Exception:
+                        pass
                     if _vacuum_student_for_teacher_eval and student is None:
-                        log.warning(
-                            "Teacher load failed; restoring student on GPUs %s before re-raising.",
-                            student_gpus,
+                        _purge_cuda_model_hold(
+                            "teacher eval load failed — reclaim VRAM before student restore"
                         )
-                        student = _instantiate_causal_lm(
-                            student_source, student_load_kwargs, train=True, freeze_all=False
-                        )
-                        optimizer = AdamW(
-                            [p for p in student.parameters() if p.requires_grad],
-                            lr=args.lr,
-                            weight_decay=args.weight_decay,
-                        )
-                        if _student_reload_opt_state is not None:
-                            optimizer.load_state_dict(_student_reload_opt_state)
-                        scheduler = get_cosine_schedule_with_warmup(
-                            optimizer, int(args.warmup_steps), scheduler_total_steps
-                        )
-                        if _student_reload_sched_state is not None:
-                            scheduler.load_state_dict(_student_reload_sched_state)
-                    raise
+                        try:
+                            student = _instantiate_causal_lm(
+                                student_source,
+                                student_load_kwargs,
+                                train=True,
+                                freeze_all=False,
+                            )
+                            optimizer = AdamW(
+                                [p for p in student.parameters() if p.requires_grad],
+                                lr=args.lr,
+                                weight_decay=args.weight_decay,
+                            )
+                            if _student_reload_opt_state is not None:
+                                optimizer.load_state_dict(_student_reload_opt_state)
+                            scheduler = get_cosine_schedule_with_warmup(
+                                optimizer,
+                                int(args.warmup_steps),
+                                scheduler_total_steps,
+                            )
+                            if _student_reload_sched_state is not None:
+                                scheduler.load_state_dict(_student_reload_sched_state)
+                        except Exception as restore_exc:
+                            log.exception(
+                                "Student restore after teacher-eval failure failed; "
+                                "check GPU memory and retry."
+                            )
+                            raise restore_exc
         king_load_kwargs = {
             "revision": args.king_revision,
             "dtype": torch.bfloat16,
@@ -2411,78 +2716,87 @@ def train_online(args):
             )
 
         if not eval_cache:
-            if teacher_eval is not None:
-                teacher_eval.eval()
-            log.info("Preparing deterministic eval cache from teacher continuations...")
             cross_tc = bool(getattr(data, "dual_tokenizers", False))
-            try:
-                eval_cache = _prepare_eval_cache(
-                    teacher_eval=teacher_eval,
-                    teacher_tokenizer=teacher_hf_tok,
-                    prompts=eval_prompts,
-                    max_new_tokens=eval_tokens,
-                    seed=eval_seed,
-                    cross_tokenizer=cross_tc,
-                    student_tokenizer=tokenizer if cross_tc else None,
-                    max_student_seq=int(args.max_seq_len),
+            if teacher_eval is None:
+                eval_cache = []
+                log.info(
+                    "Skipping eval-cache generation (teacher LM not loaded). "
+                    "King comparison disabled unless you supply a valid --eval_cache_path."
                 )
-                if cache_path:
-                    meta = {
-                        "teacher": args.teacher,
-                        "student": str(args.student),
-                        "assume_same_tokenizer_as_teacher": bool(
-                            getattr(args, "assume_same_tokenizer_as_teacher", False)
-                        ),
-                        "cross_tokenizer_kd": cross_tc,
-                        "prompt_source_mode": "api" if eval_prompts_from_api else "dataset",
-                        "eval_data_url": args.eval_data_url if eval_prompts_from_api else None,
-                        "eval_dataset": None if eval_prompts_from_api else args.eval_dataset,
-                        "eval_block_number": None if eval_prompts_from_api else args.eval_block_number,
-                        "eval_block_hash": None if eval_prompts_from_api else (args.eval_block_hash or None),
-                        "eval_prompts": len(eval_prompts),
-                        "max_new_tokens": eval_tokens,
-                        "eval_seed": eval_seed,
-                        "saved_at": _utc_now_iso(),
-                    }
-                    _save_eval_cache_payload(cache_path, eval_cache, eval_prompts, meta)
-                    log.info("Saved eval cache to %s", cache_path)
-            except Exception as cache_exc:
-                if _is_cuda_oom(cache_exc):
-                    periodic_eval_ok = False
-                    eval_cache = []
-                    log.warning(
-                        "Teacher eval-cache generation CUDA-OOM (%s). Continuing training without periodic "
-                        "king eval for this run. Options: prebuilt --eval_cache_path, lower "
-                        "--eval_max_new_tokens, lower env DISTIL_TEACHER_DECOMPRESS_GPU_FRAC or "
-                        "DISTIL_EVAL_TEACHER_PRIMARY_FRAC, or build cache on beefier hardware.",
-                        cache_exc,
+            else:
+                teacher_eval.eval()
+                log.info("Preparing deterministic eval cache from teacher continuations...")
+                try:
+                    eval_cache = _prepare_eval_cache(
+                        teacher_eval=teacher_eval,
+                        teacher_tokenizer=teacher_hf_tok,
+                        prompts=eval_prompts,
+                        max_new_tokens=eval_tokens,
+                        seed=eval_seed,
+                        cross_tokenizer=cross_tc,
+                        student_tokenizer=tokenizer if cross_tc else None,
+                        max_student_seq=int(args.max_seq_len),
                     )
-                else:
-                    raise
-            finally:
-                # Ephemeral teacher copy (sequential trainer or parallel without resident teacher).
-                if teacher_eval is not None and teacher_eval is not teacher:
-                    _tee_drop = teacher_eval
-                    teacher_eval = None
-                    del _tee_drop
-                    _purge_cuda_model_hold("teacher LM (eval cache build only)")
-                if _vacuum_student_for_teacher_eval and student is None:
-                    log.info("Reloading student (%s) on GPUs %s...", student_source, student_gpus)
-                    student = _instantiate_causal_lm(
-                        student_source, student_load_kwargs, train=True, freeze_all=False
-                    )
-                    optimizer = AdamW(
-                        [p for p in student.parameters() if p.requires_grad],
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                    )
-                    if _student_reload_opt_state is not None:
-                        optimizer.load_state_dict(_student_reload_opt_state)
-                    scheduler = get_cosine_schedule_with_warmup(
-                        optimizer, int(args.warmup_steps), scheduler_total_steps
-                    )
-                    if _student_reload_sched_state is not None:
-                        scheduler.load_state_dict(_student_reload_sched_state)
+                    if cache_path:
+                        meta = {
+                            "teacher": args.teacher,
+                            "student": str(args.student),
+                            "assume_same_tokenizer_as_teacher": bool(
+                                getattr(args, "assume_same_tokenizer_as_teacher", False)
+                            ),
+                            "cross_tokenizer_kd": cross_tc,
+                            "prompt_source_mode": "api" if eval_prompts_from_api else "dataset",
+                            "eval_data_url": args.eval_data_url if eval_prompts_from_api else None,
+                            "eval_dataset": None if eval_prompts_from_api else args.eval_dataset,
+                            "eval_block_number": None if eval_prompts_from_api else args.eval_block_number,
+                            "eval_block_hash": None if eval_prompts_from_api else (args.eval_block_hash or None),
+                            "eval_prompts": len(eval_prompts),
+                            "max_new_tokens": eval_tokens,
+                            "eval_seed": eval_seed,
+                            "saved_at": _utc_now_iso(),
+                        }
+                        _save_eval_cache_payload(cache_path, eval_cache, eval_prompts, meta)
+                        log.info("Saved eval cache to %s", cache_path)
+                except Exception as cache_exc:
+                    if _is_cuda_oom(cache_exc):
+                        periodic_eval_ok = False
+                        eval_cache = []
+                        log.warning(
+                            "Teacher eval-cache generation CUDA-OOM (%s). Continuing training without periodic "
+                            "king eval for this run. Options: prebuilt --eval_cache_path, lower "
+                            "--eval_max_new_tokens, lower env DISTIL_TEACHER_DECOMPRESS_GPU_FRAC or "
+                            "DISTIL_TEACHER_PACKED_PLACEMENT_FUDGE, DISTIL_CT_UNPACK_ON_CPU, DISTIL_CT_DEQUANT_ON_CPU, "
+                            "try DISTIL_CT_RUN_COMPRESSED=1 (lazy GPU decompress, higher peak risk), "
+                            "enable DISTIL_COMPRESSED_TEACHER_PRIMARY_SKEW plus DISTIL_EVAL_TEACHER_PRIMARY_FRAC "
+                            "if asymmetric primary caps are required, or build cache on beefier hardware.",
+                            cache_exc,
+                        )
+                    else:
+                        raise
+                finally:
+                    # Ephemeral teacher copy (sequential trainer or parallel without resident teacher).
+                    if teacher_eval is not None and teacher_eval is not teacher:
+                        _tee_drop = teacher_eval
+                        teacher_eval = None
+                        del _tee_drop
+                        _purge_cuda_model_hold("teacher LM (eval cache build only)")
+                    if _vacuum_student_for_teacher_eval and student is None:
+                        log.info("Reloading student (%s) on GPUs %s...", student_source, student_gpus)
+                        student = _instantiate_causal_lm(
+                            student_source, student_load_kwargs, train=True, freeze_all=False
+                        )
+                        optimizer = AdamW(
+                            [p for p in student.parameters() if p.requires_grad],
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                        )
+                        if _student_reload_opt_state is not None:
+                            optimizer.load_state_dict(_student_reload_opt_state)
+                        scheduler = get_cosine_schedule_with_warmup(
+                            optimizer, int(args.warmup_steps), scheduler_total_steps
+                        )
+                        if _student_reload_sched_state is not None:
+                            scheduler.load_state_dict(_student_reload_sched_state)
         log.info("Prepared eval cache for %s prompts", len(eval_cache))
         if periodic_eval_ok:
             log.info(
