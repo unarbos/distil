@@ -15619,8 +15619,42 @@ def _stub_missing_preprocessor_config(model_name, revision=None):
     # one for them.
     if "vision_config" not in cfg:
         return
-    # Minimal Qwen2-VL-shape image processor config. Values aren't used
-    # at inference because mm is disabled via --limit-mm-per-prompt.
+
+    model_type = (cfg.get("model_type") or "").lower()
+
+    # Kimi K2.5/K2.6 family: vLLM's kimi_k25 model integration accesses
+    # ``image_processor.media_tokens_calculator`` at engine init. The
+    # generic Qwen2-VL stub silently produces a Qwen2VLImageProcessor
+    # which lacks that attribute and crashes the engine with
+    #   AttributeError: 'Qwen2VLImageProcessor' object has no attribute
+    #   'media_tokens_calculator'
+    # Kimi K2.6 ships its own image processor class
+    # (``KimiK25VisionProcessor`` in ``kimi_k25_vision_processing.py``)
+    # that does have that attribute. Stub a config that points
+    # transformers + trust_remote_code at THAT class instead.
+    if model_type in {"kimi_k25", "kimi_k2"}:
+        stub = {
+            "image_processor_type": "KimiK25VisionProcessor",
+            "processor_class": "KimiK25Processor",
+            "auto_map": {
+                "AutoImageProcessor": "kimi_k25_vision_processing.KimiK25VisionProcessor",
+                "AutoProcessor": "kimi_k25_processor.KimiK25Processor",
+            },
+        }
+        try:
+            pp_path.write_text(_json.dumps(stub, indent=2))
+            print(
+                f"[vllm] Stubbed Kimi-aware preprocessor_config.json at {pp_path} "
+                f"(image_processor_type=KimiK25VisionProcessor)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[vllm] Failed to write Kimi preprocessor stub: {e}", flush=True)
+        return
+
+    # Default: minimal Qwen2-VL-shape image processor config. Values
+    # aren't used at inference because mm is disabled via
+    # --limit-mm-per-prompt.
     stub = {
         "image_processor_type": "Qwen2VLImageProcessor",
         "min_pixels": 3136,
