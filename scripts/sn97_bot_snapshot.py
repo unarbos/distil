@@ -816,6 +816,44 @@ lines.append(f"- **Last COMPLETED eval block:** {g(hs,'last_eval_block')} ({g(hs
 lines.append(f"- **Eval active right now (validator view):** {g(hs,'eval_active')}")
 lines.append("")
 
+# 2026-05-03: inline the LIVE subnet config so any answer about
+# teacher / max student / vocab / arch quotes the right numbers
+# without a second read. Reads from the same subnet-config.json
+# shipped into the bot mirror; falls back to defaults if missing.
+_subnet_cfg_path = REPO / "frontend" / "src" / "lib" / "subnet-config.json"
+try:
+    _cfg = json.loads(_subnet_cfg_path.read_text())
+    _t = _cfg.get("teacher", {}) or {}
+    _model = _t.get("model") or "moonshotai/Kimi-K2.6"
+    _msp = _t.get("maxStudentParams") or 0
+    _msp_b = round(_msp / 1e9, 2) if _msp else "?"
+    _vocab = _t.get("vocabSize") or "?"
+    _arch_list = _t.get("studentArchAllowlist") or []
+    _arch_str = ", ".join(
+        f"`{a.get('model_type')}`/`{a.get('architecture')}`"
+        for a in _arch_list if isinstance(a, dict)
+    ) or "?"
+    _ref = _cfg.get("validator", {}).get("referenceModel") or "?"
+    _prev = (_cfg.get("teacher", {}).get("previousTeacher")
+             or _cfg.get("previousTeacher", {}).get("model")
+             or "(none recorded)")
+    lines.append("## Live Subnet Config (live from `frontend/src/lib/subnet-config.json` — quote these for cap/teacher/vocab/arch questions)")
+    lines.append("")
+    lines.append(f"- **Teacher:** `{_model}`")
+    lines.append(f"- **Max student total params:** `{_msp}` (= **{_msp_b}B**)")
+    lines.append(f"- **Required vocab size:** `{_vocab}` (Kimi BPE; not 248,320, not 152,064)")
+    lines.append(f"- **Allowed model_type / architecture:** {_arch_str}")
+    lines.append(f"- **Reference baseline (UID -1):** `{_ref}`")
+    lines.append(f"- **Previous teacher (retired, do not quote as live):** `{_prev}`")
+    lines.append("")
+    lines.append("If a miner asks 'what is the cap / teacher / vocab / which arch?' — the answer is the line above. Never quote 7B, 5.25B, 40B, 4B, 248,320, or `Qwen3_5ForConditionalGeneration` as the LIVE config; those are pre-cutover historical numbers.")
+    lines.append("")
+except Exception as _cfg_exc:
+    lines.append("## Live Subnet Config")
+    lines.append("")
+    lines.append(f"- (config read failed: `{_cfg_exc}`; fall back to `mirror/code/frontend/src/lib/subnet-config.json` directly)")
+    lines.append("")
+
 narrative = []
 pl = pod_live
 api_eval = bool(g(hs, "eval_active"))
