@@ -14692,6 +14692,114 @@ def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None, concurrency=16):
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
 
 
+def prepare_teacher_probe_refs_api(tokenizer, api_cfg, block_seed=None, concurrency=8):
+    """Cloud-API equivalent of :func:`prepare_teacher_probe_refs_vllm`.
+
+    Same ``(think_samples, cap_answers, cap_gen_lens, chat_gen_lens)``
+    return tuple. Greedy text-only — no logprobs needed for probe refs.
+
+    Why we still render the chat template locally (rather than letting
+    the API render it): we want bit-identical prompts to those the local
+    vLLM path produced for our existing baselines and cached probes. The
+    teacher is a single MoE behind both providers, so feeding it the
+    pre-rendered prompt via either ``/v1/chat/completions`` (with the
+    rendered text as a single user message) or ``/v1/completions`` (raw
+    prompt) reproduces the same generation. Chat-endpoint providers will
+    apply *another* template wrap on top, which is still deterministic
+    and reproducible across rounds.
+    """
+    # ``pod_eval_vllm`` runs both as a script (``python pod_eval_vllm.py``)
+    # and as a module (``python -m scripts.pod_eval_vllm``). Try a package
+    # import first; if we're a script, fall back to sys.path-relative.
+    try:
+        from scripts.api_teacher import _greedy_text_one  # type: ignore
+    except ImportError:
+        import os as _os
+        import sys as _sys
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        if _here not in _sys.path:
+            _sys.path.insert(0, _here)
+        from api_teacher import _greedy_text_one  # type: ignore
+
+    think_samples = []
+    cap_answers = []
+    cap_gen_lens = []
+    chat_gen_lens = []
+    if tokenizer is None:
+        return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
+    think_prompts = _pick_think_probe_prompts(block_seed)
+
+    def _post(rendered, max_tokens):
+        return _greedy_text_one(rendered, api_cfg, max_tokens, idx=0)
+
+    def _do_think(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=True)
+            return idx, _post(rendered, THINK_PROBE_MAX_TOKENS), None
+        except Exception as e:
+            return idx, "", e
+
+    def _do_cap(idx_item):
+        idx, item = idx_item
+        try:
+            rendered = _render_chat_prompt(tokenizer, item["q"], enable_thinking=False)
+            txt = _post(rendered, CAPABILITY_PROBE_MAX_TOKENS)
+            try:
+                gen_len = len(tokenizer(txt, return_tensors="pt").input_ids[0])
+            except Exception:
+                gen_len = 0
+            return idx, _extract_capability_answer(txt, item["kind"]), gen_len, None
+        except Exception as e:
+            return idx, "", 0, e
+
+    def _do_chat(idx_prompt):
+        idx, prompt = idx_prompt
+        try:
+            rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+            txt = _post(rendered, CHAT_PROBE_MAX_TOKENS)
+            try:
+                gen_len = len(
+                    tokenizer(txt, return_tensors="pt", truncation=False).input_ids[0]
+                )
+            except Exception:
+                gen_len = 0
+            return idx, gen_len, None
+        except Exception as e:
+            return idx, 0, e
+
+    try:
+        think_samples = [""] * len(think_prompts)
+        with ThreadPoolExecutor(max_workers=min(concurrency, max(1, len(think_prompts)))) as ex:
+            for idx, txt, err in ex.map(_do_think, list(enumerate(think_prompts))):
+                if err is not None:
+                    print(f"[eval] API teacher think-probe failed: {err}", flush=True)
+                think_samples[idx] = txt
+
+        cap_answers = [""] * len(CAPABILITY_PROBE_PROMPTS)
+        cap_gen_lens = [0] * len(CAPABILITY_PROBE_PROMPTS)
+        with ThreadPoolExecutor(
+            max_workers=min(concurrency, max(1, len(CAPABILITY_PROBE_PROMPTS)))
+        ) as ex:
+            for idx, ans, glen, err in ex.map(_do_cap, list(enumerate(CAPABILITY_PROBE_PROMPTS))):
+                if err is not None:
+                    print(f"[eval] API teacher capability failed: {err}", flush=True)
+                cap_answers[idx] = ans
+                cap_gen_lens[idx] = glen
+
+        chat_gen_lens = [0] * len(CHAT_PROBE_PROMPTS)
+        with ThreadPoolExecutor(
+            max_workers=min(concurrency, max(1, len(CHAT_PROBE_PROMPTS)))
+        ) as ex:
+            for idx, glen, err in ex.map(_do_chat, list(enumerate(CHAT_PROBE_PROMPTS))):
+                if err is not None:
+                    print(f"[eval] API teacher chat-probe failed: {err}", flush=True)
+                chat_gen_lens[idx] = glen
+    except Exception as e:
+        print(f"[eval] prepare_teacher_probe_refs_api error: {e}", flush=True)
+    return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
+
+
 def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=None,
                              block_seed=None):
     """Degeneracy probe for off-policy CoT collapse — threshold-free design.
@@ -16968,6 +17076,29 @@ def main():
     parser.add_argument("--save-teacher-logits", default=None)
     parser.add_argument("--king", default=None, help="King model name — stays in VRAM between rounds")
     parser.add_argument("--no-vllm", action="store_true", help="Disable vLLM, use pure HF")
+    # ── Cloud-API teacher path (skips local vLLM + teacher VRAM entirely) ──
+    # When teacher-mode=api we do NOT load the teacher locally at all. We
+    # call an OpenAI-compatible inference provider (OpenRouter / Moonshot /
+    # Cloudflare Workers AI / Together AI / etc.) for both generation and
+    # top-K logprobs, and Phase-1b HF logits is skipped. This frees the
+    # entire pod GPU budget for student scoring and removes the 6+ min
+    # vLLM cold-start. See scripts/api_teacher.py for the full design note.
+    parser.add_argument("--teacher-mode", choices=["vllm", "api"],
+                        default=os.environ.get("DISTIL_TEACHER_MODE", "vllm"),
+                        help="vllm = local vLLM server (default); "
+                             "api = OpenAI-compatible cloud inference "
+                             "(set DISTIL_TEACHER_API_KEY + DISTIL_TEACHER_API_MODEL).")
+    parser.add_argument("--api-base-url", default=None,
+                        help="Override DISTIL_TEACHER_API_BASE (default https://openrouter.ai/api).")
+    parser.add_argument("--api-model", default=None,
+                        help="Override DISTIL_TEACHER_API_MODEL (default moonshotai/kimi-k2.6).")
+    parser.add_argument("--api-endpoint", choices=["chat", "completions"],
+                        default=None,
+                        help="API endpoint flavor; chat (default) or legacy text completions.")
+    parser.add_argument("--api-concurrency", type=int, default=None,
+                        help="Parallel API requests (default 8 / from DISTIL_TEACHER_API_CONCURRENCY).")
+    parser.add_argument("--api-top-logprobs", type=int, default=None,
+                        help="top_logprobs per position (default 20 = OpenAI-spec max).")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                         help="vLLM GPU memory utilization (default 0.90)")
     parser.add_argument("--vllm-max-model-len", type=int, default=8192)
@@ -17169,6 +17300,173 @@ def main():
                 print(f"[eval] ✗ Cache stale — regenerating", flush=True)
         except Exception as e:
             print(f"[eval] ✗ Cache failed: {e}", flush=True)
+
+    if not teacher_cache_loaded and args.teacher_mode == "api":
+        # ── Cloud-API teacher path ──
+        # Skips local vLLM/HF teacher entirely. Hits an OpenAI-compatible
+        # provider (default OpenRouter) for both generation and top-K
+        # logprobs. Kimi K2.6 served externally → no 1T-param VRAM, no
+        # 6 min vLLM cold-start, full pod GPU budget freed for students.
+        try:
+            from scripts.api_teacher import (
+                APIConfig, generate_via_api, api_health_check,
+            )
+        except ImportError:
+            import sys as _sys
+            _here = os.path.dirname(os.path.abspath(__file__))
+            if _here not in _sys.path:
+                _sys.path.insert(0, _here)
+            from api_teacher import (  # type: ignore
+                APIConfig, generate_via_api, api_health_check,
+            )
+
+        cfg_kwargs = {}
+        if args.api_base_url:
+            cfg_kwargs["base_url"] = args.api_base_url
+        if args.api_model:
+            cfg_kwargs["model"] = args.api_model
+        if args.api_endpoint:
+            cfg_kwargs["endpoint"] = args.api_endpoint
+        if args.api_concurrency:
+            cfg_kwargs["concurrency"] = args.api_concurrency
+        if args.api_top_logprobs:
+            cfg_kwargs["top_logprobs"] = args.api_top_logprobs
+        api_cfg = APIConfig.from_env(**cfg_kwargs)
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"PHASE 1: API teacher generation", flush=True)
+        print(f"  provider: {api_cfg.base_url}", flush=True)
+        print(f"  model:    {api_cfg.model}", flush=True)
+        print(f"  endpoint: {api_cfg.endpoint}", flush=True)
+        print(f"  top_lp:   {api_cfg.top_logprobs}  concurrency: {api_cfg.concurrency}", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"[teacher_path] api-mode  base={api_cfg.base_url}  model={api_cfg.model}", flush=True)
+
+        # Health check first — fail fast and loud rather than burning 5 min
+        # on per-prompt timeouts when the provider is misconfigured.
+        try:
+            hc = api_health_check(api_cfg)
+            print(
+                f"[api] health_check OK: {hc['elapsed_s']}s, "
+                f"{hc['n_logprob_positions']} positions × top-{hc['per_position_topk']}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[api] health_check FAILED: {e}", flush=True)
+            print(
+                f"[teacher_path] api-health-check-failed reason={type(e).__name__}",
+                flush=True,
+            )
+            raise
+
+        token_to_id = _build_token_to_id_map(tokenizer)
+
+        _write_phase(progress_path, students, "api_generating", prompts_total=len(prompts))
+        t0 = time.time()
+
+        def _api_progress(done, total):
+            _write_phase(progress_path, students, "api_generating",
+                         teacher_done=done, prompts_total=total)
+
+        try:
+            sequences_data = generate_via_api(
+                prompts, tokenizer, args.max_new_tokens,
+                block_seed=args.block_seed,
+                logprobs_k=api_cfg.top_logprobs,
+                token_to_id=token_to_id,
+                progress_cb=_api_progress,
+                concurrency=api_cfg.concurrency,
+                sparse_converter=vllm_logprobs_to_sparse,
+                align_prompt_boundary=_align_prompt_boundary,
+                config=api_cfg,
+            )
+        except Exception as e:
+            print(f"[eval] API teacher generation failed: {e}", flush=True)
+            print(f"[teacher_path] api-generation-failed reason={type(e).__name__}", flush=True)
+            raise
+
+        timings["api_generation"] = time.time() - t0
+        print(
+            f"[teacher_path] api prompts_done={len(sequences_data)}/{len(prompts)}",
+            flush=True,
+        )
+        print(
+            f"[eval] API teacher generation: {timings['api_generation']:.1f}s",
+            flush=True,
+        )
+
+        # Probe-ref collection via API (greedy text only; no logprobs).
+        try:
+            _tpr_t0 = time.time()
+            think_refs, cap_answers, cap_gen_lens, chat_gen_lens = (
+                prepare_teacher_probe_refs_api(
+                    tokenizer, api_cfg, block_seed=args.block_seed,
+                )
+            )
+            globals()["_TEACHER_PROBE_SAMPLES"] = think_refs
+            globals()["_TEACHER_CAPABILITY_REFS"] = {
+                "answers": cap_answers, "gen_lens": cap_gen_lens,
+            }
+            if chat_gen_lens:
+                globals()["_TEACHER_CHAT_PROBE_GEN_LENS"] = chat_gen_lens
+            timings["teacher_probe_refs"] = time.time() - _tpr_t0
+            teach_chat_mean = (sum(chat_gen_lens) / len(chat_gen_lens)) if chat_gen_lens else 0.0
+            print(
+                f"[eval] Teacher probe refs via API: "
+                f"{len(think_refs)} think + {len(cap_answers)} cap + "
+                f"{len(chat_gen_lens)} chat(mean={teach_chat_mean:.0f}) "
+                f"({timings['teacher_probe_refs']:.1f}s)",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[eval] Teacher probe refs (API) failed: {e}", flush=True)
+
+        # Roll API results into the same lists the existing logits-aware
+        # downstream code consumes.
+        for data in sequences_data:
+            full_ids = data["full_ids"].to(device)
+            prompt_lens.append(data["prompt_len"])
+            full_sequences.append(full_ids)
+            teacher_logits_list.append(data["sparse_logprobs"])
+
+        timings["teacher_logits_pass"] = 0.0
+        timings["teacher_hf_load"] = 0.0
+        print(
+            f"\n{'='*60}\n"
+            f"PHASE 1b: SKIPPED — API logprobs available (top-{api_cfg.top_logprobs})\n"
+            f"{'='*60}",
+            flush=True,
+        )
+
+        # Save cache (cheap — sparse top-K is tens of MB).
+        if args.save_teacher_logits:
+            try:
+                st = os.statvfs(os.path.dirname(args.save_teacher_logits) or '/')
+                free_gb = (st.f_bavail * st.f_frsize) / (1024**3)
+                if free_gb > 5:
+                    cache_tmp = args.save_teacher_logits + ".tmp"
+                    torch.save({
+                        "full_sequences": [s.cpu() for s in full_sequences],
+                        "teacher_logits": teacher_logits_list,
+                        "prompt_lens": prompt_lens,
+                        "block_seed": args.block_seed,
+                        "prompts_hash": prompts_hash,
+                        "generation_method": f"api:{api_cfg.model}",
+                        "logprobs_k": api_cfg.top_logprobs,
+                        "sparse": True,
+                        "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
+                        "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
+                        "teacher_capability_block_seed": args.block_seed,
+                        "teacher_chat_probe_gen_lens": globals().get("_TEACHER_CHAT_PROBE_GEN_LENS", []),
+                    }, cache_tmp)
+                    os.replace(cache_tmp, args.save_teacher_logits)
+                    cache_size = os.path.getsize(args.save_teacher_logits) / (1024**2)
+                    print(f"[eval] Cache saved ({cache_size:.1f}MB, method=api:{api_cfg.model})", flush=True)
+            except Exception as e:
+                print(f"[eval] Cache save failed: {e}", flush=True)
+
+        del sequences_data
+        teacher_cache_loaded = True
 
     if not teacher_cache_loaded and not args.no_vllm:
         # ── vLLM generation path ──

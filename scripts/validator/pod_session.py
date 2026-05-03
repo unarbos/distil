@@ -117,6 +117,11 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         _aux_modules = [
             ("scripts/ifeval_vendor.py", "ifeval_vendor.py"),
             ("scripts/humaneval_sandbox.py", "humaneval_sandbox.py"),
+            # 2026-05-03: cloud-API teacher module. Imported by
+            # ``pod_eval.py`` (= scripts/pod_eval_vllm.py uploaded under a
+            # neutral name) when DISTIL_TEACHER_MODE=api. Without this the
+            # API path falls back to local vLLM with an ImportError noise.
+            ("scripts/api_teacher.py", "api_teacher.py"),
         ]
         for local_aux, remote_name in _aux_modules:
             if os.path.isfile(local_aux):
@@ -619,6 +624,23 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "CHAT_TURNS_PROBE_PER_ROUND",
         "CHAT_TURNS_PROBE_MAX_TOKENS",
         "CHAT_TURNS_PROBE",
+        # ── Cloud-API teacher path (2026-05-03 Kimi K2.6 cutover) ──
+        # When DISTIL_TEACHER_MODE=api the pod skips local vLLM/HF teacher
+        # entirely and fetches generation + top-K logprobs from an external
+        # OpenAI-compatible provider. See scripts/api_teacher.py for design.
+        "DISTIL_TEACHER_MODE",
+        "DISTIL_TEACHER_API_BASE",
+        "DISTIL_TEACHER_API_KEY",
+        "OPENROUTER_API_KEY",  # accepted as alias inside api_teacher.from_env
+        "DISTIL_TEACHER_API_MODEL",
+        "DISTIL_TEACHER_API_ENDPOINT",
+        "DISTIL_TEACHER_API_PROVIDERS",
+        "DISTIL_TEACHER_API_CONCURRENCY",
+        "DISTIL_TEACHER_API_TOP_LOGPROBS",
+        "DISTIL_TEACHER_API_TIMEOUT_S",
+        "DISTIL_TEACHER_API_DISABLE_REASONING",
+        "DISTIL_OPENROUTER_REFERER",
+        "DISTIL_OPENROUTER_TITLE",
     ):
         _v = os.environ.get(_propagate)
         if _v is not None:
