@@ -950,9 +950,14 @@ def _prepare_eval_cache(
             )
             prompt_len = prompt_ids.shape[1]
             prompt_seed = int(seed) + i
-            try:
-                gen = torch.Generator(device=teacher_device)
-                gen.manual_seed(prompt_seed)
+            # Do not pass ``generator=`` into ``generate``: strict ``model_kwargs`` validation
+            # (e.g. Hub Kimi / partial GenerationMixin stacks) rejects it as unused.
+            device_idx = teacher_device.index if teacher_device.type == "cuda" else None
+            devices = [device_idx] if device_idx is not None else []
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(prompt_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(prompt_seed)
                 full_seq = teacher_eval.generate(
                     prompt_ids,
                     max_new_tokens=max_new_tokens,
@@ -960,27 +965,7 @@ def _prepare_eval_cache(
                     temperature=0.7,
                     top_p=0.9,
                     use_cache=True,
-                    generator=gen,
                 )
-            except ValueError as e:
-                # Some model wrappers/custom generation stacks reject `generator`.
-                # Fallback keeps deterministic sampling by seeding within a forked RNG scope.
-                if "not used by the model: ['generator']" not in str(e):
-                    raise
-                device_idx = teacher_device.index if teacher_device.type == "cuda" else None
-                devices = [device_idx] if device_idx is not None else []
-                with torch.random.fork_rng(devices=devices):
-                    torch.manual_seed(prompt_seed)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(prompt_seed)
-                    full_seq = teacher_eval.generate(
-                        prompt_ids,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=True,
-                        temperature=0.7,
-                        top_p=0.9,
-                        use_cache=True,
-                    )
             t_logits = teacher_eval(full_seq).logits.float()
             t_cont = t_logits[:, prompt_len - 1 : -1, :]
             t_log_p = F.log_softmax(t_cont, dim=-1).cpu()
@@ -2103,6 +2088,9 @@ def train_online(args):
     teacher_eval = None
     king_eval = None
     eval_cache = []
+    _vacuum_student_for_teacher_eval = False
+    _student_reload_opt_state: dict | None = None
+    _student_reload_sched_state: dict | None = None
     if args.eval_every_steps > 0:
         king_start_gpu = args.king_gpu if args.king_gpu is not None else args.teacher_gpu
         king_gpus = _gpu_span(king_start_gpu, args.king_gpu_count, "king")
@@ -2173,6 +2161,16 @@ def train_online(args):
             if reuse_persistent_teacher:
                 teacher_eval = teacher
             else:
+                if set(teacher_gpus) & set(student_gpus):
+                    log.info(
+                        "Unloading student temporarily so teacher eval-cache build can use the full GPU pool %s.",
+                        sorted(set(teacher_gpus) & set(student_gpus)),
+                    )
+                    _student_reload_opt_state = optimizer.state_dict()
+                    _student_reload_sched_state = scheduler.state_dict()
+                    _purge_cuda_model_hold("student (VRAM for teacher eval cache)", student)
+                    student = None
+                    _vacuum_student_for_teacher_eval = True
                 log.info("Loading teacher LM for eval cache build / metrics (release after cache)...")
                 teacher_eval_kwargs = {
                     "dtype": torch.bfloat16,
@@ -2182,9 +2180,32 @@ def train_online(args):
                 }
                 if teacher_max_memory is not None:
                     teacher_eval_kwargs["max_memory"] = teacher_max_memory
-                teacher_eval = _instantiate_causal_lm(
-                    args.teacher, teacher_eval_kwargs, train=False, freeze_all=True
-                )
+                try:
+                    teacher_eval = _instantiate_causal_lm(
+                        args.teacher, teacher_eval_kwargs, train=False, freeze_all=True
+                    )
+                except Exception:
+                    if _vacuum_student_for_teacher_eval and student is None:
+                        log.warning(
+                            "Teacher load failed; restoring student on GPUs %s before re-raising.",
+                            student_gpus,
+                        )
+                        student = _instantiate_causal_lm(
+                            student_source, student_load_kwargs, train=True, freeze_all=False
+                        )
+                        optimizer = AdamW(
+                            [p for p in student.parameters() if p.requires_grad],
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                        )
+                        if _student_reload_opt_state is not None:
+                            optimizer.load_state_dict(_student_reload_opt_state)
+                        scheduler = get_cosine_schedule_with_warmup(
+                            optimizer, int(args.warmup_steps), scheduler_total_steps
+                        )
+                        if _student_reload_sched_state is not None:
+                            scheduler.load_state_dict(_student_reload_sched_state)
+                    raise
         king_load_kwargs = {
             "revision": args.king_revision,
             "dtype": torch.bfloat16,
@@ -2210,40 +2231,59 @@ def train_online(args):
                 teacher_eval.eval()
             log.info("Preparing deterministic eval cache from teacher continuations...")
             cross_tc = bool(getattr(data, "dual_tokenizers", False))
-            eval_cache = _prepare_eval_cache(
-                teacher_eval=teacher_eval,
-                teacher_tokenizer=teacher_hf_tok,
-                prompts=eval_prompts,
-                max_new_tokens=eval_tokens,
-                seed=eval_seed,
-                cross_tokenizer=cross_tc,
-                student_tokenizer=tokenizer if cross_tc else None,
-                max_student_seq=int(args.max_seq_len),
-            )
-            if cache_path:
-                meta = {
-                    "teacher": args.teacher,
-                    "student": str(args.student),
-                    "assume_same_tokenizer_as_teacher": bool(
-                        getattr(args, "assume_same_tokenizer_as_teacher", False)
-                    ),
-                    "cross_tokenizer_kd": cross_tc,
-                    "prompt_source_mode": "api" if eval_prompts_from_api else "dataset",
-                    "eval_data_url": args.eval_data_url if eval_prompts_from_api else None,
-                    "eval_dataset": None if eval_prompts_from_api else args.eval_dataset,
-                    "eval_block_number": None if eval_prompts_from_api else args.eval_block_number,
-                    "eval_block_hash": None if eval_prompts_from_api else (args.eval_block_hash or None),
-                    "eval_prompts": len(eval_prompts),
-                    "max_new_tokens": eval_tokens,
-                    "eval_seed": eval_seed,
-                    "saved_at": _utc_now_iso(),
-                }
-                _save_eval_cache_payload(cache_path, eval_cache, eval_prompts, meta)
-                log.info("Saved eval cache to %s", cache_path)
-            # Ephemeral teacher copy (sequential trainer or parallel without resident teacher).
-            if teacher_eval is not None and teacher_eval is not teacher:
-                _purge_cuda_model_hold("teacher LM (eval cache build only)", teacher_eval)
-                teacher_eval = None
+            try:
+                eval_cache = _prepare_eval_cache(
+                    teacher_eval=teacher_eval,
+                    teacher_tokenizer=teacher_hf_tok,
+                    prompts=eval_prompts,
+                    max_new_tokens=eval_tokens,
+                    seed=eval_seed,
+                    cross_tokenizer=cross_tc,
+                    student_tokenizer=tokenizer if cross_tc else None,
+                    max_student_seq=int(args.max_seq_len),
+                )
+                if cache_path:
+                    meta = {
+                        "teacher": args.teacher,
+                        "student": str(args.student),
+                        "assume_same_tokenizer_as_teacher": bool(
+                            getattr(args, "assume_same_tokenizer_as_teacher", False)
+                        ),
+                        "cross_tokenizer_kd": cross_tc,
+                        "prompt_source_mode": "api" if eval_prompts_from_api else "dataset",
+                        "eval_data_url": args.eval_data_url if eval_prompts_from_api else None,
+                        "eval_dataset": None if eval_prompts_from_api else args.eval_dataset,
+                        "eval_block_number": None if eval_prompts_from_api else args.eval_block_number,
+                        "eval_block_hash": None if eval_prompts_from_api else (args.eval_block_hash or None),
+                        "eval_prompts": len(eval_prompts),
+                        "max_new_tokens": eval_tokens,
+                        "eval_seed": eval_seed,
+                        "saved_at": _utc_now_iso(),
+                    }
+                    _save_eval_cache_payload(cache_path, eval_cache, eval_prompts, meta)
+                    log.info("Saved eval cache to %s", cache_path)
+            finally:
+                # Ephemeral teacher copy (sequential trainer or parallel without resident teacher).
+                if teacher_eval is not None and teacher_eval is not teacher:
+                    _purge_cuda_model_hold("teacher LM (eval cache build only)", teacher_eval)
+                    teacher_eval = None
+                if _vacuum_student_for_teacher_eval and student is None:
+                    log.info("Reloading student (%s) on GPUs %s...", student_source, student_gpus)
+                    student = _instantiate_causal_lm(
+                        student_source, student_load_kwargs, train=True, freeze_all=False
+                    )
+                    optimizer = AdamW(
+                        [p for p in student.parameters() if p.requires_grad],
+                        lr=args.lr,
+                        weight_decay=args.weight_decay,
+                    )
+                    if _student_reload_opt_state is not None:
+                        optimizer.load_state_dict(_student_reload_opt_state)
+                    scheduler = get_cosine_schedule_with_warmup(
+                        optimizer, int(args.warmup_steps), scheduler_total_steps
+                    )
+                    if _student_reload_sched_state is not None:
+                        scheduler.load_state_dict(_student_reload_sched_state)
         log.info("Prepared eval cache for %s prompts", len(eval_cache))
         log.info(
             "Periodic king eval configured: %s prompts every %s steps",
