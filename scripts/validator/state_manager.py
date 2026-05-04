@@ -309,7 +309,40 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                     if k in (king_key, str(king_uid) if king_uid is not None else None)
                 }
                 if king_changed:
-                    prev_streak = 0  # fresh king, fresh slate
+                    # 2026-05-04 (Sebastian's "scores worse than 4B" report):
+                    # the cold-start crowning path picks the best-by-worst
+                    # candidate even when nobody clears KING_COMPOSITE_FLOOR
+                    # — exactly what happens after the Kimi cutover, where
+                    # the entire cohort scores judge_probe ≈ 0 and the
+                    # winning king has worst = 0.000. Pre-fix this would
+                    # then START the regression streak at 0 + 1 = 1, so it
+                    # took THREE more at-risk rounds before the floor
+                    # waived and a slightly-better challenger could
+                    # dethrone — meanwhile the chat king produced word-
+                    # salad loops the whole time and the dashboard's
+                    # composite numbers stayed pinned to 0.0.
+                    #
+                    # Fix: when we crown a king who is ALREADY at-risk,
+                    # seed the streak at MIN_STREAK − 1 so this round's
+                    # at_risk increment immediately reaches MIN_STREAK
+                    # and ``_king_regression_floor_waived`` returns True
+                    # next round. A genuinely-improved challenger (e.g.
+                    # UID 125 worst=0.125 vs UID 190 worst=0.000) can
+                    # then dethrone after a single round of regression,
+                    # not four. Healthy fresh kings still start at 0
+                    # (no waiver) — only the bad-king cold-start case is
+                    # short-circuited. Min-streak floor of 0 keeps this
+                    # safe even if the env var is set to 1.
+                    if at_risk:
+                        try:
+                            from scripts.validator.composite import (
+                                KING_REGRESSION_MIN_STREAK as _MIN_STREAK,
+                            )
+                            prev_streak = max(0, int(_MIN_STREAK) - 1)
+                        except Exception:
+                            prev_streak = 2
+                    else:
+                        prev_streak = 0
                 new_streak = prev_streak + 1 if at_risk else 0
                 state.king_regression_streak[king_key] = new_streak
                 if at_risk:

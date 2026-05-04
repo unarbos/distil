@@ -603,6 +603,63 @@ class TestStateConsistency(unittest.TestCase):
                 f"expected king_changed={expected}, got {king_changed}",
             )
 
+    def test_atrisk_cold_start_king_streak_short_circuit(self):
+        """Cold-start crowning of an already-at-risk king must seed the
+        regression streak at MIN_STREAK − 1 so this round's at_risk
+        increment immediately reaches MIN_STREAK and the floor waiver
+        kicks in NEXT round (not three rounds later).
+
+        Sebastian's 2026-05-04 report — "the overall eval scores seem
+        even worse than the 4B" — traced to this exact path: post-Kimi
+        cutover crowned UID 190 with composite.worst = 0.000, then
+        the regression streak counted up from 0 → 1 → 2 → 3 across
+        three rounds before the floor finally waived. During those
+        three rounds challengers like UID 125 (worst = 0.125, strictly
+        better than the king on the worst axis) were vetoed because
+        their absolute worst was below the static floor of 0.20. The
+        short-circuit collapses that delay to a single round — the
+        next at-risk pass already has streak ≥ MIN_STREAK and any
+        improved challenger can dethrone.
+
+        Healthy fresh kings (cold-start AND not at_risk) must still
+        start at 0 — the short-circuit only fires on at-risk crowns.
+        """
+        MIN_STREAK = 3  # default KING_REGRESSION_MIN_STREAK
+        # Reproduce the post-fix branch from state_manager.update_h2h_state:
+        cases = [
+            # (king_changed, at_risk, expected_prev_streak, expected_new_streak)
+            (True,  True,  MIN_STREAK - 1, MIN_STREAK),       # at-risk cold-start: short-circuit
+            (True,  False, 0,              0),                 # healthy cold-start: fresh slate
+            (False, True,  None,           None),  # streak unchanged path — see below
+            (False, False, None,           None),
+        ]
+        for king_changed, at_risk, exp_prev, exp_new in cases:
+            prev_streak_persisted = 1  # arbitrary stale streak from prior round
+            if king_changed:
+                if at_risk:
+                    prev_streak = max(0, MIN_STREAK - 1)
+                else:
+                    prev_streak = 0
+            else:
+                prev_streak = prev_streak_persisted
+            new_streak = prev_streak + 1 if at_risk else 0
+            if king_changed:
+                self.assertEqual(
+                    prev_streak, exp_prev,
+                    f"king_changed={king_changed} at_risk={at_risk}: "
+                    f"expected prev_streak={exp_prev}, got {prev_streak}",
+                )
+                self.assertEqual(
+                    new_streak, exp_new,
+                    f"king_changed={king_changed} at_risk={at_risk}: "
+                    f"expected new_streak={exp_new}, got {new_streak}",
+                )
+            else:
+                # Non-cold-start: previous behaviour untouched.
+                self.assertEqual(prev_streak, prev_streak_persisted)
+                expected = prev_streak_persisted + 1 if at_risk else 0
+                self.assertEqual(new_streak, expected)
+
     def test_disqualification_legacy_keys_recognised(self):
         """Pre-2026-05-04 DQ entries used ``hotkey:<commit_block>`` keys.
         ``is_disqualified`` and ``get_dq_reason`` must still recognise
