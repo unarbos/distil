@@ -131,15 +131,36 @@ def gpu_mem_str():
 
 
 def free_gpu():
-    """Free GPU memory: garbage collect, empty cache, synchronize."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    """Free GPU memory: garbage collect, empty cache, synchronize.
+
+    All CUDA calls are wrapped in try/except so that a previously-raised
+    device-side assertion (which poisons the CUDA context for the rest
+    of the process) cannot propagate out of cleanup and kill main(). A
+    poisoned context will fail every subsequent CUDA op anyway; surfacing
+    that as an unrecoverable exception here loses the eval results for
+    every still-pending student. We swallow the errors and let the
+    higher-level loop quarantine remaining students cleanly. See
+    distil-97 incident 2026-05-04: one student's vocab-OOB embed crash
+    killed the whole pod_eval process via free_gpu.empty_cache.
+    """
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    if not torch.cuda.is_available():
+        return
+    for _name, _fn in (
+        ("empty_cache", torch.cuda.empty_cache),
+        ("ipc_collect", torch.cuda.ipc_collect),
+        ("synchronize", torch.cuda.synchronize),
+    ):
         try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        torch.cuda.synchronize()
+            _fn()
+        except Exception as _exc:
+            print(
+                f"  [free_gpu] {_name} skipped: {type(_exc).__name__}: {str(_exc)[:120]}",
+                flush=True,
+            )
 
 
 def ensure_disk_space(teacher_name, threshold=85):
@@ -18051,6 +18072,10 @@ def main():
     for name, data in prior_results.items():
         if data.get("status") != "load_failed" and data.get("kl_global_avg") is not None:
             results["students"][name] = data
+    # Expose the live results dict to the top-level exception handler so
+    # any partial scoring is persisted before the script dies. See
+    # _ensure_results_file at the bottom of this file.
+    globals()["_LIVE_RESULTS"] = results
 
     # Live progress
     progress_lock = threading.Lock()
@@ -18101,8 +18126,61 @@ def main():
 
     vram_before_students = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
 
+    # Tracks whether the CUDA context has been poisoned by an earlier
+    # device-side assertion. Once set, every subsequent CUDA op in this
+    # process raises and the only way to recover is to exit and let the
+    # validator re-launch us on the next round. Rather than crashing
+    # mid-loop and losing the result file, we fast-fail remaining
+    # students with a deferred status and break out cleanly so the
+    # final json.dump still runs.
+    _cuda_poisoned = False
+
+    def _cuda_alive() -> bool:
+        """Cheap probe to detect a poisoned CUDA context.
+
+        Runs a 1-element allocate-and-empty round-trip. If the context
+        is fine, this is sub-microsecond. If a previous student tripped
+        a device-side assertion, this raises immediately. We swallow
+        the exception and return False so the caller can decide what to
+        do (typically: defer the rest of the round)."""
+        if not torch.cuda.is_available():
+            return True
+        try:
+            _t = torch.zeros((1,), device="cuda")
+            _t.add_(1.0)
+            torch.cuda.synchronize()
+            del _t
+            return True
+        except Exception:
+            return False
+
     for student_idx, student_name in enumerate(students):
         student_rev = student_revisions.get(student_name, "main")
+        if _cuda_poisoned:
+            # Earlier student wedged the GPU. Defer remaining students
+            # to the next round rather than DQ'ing them on a process-
+            # local failure that has nothing to do with their model.
+            print(
+                f"\n[eval] {student_name}: DEFERRED — CUDA context poisoned by "
+                f"a previous student in this round. Will retry next round.",
+                flush=True,
+            )
+            results["students"][student_name] = {
+                "status": "deferred_cuda_poisoned",
+                "kl_global_avg": None,
+                "error": "cuda_context_poisoned_in_prev_student",
+            }
+            try:
+                with open(args.output, "w") as f:
+                    json.dump(results, f, indent=2)
+            except Exception:
+                pass
+            live_progress["completed"].append({
+                "student_name": student_name, "status": "deferred_cuda_poisoned",
+            })
+            live_progress["current"] = None
+            _write_progress()
+            continue
         # Skip already scored
         if student_name in results["students"]:
             prior = results["students"][student_name]
@@ -18664,6 +18742,44 @@ def main():
         if pad_id_batched is None:
             pad_id_batched = 0
 
+        # Read the student's actual embedding-table size. Comparing
+        # against this (not config.vocab_size, which can lie) is the
+        # only way to detect token IDs that would trip CUDA's
+        # vectorized_gather "index out of bounds" device-side
+        # assertion in F.embedding. A poisoned CUDA context after that
+        # assertion takes down free_gpu() too and aborts the whole
+        # pod_eval before any results are written, so this guard
+        # converts the would-be CUDA crash into a normal Python
+        # ValueError that the per-prompt try/except below catches and
+        # DQs the student cleanly.
+        try:
+            _student_vocab = int(
+                student.get_input_embeddings().weight.shape[0]
+            )
+        except Exception:
+            _student_vocab = None
+
+        def _validate_token_ids(seq_tensor):
+            """Raise ValueError if any token in ``seq_tensor`` would index
+            past the student's embedding table. ``seq_tensor`` is shape
+            ``[B, T]`` (or ``[1, T]``) of int64 token IDs on any device."""
+            if _student_vocab is None:
+                return
+            try:
+                hi = int(seq_tensor.max().item())
+                lo = int(seq_tensor.min().item())
+            except Exception:
+                return
+            if hi >= _student_vocab or lo < 0:
+                raise ValueError(
+                    f"vocab_oob: token id {hi} (min {lo}) exceeds student "
+                    f"embed_size {_student_vocab}. Student claims vocab "
+                    f"compatibility with the teacher tokenizer but its "
+                    f"embedding table is smaller — likely a config edited "
+                    f"to match the teacher without retraining the embeddings. "
+                    f"DQ before forward pass to keep CUDA context clean."
+                )
+
         def _refill_cache(i: int) -> None:
             """Refill ``s_logits_cache`` with the next K prompts'
             student logits via a single batched forward pass."""
@@ -18674,6 +18790,7 @@ def main():
                 # Single-prompt path: keep the existing semantics
                 # (no padding overhead).
                 full_seq = full_sequences[i]
+                _validate_token_ids(full_seq)
                 s_logits = student(full_seq).logits.float()
                 s_logits_cache = [s_logits]
                 return
@@ -18690,6 +18807,7 @@ def main():
             for j, (s, ln) in enumerate(zip(batch_seqs, seq_lens)):
                 padded[j, :ln] = s.to(device).flatten()[:ln]
                 attn_mask[j, :ln] = 1
+            _validate_token_ids(padded)
             try:
                 batch_out = student(padded, attention_mask=attn_mask)
                 batch_logits = batch_out.logits.float()
@@ -19384,11 +19502,21 @@ def main():
 
         # Cleanup — DON'T unload king
         if not is_king:
-            del student
+            try:
+                del student
+            except Exception:
+                pass
             free_gpu()
             clean_model_cache(student_name, args.teacher)
         else:
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except Exception as _exc:
+                print(
+                    f"  [cleanup] empty_cache after king skipped: "
+                    f"{type(_exc).__name__}: {str(_exc)[:120]}",
+                    flush=True,
+                )
 
         # Wait for prefetch
         if prefetch_future:
@@ -19397,6 +19525,20 @@ def main():
             except Exception:
                 pass
             prefetch_future = None
+
+        # Probe CUDA before moving on. If a previous handler swallowed a
+        # device-side assertion (or something else corrupted the
+        # context), every subsequent forward pass will fail. Mark the
+        # context as poisoned so the next iteration skips straight to
+        # the deferred branch and we still write a usable results.json.
+        if not _cuda_alive():
+            _cuda_poisoned = True
+            print(
+                f"  [cuda] context poisoned after {student_name}; "
+                f"remaining {len(students) - student_idx - 1} student(s) "
+                f"will be deferred to next round.",
+                flush=True,
+            )
 
     # ── Phase B: teacher-side scoring (RKL + judge) ─────────────────
     # After the student loop, load the teacher once and run every
@@ -19696,6 +19838,51 @@ def _write_abort_marker(out_path, reason):
         pass
 
 
+def _ensure_results_file(out_path, reason):
+    """Make sure ``out_path`` (the eval results JSON) exists on disk.
+
+    The validator's pod.download() raises FileNotFoundError if the script
+    crashes before the final json.dump in main(). That kills the entire
+    round even when the in-memory ``results`` dict had partial scores
+    that should have been preserved.
+
+    Strategy:
+      1. If ``_LIVE_RESULTS`` is populated (set by main() after the
+         results dict is constructed), persist it as JSON. The dict is
+         updated in-place after every student so even a mid-round crash
+         keeps the per-student rows that were already scored.
+      2. If we have nothing to write, create a minimal stub file with
+         the abort reason so the validator can still download something
+         and surface a real error message rather than "No such file".
+    """
+    try:
+        live = globals().get("_LIVE_RESULTS")
+        if isinstance(live, dict):
+            try:
+                live.setdefault("_aborted", True)
+                live["_abort_reason"] = reason[:500]
+            except Exception:
+                pass
+            with open(out_path, "w") as fh:
+                json.dump(live, fh, indent=2)
+            return True
+    except Exception:
+        pass
+    try:
+        with open(out_path, "w") as fh:
+            json.dump(
+                {
+                    "students": {},
+                    "_aborted": True,
+                    "_abort_reason": reason[:500],
+                },
+                fh,
+            )
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     _out_guess = None
     for i, a in enumerate(sys.argv):
@@ -19706,6 +19893,7 @@ if __name__ == "__main__":
     def _sig(signum, _frame):
         reason = f"signal_{signum}"
         if _out_guess:
+            _ensure_results_file(_out_guess, reason)
             _write_abort_marker(_out_guess, reason)
         stop_vllm_server()
         sys.exit(128 + (signum or 0))
@@ -19721,6 +19909,8 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException as _exc:
+        reason = f"exception:{type(_exc).__name__}:{str(_exc)[:200]}"
         if _out_guess:
-            _write_abort_marker(_out_guess, f"exception:{type(_exc).__name__}")
+            _ensure_results_file(_out_guess, reason)
+            _write_abort_marker(_out_guess, reason)
         raise
