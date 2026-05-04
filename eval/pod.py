@@ -181,11 +181,17 @@ class PodManager:
         except Exception:
             return False
 
-    def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-35B-A3B"):
-        """Install required packages on the pod and apply B200 patches.
+    def ensure_dependencies(self, teacher_model: str = "moonshotai/Kimi-K2.6"):
+        """Install required packages on the pod and apply B200 + Kimi patches.
 
-        Installs vllm, accelerate, transformers, and patches grouped_mm
-        for B200 (sm_100) GPUs where torch._grouped_mm crashes.
+        Installs vllm, accelerate, transformers, and patches:
+        - grouped_mm for B200 (sm_100) GPUs where torch._grouped_mm crashes;
+        - Kimi K2.6 modeling_deepseek.py for the transformers >=5.0 removal of
+          ``is_torch_fx_available`` (HF fallback path);
+        - vLLM ``kimi_k25.py`` for the missing ``media_tokens_calculator``
+          attribute on transformers 5.x ``Qwen2VLImageProcessor`` (vLLM
+          startup path). Both Kimi patches are pure idempotent text-substitutions
+          guarded by sentinel strings so re-running on the same pod is a no-op.
         """
         try:
             logger.info("Ensuring pod dependencies...")
@@ -212,6 +218,113 @@ class PodManager:
                 '/usr/local/lib/python3.12/dist-packages/transformers/integrations/moe.py'
             )
             logger.info("Applied grouped_mm B200 patch")
+
+            # Kimi K2.6 transformers-5.x compatibility patches.
+            # Apply regardless of teacher_model so a future swap back to Qwen
+            # is a no-op (Kimi files won't be on disk → cd fails → noop).
+            kimi_patch = r"""
+set -e
+
+# Patch 1: Kimi modeling_deepseek.py — stub is_torch_fx_available
+for f in $(find /root/.cache/huggingface -path '*moonshotai*Kimi*K2*6*/modeling_deepseek.py' 2>/dev/null); do
+    [ -f "$f" ] || continue
+    if grep -q '_distil_is_torch_fx_stub' "$f"; then continue; fi
+    cp -n "$f" "$f.orig"
+    python3 -c "
+import sys
+path=sys.argv[1]
+src=open(path).read()
+old='from transformers.utils.import_utils import is_torch_fx_available'
+new=('def is_torch_fx_available():  # _distil_is_torch_fx_stub\n'
+     '    return False')
+if old in src:
+    open(path,'w').write(src.replace(old,new,1))
+    print('Patched',path)
+" "$f"
+done
+
+# Patch 2a: vLLM kimi_k25 model_executor — tolerate missing media_tokens_calculator
+V=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/kimi_k25.py
+if [ -f "$V" ] && ! grep -q '_distil_mm_tolerant' "$V"; then
+    cp -n "$V" "$V.orig"
+    python3 -c "
+import sys
+path=sys.argv[1]
+src=open(path).read()
+old='        self.media_tokens_calculator = image_processor.media_tokens_calculator'
+new=('        # _distil_mm_tolerant\n'
+     '        self.media_tokens_calculator = getattr(\n'
+     '            image_processor, \\'media_tokens_calculator\\', lambda *a, **kw: 0,\n'
+     '        )')
+if old in src:
+    open(path,'w').write(src.replace(old,new,1))
+    print('Patched',path)
+" "$V"
+fi
+
+# Patch 2b: vLLM kimi_k25 model_executor — short-circuit get_dummy_mm_items,
+# get_dummy_text, and _call_hf_processor when the image processor is a
+# transformers>=5.0 Qwen2VLImageProcessor fallback that lacks Kimi-specific
+# attrs (num_frames_per_chunk etc.). Encoder-budget profiling triggers all
+# three even with --skip-mm-profiling / --limit-mm-per-prompt; returning empty
+# / bypassing the multimodal path is safe because pod_eval feeds text-only
+# inputs at runtime.
+if [ -f "$V" ] && ! grep -q '_distil_dummy_mm_tolerant' "$V"; then
+    cp -n "$V" "$V.orig.v2"
+fi
+python3 - <<'PY'
+import sys
+path = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/kimi_k25.py"
+try:
+    src = open(path).read()
+except Exception:
+    print("vLLM kimi_k25.py not found; skipping")
+    raise SystemExit(0)
+changed = False
+
+# (a) get_dummy_mm_items returns [] when image_processor is wrong fallback
+items_old = "    def get_dummy_mm_items(self):"
+items_new = (
+    "    def get_dummy_mm_items(self):  # _distil_dummy_mm_tolerant\n"
+    "        ip = getattr(self.info, 'image_processor', None)\n"
+    "        if ip is None or not hasattr(ip, 'num_frames_per_chunk'):\n"
+    "            return []\n"
+    "        return self._real_get_dummy_mm_items()\n"
+    "\n"
+    "    def _real_get_dummy_mm_items(self):"
+)
+if items_old in src and "_distil_dummy_mm_tolerant" not in src:
+    src = src.replace(items_old, items_new, 1)
+    changed = True
+
+# (b) get_dummy_text returns " " (single space) when image_processor is wrong fallback.
+# Empty string would tokenize to 0 tokens and break the upstream
+# `(prompt_ids,) = input_ids` unpack in vLLM's processor.py:1165; a single
+# space produces 1+ tokens which is enough for the encoder budget profiling.
+text_old = "    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:"
+text_new = (
+    "    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:  # _distil_dummy_text_bypass\n"
+    "        ip = getattr(self.info, 'image_processor', None)\n"
+    "        if ip is None or not hasattr(ip, 'num_frames_per_chunk'):\n"
+    "            return \" \"\n"
+    "        return self._real_get_dummy_text(mm_counts)\n"
+    "\n"
+    "    def _real_get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:"
+)
+if text_old in src and "_distil_dummy_text_bypass" not in src:
+    src = src.replace(text_old, text_new, 1)
+    changed = True
+
+if changed:
+    open(path, "w").write(src)
+    print("vLLM kimi_k25.py patched")
+PY
+
+echo KIMI_PATCHES_OK
+"""
+            patch_result = self.exec(kimi_patch)
+            patch_out = patch_result.get('stdout', '') if isinstance(patch_result, dict) else patch_result
+            logger.info(f"Kimi compat patches: {str(patch_out).strip()[-200:]}")
         except Exception as e:
             logger.warning(f"Pod dep check failed (non-fatal): {e}")
 

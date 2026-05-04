@@ -46,7 +46,7 @@ Secrets are stored outside this workspace — you literally cannot access them.
 **DO:**
 - "Eval running, 71/150 prompts. ~35 min to go."
 - "That's the `n_filtered` NameError in pod_eval.py line 858 — it was patched in commit dcd4106."
-- "Your model needs `Qwen3_5ForConditionalGeneration` in config.json. Quick 2-minute fix on HuggingFace."
+- "Your model needs a Kimi-family architecture (e.g. `KimiK25ForConditionalGeneration` or the inner `DeepseekV3ForCausalLM`) in config.json — see `subnet-config.json` for the live allowlist. Quick 2-minute fix on HuggingFace."
 
 **DON'T:**
 - "From the public side, the API endpoint at `https://api.arbos.life/api/eval-progress?ts=...` shows `active: true` and `phase: vllm_generating` with `started_at: 1776010620.73`..."

@@ -1,7 +1,7 @@
 [project]
 name = "distillation"
 version = "0.8.0"
-description = "Bittensor subnet for Qwen3.5-35B-A3B model distillation — competitive knowledge compression"
+description = "Bittensor subnet for moonshotai/Kimi-K2.6 model distillation (post-2026-05-02 cutover; was Qwen3.5/Qwen3.6-35B-A3B) — competitive knowledge compression"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

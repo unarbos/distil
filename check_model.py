@@ -42,20 +42,78 @@ logging.basicConfig(
 logger = logging.getLogger("check_model")
 
 # ── Constants (must match validator) ────────────────────────────────────
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
-# 2026-05-02 (v30.5): student cap bumped 7B → 40B. Cap is now an
-# absolute floor (40B) rather than a fixed ratio of the teacher, so
-# it stays applicable through the upcoming Kimi K2.6 teacher swap
-# (~1T total / ~32B active) without needing a recomputation.
-TEACHER_TOTAL_PARAMS_B = 35.0
+# 2026-05-02 hard cutover: teacher swapped from Qwen3.5/Qwen3.6-35B-A3B to
+# moonshotai/Kimi-K2.6 (1T total / ~32B active MoE; INT4 compressed-tensors
+# wrapper; text inner is DeepSeek-V3 MoE, vocab 163,840). Student cap
+# stepped 5.25B → 7B → 40B → 33B; the live value lives in
+# frontend/src/lib/subnet-config.json (teacher.maxStudentParams etc.) and
+# we prefer that on disk if available so this script doesn't drift again.
+
+def _load_subnet_config():
+    """Load /frontend/src/lib/subnet-config.json relative to this file.
+
+    Returns the parsed dict, or None on any error. The validator-side
+    model_checker.py uses the same JSON as its source of truth, so the
+    constants below stay aligned with production whenever the file is
+    reachable."""
+    try:
+        repo_root = Path(__file__).resolve().parent
+        # repo layout: <root>/check_model.py and <root>/frontend/src/lib/subnet-config.json
+        path = repo_root / "frontend" / "src" / "lib" / "subnet-config.json"
+        if not path.exists():
+            return None
+        with path.open() as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+_SC = _load_subnet_config() or {}
+_SC_TEACHER = _SC.get("teacher") or {}
+
+TEACHER_MODEL = _SC_TEACHER.get("model") or "moonshotai/Kimi-K2.6"
+# Kimi K2.6 is ~1T total / ~32B active. We use the active params for the
+# "teacher size" ratio gate; the absolute cap below dominates anyway.
+TEACHER_TOTAL_PARAMS_B = (
+    (_SC_TEACHER.get("activeParams") or 32_000_000_000) / 1_000_000_000
+)
 MAX_PARAM_RATIO = 1.15  # ratio kept for legacy callers; absolute cap dominates
-MAX_STUDENT_PARAMS_B_ABS = 40.0  # hard ceiling, regardless of teacher size
-BASELINE_VOCAB_SIZE = 248320
+MAX_STUDENT_PARAMS_B_ABS = (
+    (_SC_TEACHER.get("maxStudentParams") or 33_000_000_000) / 1_000_000_000
+)
+BASELINE_VOCAB_SIZE = _SC_TEACHER.get("vocabSize") or 163_840
+_ARCH_ALLOWLIST = _SC_TEACHER.get("studentArchAllowlist") or [
+    {"model_type": "kimi_k2", "architecture": "DeepseekV3ForCausalLM"},
+    {"model_type": "deepseek_v3", "architecture": "DeepseekV3ForCausalLM"},
+    {"model_type": "kimi_k25", "architecture": "KimiK25ForConditionalGeneration"},
+]
 MIN_MODEL_BYTES = 500_000_000     # 500MB minimum
-MAX_STUDENT_VRAM_GB = 20.0        # Real 4B ≈ 8-10GB
-MIN_TOKENS_PER_SEC = 50           # Real 4B on B200 does 100+ tok/s
+MAX_STUDENT_VRAM_GB = 20.0        # 4B-class still ~8-10GB; 33B-class needs MP
+MIN_TOKENS_PER_SEC = 50           # 4B on B200 does 100+ tok/s
 KL_FRAUD_THRESHOLD = 1e-6         # KL ≤ this = identical to teacher = fraud
 FINGERPRINT_COSINE_THRESHOLD = 0.99999  # functional copy detection (bumped 2026-04-19, see commit history)
+
+
+def _arch_allowed(model_type: str, archs):
+    """Return True iff (model_type, any arch in archs) is on the allowlist."""
+    archs = set(archs or [])
+    for entry in _ARCH_ALLOWLIST:
+        mt = entry.get("model_type")
+        ar = entry.get("architecture")
+        if mt and mt != model_type:
+            continue
+        if ar and ar in archs:
+            return True
+    return False
+
+
+def _arch_allowlist_summary():
+    items = []
+    for entry in _ARCH_ALLOWLIST:
+        mt = entry.get("model_type", "?")
+        ar = entry.get("architecture", "?")
+        items.append(f"{ar} (model_type={mt})")
+    return ", ".join(items) or "(empty)"
 
 
 def banner(text: str, char: str = "═", width: int = 60):
@@ -301,35 +359,34 @@ def main(model_repo, revision, run_eval, prompts, teacher_cache, dataset, king_r
         else:
             check_pass("No quantization")
 
-        # RULE: Must use Qwen3_5ForConditionalGeneration (vLLM-native architecture)
+        # RULE: architecture must be on the live allowlist (Kimi-family
+        # post-2026-05-02 cutover). The allowlist comes from
+        # subnet-config.json::teacher.studentArchAllowlist (or the inline
+        # default). Validator-side enforcement lives in
+        # eval/model_checker.py and uses the same JSON.
         archs = config.get("architectures", [])
         model_type = config.get("model_type", "")
-        has_preproc = any(
-            getattr(s, "rfilename", "") == "preprocessor_config.json"
-            for s in (info.siblings or [])
-        ) if info else False
-        if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs and has_preproc:
-            check_pass("Architecture", f"Qwen3_5ForConditionalGeneration (vLLM-native)")
-        elif model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
-            check_warn("Architecture",
-                       f"Qwen3_5ForConditionalGeneration found but missing preprocessor_config.json. "
-                       f"Copy it from Qwen/Qwen3.5-4B.")
+        if _arch_allowed(model_type, archs):
+            check_pass("Architecture",
+                       f"{','.join(archs) or '?'} (model_type={model_type or '?'}) — on allowlist")
         else:
             check_fail("Architecture",
-                       f"Must use Qwen3_5ForConditionalGeneration (model_type=qwen3_5). "
-                       f"Found: {','.join(archs)} (model_type={model_type}). "
-                       f"See Discord announcement for conversion instructions.")
+                       f"Must use a Kimi-family architecture on the live allowlist. "
+                       f"Allowed: {_arch_allowlist_summary()}. "
+                       f"Found: {','.join(archs) or '(none)'} (model_type={model_type or '(none)'}).")
             failures.append(("architecture", f"{','.join(archs)} / {model_type}"))
 
-        # RULE: Vocab size matches teacher
+        # RULE: Vocab size matches teacher (Kimi K2.6 BPE = 163,840;
+        # pre-cutover Qwen3.5/Qwen3.6 was 248,320 — that vocab is rejected
+        # under the new teacher).
         vocab_size = config.get("vocab_size", 0)
         if not vocab_size:
             vocab_size = config.get("text_config", {}).get("vocab_size", 0)
 
         if vocab_size != BASELINE_VOCAB_SIZE:
             check_fail("Vocab size",
-                       f"{vocab_size} ≠ {BASELINE_VOCAB_SIZE} (teacher). "
-                       f"Must use same tokenizer as Qwen3.5-35B-A3B.")
+                       f"{vocab_size} ≠ {BASELINE_VOCAB_SIZE} (teacher {TEACHER_MODEL}). "
+                       f"Must use the same tokenizer as the teacher.")
             failures.append(("vocab_size", f"{vocab_size} ≠ {BASELINE_VOCAB_SIZE}"))
         else:
             check_pass("Vocab size", f"{vocab_size} matches teacher")

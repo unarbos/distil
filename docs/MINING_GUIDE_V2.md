@@ -32,7 +32,7 @@ The conclusion is unambiguous: **skip the mid-train phase and your 4B will regre
 
 **Recipe:**
 
-- Start from `Qwen/Qwen3.5-4B` base (the SN97-mandated architecture).
+- Start from a **Kimi-family** base on the live allowlist in [`subnet-config.json`](../frontend/src/lib/subnet-config.json) — typically a small DeepSeek-V3-text variant (≤33B) or one of the small public Kimi-K2.x text releases. (Pre-cutover this said "Qwen/Qwen3.5-4B"; that base is no longer accepted by the eval.)
 - Train 5–20B tokens of **diverse reasoning traces** from a strong teacher: a representative mix of math (GSM8K, MATH, NuminaMath), code (CodeContests, MBPP, HumanEval), reasoning (BBH, ARC, PIQA), and chat (LMSYS-style). Phi-4-Mini-Reasoning used 16B tokens of R1-distill traces here.
 - This stage is **not** rejection-sampled. The point is *coverage*, not perfection.
 - Loss: standard cross-entropy on teacher tokens. Optionally add a forward-KL term against the teacher's top-K logits (~5–10% improvement, but not required).
@@ -112,7 +112,7 @@ config = DistillationConfig(
 - `lmbda=1.0` → **fully on-policy**. `lmbda<1` mixes off-policy data and is only worth it if your stage-2 SFT didn't fully converge.
 - `beta=1.0` → **reverse-KL**. Reverse KL is mode-seeking, which is what you want here. Forward KL is mode-covering — already done in stage 2.
 - `loss_top_k=1` → **top-1 approximation** is enough at scale. The 2026 paper found no measurable gap to full-vocab.
-- Teacher: same as the validator's teacher (currently **Qwen3.6-35B-A3B**) so OPD mass concentrates on the same support.
+- Teacher: same as the validator's teacher (currently **moonshotai/Kimi-K2.6** post-2026-05-02; previously Qwen3.6-35B-A3B) so OPD mass concentrates on the same support. Always re-check `subnet-config.json` for the live teacher.
 - Train for 1k–10k steps. The "elbow" where AIME climbs sharpest is typically 2k–5k steps.
 
 **LoRA shortcut for compute-constrained miners:**
@@ -122,7 +122,7 @@ config = DistillationConfig(
 - LR **10×** higher than full FT, typically 1e-5
 - Effective batch < 32
 
-LoRA-r=128 + OPD on Qwen3.5-4B base is the right sweet-spot for consumer GPUs. Memory: ~24GB at bf16. Wall time on a single A100 80GB: ~36 hours for 5k OPD steps.
+LoRA-r=128 + OPD on a small Kimi-compatible base (e.g. a 4B-class DeepSeek-V3-text variant) is the right sweet-spot for consumer GPUs. Memory: ~24GB at bf16. Wall time on a single A100 80GB: ~36 hours for 5k OPD steps. (For full 33B-class students you'll want 4–8× H100/H200; consumer GPUs are fine for sub-7B sanity students against a small teacher.)
 
 **What you should see at the end of stage 3:**
 
@@ -259,7 +259,7 @@ Total weight on bench axes ≈ 0.85; total relative-axis weight ≈ 0.93. Both r
 
 6. **Single-axis specialisation.** "I'll just maximise `aime_bench`" is a guaranteed-to-lose strategy. `aime_bench` is weighted 0.04 and 0.55 on `aime_bench` with 0.30 on every other axis still gives you `worst = 0.30`. Always optimise the bottom of your axis distribution, not the top.
 
-7. **Per-axis baseline regression.** v29.1 ships a baseline-relative penalty: any bench axis where you score *below the same-round Qwen3.5-4B base reference* gets docked by `1.5 × (ref - your_score)`. So a regression of 10pp below base costs you 25pp on that axis (10pp raw + 15pp dock). This makes "stay above base" the dominant strategy.
+7. **Per-axis baseline regression.** v29.1 ships a baseline-relative penalty: any bench axis where you score *below the same-round reference baseline* (UID -1 — Kimi-compatible reference under the post-cutover allowlist; see `subnet-config.json` `referenceModel`. Pre-cutover this was Qwen3.5-4B base) gets docked by `1.5 × (ref - your_score)`. So a regression of 10pp below base costs you 25pp on that axis (10pp raw + 15pp dock). This makes "stay above base" the dominant strategy.
 
 8. **Cross-validator drift.** All procedural items derive from `block_seed`, so every validator generates the same items each round. Don't try to fingerprint individual validators — your composite is the same regardless.
 
@@ -269,15 +269,15 @@ Total weight on bench axes ≈ 0.85; total relative-axis weight ≈ 0.93. Both r
 
 Before you push your model + commit on-chain:
 
-- [ ] Architecture is `Qwen3_5ForConditionalGeneration` with `model_type: "qwen3_5"`.
-- [ ] Total params ≤ **7B** (v29.7 raised the cap from 5.25B; check `frontend/src/lib/subnet-config.json` for the live value).
-- [ ] Tokenizer is **byte-identical** to the teacher's (vocab 248,320). Don't modify `tokenizer.json` or `tokenizer_config.json`.
-- [ ] No quantisation (bf16 / fp16 only).
+- [ ] Architecture is one of the **Kimi-family arches** on the live allowlist in [`frontend/src/lib/subnet-config.json`](../frontend/src/lib/subnet-config.json) (currently `KimiK25ForConditionalGeneration` or the inner `DeepseekV3ForCausalLM`) with the matching `model_type`. Legacy `Qwen3_5ForConditionalGeneration` is **no longer accepted** post-2026-05-02.
+- [ ] Total params ≤ **33B** (post-Kimi-cutover cap, was 40B before; always re-check `frontend/src/lib/subnet-config.json` for the live value).
+- [ ] Tokenizer is **byte-identical** to the Kimi K2.6 teacher's (vocab **163,840**). Don't modify `tokenizer.json` or `tokenizer_config.json`. (The legacy Qwen vocab of 248,320 is wrong post-cutover.)
+- [ ] No quantisation (bf16 / fp16 only). The teacher's INT4 compressed-tensors wrapper does **not** carry over to your student.
 - [ ] No `.py` files (except `__init__.py`).
 - [ ] Safetensors only (no `.bin`-only models).
 - [ ] HuggingFace repo is **public** and stays public.
-- [ ] Local eval shows `composite.worst ≥ 0.45` against the v30 procedural benches (run your own copy of `pod_eval_vllm.py` if you want to mirror exactly).
-- [ ] No regression below Qwen3.5-4B base on any axis (verify with the reference axes from a recent `composite_scores.json`).
+- [ ] Local eval shows `composite.final ≥ 0.45` against the v30 procedural benches (run your own copy of `pod_eval_vllm.py` if you want to mirror exactly).
+- [ ] No regression below the Kimi-era reference baseline (UID -1, see `subnet-config.json` `referenceModel`) on any axis (verify with the reference axes from a recent `composite_scores.json`).
 - [ ] Held-out canary: AIME24 ≥ 30%, MATH-500 ≥ 80%, MBPP+ ≥ 65%, IFEval ≥ 60%. The validator runs Evalscope canaries on the king out-of-band; a king that regresses on the canary triggers the `king_canary_streak` auto-dethrone gate (see [`reports/2026-04-28-grief-tiebreaker-and-canary-streak.md`](../reports/2026-04-28-grief-tiebreaker-and-canary-streak.md)).
 - [ ] Long-form sanity check: write 4 prompts that demand 300-500 word essays, run greedy generation, eyeball the responses for structure / depth / coherence. If they look like 1-line answers or unstructured rambles, your `long_form_judge` axis will be ≤0.30.
 - [ ] Pragmatic sanity check: write 3 false-belief items by hand, verify the model gives the actor's-belief answer, not the world-state answer.

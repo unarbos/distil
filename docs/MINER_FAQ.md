@@ -2,9 +2,11 @@
 
 ## What is Subnet 97?
 
-Distil is a Bittensor subnet where miners compete to distill knowledge from a large teacher model into smaller student models. The teacher is **Qwen/Qwen3.5-35B-A3B** (35B total params, ~3B active — it's a Mixture-of-Experts model). Your job: produce the most faithful small model (≤5.25B params), measured on a **17-axis composite** that covers distribution match, capability against ground truth, conversational quality, generation discipline, and robustness to prompt rewrites.
+Distil is a Bittensor subnet where miners compete to distill knowledge from a large teacher model into smaller student models. The teacher is **moonshotai/Kimi-K2.6** (1T total / ~32B active MoE; INT4 compressed-tensors wrapper; text inner is DeepSeek-V3 MoE — 61 layers, 384 experts, 8 active per token; Kimi BPE tokenizer with vocab 163,840). Your job: produce the most faithful small model (**≤33B total params**, Kimi-family architecture), measured on a multi-axis composite that covers distribution match, capability against ground truth, conversational quality, generation discipline, and robustness to prompt rewrites.
 
-The ranking key is **`composite.worst`** — the single weakest axis. KL is one of those 17 axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
+> **Teacher swap (2026-05-02):** the previous Qwen3.5/Qwen3.6-35B-A3B teacher and the 5.25B/7B caps were retired in favor of Kimi K2.6 + 33B. The live source of truth for teacher / cap / vocab / architecture allowlist is [`frontend/src/lib/subnet-config.json`](../frontend/src/lib/subnet-config.json). Older numbers in this FAQ that mention 5.25B / 7B / Qwen3.5-4B are historical.
+
+The ranking key is **`composite.final`** = α · worst-3-axis-mean + (1 − α) · weighted-mean of every axis (α = 0.7). KL is one of the axes, not the gate. A model that wins KL but loses on grade-school math, IFEval, or reasoning-density cannot take the crown. Winner takes all — the king gets 100% of emissions.
 
 > **Heads up.** If you've miner'd here before and remember "lower KL = win", that framing is wrong under the current eval. The 2026-04-17 reasoning-spiral king (UID 107: 4096-token loops on `"Hi"`, strictly worse than the unfine-tuned 4B base on every reasoning bench) was the wake-up call. The composite, the on-policy RKL axis, and the `reasoning_density` axis exist specifically to close that gap. Read the axis-by-axis playbook below before training. See [`paper/off_policy_cot_collapse.md`](../paper/off_policy_cot_collapse.md) for the full diagnosis.
 
@@ -18,11 +20,11 @@ Register a hotkey on subnet 97 via the standard Bittensor registration flow (`bt
 
 ### 2. Train Your Student Model
 
-- **Architecture:** Must be `Qwen3_5ForConditionalGeneration` with `model_type: "qwen3_5"` in `config.json`
-  - ⚠️ **NOT** `Qwen3_5ForCausalLM` / `qwen3_5_text` — this will get you disqualified
-- **Max total params:** 5.25B (total, not active — MoE tricks won't help)
-- **Tokenizer:** Must be identical to the teacher's tokenizer (vocab size 248,320). Don't modify `tokenizer.json` or `tokenizer_config.json`
-- **No quantization:** bf16/fp16 only. GPTQ, AWQ, GGUF etc. are rejected
+- **Architecture:** Must be **Kimi-family** — `KimiK25ForConditionalGeneration` (preferred) or the inner text-only `DeepseekV3ForCausalLM` (the same MoE backbone Kimi K2.6 uses internally) with the matching `model_type` in `config.json`. The current allowlist lives in [`frontend/src/lib/subnet-config.json`](../frontend/src/lib/subnet-config.json) under `architectures` — that file is the source of truth, not this FAQ.
+  - ⚠️ Old Qwen3.5 / Qwen3.6 `*_5ForConditionalGeneration` archs are **no longer accepted** post-cutover.
+- **Max total params:** **33B total** (not active — MoE tricks won't help; we sum every parameter that ships in safetensors).
+- **Tokenizer:** Must be **identical to the teacher's tokenizer** — Kimi K2.6 BPE with `vocab_size=163,840`. Don't modify `tokenizer.json` / `tokenizer_config.json`. (The previous Qwen3.5 vocab of 248,320 is **wrong** under the Kimi cutover.)
+- **No quantization:** bf16/fp16 only. GPTQ, AWQ, GGUF, INT4/INT8 are rejected. (Yes — even though the *teacher* ships an INT4 compressed-tensors wrapper. That wrapper is Kimi's, not yours to inherit.)
 - **No custom code:** `.py` files in your repo (except `__init__.py`) will get you DQ'd
 - **Format:** Safetensors required (no pytorch `.bin`-only models)
 
@@ -55,7 +57,7 @@ Each student is scored on many **independent axes**; the leaderboard is ordered 
 3. **One eval per commitment** for non-king miners — the validator stores `composite.final`, all axes, and the commit signature in `composite_scores.json`.
 4. **King paired re-eval each round** (v30.2 fix): the king is forced into the round's eval set so its score is on the same procedural items as challengers. Their `composite_scores.json` record overwrites each round.
 5. **Cross-round dethrone gate**: a new commitment dethrones the king when its `composite.final` exceeds the king's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%).
-6. **Reference baseline.** Undistilled `Qwen/Qwen3.5-4B` is included in every round as UID `-1` for the per-axis baseline-relative penalty + axis-floor anchoring. Not a contender.
+6. **Reference baseline.** A small dense Kimi-compatible reference model (currently a small DeepSeek-V3-text variant from the allowlist; consult `subnet-config.json` for the live `referenceModel`) is included in every round as UID `-1` for the per-axis baseline-relative penalty + axis-floor anchoring. Not a contender. (Pre-cutover this slot was undistilled `Qwen/Qwen3.5-4B`; the historical KL ranges in this FAQ refer to that era.)
 7. **Winner takes all** — the king gets 100% of emissions on chain.
 
 **Implication for miners.** Pick your weights carefully before you commit. The on-chain registration burn is the price of an evaluation: there is no "re-roll the same commitment until variance lands well." A model that scores 0.42 final stays at 0.42 forever (until you push a new commitment to the same hotkey, which fully overwrites the previous record).
@@ -149,7 +151,7 @@ A student that exactly matches the teacher scores 0; one that beats teacher by ~
 | `capability`      | Verifiable prompts (arithmetic/yes-no/one-word factual). `min(frac/teacher_frac, frac/0.6)` — absolute floor prevents winning by echoing teacher mistakes. |
 | `length`          | Student generation length vs a teacher anchor. Rambling models lose here. 1.0 when you match the teacher.  |
 | `degeneracy`      | Termination fraction + MAD-z-scored repetition + cross-rollout Self-BLEU. 1.0 = teacher-like.             |
-| `judge_probe`     | Teacher (Qwen3.5-35B) rates your response on a 1-5 rubric, rotated to 16 prompts/round. Normalized to [0,1]. |
+| `judge_probe`     | Teacher (Kimi K2.6) rates your response on a 1-5 rubric, rotated to 16 prompts/round. Normalized to [0,1]. |
 
 **Absolute-correctness axes** (scored vs ground truth, weight 0.45 total):
 
@@ -219,7 +221,7 @@ All bench pools rotate per-round via `block_seed`, so every validator picks the 
 
 1. **Final-score margin (v30.2).** Your single eval's `composite.final` must exceed the king's stored `composite.final` by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). 0.50 → 0.515 is not enough; 0.50 → 0.52 is. (Legacy v28-and-earlier records that lack `final` fall back to the old `composite.worst`-based rule.)
 2. **Worst-axis floor.** If `composite.worst < COMPOSITE_DETHRONE_FLOOR = 0.20`, the dethrone is **vetoed** even if the margin passes — unless the king-canary streak is active (king regressed on held-out gsm8k/humaneval/bbh/ifeval for 2+ consecutive rounds), in which case the floor is waived.
-3. **Per-axis baseline-relative penalty (v29.1).** Each bench axis where you regress below the same-round Qwen3.5-4B-base reference is docked by `1.5 × (ref - your_score)`. So a 10pp regression below base costs you 25pp on that axis (10pp raw + 15pp dock). This makes "stay above base on every axis" the dominant strategy.
+3. **Per-axis baseline-relative penalty (v29.1).** Each bench axis where you regress below the same-round reference baseline (UID -1, Kimi-compatible reference under the post-cutover allowlist; previously Qwen3.5-4B-base) is docked by `1.5 × (ref - your_score)`. So a 10pp regression below base costs you 25pp on that axis (10pp raw + 15pp dock). This makes "stay above base on every axis" the dominant strategy.
 4. **Pareto-dominance gate.** A challenger that wins on `composite.final` but loses to the king on a majority of comparable axes is blocked. Soft Pareto: majority win AND `n_wins ≥ n_losses`, with a 2% noise margin. Insufficient comparable axes fails open.
 
 ---
@@ -263,12 +265,12 @@ The fastest way to climb Arena v3 is to broaden your distillation data mix so th
 
 ## Training Tips
 
-- **Base model:** Start from [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) or a compatible Qwen3.5 architecture.
-- **Objective:** Optimise for `composite.worst`, not KL. KL(teacher ‖ student) is one of 17 axes — useful but never sufficient. A pure-KL model loses to a slightly-worse-KL model that also answers GSM8K correctly, doesn't loop on `"Hi"`, and survives prompt paraphrase.
+- **Base model:** Start from a Kimi-family checkpoint that fits the 33B cap — e.g. a small DeepSeek-V3-text variant from the allowlist, or one of the public small Kimi-K2.x text-only releases. Always re-verify the architecture string against [`subnet-config.json`](../frontend/src/lib/subnet-config.json) before committing; the allowlist is the gate, not this FAQ.
+- **Objective:** Optimise for `composite.final` (worst-3-mean blended with the weighted mean). KL(teacher ‖ student) is one of many axes — useful but never sufficient. A pure-KL model loses to a slightly-worse-KL model that also answers GSM8K correctly, doesn't loop on `"Hi"`, and survives prompt paraphrase.
 - **Data mix:** at minimum combine ClimbMix-style distillation data with ~10–20% instruction/reasoning/code data (see the playbook above). Miners who run SFT + DPO on top of their distillation have been climbing the bench axes fastest.
 - **Long completions matter:** eval uses `max_new_tokens=8192`. The model needs to terminate naturally on simple prompts and reason coherently on long ones.
 - **Temperature:** vLLM runs at `temperature=0.7, top_p=0.9` with per-prompt seed `block_seed + prompt_idx`. Deterministic per round, rotating between rounds. Greedy (temp=0) only applies to local dev runs without `--block-seed`.
-- **Don't modify the chat template:** it's checked against the reference Qwen3.5 template hash. Injected comments or modifications = DQ.
+- **Don't modify the chat template:** it's checked against the reference Kimi K2.6 template hash. Injected comments or modifications = DQ.
 - **Bench probes run offline.** All datasets are pre-cached on the pod (`HF_HUB_OFFLINE=1`). No network-dependency required in your model.
 
 ---
@@ -289,15 +291,15 @@ This subnet enforces **one registration → one commitment → one eval**. The i
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "Wrong architecture" DQ | `config.json` has `Qwen3_5ForCausalLM` or wrong `model_type` | Change `architectures` to `["Qwen3_5ForConditionalGeneration"]` and `model_type` to `"qwen3_5"` in config.json. No weight changes needed. |
+| "Wrong architecture" DQ | `config.json` has an arch that's not on the live allowlist (e.g. legacy Qwen3_5*) | Set `architectures` to one of the allowlisted Kimi-family arches in [`subnet-config.json`](../frontend/src/lib/subnet-config.json) (currently `KimiK25ForConditionalGeneration` or the inner `DeepseekV3ForCausalLM`) with the matching `model_type`. No weight changes needed if the underlying topology already matches; otherwise retrain. |
 | "Integrity check failed" | HF repo deleted, made private, or otherwise unreachable since the validator first hashed it | Make the repo public and re-upload the same weights — the integrity DQ clears next epoch when the validator can re-verify. The on-chain commitment doesn't move; only the HF repo state matters. (Permanent DQs from `copy`, `anti_finetune`, or `arch` cannot be cleared this way — those require a new hotkey.) |
 | "Copy detected" | Model hash matches another miner's submission | Your weights are identical to another miner's. Train your own model. |
 | "Model is now private" DQ | HuggingFace repo set to private or deleted | Keep your model repo public at all times. |
-| "Vocab size mismatch" | Modified tokenizer | Use the exact same tokenizer as the teacher (Qwen3.5-35B-A3B). |
-| "Quantized model detected" | Model has `quantization_config` in config.json | Remove quantization. Use bf16/fp16 weights only. |
+| "Vocab size mismatch" | Modified tokenizer / using legacy Qwen3.5 tokenizer post-cutover | Use the exact same tokenizer as the Kimi K2.6 teacher (`vocab_size=163,840`). |
+| "Quantized model detected" | Model has `quantization_config` in config.json | Remove quantization. Use bf16/fp16 weights only. (The teacher's INT4 wrapper does not transfer to your student.) |
 | "Custom code files" DQ | `.py` files found in your repo | Remove all Python files from your HuggingFace repo. |
-| "Tokenizer encoding mismatch" | Tokenizer produces different token IDs than teacher | Use the unmodified teacher tokenizer files. |
-| "Chat template modified" | `chat_template` in tokenizer_config.json differs from reference | Use the original Qwen3.5 chat template without modifications. |
+| "Tokenizer encoding mismatch" | Tokenizer produces different token IDs than teacher | Use the unmodified Kimi K2.6 tokenizer files. |
+| "Chat template modified" | `chat_template` in tokenizer_config.json differs from reference | Use the original Kimi K2.6 chat template without modifications. |
 
 ---
 
@@ -329,21 +331,23 @@ All endpoints are on `api.arbos.life`.
 
 ## Key Constants
 
+> **Reminder.** The values below are mirrored from [`frontend/src/lib/subnet-config.json`](../frontend/src/lib/subnet-config.json) and the `subnet_config` API endpoint. If they ever drift, **trust the JSON / API**, not this table. The Discord bot and the dashboard read directly from `subnet-config.json`.
+
 | Parameter | Value |
 |-----------|-------|
 | Subnet UID | 97 |
-| Teacher model | `Qwen/Qwen3.5-35B-A3B` |
-| Max student params | 5.25B (total) |
-| Required architecture | `Qwen3_5ForConditionalGeneration` |
-| Required model_type | `qwen3_5` |
-| Vocab size | 248,320 |
+| Teacher model | `moonshotai/Kimi-K2.6` (post-2026-05-02 cutover) |
+| Max student params | **33B (total)** |
+| Required architecture | Kimi-family (e.g. `KimiK25ForConditionalGeneration` or inner `DeepseekV3ForCausalLM`); see allowlist in `subnet-config.json` |
+| Required model_type | matching the chosen Kimi-family arch (`kimi_k25` / `deepseek_v3`); see `subnet-config.json` |
+| Vocab size | **163,840** (Kimi K2.6 BPE) |
 | Eval prompts per UID | 300 (block-seeded, single-eval policy) |
 | Eval prompts (broad sweep) | 60 |
 | Max new tokens | 8,192 |
 | Max prompt tokens | 1,024 |
 | Eval policy | `SINGLE_EVAL_MODE=1` — one commitment, one eval |
 | Challengers per round (cap) | `SINGLE_EVAL_MAX_PER_ROUND=10` (FIFO by `commit_block`) |
-| Dethronement gate | `challenger.composite.worst > incumbent.composite.worst × 1.03` (cross-round, on absolute composite) |
+| Dethronement gate | `challenger.composite.final > incumbent.composite.final × 1.03` (cross-round, on absolute composite) |
 | Saturated-floor tiebreaker | when both `worst ≤ 0.005`, same 3% margin on `composite.weighted` |
 | King selection schema floor | `_KING_SELECTION_MIN_AXES = 17` (Arena v3.7) |
 | Composite version | Arena v3.7 |
@@ -351,4 +355,4 @@ All endpoints are on `api.arbos.life`.
 | Shadow axes | none |
 | Top-N always included | n/a in single-eval mode (no re-eval rotation) |
 | Dataset (distillation) | `karpathy/climbmix-400b-shuffle` |
-| Reference baseline | `Qwen/Qwen3.5-4B` (UID -1) |
+| Reference baseline | UID -1 — small Kimi-compatible reference (consult `subnet-config.json` `referenceModel`) |
