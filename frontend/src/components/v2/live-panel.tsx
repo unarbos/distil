@@ -36,6 +36,13 @@ interface EvalProgress {
   // still 0 (i.e. before KL scoring begins). Surfaced via
   // ``current.stage`` from the pod's eval_progress.json.
   current_stage?: string | null;
+  // 2026-05-04: bench-battery sub-axis index (1-based) and total
+  // (~17 axes). Stage is "bench_battery:<axis_name>" while the
+  // axis is in flight. Lets the queue row render
+  // "running bench: aime (6/17)" so the ~25-min phase doesn't
+  // look stuck on a static "bench_battery" stamp.
+  bench_axis_idx?: number | null;
+  bench_axis_total?: number | null;
   teacher_prompts_done?: number;
   started_at?: number;
   estimated_completion?: number;
@@ -387,6 +394,8 @@ function QueueRow({ status, uid, model, role, completed, current }: QueueRowProp
           ? ` · KL ${current.current_kl.toFixed(4)}`
           : "";
       const stage = current.current_stage as string | null | undefined;
+      const benchAxisIdx = current.bench_axis_idx as number | null | undefined;
+      const benchAxisTotal = current.bench_axis_total as number | null | undefined;
       // 2026-05-04: when a stage is reported and we haven't started
       // KL scoring yet, show what the eval is actually doing instead
       // of "0/N prompts". The X/N counter only increments during the
@@ -395,6 +404,18 @@ function QueueRow({ status, uid, model, role, completed, current }: QueueRowProp
       // turns / bench probes for ~15 min and miners read "0/60" as
       // "the eval is hung".
       if (stage && stage !== "kl_scoring" && pd === 0) {
+        // bench_battery:aime_bench → "bench: aime (6/17)"
+        if (stage.startsWith("bench_battery:")) {
+          const axis = stage
+            .slice("bench_battery:".length)
+            .replace(/_bench$/, "")
+            .replace(/_/g, " ");
+          const counter =
+            typeof benchAxisIdx === "number" && typeof benchAxisTotal === "number"
+              ? ` (${benchAxisIdx}/${benchAxisTotal})`
+              : "";
+          return `running bench: ${axis}${counter}`;
+        }
         const stageLabel = stage
           .replace(/_/g, " ")
           .replace(/\bprobe\b/, "probe");

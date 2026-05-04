@@ -355,6 +355,8 @@ export interface EvalProgress {
   current_ci?: [number, number];
   current_best?: number;
   current_stage?: string | null;
+  bench_axis_idx?: number | null;
+  bench_axis_total?: number | null;
   teacher_prompts_done?: number;
   models?: Record<string, string>;
   eval_order?: Array<{ uid: number; model: string; role: "king" | "challenger" }>;

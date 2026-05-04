@@ -220,6 +220,12 @@ def normalize_eval_progress(progress):
         # dashboard's eval-queue row to show what's running between
         # "loading_student" and "kl_scoring N/60 prompts".
         "current_stage": "stage",
+        # 2026-05-04: bench-battery sub-axis counter. ``stage`` will
+        # be ``bench_battery:<axis_name>`` and these two carry the
+        # X/Y position within the 17-axis battery so the dashboard
+        # can render "running bench: aime (6/17)".
+        "bench_axis_idx": "bench_axis_idx",
+        "bench_axis_total": "bench_axis_total",
     }
     for flat_key, nested_key in fields.items():
         flat_value = normalized.get(flat_key)

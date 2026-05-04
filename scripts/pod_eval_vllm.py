@@ -14492,7 +14492,8 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
-def run_bench_battery(model, tokenizer, device="cuda"):
+def run_bench_battery(model, tokenizer, device="cuda",
+                       stage_callback=None):
     """Run all bench probes for one student. Returns a dict keyed by axis
     name (``math_bench`` / ``code_bench`` / ... / ``aime_bench`` / etc.).
     Each value is a dict with ``n``, ``correct``, ``pass_frac``, ``items``,
@@ -14503,6 +14504,15 @@ def run_bench_battery(model, tokenizer, device="cuda"):
     outage in the Session 3 (shadow) tail can't corrupt the production
     numbers. Each probe is wrapped so a single failure doesn't abort the
     battery.
+
+    2026-05-04 — ``stage_callback`` is an optional ``f(name, idx, total)``
+    invoked before each probe. The dispatcher uses this to update
+    ``current.stage`` in ``eval_progress.json`` so the dashboard shows
+    "running aime_bench (6/17)" instead of a single static "bench_battery"
+    label for the entire ~25-min phase. Per-axis logging also lands in
+    the pod log so we can tell from a glance which axis is the wall-time
+    sink for each student (key for the ongoing eager-attn-vs-FA2 perf
+    investigation).
     """
     if not BENCH_BATTERY_ENABLED:
         return {}
@@ -14560,7 +14570,13 @@ def run_bench_battery(model, tokenizer, device="cuda"):
                 "n": 0, "correct": 0, "pass_frac": 0.0, "wall_s": 0.0,
                 "_skipped": True,
             }
-    for name, fn in _probes:
+    total = len(_probes)
+    for idx, (name, fn) in enumerate(_probes, start=1):
+        if stage_callback is not None:
+            try:
+                stage_callback(name, idx, total)
+            except Exception:
+                pass
         st = time.time()
         try:
             res = fn(model, tokenizer, device)
@@ -14568,6 +14584,16 @@ def run_bench_battery(model, tokenizer, device="cuda"):
             res = {"error": str(e)[:200], "n": 0, "correct": 0, "pass_frac": 0.0}
         res["wall_s"] = round(time.time() - st, 1)
         out[name] = res
+        n_done = res.get("n", 0) or 0
+        n_correct = res.get("correct", 0) or 0
+        err = res.get("error")
+        if err:
+            print(f"  [bench {idx}/{total}] {name}: ERROR {err[:80]} ({res['wall_s']:.1f}s)", flush=True)
+        elif n_done > 0:
+            pf = (n_correct / n_done) if n_done else 0.0
+            print(f"  [bench {idx}/{total}] {name}: {n_correct}/{n_done} ({pf*100:.0f}%) ({res['wall_s']:.1f}s)", flush=True)
+        else:
+            print(f"  [bench {idx}/{total}] {name}: skipped/empty ({res['wall_s']:.1f}s)", flush=True)
     out["_total_wall_s"] = round(time.time() - t0, 1)
     out["_shadow_axes_enabled"] = BENCH_BATTERY_SHADOW_AXES
     return out
@@ -18760,7 +18786,20 @@ def main():
                             f"(saves ~19 min/student of garbage generation)",
                             flush=True,
                         )
-                bench_res = run_bench_battery(student, tokenizer, device)
+                # Surface the in-flight axis to the dashboard so the
+                # ~25-min bench phase doesn't look stuck. The
+                # _set_stage helper is captured from the enclosing
+                # main() scope.
+                def _bench_stage_cb(axis_name: str, ax_idx: int, ax_total: int):
+                    _set_stage(
+                        f"bench_battery:{axis_name}",
+                        bench_axis_idx=ax_idx,
+                        bench_axis_total=ax_total,
+                    )
+                bench_res = run_bench_battery(
+                    student, tokenizer, device,
+                    stage_callback=_bench_stage_cb,
+                )
                 total_w = bench_res.pop("_total_wall_s", 0.0)
                 results["students"].setdefault(student_name, {})
                 summary_bits = []

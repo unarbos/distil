@@ -349,6 +349,13 @@ def get_queue():
     # report the round as hung in #distil-97.
     cur = prog.get("current") or {}
     current_stage = cur.get("stage") if isinstance(cur, dict) else None
+    # 2026-05-04: bench-battery sub-axis counter (e.g. aime_bench is
+    # axis 6/17 of the battery) so the dashboard can render
+    # "running bench: aime (6/17)" — the bench phase is ~25 min on
+    # eager-attn Kimi 33B and a static "bench_battery" stamp doesn't
+    # tell the user that 11/17 axes are still pending.
+    bench_axis_idx = cur.get("bench_axis_idx") if isinstance(cur, dict) else None
+    bench_axis_total = cur.get("bench_axis_total") if isinstance(cur, dict) else None
     payload = {
         "active": bool(prog.get("active")),
         "phase": prog.get("phase"),
@@ -363,6 +370,8 @@ def get_queue():
         "prompts_total": prog.get("prompts_total"),
         "prompts_done": prog.get("prompts_done"),
         "current_stage": current_stage,
+        "bench_axis_idx": bench_axis_idx,
+        "bench_axis_total": bench_axis_total,
         "teacher_prompts_done": prog.get("teacher_prompts_done"),
         "slots": slots,
         "top4_leaderboard_contenders": lb_contenders,
@@ -745,6 +754,8 @@ def get_dashboard():
                 "current_student": prog.get("current_student") or (prog.get("current") or {}).get("student_name"),
                 "current_kl": prog.get("current_kl") or (prog.get("current") or {}).get("kl_running_mean"),
                 "current_stage": (prog.get("current") or {}).get("stage"),
+                "bench_axis_idx": (prog.get("current") or {}).get("bench_axis_idx"),
+                "bench_axis_total": (prog.get("current") or {}).get("bench_axis_total"),
                 "eval_order": prog.get("eval_order"),
                 "teacher_prompts_done": prog.get("teacher_prompts_done"),
             },
