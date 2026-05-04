@@ -1851,17 +1851,7 @@ def judge_response_probe(model, tokenizer, device="cuda"):
         return out
     if not getattr(tokenizer, "chat_template", None):
         return out
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     with _model_eval_no_grad(model):
         for prompt in JUDGE_PROBE_PROMPTS:
             try:
@@ -2033,17 +2023,7 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
     responses = collected.get("responses") or []
     if not prompts or not responses:
         return agg
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     scores: list[int | None] = []
     with _model_eval_no_grad(teacher):
         for prompt, response in zip(prompts, responses):
@@ -2124,17 +2104,7 @@ def long_form_judge_response_probe(model, tokenizer, device="cuda",
         return out
     if not getattr(tokenizer, "chat_template", None):
         return out
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     with _model_eval_no_grad(model):
         for prompt in LONG_FORM_JUDGE_PROMPTS:
             try:
@@ -2278,17 +2248,7 @@ def long_form_judge_teacher_score(teacher, tokenizer, collected: dict,
     responses = collected.get("responses") or []
     if not prompts or not responses:
         return agg
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     scores: list[int | None] = []
     with _model_eval_no_grad(teacher):
         for prompt, response in zip(prompts, responses):
@@ -3167,17 +3127,7 @@ def chat_turns_response_probe(model, tokenizer, device="cuda"):
         return out
     if not getattr(tokenizer, "chat_template", None):
         return out
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     with _model_eval_no_grad(model):
         for convo in CHAT_TURNS_PROBE_PROMPTS:
             turn_responses: list[str] = []
@@ -3233,17 +3183,7 @@ def chat_turns_teacher_score(teacher, tokenizer, collected: dict,
     responses = collected.get("responses") or []
     if not prompts or not responses:
         return agg
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     scores: list[int | None] = []
     with _model_eval_no_grad(teacher):
         for convo, convo_responses in zip(prompts, responses):
@@ -4491,18 +4431,7 @@ def chat_response_probe(model, tokenizer, device="cuda"):
         if not tpl_ok:
             stats["reason"] = "probe_skip:no_chat_template"
             return stats
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
-
-        pad_id = getattr(tokenizer, "pad_token_id", None)
-        if pad_id is None:
-            pad_id = eos_ids[0] if eos_ids else 0
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
         was_training = model.training
         model.eval()
@@ -4802,15 +4731,7 @@ def capability_probe(model, tokenizer, device="cuda"):
         if not getattr(tokenizer, "chat_template", None):
             return out
 
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
-        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
         with _model_eval_no_grad(model):
             for item in CAPABILITY_PROBE_PROMPTS:
@@ -6060,6 +5981,36 @@ def _model_eval_no_grad(model):
             model.train()
 
 
+def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
+    """Return ``(eos_ids, pad_id)`` for greedy ``model.generate`` calls.
+
+    The pattern was duplicated 13 times across this file with minor
+    variations (tuple vs list, multi-line vs short-circuit pad fallback).
+    Centralising it removes ~120 LOC of boilerplate and means a future
+    teacher-tokenizer swap (e.g. dropping ``<|im_end|>`` for a Kimi-style
+    end token) only needs one edit.
+
+    The eos set is the union of the chat-template tokens we use
+    (``<|im_end|>``, ``<|endoftext|>``) and the tokenizer's own
+    ``eos_token_id``. Returns ``None`` for ``eos_ids`` if the tokenizer
+    knows no eos at all (theoretical — every real tokenizer we see has
+    one). ``pad_id`` falls back to the first eos_id (matches HF's own
+    GenerationConfig default) or 0.
+    """
+    eos_ids: list[int] = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_set = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_set[0] if eos_set else 0
+    return eos_set, pad_id
+
+
 def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
                     device: str, enable_thinking: bool = False) -> tuple[str, int]:
     """Greedy generation for a single bench prompt. Returns (text, gen_tokens).
@@ -6067,15 +6018,7 @@ def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     Uses the same eos/pad setup as the existing probes so behavior is
     identical to capability_probe / chat_response_probe.
     """
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     # Apply the derail-budget multiplier. Floor at 64 tokens so even
@@ -7162,15 +7105,7 @@ def _bench_generate_sampled(model, tokenizer, prompt: str, max_new_tokens: int,
     (prompt, seed, temperature, top_p)). Everything else matches the
     greedy variant for behavioral parity.
     """
-    eos_ids = []
-    for tok in ("<|im_end|>", "<|endoftext|>"):
-        tid = tokenizer.convert_tokens_to_ids(tok)
-        if isinstance(tid, int) and tid >= 0:
-            eos_ids.append(tid)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     prev_state = None
@@ -14386,15 +14321,7 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
         return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
     think_prompts = _pick_think_probe_prompts(block_seed)
     try:
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
-        pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
         with _model_eval_no_grad(teacher):
             for prompt in think_prompts:
@@ -14722,17 +14649,7 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
             stats["reason"] = "think_probe_skip:no_chat_template"
             return stats
 
-        eos_ids = []
-        for tok in ["<|im_end|>", "<|endoftext|>"]:
-            tid = tokenizer.convert_tokens_to_ids(tok)
-            if isinstance(tid, int) and tid >= 0:
-                eos_ids.append(tid)
-        if getattr(tokenizer, "eos_token_id", None) is not None:
-            eos_ids.append(int(tokenizer.eos_token_id))
-        eos_ids = list(set(eos_ids)) or None
-        pad_id = getattr(tokenizer, "pad_token_id", None)
-        if pad_id is None:
-            pad_id = eos_ids[0] if eos_ids else 0
+        eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
         was_training = model.training
         model.eval()
@@ -14949,17 +14866,7 @@ def on_policy_rollouts(student, tokenizer, device="cuda",
     if not getattr(tokenizer, "chat_template", None):
         return rollouts
 
-    eos_ids = []
-    for t in ("<|im_end|>", "<|endoftext|>"):
-        i = tokenizer.convert_tokens_to_ids(t)
-        if isinstance(i, int) and i >= 0:
-            eos_ids.append(i)
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        eos_ids.append(int(tokenizer.eos_token_id))
-    eos_ids = list(set(eos_ids)) or None
-    pad_id = getattr(tokenizer, "pad_token_id", None)
-    if pad_id is None:
-        pad_id = eos_ids[0] if eos_ids else 0
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
 
     was_training = student.training
     student.eval()
