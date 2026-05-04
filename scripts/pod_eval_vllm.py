@@ -8250,20 +8250,6 @@ def _rot_text(s: str, n: int) -> str:
 import math as _v27_math
 
 
-def _v27_int_to_words(n: int) -> str:
-    """Tiny number-words helper for word-problem prompts."""
-    units = ["zero","one","two","three","four","five","six","seven","eight",
-             "nine","ten","eleven","twelve","thirteen","fourteen","fifteen",
-             "sixteen","seventeen","eighteen","nineteen"]
-    tens = ["","","twenty","thirty","forty","fifty","sixty","seventy","eighty","ninety"]
-    if n < 20:
-        return units[n]
-    if n < 100:
-        t, u = divmod(n, 10)
-        return tens[t] + ("-" + units[u] if u else "")
-    return str(n)
-
-
 def _generate_math_items(block_seed, n_items: int) -> list[dict]:
     """Procedural math items for math_bench (v29 — gsm8k-narrative rebalance).
 
