@@ -674,9 +674,38 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             )
             continue
         if "error" in student_result:
-            logger.warning(f"UID {uid} ({model_name}): eval error — {student_result['error']}")
+            err_str = str(student_result["error"])
+            logger.warning(f"UID {uid} ({model_name}): eval error — {err_str}")
             rev = models_to_eval.get(uid, {}).get("revision", "main")
-            record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
+            # 2026-05-04 — CUDA poisoners get fast-tracked to stale.
+            # A device-side assert in a student model isn't a transient
+            # failure: the model has either bad weights (NaN/Inf) or an
+            # invalid token in its embedding indexing. Worse, every
+            # CUDA assert poisons the GPU context for ~9 sibling
+            # students this round (avg observed); UID 73 alone burned
+            # 3 round-cycles + ~30 deferred attempts before reaching the
+            # 3-strike stale gate. Bump to 3 strikes immediately so the
+            # stale-skip kicks in next round instead of after 3 cascades.
+            is_cuda_assert = (
+                "device-side assert" in err_str
+                or "CUDA error" in err_str
+                or "CUBLAS_STATUS_" in err_str
+                or "PRECHECK_BYPASS" in err_str
+            )
+            record_failure(
+                uid, state.failures, state.failure_models,
+                f"{model_name}@{rev}",
+            )
+            if is_cuda_assert:
+                state.failures[str(uid)] = max(
+                    state.failures.get(str(uid), 0), 3
+                )
+                logger.info(
+                    f"UID {uid} ({model_name}): CUDA-poisoner fast-track "
+                    f"to stale (failures={state.failures[str(uid)]}); next "
+                    f"round will skip without re-loading. Repeat poisoners "
+                    f"waste ~30min of pod time per round via cascade."
+                )
             continue
         if student_result.get("functional_copy"):
             copy_of = student_result.get("copy_of", "unknown")

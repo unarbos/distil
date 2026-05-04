@@ -36,7 +36,26 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     ordered_uids = []
     if king_uid is not None and king_uid in models_to_eval:
         ordered_uids.append(king_uid)
-    challenger_uids_sorted = sorted([uid for uid in models_to_eval if uid != king_uid], key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")))
+    # 2026-05-04 — order challengers by (failure_count asc, commit_block asc).
+    # Previously the only sort key was commit_block; that's reasonable as a
+    # tie-breaker but it puts proven CUDA-poisoners (UID 73 gutenmorgan/guten4
+    # for 3 consecutive rounds) at the FRONT of the queue every round simply
+    # because their commitment is older. When such a model triggers a
+    # device-side assert it poisons the GPU context for every sibling student
+    # — observed cost ~9 deferred students × 30+ min per round. Putting models
+    # with prior failures last means the cascade only torpedoes already-failed
+    # models, while the rest of the round still produces real composite scores.
+    # Honest models with failure_count == 0 are still ordered by commit_block
+    # so the FIFO-by-commit policy still holds for them.
+    failures_state = getattr(state, "failures", {}) if state is not None else {}
+    def _challenger_sort_key(uid):
+        fc = int((failures_state or {}).get(str(uid), 0))
+        cb = int((models_to_eval[uid] or {}).get("commit_block") or 0)
+        return (fc, cb, int(uid))
+    challenger_uids_sorted = sorted(
+        [uid for uid in models_to_eval if uid != king_uid],
+        key=_challenger_sort_key,
+    )
     ordered_uids.extend(challenger_uids_sorted)
     now = time.time()
     is_resuming = isinstance(resume_pod_eval, dict) and bool(resume_pod_eval.get("run_dir"))
