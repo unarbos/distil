@@ -49,6 +49,7 @@ File layout (single-file — uploaded to remote GPU pod via SCP):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import argparse
+import contextlib
 import gc
 import glob
 import hashlib
@@ -4847,9 +4848,7 @@ def capability_probe(model, tokenizer, device="cuda"):
         eos_ids = list(set(eos_ids)) or None
         pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
 
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for item in CAPABILITY_PROBE_PROMPTS:
                 msgs = [{"role": "user", "content": item["q"]}]
                 try:
@@ -4882,8 +4881,6 @@ def capability_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"q": item["q"], "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
     except Exception as e:
         out["error"] = str(e)[:200]
@@ -6074,6 +6071,31 @@ def set_bench_block_seed(block_seed):
 _BENCH_TOKEN_BUDGET_FACTOR = 1.0
 
 
+@contextlib.contextmanager
+def _model_eval_no_grad(model):
+    """Context manager: put ``model`` into eval+no_grad, restore on exit.
+
+    Replaces the ``was_training = model.training; model.eval(); with
+    torch.no_grad(): ...; if was_training: model.train()`` pattern that
+    appears ~30 times across this file. The try/finally ensures the
+    training-state is restored even if the body raises (the inline
+    pattern silently leaves the model in eval mode on exception, which
+    can confuse downstream training code).
+    """
+    if model is None:
+        with torch.no_grad():
+            yield
+        return
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            yield
+    finally:
+        if was_training:
+            model.train()
+
+
 def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
                     device: str, enable_thinking: bool = False) -> tuple[str, int]:
     """Greedy generation for a single bench prompt. Returns (text, gen_tokens).
@@ -6261,9 +6283,7 @@ def math_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _math_format_prompt(it["question"], it.get("src", ""))
@@ -6285,8 +6305,6 @@ def math_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -6308,9 +6326,7 @@ def code_bench_probe(model, tokenizer, device="cuda"):
         return out
     try:
         generations: list[tuple[str, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = (
@@ -6325,8 +6341,6 @@ def code_bench_probe(model, tokenizer, device="cuda"):
                     generations.append((gen, int(tok), it))
                 except Exception as e:
                     generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
         sandbox_input = [
             (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
             for gen, _tok, it in generations if "gen_error" not in it
@@ -6382,9 +6396,7 @@ def debug_bench_probe(model, tokenizer, device="cuda"):
         return out
     try:
         generations: list[tuple[str, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = (
@@ -6400,8 +6412,6 @@ def debug_bench_probe(model, tokenizer, device="cuda"):
                     generations.append((gen, int(tok), it))
                 except Exception as e:
                     generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
         sandbox_input = [
             (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
             for gen, _tok, it in generations if "gen_error" not in it
@@ -6456,9 +6466,7 @@ def correction_bench_probe(model, tokenizer, device="cuda"):
         return out
     try:
         generations: list[tuple[str, int, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = (
@@ -6474,8 +6482,6 @@ def correction_bench_probe(model, tokenizer, device="cuda"):
                     generations.append((gen, int(tok), it))
                 except Exception as e:
                     generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
         sandbox_input = [
             (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
             for gen, _tok, it in generations if "gen_error" not in it
@@ -6531,9 +6537,7 @@ def multi_doc_synthesis_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _format_multi_doc_prompt(it)
@@ -6566,8 +6570,6 @@ def multi_doc_synthesis_bench_probe(model, tokenizer, device="cuda"):
                     out["items"].append({
                         "src": it.get("src", ""), "error": str(e)[:120],
                     })
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -6615,9 +6617,7 @@ def calibration_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = (
@@ -6655,8 +6655,6 @@ def calibration_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         # Per-half pass-fracs surface in telemetry so we can tell which
         # half a model is failing on (always-refuse vs always-confabulate).
@@ -6757,9 +6755,7 @@ def refactor_bench_probe(model, tokenizer, device="cuda"):
         return out
     try:
         generations: list[tuple[str, int, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = (
@@ -6776,8 +6772,6 @@ def refactor_bench_probe(model, tokenizer, device="cuda"):
                     generations.append((gen, int(tok), it))
                 except Exception as e:
                     generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
         sandbox_input = [
             (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
             for gen, _tok, it in generations if "gen_error" not in it
@@ -6844,9 +6838,7 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = it["question"]
@@ -6884,8 +6876,6 @@ def pragmatic_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += int(ok)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         for sub_name, sub_stats in out["per_subtype"].items():
             sub_stats["pass_frac"] = (
@@ -6963,9 +6953,7 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _reasoning_format_prompt(it["question"], it["gold"])
@@ -6987,8 +6975,6 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -7110,9 +7096,7 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     is_v2 = "accept" in it
@@ -7151,8 +7135,6 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -7173,9 +7155,7 @@ def ifeval_bench_probe(model, tokenizer, device="cuda"):
         out["error"] = "ifeval_vendor not importable on pod"
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     text, tok = _bench_generate(
@@ -7198,8 +7178,6 @@ def ifeval_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += int(all_pass)
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -7303,9 +7281,7 @@ def aime_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _aime_format_prompt(it["question"])
@@ -7327,8 +7303,6 @@ def aime_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -7379,9 +7353,7 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
         return out
     try:
         generations: list[tuple[str, int, dict]] = []
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _mbpp_build_prompt(it)
@@ -7392,8 +7364,6 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
                     generations.append((gen, int(tok), it))
                 except Exception as e:
                     generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        if was_training:
-            model.train()
         # MBPP solutions often don't stub the function signature at the
         # top of the prompt the way HumanEval does (which uses signature
         # + docstring). To reuse the sandbox runner, we:
@@ -7525,9 +7495,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     pass1_prompt = (
@@ -7587,8 +7555,6 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         out["tool_used_count"] = sum(
             1 for i in out["items"] if isinstance(i, dict) and i.get("tool_used")
@@ -7620,9 +7586,7 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
     base_seed = _coerce_block_seed(_BENCH_BLOCK_SEED) or 0
     base_seed ^= _BENCH_STREAM.get("self_consistency", 0)
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for q_idx, it in enumerate(samples):
                 try:
                     prompt_text = _math_format_prompt(it["question"], "math500")
@@ -7673,8 +7637,6 @@ def self_consistency_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         out["k_samples"] = k_samples
         out["temperature"] = BENCH_SELF_CONSISTENCY_TEMP
@@ -7703,9 +7665,7 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _format_arc_prompt(it)
@@ -7728,8 +7688,6 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -13894,9 +13852,7 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
     if not perturbations:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 base_prompt = _math_format_prompt(
                     it["question"], it.get("src", ""),
@@ -13927,8 +13883,6 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
                             "perturbation": name,
                             "error": str(e)[:120],
                         })
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -14120,9 +14074,7 @@ def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
         return out
     seed_root = int(_BENCH_BLOCK_SEED or 0) ^ _BENCH_STREAM.get("noise", 0)
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for item_idx, it in enumerate(samples):
                 base_prompt = _math_format_prompt(
                     it["question"], it.get("src", ""),
@@ -14158,8 +14110,6 @@ def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
                             "perturbation": name,
                             "error": str(e)[:120],
                         })
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -14173,9 +14123,7 @@ def procedural_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     text, tok = _bench_generate(
@@ -14196,8 +14144,6 @@ def procedural_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -14231,9 +14177,7 @@ def truthful_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _format_truthful_prompt(it)
@@ -14256,8 +14200,6 @@ def truthful_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
@@ -14301,9 +14243,7 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
     if not samples or model is None or tokenizer is None:
         return out
     try:
-        was_training = model.training
-        model.eval()
-        with torch.no_grad():
+        with _model_eval_no_grad(model):
             for it in samples:
                 try:
                     prompt_text = _format_long_context_prompt(it)
@@ -14339,8 +14279,6 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
                     out["correct"] += ok
                 except Exception as e:
                     out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
-        if was_training:
-            model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
         _bench_finalize_token_stats(out)
     except Exception as e:
