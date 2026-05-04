@@ -113,15 +113,71 @@ def _resolve_king(valid_models, state):
         # round, even though UID 144 wasn't in the round.
         # h2h_latest is the canonical "who won the last actually-run
         # round?" field, written by ``post_round`` after weights are set.
+        #
+        # 2026-05-04 — DROPPED the ``persisted_king in valid_models``
+        # gate that previously bracketed this return. In single-eval mode
+        # the king is INTENTIONALLY excluded from the per-round challenger
+        # selection (challengers are picked from non-king commitments so
+        # the king isn't paired against itself). The old ``in valid_models``
+        # gate therefore evicted the persisted king at the start of every
+        # single-eval round → ``king_uid=None`` → no defender → whoever
+        # wins crowns automatically with the dethrone gate disabled. This
+        # is the bug Sebastian reported on 2026-05-04 19:00 UTC: UID 188
+        # won round 2 cleanly (KL 2.056), persisted as h2h_latest.king_uid
+        # AND in recent_kings, but round 3 launched with king=None because
+        # 188 wasn't in this round's challenger pool. Fix: gate on
+        # ``_is_kingship_eligible`` (registered + same hotkey + not DQ'd
+        # + not the reference) instead of round-membership. The kingship
+        # eligibility filter exists exactly for this use case.
         if state.h2h_latest:
             persisted_king = state.h2h_latest.get("king_uid")
-            if persisted_king is not None and persisted_king in valid_models:
-                king_kl = state.scores.get(str(persisted_king), float("inf"))
-                logger.info(
-                    f"single-eval: king from h2h_latest: UID {persisted_king} "
-                    f"(KL={king_kl})"
+            if persisted_king is not None:
+                from scripts.validator.single_eval import _is_kingship_eligible
+                # uid_to_hotkey + commitments are already on state via
+                # state.uid_hotkey_map (set in run_validator before this
+                # call) and the most recent commitments cache. Resolve
+                # them defensively.
+                uid_to_hotkey = {}
+                try:
+                    for uid_str, hk in (
+                        getattr(state, "uid_hotkey_map", {}) or {}
+                    ).items():
+                        try:
+                            uid_to_hotkey[int(uid_str)] = hk
+                        except (TypeError, ValueError):
+                            pass
+                except Exception:
+                    uid_to_hotkey = {}
+                commitments_cache = {}
+                try:
+                    from api.state_store import read_commitments as _rc
+                    commitments_cache = (_rc() or {}).get("commitments", {})
+                    commitments_cache = {
+                        int(k): v for k, v in commitments_cache.items()
+                        if str(k).lstrip("-").isdigit()
+                    }
+                except Exception:
+                    commitments_cache = {}
+                if _is_kingship_eligible(
+                    state, persisted_king, state.dq_reasons,
+                    uid_to_hotkey, commitments_cache,
+                ):
+                    king_kl = state.scores.get(
+                        str(persisted_king), float("inf"),
+                    )
+                    in_pool = persisted_king in valid_models
+                    logger.info(
+                        f"single-eval: king from h2h_latest: UID "
+                        f"{persisted_king} (KL={king_kl}; "
+                        f"in_round_pool={in_pool})"
+                    )
+                    return persisted_king, king_kl, "composite"
+                logger.warning(
+                    f"single-eval: persisted king UID {persisted_king} "
+                    f"no longer kingship-eligible (deregistered, hotkey "
+                    f"changed, or DQ'd) — falling back to composite "
+                    f"selection."
                 )
-                return persisted_king, king_kl, "composite"
         # Fallback: bootstrap from composite_scores only when h2h_latest
         # is empty (cold start, first round after upgrade).
         composite_king_uid, _ = select_king_by_composite(state, valid_models)
@@ -993,9 +1049,23 @@ def post_round(
         log_event(f"Pod cleanup error: {str(exc)[:100]}", level="warn", state_dir=state_dir)
         logger.warning(f"Pod cleanup error: {exc}")
 
-    if winner_uid is not None and winner_uid != king_uid and king_uid is not None:
+    # 2026-05-04 — gate now fires on COLD-START crowning too (king_uid
+    # is None and a new winner emerges). The pre-fix condition required
+    # ``king_uid is not None``, which silently skipped the announcement
+    # for the first king of a new era — exactly the case Sebastian
+    # flagged on 2026-05-04 19:00 UTC ("can we get an official king
+    # announcement on the general channel here for everyone to see like
+    # we did with Qwen kings"). Cold-start crownings still hit the same
+    # ``announce_new_king`` codepath; the function tolerates
+    # ``old_uid=None`` / ``old_model="(no prior king)"`` and renders the
+    # announcement headline against the new king alone.
+    if winner_uid is not None and winner_uid != king_uid:
         new_king_model = uid_to_model.get(winner_uid, valid_models.get(winner_uid, {}).get("model", "unknown"))
-        old_king_model = uid_to_model.get(king_uid, valid_models.get(king_uid, {}).get("model", "unknown"))
+        old_king_model = (
+            uid_to_model.get(king_uid, valid_models.get(king_uid, {}).get("model", "unknown"))
+            if king_uid is not None
+            else "(no prior king — first crown of the era)"
+        )
         old_kl = king_h2h_kl if king_h2h_kl is not None else king_kl
         winner_entry = next((row for row in h2h_results if row.get("uid") == winner_uid), {})
         winner_tt = winner_entry.get("t_test") if isinstance(winner_entry.get("t_test"), dict) else {}

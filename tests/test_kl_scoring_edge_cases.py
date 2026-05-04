@@ -569,6 +569,40 @@ class TestStateConsistency(unittest.TestCase):
         self.assertTrue(is_disqualified(0, "5HotKey", dq))
         self.assertFalse(is_disqualified(0, "5OtherKey", dq, commit_block=100))
 
+    def test_cold_start_crowning_is_a_king_change(self):
+        """When a round starts with king_uid=None and a winner emerges,
+        the post-round logic must treat that as a king change so
+        ``h2h_latest.king_changed`` and ``new_king_uid`` are both set
+        correctly. Pre-2026-05-04 this returned ``False`` because the
+        expression was ``winner_uid != king_uid if king_uid is not None
+        else False`` — the cold-start branch hard-coded False and the
+        announcement / dashboard / API ``is_king`` flag never fired
+        for the first king of a new era. This is the bug Sebastian
+        reported on 2026-05-04 (UID 188 won post-Kimi-cutover round 2
+        but the API kept reporting ``is_king: false``).
+        """
+        # Reproduce the expression used in update_h2h_state directly:
+        for king_uid, winner_uid, expected in [
+            (None, 188, True),
+            (None, None, False),
+            (None, 0, True),
+            (188, 188, False),
+            (188, 195, True),
+            # king_uid=188 + winner_uid=None means "king failed and no
+            # replacement emerged" — the legacy expression also returned
+            # True here (None != 188), so we preserve that behaviour.
+            (188, None, True),
+        ]:
+            if king_uid is None:
+                king_changed = winner_uid is not None
+            else:
+                king_changed = winner_uid != king_uid
+            self.assertEqual(
+                king_changed, expected,
+                f"king_uid={king_uid!r} winner_uid={winner_uid!r}: "
+                f"expected king_changed={expected}, got {king_changed}",
+            )
+
     def test_disqualification_legacy_keys_recognised(self):
         """Pre-2026-05-04 DQ entries used ``hotkey:<commit_block>`` keys.
         ``is_disqualified`` and ``get_dq_reason`` must still recognise

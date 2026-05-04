@@ -163,18 +163,42 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
             f"📊 **KL: {new_kl:.6f}** (one of N axes; previous king's KL: {old_kl:.6f})"
         )
 
+    # 2026-05-04 — cold-start crowning: ``old_uid`` is None when this is
+    # the first king of a new era (e.g. immediately after a teacher
+    # cutover that reset all composite scores). Render a different
+    # headline that doesn't pretend there was a "previous king" to
+    # dethrone, but still surfaces the same composite/KL telemetry so
+    # miners can see what bar the new king cleared.
+    is_cold_start = old_uid is None
+    if is_cold_start:
+        title_line = "## 🏆 First King of the Kimi-K2.6 era!"
+        action_line = (
+            f"**UID {new_uid}** is the first miner to clear the post-cutover "
+            f"composite gate and take the crown."
+        )
+        prev_line = (
+            "👑 Previous king: *(none — fresh state after the 2026-05-02 "
+            "Qwen → Kimi-K2.6 teacher cutover)*"
+        )
+    else:
+        title_line = "## 🏆 New King of Distil SN97!"
+        action_line = f"**UID {new_uid}** has dethroned **UID {old_uid}**"
+        prev_line = (
+            f"👑 Previous king: [{old_model}]"
+            f"(<https://huggingface.co/{old_model}>)"
+        )
     announcement = {
         "type": "new_king",
         "timestamp": time.time(),
         "posted": False,
         "message": (
             f"{role_ping}\n"
-            f"## 🏆 New King of Distil SN97!\n\n"
-            f"**UID {new_uid}** has dethroned **UID {old_uid}**\n\n"
+            f"{title_line}\n\n"
+            f"{action_line}\n\n"
             f"{headline}\n"
             f"{prompt_line}{p_line}\n"
             f"🤗 Model: [{new_model}](<https://huggingface.co/{new_model}>)\n"
-            f"👑 Previous king: [{old_model}](<https://huggingface.co/{old_model}>)\n"
+            f"{prev_line}\n"
             f"{earnings_line}\n"
             f"{gate_explainer} "
             f"Check the [mining guide](<https://github.com/unarbos/distil#mining-guide>) to get started.\n\n"

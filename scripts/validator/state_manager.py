@@ -116,7 +116,19 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     """Update H2H state files: latest, history, tested-against-king."""
 
     n_challenger_results = sum(1 for r in h2h_results if not r.get("is_king"))
-    king_changed = winner_uid != king_uid if king_uid is not None else False
+    # 2026-05-04 — cold-start crowning is also a king change. Pre-fix
+    # this expression returned False whenever ``king_uid is None`` (the
+    # cold-start case after the Kimi cutover), which prevented the
+    # post-round path from announcing the first crown of a new era and
+    # left ``h2h_latest.king_changed=False`` / ``new_king_uid=None``,
+    # which the API surfaces as ``is_king=false`` on the dashboard even
+    # though the winner is in fact the live king. Fix: any transition
+    # to a non-None winner counts as a king change, regardless of
+    # whether there was a prior king to dethrone.
+    if king_uid is None:
+        king_changed = winner_uid is not None
+    else:
+        king_changed = winner_uid != king_uid
 
     if n_challenger_results == 0 and not king_changed:
         logger.info("All challengers failed and king unchanged — skipping H2H round save")
@@ -503,7 +515,63 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
 
     try:
         if state.top4_leaderboard.get("phase") == "initial_eval":
-            # Check if all models tested
+            # 2026-05-04 — auto-promote to maintenance as soon as a winner
+            # actually emerges from a canonical round. The legacy
+            # "wait until 4 tested + zero untested" gate was designed
+            # for a stable network-wide pool and never fires after a
+            # teacher cutover (post-Kimi the network has hundreds of
+            # untested commitments because everyone needs to retrain
+            # from scratch — `untested_count` is permanently in the
+            # hundreds). The symptom Sebastian reported on 2026-05-04:
+            # h2h_latest.king_uid=188 (correctly persisted) AND
+            # recent_kings=[188] (correctly emitting weights), but
+            # top4_leaderboard.king=None (still phase=initial_eval), so
+            # the API endpoint at `/api/miners/{uid}` reads
+            # `top4.king.uid` and reports `is_king=false` for UID 188
+            # → the dashboard never crowns the first Kimi-era king.
+            # Auto-promotion fires when there's a real winner with a
+            # real KL.
+            if winner_uid is not None:
+                winner_kl_for_lb = next(
+                    (r.get("kl") for r in h2h_results if r.get("uid") == winner_uid),
+                    state.scores.get(str(winner_uid)),
+                )
+                winner_model = uid_to_model.get(
+                    winner_uid,
+                    valid_models.get(winner_uid, {}).get("model", "unknown"),
+                )
+                state.top4_leaderboard["king"] = {
+                    "uid": int(winner_uid), "model": winner_model,
+                    "h2h_kl": round(winner_kl_for_lb, 6) if isinstance(winner_kl_for_lb, float) else winner_kl_for_lb,
+                    "block": current_block,
+                }
+                contender_cap_cs = max(1, TOP_N_ALWAYS_INCLUDE - 1)
+                cs_contenders = []
+                for r in sorted(h2h_results, key=lambda r: r.get("kl", float("inf"))):
+                    if r.get("uid") == winner_uid:
+                        continue
+                    if int(r.get("uid", 0)) < 0:
+                        continue
+                    if int(r.get("uid", 0)) in disqualified:
+                        continue
+                    cs_contenders.append({
+                        "uid": r.get("uid"), "model": r.get("model"),
+                        "h2h_kl": round(r["kl"], 6) if isinstance(r.get("kl"), float) else r.get("kl"),
+                        "block": current_block,
+                    })
+                    if len(cs_contenders) >= contender_cap_cs:
+                        break
+                state.top4_leaderboard["contenders"] = cs_contenders
+                state.top4_leaderboard["phase"] = "maintenance"
+                state.top4_leaderboard["initial_eval_complete"] = True
+                state.top4_leaderboard["completed_at"] = time.time()
+                state.top4_leaderboard["completed_block"] = current_block
+                state.save_top4()
+                logger.info(
+                    f"👑 TOP-4 PROMOTED to maintenance via cold-start "
+                    f"crowning: UID {winner_uid} ({winner_model})"
+                )
+                return
             untested_count = 0
             tested_results = []
             for uid_str, score in state.scores.items():
