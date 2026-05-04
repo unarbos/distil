@@ -18448,6 +18448,13 @@ def main():
     live_progress = {
         "phase": "scoring", "students": students,
         "students_total": len(students), "prompts_total": len(prompts),
+        # Phase A is complete by the time we initialise this dict; carry
+        # the final teacher_prompts_done count forward so the dashboard's
+        # Phase A bar stays at "60/60" instead of resetting to 0 the
+        # moment Phase 2 (per-student loop) starts. Without this the
+        # validator's pod_session.py poller reads None and miners read
+        # the empty bar as "we lost the teacher cache".
+        "teacher_prompts_done": len(prompts),
         "completed": [], "current": None,
     }
     def _write_progress():
