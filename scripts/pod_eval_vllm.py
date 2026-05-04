@@ -475,6 +475,33 @@ def load_model(name, device="cuda", dtype=torch.bfloat16, revision=None):
                 return m
         except Exception as e:
             err_str = str(e)
+            # 2026-05-04: students that declare a native arch (e.g.
+            # DeepseekV3ForCausalLM) but ALSO ship an ``auto_map`` pointing
+            # at custom .py files trigger the "contains custom code" hard
+            # error from AutoModel.from_pretrained even though the AutoConfig
+            # peek succeeded with trust_remote_code=False. The arch precheck
+            # already validated that any .py files in the repo are byte-
+            # identical to the teacher's, so it's safe to retry with TRC=True
+            # — the alternative is mass load_failed DQs across the whole
+            # round, which is exactly what we just observed on epoch 2.
+            #
+            # We inject the teacher's .py files first (the auto_map paths
+            # may reference filenames not present in the student snapshot,
+            # and the .py files are guaranteed safe by the precheck).
+            needs_trc_retry = (
+                ("trust_remote_code=True" in err_str or "contains custom code" in err_str)
+                and not kwargs.get("trust_remote_code", False)
+                and not is_teacher
+            )
+            if needs_trc_retry and attempt < max_retries - 1:
+                try:
+                    _inject_kimi_pyfiles_from_teacher(name, kwargs.get("revision"))
+                except Exception as _inj_exc:
+                    print(f"  [model] {name}: pyfile inject for TRC retry failed: {_inj_exc}", flush=True)
+                kwargs = dict(kwargs)
+                kwargs["trust_remote_code"] = True
+                print(f"  [model] {name}: retrying with trust_remote_code=True (auto_map in config requires it)", flush=True)
+                continue
             is_transient = any(s in err_str for s in ["429", "503", "rate limit", "Connection", "Timeout", "HTTPSConnection"])
             if is_transient and attempt < max_retries - 1:
                 wait = (attempt + 1) * 30
@@ -14692,7 +14719,7 @@ def prepare_teacher_probe_refs_vllm(tokenizer, block_seed=None, concurrency=16):
     return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
 
 
-def prepare_teacher_probe_refs_api(tokenizer, api_cfg, block_seed=None, concurrency=8):
+def prepare_teacher_probe_refs_api(tokenizer, api_cfg, block_seed=None, concurrency=None):
     """Cloud-API equivalent of :func:`prepare_teacher_probe_refs_vllm`.
 
     Same ``(think_samples, cap_answers, cap_gen_lens, chat_gen_lens)``
@@ -14727,6 +14754,15 @@ def prepare_teacher_probe_refs_api(tokenizer, api_cfg, block_seed=None, concurre
     chat_gen_lens = []
     if tokenizer is None:
         return think_samples, cap_answers, cap_gen_lens, chat_gen_lens
+    # 2026-05-04: probe concurrency defaults to ~half the api_cfg.concurrency
+    # because Phase 1 ran sustained at api_cfg.concurrency for ~9 min, leaving
+    # the Inceptron rate bucket warm. Bursting the probes at the same level
+    # immediately tripped 429 storms (~30 consecutive failures observed in
+    # epoch 2). Halving the concurrency for probes (min 1) keeps the burst
+    # within the per-second budget while the bucket recovers, and the probe
+    # batches are short enough that wall-clock impact is negligible.
+    if concurrency is None:
+        concurrency = max(1, getattr(api_cfg, "concurrency", 4) // 2)
     think_prompts = _pick_think_probe_prompts(block_seed)
 
     def _post(rendered, max_tokens):

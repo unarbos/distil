@@ -539,7 +539,16 @@ def generate_via_api(
 # ---------------------------------------------------------------------------
 
 def _greedy_text_one(prompt_text: str, cfg: APIConfig, max_new_tokens: int, idx: int) -> str:
-    """Single greedy generation, text only (no logprobs). Used for probe refs."""
+    """Single greedy generation, text only (no logprobs). Used for probe refs.
+
+    Uses the same exp-backoff retry strategy as the logprob-fetching worker
+    (:func:`_generate_single_prompt_api`). Probe refs are fired in waves
+    (think-probe ≈ 30, capability ≈ 36, chat-probe ≈ 4) right after the
+    main 60-prompt logprob batch finishes, so the Inceptron rate-limit
+    bucket is still cold and the first dozen+ requests routinely 429.
+    Without retries that would cascade into 'API teacher capability
+    failed' for every probe and the round would lose all benchmark axes.
+    """
     import requests
 
     if cfg.endpoint == "chat":
@@ -560,15 +569,38 @@ def _greedy_text_one(prompt_text: str, cfg: APIConfig, max_new_tokens: int, idx:
         url = f"{cfg.base_url}/v1/completions"
     payload.update(cfg.extra_body())
 
-    resp = requests.post(url, headers=cfg.headers(), data=json.dumps(payload), timeout=cfg.timeout_s)
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data and not data.get("choices"):
-        raise RuntimeError(f"API error: {data['error']}")
-    choice = data["choices"][0]
-    if cfg.endpoint == "chat":
-        return (choice.get("message") or {}).get("content") or ""
-    return choice.get("text") or ""
+    last_err: Optional[Exception] = None
+    for attempt in range(6):
+        try:
+            resp = requests.post(url, headers=cfg.headers(), data=json.dumps(payload),
+                                 timeout=cfg.timeout_s)
+            sc = resp.status_code
+            if sc == 429 or 500 <= sc < 600:
+                retry_after_hdr = resp.headers.get("Retry-After")
+                try:
+                    backoff_s = float(retry_after_hdr) if retry_after_hdr else (2.0 ** attempt)
+                except Exception:
+                    backoff_s = 2.0 ** attempt
+                backoff_s = max(min(backoff_s, 30.0), 1.0)
+                last_err = RuntimeError(f"HTTP {sc}: {resp.text[:160]}")
+                if attempt < 5:
+                    time.sleep(backoff_s)
+                    continue
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data and not data.get("choices"):
+                raise RuntimeError(f"API error: {data['error']}")
+            choice = data["choices"][0]
+            if cfg.endpoint == "chat":
+                return (choice.get("message") or {}).get("content") or ""
+            return choice.get("text") or ""
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < 5:
+                time.sleep(min(2.0 ** attempt, 30.0))
+                continue
+            raise
+    raise RuntimeError(f"_greedy_text_one[{idx}] exhausted retries: {last_err}")
 
 
 def greedy_batch_api(
