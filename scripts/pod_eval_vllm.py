@@ -2034,7 +2034,8 @@ def judge_teacher_score(teacher, tokenizer, collected: dict, device: str = "cuda
     return agg
 
 
-def long_form_judge_response_probe(model, tokenizer, device="cuda"):
+def long_form_judge_response_probe(model, tokenizer, device="cuda",
+                                    max_tokens_override: int | None = None):
     """v30 — collect greedy student responses to long-form essay prompts.
 
     Same shape as ``judge_response_probe`` but uses
@@ -2045,11 +2046,23 @@ def long_form_judge_response_probe(model, tokenizer, device="cuda"):
 
     Phase A only. The collected responses are stashed in
     ``_LONG_FORM_JUDGE_ROLLOUTS`` for Phase B teacher scoring.
+
+    2026-05-04 — ``max_tokens_override`` lets the caller cap the
+    per-prompt budget below ``LONG_FORM_JUDGE_MAX_TOKENS`` (default
+    6144). Used by the per-student dispatcher to slash LFJ wall time
+    on derail-prone students that we already KNOW from chat_probe will
+    fill the entire 6144-token budget without emitting EOS. We still
+    get the full derail signal at 2048 tokens (the coherence detector
+    works on the response text length, not the absolute cap), but pay
+    1/3 the wall time per derailed student. Healthy students that
+    emit EOS at ~500-1000 tokens are not affected by the cap.
     """
+    cap = int(max_tokens_override) if max_tokens_override else LONG_FORM_JUDGE_MAX_TOKENS
     out = {
         "prompts": list(LONG_FORM_JUDGE_PROMPTS),
         "responses": [],
         "gen_tokens": [],
+        "max_tokens_cap": cap,
     }
     if tokenizer is None or model is None or not LONG_FORM_JUDGE_PROMPTS:
         return out
@@ -2075,7 +2088,7 @@ def long_form_judge_response_probe(model, tokenizer, device="cuda"):
                     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
                     gen = model.generate(
-                        ids, max_new_tokens=LONG_FORM_JUDGE_MAX_TOKENS,
+                        ids, max_new_tokens=cap,
                         do_sample=False, temperature=1.0, top_p=1.0,
                         pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
                     )
@@ -6181,6 +6194,30 @@ def set_bench_block_seed(block_seed):
 
 # ── bench generation helper (reuses chat template + eos/pad setup) ────
 
+# 2026-05-04: Per-student bench-budget multiplier. Set by the per-
+# student dispatcher (after chat_probe runs and we know the student's
+# derail status) and consumed by ``_bench_generate`` to scale the
+# per-axis ``max_new_tokens`` budgets. Default 1.0 = no change.
+#
+# When chat_probe detects a chronic derailer (term_rate < 0.25 AND
+# mean_gen at the chat-probe ceiling), we set this to 0.25. Rationale:
+#   • A model that fills the chat-probe budget on "hi" will fill the
+#     AIME budget on "compute the answer". The output is uniformly
+#     garbage past ~200 tokens; the answer-extractor finds nothing in
+#     either case.
+#   • Cutting BENCH_AIME_MAX_TOKENS from 1024→256 takes AIME from
+#     ~7 min/derailed student to ~1.8 min — same final pass_frac (0)
+#     in either case, just less wasted GPU time generating garbage.
+#   • Healthy students (term_rate >= 0.5 in chat_probe) are not
+#     affected because the multiplier defaults back to 1.0 between
+#     students.
+#
+# Stored as a module global so it propagates through ``run_bench_
+# battery`` → individual probes → ``_bench_generate`` without
+# threading a parameter through 17 probe signatures.
+_BENCH_TOKEN_BUDGET_FACTOR = 1.0
+
+
 def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
                     device: str, enable_thinking: bool = False) -> tuple[str, int]:
     """Greedy generation for a single bench prompt. Returns (text, gen_tokens).
@@ -6199,8 +6236,12 @@ def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+    # Apply the derail-budget multiplier. Floor at 64 tokens so even
+    # short-answer probes (knowledge: 64 baseline → 16 with factor 0.25)
+    # don't shrink below the answer length itself.
+    effective_max = max(64, int(max_new_tokens * _BENCH_TOKEN_BUDGET_FACTOR))
     gen = model.generate(
-        ids, max_new_tokens=max_new_tokens,
+        ids, max_new_tokens=effective_max,
         do_sample=False, temperature=1.0, top_p=1.0,
         pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
     )
@@ -18592,7 +18633,41 @@ def main():
             try:
                 _set_stage("long_form_judge_probe")
                 _lf_start = time.time()
-                lf_raw = long_form_judge_response_probe(student, tokenizer, device)
+                # 2026-05-04: adaptive LFJ cap based on chat_probe.
+                # Derail-prone students (chat term=0/N, every trivial
+                # prompt fills the chat-probe budget) reliably fill
+                # the full LFJ_MAX_TOKENS=6144 budget too — confirmed
+                # in distil-97 round 04:15 where talent-richer/top-
+                # student burnt 1027s = 17 min on LFJ alone, all 8
+                # responses hit the 6144-cap. Capping at 2048 for
+                # those students cuts LFJ wall time by ~70% (5 min vs
+                # 17 min) while preserving the derail signal: the
+                # coherence detector keys off response-length and
+                # punctuation density, neither of which needs the
+                # full 5300-token derailed tail. Healthy students
+                # (term_rate >= 0.5) keep the full 6144 cap because
+                # they typically emit EOS at 500-1000 tokens anyway,
+                # so the cap is moot for them.
+                lf_cap_override = None
+                _cprobe_meta = (
+                    results["students"].get(student_name, {}).get("chat_probe")
+                )
+                if isinstance(_cprobe_meta, dict):
+                    _term = int(_cprobe_meta.get("prompts_terminated") or 0)
+                    _tested = int(_cprobe_meta.get("prompts_tested") or 0)
+                    _mean_gen = float(_cprobe_meta.get("mean_gen_tokens") or 0.0)
+                    if _tested > 0 and (_term / _tested) < 0.25 and _mean_gen >= 700:
+                        lf_cap_override = 2048
+                        print(
+                            f"  [lfj] derail detected (chat term="
+                            f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
+                            f"capping LFJ_MAX_TOKENS=6144→2048 to save ~12 min",
+                            flush=True,
+                        )
+                lf_raw = long_form_judge_response_probe(
+                    student, tokenizer, device,
+                    max_tokens_override=lf_cap_override,
+                )
                 _lf_dur = time.time() - _lf_start
                 if lf_raw and lf_raw.get("responses"):
                     _lf_store = globals().setdefault("_LONG_FORM_JUDGE_ROLLOUTS", {})
@@ -18674,6 +18749,31 @@ def main():
         if bench_this:
             try:
                 _set_stage("bench_battery")
+                # 2026-05-04: derail-aware bench budget. Same logic as the
+                # LFJ adaptive cap above. A model that can't terminate a
+                # 4-prompt chat probe at the budget will burn the full
+                # AIME 1024-token budget too — the answer-extractor finds
+                # the same "nothing" in both cases. Cut the per-prompt
+                # token budget to 25% for derail-detected students,
+                # saving ~19 min per derailed student on bench battery.
+                global _BENCH_TOKEN_BUDGET_FACTOR
+                _BENCH_TOKEN_BUDGET_FACTOR = 1.0
+                _cprobe_meta = (
+                    results["students"].get(student_name, {}).get("chat_probe")
+                )
+                if isinstance(_cprobe_meta, dict):
+                    _term = int(_cprobe_meta.get("prompts_terminated") or 0)
+                    _tested = int(_cprobe_meta.get("prompts_tested") or 0)
+                    _mean_gen = float(_cprobe_meta.get("mean_gen_tokens") or 0.0)
+                    if _tested > 0 and (_term / _tested) < 0.25 and _mean_gen >= 700:
+                        _BENCH_TOKEN_BUDGET_FACTOR = 0.25
+                        print(
+                            f"  [bench] derail detected (chat term="
+                            f"{_term}/{_tested}, mean_gen={_mean_gen:.0f}); "
+                            f"capping per-axis MAX_TOKENS to 25% "
+                            f"(saves ~19 min/student of garbage generation)",
+                            flush=True,
+                        )
                 bench_res = run_bench_battery(student, tokenizer, device)
                 total_w = bench_res.pop("_total_wall_s", 0.0)
                 results["students"].setdefault(student_name, {})
