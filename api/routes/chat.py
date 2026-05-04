@@ -245,6 +245,26 @@ async def _local_models_probe(timeout: float = 2.5) -> str | None:
     return None
 
 
+# ── Streaming response helpers ───────────────────────────────────────────────
+
+_SSE_RESPONSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    # Disable Cloudflare/Caddy buffering so SSE deltas reach the
+    # client without a multi-second batched flush at the proxy.
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse_response(generator) -> StreamingResponse:
+    """Wrap an SSE async generator with the standard headers used by both
+    the dashboard chat proxy and the OpenAI-compatible passthrough."""
+    return StreamingResponse(
+        generator, media_type="text/event-stream",
+        headers=_SSE_RESPONSE_HEADERS,
+    )
+
+
 # ── Chat-side coherence helper (eval-side parity, kept for reference) ────────
 # These helpers used to feed an in-proxy truncator that we removed on
 # 2026-05-01 (chat.arbos.life is a transparent window — derail belongs
@@ -424,15 +444,7 @@ def _stream_chat(payload, king_uid, king_model):
             except Exception:
                 pass
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return _sse_response(generate())
 
 
 # ── Chat turn logging ─────────────────────────────────────────────────────────
@@ -770,15 +782,7 @@ async def openai_chat_completions(request: Request):
             except Exception:
                 yield 'data: {"error": {"message": "stream interrupted"}}\n\n'
 
-        return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        return _sse_response(generate())
 
     try:
         data = await _local_chat_post(body, timeout=120.0)
