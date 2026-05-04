@@ -713,7 +713,16 @@ async def chat_with_king(request: Request):
 
 @router.get("/api/chat/status")
 def chat_status():
-    """Check if the king chat server is available. Auto-starts if down."""
+    """Check if the king chat server is available. Auto-starts if down.
+
+    2026-05-04 (Sebastian's "the overall eval scores seem worse than the
+    4B" report): we now also surface the king's long-form coherence
+    score so the chat UI can warn users when the king is producing
+    degraded text. Cold-start kings post-Kimi-cutover are scoring
+    long_form_judge ≤ 0.2 and chat output is visibly looping /
+    word-salad. Without this signal, users see "Chat live" + chat reply
+    that's garbage and assume chat is broken — it isn't, the king is.
+    """
     king_uid, king_model = _get_king_info()
     progress = _safe_json_load(os.path.join(STATE_DIR, "eval_progress.json"), {})
     eval_active = progress.get("active", False)
@@ -733,12 +742,39 @@ def chat_status():
         except SshExecError:
             pass
 
+    # Pull the king's most recent long-form coherence + judge scores so
+    # the dashboard can surface output-quality warnings. We deliberately
+    # tap h2h_latest (already cached in state_store) instead of issuing
+    # a fresh probe — chat status polls every 30 s and we don't want it
+    # to thrash the eval pod.
+    quality = {
+        "long_form_judge": None,
+        "long_gen_coherence": None,
+        "judge_probe": None,
+        "composite_final": None,
+    }
+    if king_uid is not None and king_uid >= 0:
+        try:
+            h2h = h2h_latest()
+            for r in (h2h.get("results") or []):
+                if r.get("uid") == king_uid:
+                    comp = r.get("composite") or {}
+                    axes = comp.get("axes") or {}
+                    quality["long_form_judge"] = axes.get("long_form_judge")
+                    quality["long_gen_coherence"] = axes.get("long_gen_coherence")
+                    quality["judge_probe"] = axes.get("judge_probe")
+                    quality["composite_final"] = comp.get("final")
+                    break
+        except Exception:
+            pass
+
     return {
         "available": server_ok and king_uid is not None,
         "king_uid": king_uid,
         "king_model": king_model,
         "eval_active": eval_active,
         "server_running": server_ok,
+        "quality": quality,
         "note": (
             "King model is loaded on GPU and ready for chat."
             if server_ok
