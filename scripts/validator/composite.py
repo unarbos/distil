@@ -1180,51 +1180,32 @@ def _axis_skill_group_mean(
     return sum(vals) / len(vals)
 
 
-def _axis_code_skill_group(
-    student: dict, broken_axes: set[str] | None = None,
-) -> float | None:
-    """Mean of {code_bench, mbpp_bench, debug_bench, correction_bench,
-    refactor_bench}. Catches code competence across write-from-scratch
-    (code/mbpp), bug fixing (debug/correction), and behaviour-preserving
-    refactoring. Excludes broken sub-axes (v30.2)."""
-    return _axis_skill_group_mean(
-        student, CODE_SKILL_GROUP_SUB_AXES, broken_axes,
-    )
+# v30.2 — Skill-group registry. Each entry is
+# ``(group_axis_name, sub_axes)``. The composite ``axes`` dict is
+# populated for every group via a loop in compute_axes; consumers
+# (composite weights, telemetry, broken-axis sanity) reference the
+# group axis name directly. Per-group wrapper functions
+# (``_axis_<group>_skill_group``) are defined right below for
+# backwards-compat with the existing test suite — they all delegate
+# to ``_axis_skill_group_mean``.
+_SKILL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("code_skill_group", CODE_SKILL_GROUP_SUB_AXES),
+    ("math_skill_group", MATH_SKILL_GROUP_SUB_AXES),
+    ("reasoning_skill_group", REASONING_SKILL_GROUP_SUB_AXES),
+    ("knowledge_skill_group", KNOWLEDGE_SKILL_GROUP_SUB_AXES),
+)
 
 
-def _axis_math_skill_group(
-    student: dict, broken_axes: set[str] | None = None,
-) -> float | None:
-    """Mean of {math_bench, aime_bench, robustness_bench}. Catches
-    word-problem narrative (math), olympiad-level (aime), and
-    paraphrase-invariant solving (robustness). Excludes broken
-    sub-axes (v30.2)."""
-    return _axis_skill_group_mean(
-        student, MATH_SKILL_GROUP_SUB_AXES, broken_axes,
-    )
+def _make_skill_group_axis(sub_axes: tuple[str, ...]):
+    def _axis(student: dict, broken_axes: set[str] | None = None) -> float | None:
+        return _axis_skill_group_mean(student, sub_axes, broken_axes)
+    return _axis
 
 
-def _axis_reasoning_skill_group(
-    student: dict, broken_axes: set[str] | None = None,
-) -> float | None:
-    """Mean of {reasoning_bench, multi_doc_synthesis_bench,
-    long_context_bench}. Catches multi-step deduction (BBH-style),
-    cross-document synthesis, and needle-in-haystack retrieval.
-    Excludes broken sub-axes (v30.2)."""
-    return _axis_skill_group_mean(
-        student, REASONING_SKILL_GROUP_SUB_AXES, broken_axes,
-    )
-
-
-def _axis_knowledge_skill_group(
-    student: dict, broken_axes: set[str] | None = None,
-) -> float | None:
-    """Mean of {knowledge_bench v2, pragmatic_bench}. Catches
-    factual reasoning + theory-of-mind / pragmatic competence.
-    Excludes broken sub-axes (v30.2)."""
-    return _axis_skill_group_mean(
-        student, KNOWLEDGE_SKILL_GROUP_SUB_AXES, broken_axes,
-    )
+_axis_code_skill_group = _make_skill_group_axis(CODE_SKILL_GROUP_SUB_AXES)
+_axis_math_skill_group = _make_skill_group_axis(MATH_SKILL_GROUP_SUB_AXES)
+_axis_reasoning_skill_group = _make_skill_group_axis(REASONING_SKILL_GROUP_SUB_AXES)
+_axis_knowledge_skill_group = _make_skill_group_axis(KNOWLEDGE_SKILL_GROUP_SUB_AXES)
 
 
 # v30.2 — Super-teacher axis: rewards exceeding the teacher on
@@ -1441,13 +1422,12 @@ def compute_axes(student: dict, king_kl: float | None = None,
     }
     for _bench in _BENCH_AXIS_NAMES:
         out[_bench] = _axis_bench_pass_frac(student, _bench)
+    # v30.2 — skill-group axes (mean of non-broken sub-axes; sub-axes
+    # still populated above for telemetry). Driven by ``_SKILL_GROUPS``
+    # so adding a new group is a one-line registry edit.
+    for group_name, sub_axes in _SKILL_GROUPS:
+        out[group_name] = _axis_skill_group_mean(student, sub_axes, broken_axes)
     out.update({
-        # v30.2 — skill-group axes (mean of non-broken sub-axes,
-        # sub-axes still populated above for telemetry).
-        "code_skill_group": _axis_code_skill_group(student, broken_axes),
-        "math_skill_group": _axis_math_skill_group(student, broken_axes),
-        "reasoning_skill_group": _axis_reasoning_skill_group(student, broken_axes),
-        "knowledge_skill_group": _axis_knowledge_skill_group(student, broken_axes),
         # v30.2 — incentivize exceeding the teacher on verifiable
         # benches. Reads the teacher's per-axis scores (None when
         # teacher_axes not threaded through).
