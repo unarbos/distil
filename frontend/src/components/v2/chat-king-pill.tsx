@@ -55,44 +55,45 @@ const POLL_INTERVAL_MS = 30_000;
  * long_form_judge ≤ 0.2 and judge_probe = 0.0, the model itself is
  * what's degraded).
  *
- * Threshold logic:
- *  - long_form_judge < 0.3 OR judge_probe < 0.2 → "degraded" warning
- *  - long_form_judge < 0.55 → "fragile" caution
+ * Thresholds:
+ *  - long_form_judge < DEGRADED_LFJ OR judge_probe < DEGRADED_JP → "degraded"
+ *  - long_form_judge < FRAGILE_LFJ  → "fragile"
  *  - otherwise no warning
  *
- * 0.3 / 0.2 are the cold-start ceilings observed on the post-Kimi
- * cohort (UID 188 ~0.16 long_form_judge, UID 190 ~0.16 long_form_judge
- * + 0.0 judge_probe). 0.55 is the ~30th percentile of pre-cutover
- * Qwen 4B kings — anything below that hasn't matured yet.
+ * Defaults are the cold-start ceilings observed on the post-Kimi cohort
+ * (UID 188 ~0.16 long_form_judge, UID 190 ~0.16 long_form_judge + 0.0
+ * judge_probe). 0.55 is the ~30th percentile of pre-cutover Qwen 4B
+ * kings — below that hasn't matured yet.
  */
-function _qualityBanner(q: Quality | undefined): {
-  level: "ok" | "fragile" | "degraded";
+const DEGRADED_LFJ = 0.3;
+const DEGRADED_JP = 0.2;
+const FRAGILE_LFJ = 0.55;
+
+type BannerLevel = "ok" | "fragile" | "degraded";
+
+function qualityBanner(q: Quality | undefined): {
+  level: BannerLevel;
   text: string | null;
 } {
   if (!q) return { level: "ok", text: null };
-  const lfj = q.long_form_judge;
-  const jp = q.judge_probe;
-  if (
-    (typeof lfj === "number" && lfj < 0.3) ||
-    (typeof jp === "number" && jp < 0.2)
-  ) {
+  const { long_form_judge: lfj, judge_probe: jp } = q;
+  const isNum = (v: unknown): v is number => typeof v === "number";
+  if ((isNum(lfj) && lfj < DEGRADED_LFJ) || (isNum(jp) && jp < DEGRADED_JP)) {
+    const lfjStr = isNum(lfj) ? lfj.toFixed(2) : "—";
     return {
       level: "degraded",
       text:
-        "King is producing degraded text right now (long-form judge " +
-        (typeof lfj === "number" ? lfj.toFixed(2) : "—") +
-        "). Chat may show looping / word-salad output. The eval " +
-        "pipeline will dethrone this king as soon as a stronger " +
-        "challenger appears.",
+        `King is producing degraded text right now (long-form judge ${lfjStr}). ` +
+        "Chat may show looping / word-salad output. The eval pipeline will " +
+        "dethrone this king as soon as a stronger challenger appears.",
     };
   }
-  if (typeof lfj === "number" && lfj < 0.55) {
+  if (isNum(lfj) && lfj < FRAGILE_LFJ) {
     return {
       level: "fragile",
       text:
-        "King is fragile (long-form judge " +
-        lfj.toFixed(2) +
-        "). Short answers usually fine; long generations may derail.",
+        `King is fragile (long-form judge ${lfj.toFixed(2)}). ` +
+        "Short answers usually fine; long generations may derail.",
     };
   }
   return { level: "ok", text: null };
@@ -132,73 +133,29 @@ export function ChatKingPill({
     };
   }, []);
 
-  const state: "available" | "paused" | "offline" = (() => {
-    if (!status) return "offline";
-    if (status.available) return "available";
-    if (status.eval_active) return "paused";
-    return "offline";
-  })();
+  const state: "available" | "paused" | "offline" = !status
+    ? "offline"
+    : status.available
+    ? "available"
+    : status.eval_active
+    ? "paused"
+    : "offline";
+  const banner = qualityBanner(status?.quality);
+  const isDegraded = state === "available" && banner.level === "degraded";
 
-  const banner = _qualityBanner(status?.quality);
-
-  // Available + degraded → amber dot (warn) instead of green.
-  const dot =
-    state === "available"
-      ? banner.level === "degraded"
-        ? "bg-king"
-        : "bg-ok"
-      : state === "paused"
+  // Available healthy → green ok pulse.
+  // Available degraded or paused → amber king (warn) — no pulse.
+  // Offline → soft grey, no pulse.
+  const dotClass =
+    state === "available" && !isDegraded
+      ? "bg-ok"
+      : state === "available" || state === "paused"
       ? "bg-king"
       : "bg-[var(--ink-meta-soft)]";
+  const shouldPulse = state === "available" && !isDegraded;
 
-  // Headline + tooltip text.
-  const { headline, tooltip } = (() => {
-    if (error || !status) {
-      return {
-        headline: "Chat: status unknown",
-        tooltip: "Couldn't reach /api/chat/status — try refreshing.",
-      };
-    }
-    const uidText =
-      status.king_uid != null && status.king_uid >= 0
-        ? `UID ${status.king_uid}`
-        : "the king";
-    if (status.available) {
-      const baseHeadline =
-        banner.level === "degraded"
-          ? `Chat live · ${uidText} (degraded)`
-          : `Chat live · ${uidText}`;
-      const baseTooltip = status.king_model
-        ? `chat.arbos.life is talking to ${status.king_model} (${uidText}). Click to open.`
-        : `chat.arbos.life is live. Click to open.`;
-      return {
-        headline: baseHeadline,
-        tooltip: banner.text ? `${baseTooltip}\n\n${banner.text}` : baseTooltip,
-      };
-    }
-    if (status.eval_active) {
-      return {
-        headline: `Chat paused · ${uidText} being benchmarked`,
-        tooltip:
-          "The chat pod and eval pod share a single H200, so the chat vLLM is paused while the validator is running an eval round. It auto-resumes when the round finishes (typically ~30–90 min from start).",
-      };
-    }
-    if (status.king_uid == null) {
-      return {
-        headline: "Chat: no king yet",
-        tooltip:
-          "No king crowned yet. Chat will go live as soon as the validator crowns one.",
-      };
-    }
-    return {
-      headline: `Chat: ${uidText} loading`,
-      tooltip:
-        status.note || "Chat server is starting; refresh in a few seconds.",
-    };
-  })();
+  const { headline, tooltip } = computeChatPillCopy(status, error, banner);
 
-  // Block variant for the home panel / docs — full pill, with a
-  // secondary line showing quality warning when applicable.
   if (variant === "block") {
     return (
       <div className="flex flex-col gap-1">
@@ -211,10 +168,8 @@ export function ChatKingPill({
         >
           <span className="relative inline-flex items-center justify-center w-1.5 h-1.5">
             <span
-              className={`absolute inset-0 rounded-full ${dot} ${
-                state === "available" && banner.level !== "degraded"
-                  ? "live-pulse"
-                  : ""
+              className={`absolute inset-0 rounded-full ${dotClass} ${
+                shouldPulse ? "live-pulse" : ""
               }`}
             />
           </span>
@@ -242,7 +197,6 @@ export function ChatKingPill({
     );
   }
 
-  // Inline variant for tight strips — just dot + short headline.
   return (
     <a
       href="https://chat.arbos.life"
@@ -252,11 +206,59 @@ export function ChatKingPill({
       className="inline-flex items-center gap-1.5 text-[11px] num text-meta hover:text-foreground transition-colors"
     >
       <span
-        className={`w-1.5 h-1.5 rounded-full ${dot} ${
-          state === "available" ? "live-pulse" : ""
+        className={`w-1.5 h-1.5 rounded-full ${dotClass} ${
+          shouldPulse ? "live-pulse" : ""
         }`}
       />
       <span>{headline}</span>
     </a>
   );
+}
+
+function computeChatPillCopy(
+  status: ChatStatus | null,
+  error: boolean,
+  banner: ReturnType<typeof qualityBanner>,
+): { headline: string; tooltip: string } {
+  if (error || !status) {
+    return {
+      headline: "Chat: status unknown",
+      tooltip: "Couldn't reach /api/chat/status — try refreshing.",
+    };
+  }
+  const uidText =
+    status.king_uid != null && status.king_uid >= 0
+      ? `UID ${status.king_uid}`
+      : "the king";
+  if (status.available) {
+    const headline =
+      banner.level === "degraded"
+        ? `Chat live · ${uidText} (degraded)`
+        : `Chat live · ${uidText}`;
+    const baseTooltip = status.king_model
+      ? `chat.arbos.life is talking to ${status.king_model} (${uidText}). Click to open.`
+      : `chat.arbos.life is live. Click to open.`;
+    return {
+      headline,
+      tooltip: banner.text ? `${baseTooltip}\n\n${banner.text}` : baseTooltip,
+    };
+  }
+  if (status.eval_active) {
+    return {
+      headline: `Chat paused · ${uidText} being benchmarked`,
+      tooltip:
+        "The chat pod and eval pod share a single H200, so the chat vLLM is paused while the validator is running an eval round. It auto-resumes when the round finishes (typically ~30–90 min from start).",
+    };
+  }
+  if (status.king_uid == null) {
+    return {
+      headline: "Chat: no king yet",
+      tooltip:
+        "No king crowned yet. Chat will go live as soon as the validator crowns one.",
+    };
+  }
+  return {
+    headline: `Chat: ${uidText} loading`,
+    tooltip: status.note || "Chat server is starting; refresh in a few seconds.",
+  };
 }
