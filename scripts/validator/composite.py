@@ -1609,6 +1609,108 @@ def _apply_baseline_relative_penalty(
     return max(0.0, docked)
 
 
+def _blended_final_score(
+    worst_k_mean: float | None,
+    weighted: float | None,
+) -> float | None:
+    """Blend the bottom-K mean with the weighted mean (v30.2 ranking).
+
+    Default ``COMPOSITE_FINAL_BOTTOM_WEIGHT`` is 0.7 so the worst-axis
+    component dominates while the weighted mean stops a strong all-rounder
+    from being shut out by a single noisy axis. Falls back to whichever
+    component is non-None when only one is computable; returns None if
+    both are missing (e.g. zero ranked axes).
+    """
+    if worst_k_mean is not None and weighted is not None:
+        return (
+            COMPOSITE_FINAL_BOTTOM_WEIGHT * worst_k_mean
+            + (1.0 - COMPOSITE_FINAL_BOTTOM_WEIGHT) * weighted
+        )
+    return worst_k_mean if worst_k_mean is not None else weighted
+
+
+def _axis_spread(axes: dict[str, float | None]) -> float | None:
+    """Population stdev of present axis values (anti-gaming visibility).
+
+    A balanced student has spread ~0.05; a specialist who games one axis
+    sits >0.15. Not used for gating — the worst-axis rule already
+    captures specialist failure; this just makes narrow profiles visible
+    earlier in the dashboard.
+    """
+    values = [v for v in axes.values() if v is not None]
+    if len(values) < 2:
+        return None
+    m = sum(values) / len(values)
+    var = sum((v - m) ** 2 for v in values) / len(values)
+    return var ** 0.5
+
+
+_BENCH_VS_REL_RELATIVE_KEYS: tuple[str, ...] = (
+    "kl", "on_policy_rkl", "top_k_overlap", "entropy_aware_kl",
+    "kl_is", "forking_rkl", "teacher_trace_plausibility",
+    "tail_decoupled_kl",
+    "capability", "judge_probe", "long_form_judge",
+    "chat_turns_probe", "length", "degeneracy",
+)
+
+
+def _bench_vs_rel_gap(axes: dict[str, float | None]) -> float | None:
+    """``mean(bench pass-fracs) - mean(relative axes)`` (memorisation tell).
+
+    A miner who memorised bench items via rotation inspection without
+    improving policy-level capability shows up as a big positive gap.
+    Normal miners sit around zero. Surfaced in telemetry so we can audit
+    rotation-memorisation attempts before they matter for ranking.
+    Returns None when fewer than two axes per group reported.
+    """
+    bench_keys = tuple(BENCH_AXIS_WEIGHTS.keys()) + tuple(ARENA_V3_AXIS_WEIGHTS.keys())
+    rel_vals = [axes[k] for k in _BENCH_VS_REL_RELATIVE_KEYS if axes.get(k) is not None]
+    bench_vals = [axes[k] for k in bench_keys if axes.get(k) is not None]
+    if len(rel_vals) < 2 or len(bench_vals) < 2:
+        return None
+    return (sum(bench_vals) / len(bench_vals)) - (sum(rel_vals) / len(rel_vals))
+
+
+def _baseline_penalty_summary(
+    raw_axes: dict[str, float | None],
+    axes: dict[str, float | None],
+    reference_axes: dict[str, float | None] | None,
+) -> dict | None:
+    """Summarise per-axis baseline-relative dock for the dashboard.
+
+    When the v29.1 baseline-relative penalty is in effect, ``axes``
+    reflects post-penalty values that drive ranking. This helper builds
+    the per-axis dock table (raw vs adjusted vs reference + gap/dock)
+    so the dashboard can show both the raw bench score and the
+    regression dock without losing signal. Returns None when no
+    reference is available — penalty silently inactive that round.
+    """
+    if not reference_axes:
+        return None
+    deltas: dict[str, dict[str, float]] = {}
+    for axis in BASELINE_RELATIVE_PENALTY_AXES:
+        raw_v = raw_axes.get(axis)
+        adj_v = axes.get(axis)
+        ref_v = reference_axes.get(axis)
+        if raw_v is None or ref_v is None or adj_v is None:
+            continue
+        if abs(raw_v - adj_v) < 1e-6 and raw_v >= ref_v:
+            continue
+        deltas[axis] = {
+            "raw": round(float(raw_v), 4),
+            "adjusted": round(float(adj_v), 4),
+            "reference": round(float(ref_v), 4),
+            "gap": round(float(ref_v - raw_v), 4),
+            "dock": round(float(raw_v - adj_v), 4),
+        }
+    return {
+        "enabled": BASELINE_RELATIVE_PENALTY_ENABLED,
+        "alpha": BASELINE_RELATIVE_PENALTY_ALPHA,
+        "applied": deltas,
+        "n_docked": len(deltas),
+    }
+
+
 def compute_composite(student: dict, king_kl: float | None = None,
                       king_rkl: float | None = None,
                       broken_axes: set[str] | None = None,
@@ -1745,87 +1847,10 @@ def compute_composite(student: dict, king_kl: float | None = None,
         sum(effective_weights[k] * v for k, v in weighted_axes.items()) / total_w
         if total_w else None
     )
-    # v30.2 — final ranking key. Blends the bottom-K mean with the
-    # weighted mean. Default 0.7 / 0.3 split (heavy on the bottom).
-    # If either component is None, fall back to the available one.
-    if worst_k_mean is not None and weighted is not None:
-        final_score = (
-            COMPOSITE_FINAL_BOTTOM_WEIGHT * worst_k_mean
-            + (1.0 - COMPOSITE_FINAL_BOTTOM_WEIGHT) * weighted
-        )
-    elif worst_k_mean is not None:
-        final_score = worst_k_mean
-    elif weighted is not None:
-        final_score = weighted
-    else:
-        final_score = None
-
-    # 2026-04-25 — anti-gaming visibility. Two informational scores that
-    # tell operators when a student is unusually narrow:
-    #
-    #   * ``axis_spread``: stdev of all axis values present in the round
-    #     (whether they're in the composite or not). A balanced student
-    #     has low spread (~0.05); a specialist who games one axis has
-    #     spread > 0.15. Not used for gating — the worst-axis rule
-    #     already captures specialist failure, this just makes narrow
-    #     profiles visible earlier.
-    #
-    #   * ``bench_vs_rel_gap``: mean(bench pass-fracs) minus mean(relative
-    #     axes). A miner who memorized bench items via rotation
-    #     inspection without improving policy-level capability shows up
-    #     as a big positive gap. Normal miners: roughly zero. Flagged
-    #     in telemetry so we can audit rotation-memorization attempts
-    #     before they matter.
-    all_values = [v for v in axes.values() if v is not None]
-    axis_spread = None
-    if len(all_values) >= 2:
-        m = sum(all_values) / len(all_values)
-        var = sum((v - m) ** 2 for v in all_values) / len(all_values)
-        axis_spread = var ** 0.5
-
-    rel_keys = ("kl", "on_policy_rkl", "top_k_overlap", "entropy_aware_kl",
-                "kl_is", "forking_rkl", "teacher_trace_plausibility",
-                "tail_decoupled_kl",
-                "capability", "judge_probe", "long_form_judge",
-                "chat_turns_probe", "length", "degeneracy")
-    bench_keys = tuple(BENCH_AXIS_WEIGHTS.keys()) + tuple(ARENA_V3_AXIS_WEIGHTS.keys())
-    rel_vals = [axes[k] for k in rel_keys if axes.get(k) is not None]
-    bench_vals = [axes[k] for k in bench_keys if axes.get(k) is not None]
-    bench_vs_rel_gap = None
-    if len(rel_vals) >= 2 and len(bench_vals) >= 2:
-        bench_vs_rel_gap = (sum(bench_vals) / len(bench_vals)) - (sum(rel_vals) / len(rel_vals))
-
-    # 2026-04-28 (v29.1): when the baseline-relative penalty is in
-    # effect, ``axes`` reflects the *post-penalty* values that drive
-    # ranking. We also surface ``axes_raw`` (pre-penalty) and a
-    # ``baseline_penalty`` summary so the dashboard can show both the
-    # raw bench score and the regression dock without losing signal.
-    baseline_penalty_summary = None
-    if reference_axes:
-        deltas: dict[str, dict[str, float]] = {}
-        for axis in BASELINE_RELATIVE_PENALTY_AXES:
-            raw_v = raw_axes.get(axis)
-            adj_v = axes.get(axis)
-            ref_v = reference_axes.get(axis)
-            if raw_v is None or ref_v is None:
-                continue
-            if adj_v is None:
-                continue
-            if abs(raw_v - adj_v) < 1e-6 and raw_v >= ref_v:
-                continue
-            deltas[axis] = {
-                "raw": round(float(raw_v), 4),
-                "adjusted": round(float(adj_v), 4),
-                "reference": round(float(ref_v), 4),
-                "gap": round(float(ref_v - raw_v), 4),
-                "dock": round(float(raw_v - adj_v), 4),
-            }
-        baseline_penalty_summary = {
-            "enabled": BASELINE_RELATIVE_PENALTY_ENABLED,
-            "alpha": BASELINE_RELATIVE_PENALTY_ALPHA,
-            "applied": deltas,
-            "n_docked": len(deltas),
-        }
+    final_score = _blended_final_score(worst_k_mean, weighted)
+    axis_spread = _axis_spread(axes)
+    bench_vs_rel_gap = _bench_vs_rel_gap(axes)
+    baseline_penalty_summary = _baseline_penalty_summary(raw_axes, axes, reference_axes)
 
     return {
         "version": COMPOSITE_SHADOW_VERSION,
@@ -2046,6 +2071,39 @@ def _resolve_king_eopd(students_data: dict[Any, dict],
     return _resolve_king_metric_min(students_data, "eopd_adaptive_mean")
 
 
+# Per-shadow-axis ``(kwargs_key, students_data_field)`` registry used by
+# :func:`_resolve_all_king_refs`. Adding a new shadow axis is a one-line
+# entry here instead of an extra ``_resolve_king_*`` plus a fresh
+# call site in ``annotate_h2h_with_composite``.
+_KING_SHADOW_AXIS_REGISTRY: tuple[tuple[str, str], ...] = (
+    ("king_eopd", "eopd_adaptive_mean"),
+    ("king_kl_is", "kl_is_mean"),
+    ("king_forking_rkl", "forking_rkl_mean"),
+    ("king_trace_nll", "teacher_trace_nll_mean"),
+    ("king_kl_tail", "kl_tail_mean"),
+)
+
+
+def _resolve_all_king_refs(
+    king_kl: float | None,
+    students_data: dict[Any, dict],
+    h2h_results: list[dict],
+) -> tuple[float | None, float | None, dict[str, float | None]]:
+    """Resolve ``(king_kl, king_rkl, king_shadow_kwargs)`` in one pass.
+
+    Bundles every shadow-axis king reference through the registry above
+    so callers (currently :func:`annotate_h2h_with_composite`) need a
+    single line instead of one ``_resolve_king_*`` invocation per axis.
+    """
+    king_kl = _resolve_king_kl(king_kl, students_data)
+    king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
+    shadow_kwargs: dict[str, float | None] = {
+        key: _resolve_king_metric_min(students_data, field)
+        for key, field in _KING_SHADOW_AXIS_REGISTRY
+    }
+    return king_kl, king_rkl, shadow_kwargs
+
+
 def compute_king_health(
     king_composite: dict | None,
     base_composite: dict | None,
@@ -2213,18 +2271,13 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     ``kl_global_avg``. The new winner scores 1.0; subsequent rounds
     inherit the crowned king's KL as the natural anchor.
     """
-    king_kl = _resolve_king_kl(king_kl, students_data)
-    king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
-    king_eopd = _resolve_king_eopd(students_data, h2h_results)
-    # v30 — three additional research-paper shadow-axis king references.
-    # Resolved via the same min-with-floor pattern as king_eopd.
-    king_kl_is = _resolve_king_metric_min(students_data, "kl_is_mean")
-    king_forking_rkl = _resolve_king_metric_min(students_data, "forking_rkl_mean")
-    king_trace_nll = _resolve_king_metric_min(
-        students_data, "teacher_trace_nll_mean"
+    # v30 — every shadow-axis king reference resolved in one pass via
+    # the ``_KING_SHADOW_AXIS_REGISTRY``. Adding a new axis is a single
+    # registry entry now, not five edits across compute_axes /
+    # compute_composite / annotate_h2h_with_composite call sites.
+    king_kl, king_rkl, shadow_king_kwargs = _resolve_all_king_refs(
+        king_kl, students_data, h2h_results,
     )
-    # v30.3 — tail-decoupled KL king reference.
-    king_kl_tail = _resolve_king_metric_min(students_data, "kl_tail_mean")
     broken = resolve_teacher_broken_axes(teacher_student_row, king_kl, king_rkl)
 
     # v30.2 — Teacher axis values for the super_teacher axis.
@@ -2269,16 +2322,9 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     # Bundle the v30 shadow-axis king references + teacher axes into a
     # single kwargs dict so the four compute_axes/compute_composite call
     # sites below stop repeating the same 6-line keyword block. Adding a
-    # new shadow axis now means one extra entry here instead of editing
-    # four call sites.
-    king_refs_kwargs = {
-        "king_eopd": king_eopd,
-        "king_kl_is": king_kl_is,
-        "king_forking_rkl": king_forking_rkl,
-        "king_trace_nll": king_trace_nll,
-        "king_kl_tail": king_kl_tail,
-        "teacher_axes": teacher_axes_for_super,
-    }
+    # new shadow axis is a one-line edit in ``_KING_SHADOW_AXIS_REGISTRY``
+    # — this expansion automatically picks it up.
+    king_refs_kwargs = {**shadow_king_kwargs, "teacher_axes": teacher_axes_for_super}
 
     # 2026-04-28 (v29.1): same-round reference axes for the per-axis
     # baseline-relative penalty. We compute the Qwen-4B-base axis values
