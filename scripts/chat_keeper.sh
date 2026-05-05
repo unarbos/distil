@@ -64,6 +64,33 @@ probe_local() {
   curl -fsS --max-time "$TIMEOUT" "http://127.0.0.1:${APP_PORT}/v1/models" >/dev/null 2>&1
 }
 
+# probe_local_tool_calls — verify vLLM accepts ``tool_choice: "auto"`` requests.
+#
+# 2026-05-05: the chat-bench pod can be "alive" (``/v1/models`` returns 200)
+# but still serve every chat.arbos.life turn as HTTP 400 if it was launched
+# without ``--tool-call-parser``. Open-WebUI sends every conversation with
+# the SN97 status toolkit attached and ``function_calling=native``, so a
+# missing parser breaks chat for every user while ``probe_local`` says
+# everything is fine. We flush this whole class of regressions out by
+# sending a *minimal* tool-enabled completion (``max_tokens=1``, empty
+# tool-args schema) and treating an HTTP 400 response as broken even if
+# ``/v1/models`` is happy. Anything else (200 / 500 / network error) is
+# treated as "tool-call wiring is at least configured" — we don't want to
+# trigger a heal on transient model-side issues like OOM or context
+# overflow.
+probe_local_tool_calls() {
+  local body
+  body='{"model":"sn97-king","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"tools":[{"type":"function","function":{"name":"_keeper_probe","description":"noop","parameters":{"type":"object","properties":{}}}}],"tool_choice":"auto"}'
+  local code
+  code=$(curl -s -o /dev/null --max-time "$TIMEOUT" \
+    -H 'Content-Type: application/json' \
+    -X POST -d "$body" \
+    -w '%{http_code}' \
+    "http://127.0.0.1:${APP_PORT}/v1/chat/completions" 2>/dev/null)
+  [ "$code" = "400" ] && return 1
+  return 0
+}
+
 probe_remote() {
   cd "$REPO_ROOT" || return 1
   python3 -m scripts.validator.chat_pod_admin probe >/dev/null 2>&1
@@ -80,8 +107,28 @@ heal_remote() {
 }
 
 if probe_local; then
-  log "ok (local tunnel + vLLM)"
-  exit 0
+  if probe_local_tool_calls; then
+    log "ok (local tunnel + vLLM + tool-call wiring)"
+    exit 0
+  fi
+  # vLLM is alive but rejecting ``tool_choice: "auto"`` with HTTP 400.
+  # That means it was launched without ``--tool-call-parser`` (or with a
+  # name vLLM doesn't recognise) — every chat.arbos.life turn is broken
+  # for end users even though models endpoint is happy. Force a full
+  # heal so the bootstrapper re-runs and picks up the right
+  # family-specific parser flags.
+  log "vLLM up but rejects tool_choice=auto (HTTP 400) — forcing heal"
+  KING_MODEL="$(resolve_king_model)"
+  if [ -z "$KING_MODEL" ]; then
+    log "no king model recorded yet; cannot heal tool-call wiring"
+    exit 0
+  fi
+  if heal_remote "$KING_MODEL"; then
+    log "heal command issued for tool-call wiring — vLLM warm-up takes ~60s"
+    exit 0
+  fi
+  log "heal failed"
+  exit 1
 fi
 
 log "local probe failed — investigating"
