@@ -356,8 +356,81 @@ def write_health(status: str = "starting"):
         f.write(MODEL_NAME)
 
 
+def _install_custom_reasoning_parser():
+    """Copy ``distil_kimi_reasoning_parser.py`` into vLLM's parser dir
+    AND patch vLLM's ``vllm/reasoning/__init__.py`` to import it.
+
+    The parser self-registers via the
+    ``@ReasoningParserManager.register_module("distil_kimi")`` decorator,
+    but dropping the file alone isn't enough: vLLM's ``__init__.py``
+    only auto-imports parsers listed in ``_REASONING_PARSERS_TO_REGISTER``
+    (lazy registration); the file just sits there until something imports
+    it. So we also append a single ``from . import …`` line to
+    ``__init__.py`` (guarded by a sentinel so re-runs are no-ops),
+    which forces the decorator to run at vLLM startup.
+
+    We do BOTH actions from chat_server (NOT from a separate deployment
+    step) so the chat-king pod self-heals when the underlying vLLM
+    image is wiped or upgraded — every fresh bootstrap re-installs the
+    parser before launching vLLM.
+
+    Idempotent: re-copies the parser file on every boot so an in-place
+    edit ships, but the ``__init__.py`` patch is sentinel-guarded so it
+    only adds the import line once. No-op (logs a warning) if the
+    source file is missing or the destination dir doesn't exist (e.g. a
+    future vLLM re-org); chat falls back to the stock parsers and
+    ``--reasoning-parser distil_kimi`` will fail loudly at startup.
+    """
+    src = Path(__file__).parent / "distil_kimi_reasoning_parser.py"
+    if not src.is_file():
+        log(f"warning: custom reasoning parser src missing: {src}")
+        return
+    candidates = list(
+        Path("/usr/local/lib").glob("python3.*/dist-packages/vllm/reasoning")
+    )
+    if not candidates:
+        candidates = list(
+            Path("/usr/lib").glob("python3.*/dist-packages/vllm/reasoning")
+        )
+    if not candidates:
+        log("warning: vLLM reasoning dir not found; skipping custom parser install")
+        return
+    dst_dir = candidates[0]
+    dst = dst_dir / "distil_kimi_reasoning_parser.py"
+    try:
+        shutil.copy2(src, dst)
+        log(f"installed custom reasoning parser: {dst}")
+    except OSError as exc:
+        log(f"warning: could not install custom reasoning parser: {exc}")
+        return
+
+    init_path = dst_dir / "__init__.py"
+    sentinel = "# distil_kimi_reasoning_parser auto-registered"
+    import_line = (
+        f"\n{sentinel}\n"
+        "try:\n"
+        "    from . import distil_kimi_reasoning_parser  # noqa: F401\n"
+        "except Exception as _e:  # pragma: no cover\n"
+        "    import logging\n"
+        "    logging.getLogger('vllm').warning(\n"
+        "        'distil_kimi parser auto-import failed: %s', _e,\n"
+        "    )\n"
+    )
+    try:
+        existing = init_path.read_text(encoding="utf-8")
+        if sentinel in existing:
+            log(f"distil_kimi parser already wired into {init_path.name}")
+            return
+        with open(init_path, "a", encoding="utf-8") as f:
+            f.write(import_line)
+        log(f"wired distil_kimi import into {init_path}")
+    except OSError as exc:
+        log(f"warning: could not patch vLLM __init__.py: {exc}")
+
+
 def exec_vllm():
     write_health()
+    _install_custom_reasoning_parser()
     # Chat-king coexists with the validator's eval workload on the same GPU
     # most of the time. ``pod_eval.py`` claims ~0.90 of the H200 during
     # rounds, so a 0.90 chat slice would OOM the second vLLM to come up
@@ -410,44 +483,38 @@ def exec_vllm():
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k25":
-        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text chat
-        # and wire the Kimi tool parser so Open-WebUI's
-        # ``function_calling=native`` requests succeed end-to-end.
-        #
-        # We deliberately do NOT add ``--reasoning-parser kimi_k2``: that
-        # parser treats everything before ``</think>`` (or
-        # ``<|tool_calls_section_begin|>``) as reasoning. The Kimi K2
-        # chat template auto-prepends ``<think>`` to the assistant turn,
-        # so a king that never emits ``</think>`` lands the entire answer
-        # in ``message.reasoning`` (empty content) — verified live on
-        # ``bodenmaurice/distil-new-v16`` after we tried it.
-        #
-        # Instead we surface thinking client-side: the v5 system prompt
-        # (``<!--sn97-system-v5-thinking-->`` in
-        # ``configure_webui_tools.py``) tells the king to wrap scratch in
-        # ``<think>…</think>`` blocks, and Open-WebUI's
-        # ``DEFAULT_REASONING_TAGS`` (in
-        # ``open_webui/utils/middleware.py``) splits those out into a
-        # collapsible Thinking section client-side. When the king ignores
-        # the instruction we fall back to plain content rendering — the
-        # chat is still usable, just without a Thinking pane for that
-        # turn. Future thinking-capable kings (or a vLLM that ships a
-        # parser with a friendlier "no </think>" fallback) can flip the
-        # parser back on without other changes.
+        # Kimi K2.5/K2.6 vision wrapper — disable vision path for text
+        # chat, wire the Kimi tool parser so Open-WebUI's
+        # ``function_calling=native`` requests succeed end-to-end, and
+        # use the custom ``distil_kimi`` reasoning parser
+        # (scripts/chat_pod/distil_kimi_reasoning_parser.py, installed
+        # by ``_install_custom_reasoning_parser`` below) so the
+        # Thinking pane lights up cleanly:
+        #   * model emits ``thoughts</think>answer`` → split (thinking
+        #     pane shows ``thoughts``, answer shows ``answer``)
+        #   * model emits ``answer`` (no </think>) → all content (NO
+        #     thinking pane that turn — accurate, the model didn't
+        #     think — but the answer is visible, not buried in
+        #     reasoning like the stock kimi_k2 parser does)
+        # Stock vLLM ``kimi_k2`` reasoning parser was tried earlier and
+        # rejected because it returned ``content=None`` for every turn
+        # the king didn't close ``</think>`` — verified empty on
+        # ``bodenmaurice/distil-new-v16``.
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "kimi_k2",
+            "--reasoning-parser", "distil_kimi",
             "--limit-mm-per-prompt", '{"image": 0, "video": 0}',
             "--skip-mm-profiling",
         ]
     elif family == "kimi_k2":
-        # Text-only DeepSeek V3 inner of Kimi K2 — same tool-call template
-        # as the vision wrapper. Reasoning parser is off for the same
-        # reason as ``kimi_k25``; we use the v5 system prompt + Open-WebUI
-        # client-side ``<think>…</think>`` parsing instead.
+        # Text-only DeepSeek V3 inner of Kimi K2 — same tool-call +
+        # reasoning template as the vision wrapper. See ``kimi_k25``
+        # for the rationale on the custom ``distil_kimi`` parser.
         cmd += [
             "--enable-auto-tool-choice",
             "--tool-call-parser", "kimi_k2",
+            "--reasoning-parser", "distil_kimi",
         ]
     else:
         # Unknown architecture — pass no family-specific flags. We also
