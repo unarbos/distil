@@ -400,6 +400,22 @@ def _student_id(
     return hotkey, commit_block
 
 
+def _can_persist_kl_score(early_stopped: bool, scored_prompts: int) -> bool:
+    """Gate: should we overwrite a global score with this round's KL?
+
+    A round that died before reaching ``MIN_PROMPTS_FOR_SCORE_UPDATE``
+    prompts has a noisy KL estimate that can drift dramatically from
+    the model's true KL (2026-04-24 incident: a king died at 129/300
+    prompts and its kl=0.06 overwrote the prior canonical kl=0.20,
+    silently propagating a corrupt score everywhere). Skip the score
+    write in that case and preserve the prior global score.
+
+    Used for both king and challenger paths so they apply the same
+    threshold; only the log messaging differs between them.
+    """
+    return (not early_stopped) or scored_prompts >= MIN_PROMPTS_FOR_SCORE_UPDATE
+
+
 def _dq_student(
     *,
     state, uid: int, model_name: str, hotkey: str, commit_block: int | None,
@@ -982,43 +998,24 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
             continue
         this_round_uids.add(uid)
+        scored_prompts = student_result.get("prompts_scored", n_prompts) or 0
+        early_stopped = bool(student_result.get("early_stopped", False))
         if uid == king_uid:
             king_h2h_kl = kl
-            king_scored_prompts = student_result.get("prompts_scored", n_prompts) or 0
-            king_early_stopped = bool(student_result.get("early_stopped", False))
-            # Gate king's score write too. When the king died early (e.g. 129/300
-            # prompts on 2026-04-24) its `kl` is computed on a much smaller
-            # sample and drifts dramatically from its canonical global KL,
-            # producing the 0.068731 vs 0.198586 discrepancy that overwrote
-            # the real score and propagated everywhere.
-            can_persist_king_score = (
-                not king_early_stopped
-                or king_scored_prompts >= MIN_PROMPTS_FOR_SCORE_UPDATE
-            )
-            if can_persist_king_score:
+            if _can_persist_kl_score(early_stopped, scored_prompts):
                 state.scores[str(uid)] = kl
                 logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
             else:
                 logger.warning(
                     f"UID {uid} ({model_name}): king early-stopped at "
-                    f"{king_scored_prompts}/{n_prompts} prompts — NOT persisting "
+                    f"{scored_prompts}/{n_prompts} prompts — NOT persisting "
                     f"KL={kl:.6f}, preserving prior global score "
                     f"{state.scores.get(str(uid))}"
                 )
             state.evaluated_uids.add(str(uid))
             log_event(f"UID {uid}: KL={kl:.6f} (king)", state_dir=str(state.state_dir))
         else:
-            scored_prompts = student_result.get("prompts_scored", n_prompts) or 0
-            early_stopped = bool(student_result.get("early_stopped", False))
-            # Gate: do not persist a potentially-corrupt KL into state.scores
-            # if the challenger stopped before reaching the leaderboard floor.
-            # 2026-04-24: previously a challenger that died at 129/300 prompts
-            # wrote kl=0.06 into state.scores over a pre-existing kl=0.20,
-            # which then flowed into the contender leaderboard and silently
-            # replaced real top contenders. See MIN_PROMPTS_FOR_SCORE_UPDATE
-            # docstring above for the full incident.
-            can_persist_score = not early_stopped or scored_prompts >= MIN_PROMPTS_FOR_SCORE_UPDATE
-            if can_persist_score:
+            if _can_persist_kl_score(early_stopped, scored_prompts):
                 state.scores[str(uid)] = kl
             else:
                 logger.info(
