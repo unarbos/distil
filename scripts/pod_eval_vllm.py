@@ -6416,49 +6416,30 @@ def _format_multi_doc_prompt(it: dict) -> str:
 
 def multi_doc_synthesis_bench_probe(model, tokenizer, device="cuda"):
     """Run the multi_doc_synthesis_bench probe (v29.4)."""
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("multi_doc") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _format_multi_doc_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MULTI_DOC_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    cleaned = _strip_thinking_probe(text or "").strip()
-                    gold = str(it.get("answer", ""))
-                    confuser_answers = it.get("confuser_answers") or []
-                    pred_lower = cleaned.lower()
-                    gold_in_pred = bool(gold and gold.lower() in pred_lower)
-                    confuser_in_pred = any(
-                        ca and ca.lower() in pred_lower for ca in confuser_answers
-                    )
-                    ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
-                    out["items"].append({
-                        "src": it.get("src", ""),
-                        "kind": it.get("kind"),
-                        "gold": gold[:60],
-                        "pred_tail": cleaned[-160:],
-                        "ok": bool(ok),
-                        "gen_tokens": int(tok),
-                        "confuser_hit": bool(confuser_answers and confuser_in_pred),
-                        "gold_in_pred": gold_in_pred,
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
-                except Exception as e:
-                    out["items"].append({
-                        "src": it.get("src", ""), "error": str(e)[:120],
-                    })
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    def _grade(it, text, tok):
+        cleaned = _strip_thinking_probe(text or "").strip()
+        gold = str(it.get("answer", ""))
+        confuser_answers = it.get("confuser_answers") or []
+        pred_lower = cleaned.lower()
+        gold_in_pred = bool(gold and gold.lower() in pred_lower)
+        confuser_in_pred = any(
+            ca and ca.lower() in pred_lower for ca in confuser_answers
+        )
+        ok = 1 if (gold_in_pred and not confuser_in_pred) else 0
+        return {
+            "src": it.get("src", ""),
+            "kind": it.get("kind"),
+            "gold": gold[:60],
+            "pred_tail": cleaned[-160:],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+            "confuser_hit": bool(confuser_answers and confuser_in_pred),
+            "gold_in_pred": gold_in_pred,
+        }, ok
+    return _run_simple_bench(
+        model, tokenizer, device, "multi_doc", BENCH_MULTI_DOC_MAX_TOKENS,
+        prompt_fn=_format_multi_doc_prompt, grade_fn=_grade,
+    )
 
 
 # ── calibration_bench (v29.4) ────────────────────────────────────────────
@@ -13584,46 +13565,53 @@ def _pick_robustness_perturbations(
     return pool[:target_k]
 
 
-def robustness_bench_probe(model, tokenizer, device="cuda"):
+def _run_perturbation_bench(model, tokenizer, device, *, sample_key: str,
+                            max_tokens: int, perturbations,
+                            base_prompt_fn, grade_fn,
+                            seed_root: int | None = None) -> dict:
+    """Scaffolding for robustness/noise bench probes.
+
+    Both axes test the same shape: per-item × per-perturbation grid where
+    each cell perturbs ``base_prompt_fn(item)`` then re-runs the standard
+    generate+grade pipeline. The only difference is the perturbation
+    signature: robustness uses ``perturb(prompt) -> str`` (deterministic
+    by axis seed at perturbation-pick time), noise uses
+    ``perturb(prompt, seed) -> str`` (sub-seeded per (item, pert) for
+    reproducible internal randomness).
+
+    ``seed_root`` toggles between the two: ``None`` → robustness mode
+    (no seed passed); int → noise mode (sub-seed mixed per cell).
+    ``perturbations`` is the list of ``(name, fn)`` pairs the caller
+    has already picked. ``grade_fn(it, text, tok) -> (record, ok)``
+    returns the per-item record (perturbation field added by helper).
+    """
     out: dict = {
         "n": 0, "correct": 0, "pass_frac": 0.0,
-        "items": [], "perturbations": [],
+        "items": [], "perturbations": [name for name, _ in perturbations],
     }
-    samples = _BENCH_SAMPLES.get("robustness") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    perturbations = _pick_robustness_perturbations(
-        _BENCH_BLOCK_SEED, BENCH_ROBUSTNESS_PERTURB_K,
-    )
-    out["perturbations"] = [name for name, _ in perturbations]
-    if not perturbations:
+    samples = _BENCH_SAMPLES.get(sample_key) or []
+    if not samples or model is None or tokenizer is None or not perturbations:
         return out
     try:
         with _model_eval_no_grad(model):
-            for it in samples:
-                base_prompt = _math_format_prompt(
-                    it["question"], it.get("src", ""),
-                )
-                for name, perturb in perturbations:
+            for item_idx, it in enumerate(samples):
+                base_prompt = base_prompt_fn(it)
+                for pert_idx, (name, perturb) in enumerate(perturbations):
                     try:
-                        prompt = perturb(base_prompt)
+                        if seed_root is None:
+                            prompt = perturb(base_prompt)
+                        else:
+                            sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
+                            prompt = perturb(base_prompt, sub_seed)
                         text, tok = _bench_generate(
                             model, tokenizer, prompt,
-                            BENCH_ROBUSTNESS_MAX_TOKENS, device,
-                            enable_thinking=False,
+                            max_tokens, device, enable_thinking=False,
                         )
-                        pred = _math_extract_answer(text, it.get("src", ""))
-                        ok = _math_score_one(pred, it["gold"])
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "pred": (pred or "")[:80],
-                            "gold": str(it.get("gold", ""))[:40],
-                            "ok": bool(ok),
-                            "gen_tokens": int(tok),
-                        })
+                        record, ok = grade_fn(it, text, int(tok))
+                        record["perturbation"] = name
+                        out["items"].append(record)
                         out["n"] += 1
-                        out["correct"] += ok
+                        out["correct"] += int(ok)
                     except Exception as e:
                         out["items"].append({
                             "src": it.get("src", ""),
@@ -13635,6 +13623,33 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
+
+
+def robustness_bench_probe(model, tokenizer, device="cuda"):
+    perturbations = _pick_robustness_perturbations(
+        _BENCH_BLOCK_SEED, BENCH_ROBUSTNESS_PERTURB_K,
+    )
+
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": (pred or "")[:80],
+            "gold": str(it.get("gold", ""))[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+        }, ok
+
+    return _run_perturbation_bench(
+        model, tokenizer, device, sample_key="robustness",
+        max_tokens=BENCH_ROBUSTNESS_MAX_TOKENS,
+        perturbations=perturbations,
+        base_prompt_fn=lambda it: _math_format_prompt(
+            it["question"], it.get("src", ""),
+        ),
+        grade_fn=_grade,
+    )
 
 
 # ── noise_resistance_bench (Session 3.7 — adversarial-noise sibling) ──
@@ -13806,62 +13821,36 @@ def _pick_noise_perturbations(
 
 
 def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
-    out: dict = {
-        "n": 0, "correct": 0, "pass_frac": 0.0,
-        "items": [], "perturbations": [],
-    }
-    samples = _BENCH_SAMPLES.get("noise") or []
-    if not samples or model is None or tokenizer is None:
-        return out
     perturbations = _pick_noise_perturbations(
         _BENCH_BLOCK_SEED, BENCH_NOISE_PERTURB_K,
     )
-    out["perturbations"] = [name for name, _ in perturbations]
-    if not perturbations:
-        return out
+
+    def _grade(it, text, tok):
+        pred = _math_extract_answer(text, it.get("src", ""))
+        ok = _math_score_one(pred, it["gold"])
+        return {
+            "src": it.get("src", ""),
+            "pred": (pred or "")[:80],
+            "gold": str(it.get("gold", ""))[:40],
+            "ok": bool(ok),
+            "gen_tokens": tok,
+        }, ok
+
+    # Per-(item, pert) deterministic seed mixing so internal randomness
+    # inside a wrapper (typo positions, etc.) is reproducible across
+    # validators in the same round but rotates per block. Seed
+    # propagation handled by _run_perturbation_bench in noise mode.
     seed_root = int(_BENCH_BLOCK_SEED or 0) ^ _BENCH_STREAM.get("noise", 0)
-    try:
-        with _model_eval_no_grad(model):
-            for item_idx, it in enumerate(samples):
-                base_prompt = _math_format_prompt(
-                    it["question"], it.get("src", ""),
-                )
-                for pert_idx, (name, perturb) in enumerate(perturbations):
-                    try:
-                        # Per-(item, pert) deterministic seed so internal
-                        # randomness inside a wrapper (typo positions, etc.)
-                        # is reproducible across validators in the same
-                        # round but rotates per block.
-                        sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
-                        prompt = perturb(base_prompt, sub_seed)
-                        text, tok = _bench_generate(
-                            model, tokenizer, prompt,
-                            BENCH_NOISE_MAX_TOKENS, device,
-                            enable_thinking=False,
-                        )
-                        pred = _math_extract_answer(text, it.get("src", ""))
-                        ok = _math_score_one(pred, it["gold"])
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "pred": (pred or "")[:80],
-                            "gold": str(it.get("gold", ""))[:40],
-                            "ok": bool(ok),
-                            "gen_tokens": int(tok),
-                        })
-                        out["n"] += 1
-                        out["correct"] += ok
-                    except Exception as e:
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "error": str(e)[:120],
-                        })
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    return _run_perturbation_bench(
+        model, tokenizer, device, sample_key="noise",
+        max_tokens=BENCH_NOISE_MAX_TOKENS,
+        perturbations=perturbations,
+        base_prompt_fn=lambda it: _math_format_prompt(
+            it["question"], it.get("src", ""),
+        ),
+        grade_fn=_grade,
+        seed_root=seed_root,
+    )
 
 
 def procedural_bench_probe(model, tokenizer, device="cuda"):
