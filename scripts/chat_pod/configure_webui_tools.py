@@ -77,49 +77,30 @@ NOW_ISO = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:
 # re-running this script will replace the prompt, never stack copies on top
 # of each other.
 #
-# v6 changes (over v5):
-#  - Drastically shorter (≈30% of v5). Empirically, distilled-student
-#    kings (e.g. ``bodenmaurice/distil-new-v16``) regurgitate the system
-#    prompt verbatim or fixate on prompt phrases when it's long — chat
-#    logs at /tmp/chat_seo.json show 122k-char devolutions where the
-#    model loops "Use an approximate, modular value, or a digit count"
-#    (a v5 prompt phrase). Cutting to ~12 lines reduces the pull.
-#  - Removes the heavy Pyodide-specific rules; they were leaking into
-#    answers ("Always end with explicit print()" appearing in user-
-#    facing text) and the model wasn't following them anyway. The
-#    feasibility-check rule is dropped for the same reason — when needed
-#    we'll add it back as a per-tool description, not a global prompt.
-#  - Keeps the ``<think>…</think>`` contract because the new
-#    ``distil_kimi`` reasoning parser (chat_server.py) only lights up
-#    the Thinking pane when the model emits a closing ``</think>`` —
-#    if it doesn't, the parser falls back to plain content (the answer
-#    is still visible).
-#  - Keeps an explicit "no markdown fake-tool-call blocks" rule because
-#    the model was emitting ```python\nsearch_web(...)\n``` markdown
-#    instead of actual OpenAI tool_calls (chat 90ef690a "jelly beans"
-#    incident).
-SYSTEM_PROMPT_MARKER = "<!--sn97-system-v6-concise-->"
-SYSTEM_PROMPT = textwrap.dedent(
-    f"""
-    {SYSTEM_PROMPT_MARKER}
-    You are the SN97 (Distil) chat assistant. Be concise and accurate.
-
-    Tool calls are available. To use one, emit a real function call —
-    NEVER write fake ```python\nsearch_web(...)\n``` markdown blocks
-    pretending to call a tool. Real calls: ``sn97_status.*`` for subnet
-    questions, ``search_web``+``fetch_url`` for live web facts,
-    ``execute_code`` for math/data. If no tool fits, answer directly.
-
-    Optional Thinking: if you reason before answering, wrap the scratch
-    in ``<think>…</think>`` at the start of your reply, then emit the
-    user-facing answer. Without the closing ``</think>`` tag the UI
-    will not hide it. If you have nothing to think about, skip the
-    block entirely.
-
-    Format math with $…$ for inline and $$…$$ on its own lines for
-    block math. Use Markdown elsewhere. Stop when you've answered.
-    """
-).strip()
+# v7 changes (over v6):
+#  - One line. Empirically the distilled-student kings (e.g.
+#    ``bodenmaurice/distil-new-v16``) regurgitate or pattern-match
+#    against ANY system prompt longer than that:
+#      * v5 (~80 lines) → 122k-char loops repeating prompt phrases
+#      * v6 (~12 lines) → "Hi" returned 2.4k chars of pseudo-Pyodide
+#        instructions (chat 297a48c3 on 2026-05-05 18:14)
+#      * v7 (1 line)    → minimal regurgitation surface
+#  - The Pyodide / "Persistent File System" / "Do not install packages"
+#    text the model was emitting wasn't even from OUR prompt — Open-WebUI
+#    auto-injects ``CODE_INTERPRETER_PYODIDE_PROMPT`` (defined in
+#    open_webui/config.py) as a user message before every turn whenever
+#    code_interpreter is enabled on the model row, even with native
+#    function calling. The companion fix in this commit disables
+#    ``meta.builtinTools.code_interpreter`` on sn97-king so OWUI stops
+#    that injection. The current king is too weak to use the code
+#    interpreter productively anyway — re-enable per-king when we get
+#    a stronger king.
+SYSTEM_PROMPT_MARKER = "<!--sn97-system-v7-minimal-->"
+SYSTEM_PROMPT = (
+    f"{SYSTEM_PROMPT_MARKER}\n"
+    "You are the SN97 (Distil) chat assistant. Be concise, accurate, "
+    "and helpful. Use tools when available."
+)
 
 
 def fail(msg: str) -> None:
@@ -314,8 +295,23 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
         tool_ids.insert(0, TOOL_ID)
     meta["toolIds"] = tool_ids
 
-    # 3e. Make sure capabilities + builtinTools are aligned with the global
-    # config we set in step 4. We only advertise things we actually wired up.
+    # 3e. Capabilities + builtinTools.
+    #
+    # 2026-05-05: ``code_interpreter`` was flipped off across the board
+    # because Open-WebUI's middleware unconditionally appends the
+    # ``CODE_INTERPRETER_PYODIDE_PROMPT`` from
+    # ``open_webui/config.py`` (≈10 lines of "Pyodide Environment / Do
+    # not install packages / /mnt/uploads/...") to the user message
+    # right before every turn whenever ``builtinTools.code_interpreter
+    # = True`` AND ``params.function_calling = "native"``. The current
+    # weak king (``bodenmaurice/distil-new-v16``) regurgitates that
+    # injected text verbatim instead of answering the question (chat
+    # 297a48c3 returned 2.4k chars of Pyodide instructions to "Hi").
+    # Disabling it on the model row stops the injection. The
+    # ``execute_code`` builtin tool is also gone, but the king couldn't
+    # use it productively anyway — every observed "code execution"
+    # turn was a fake ``print(...)`` blob in plain text content.
+    # Re-enable per-king when a tool-fluent king lands.
     caps = meta.get("capabilities") or {}
     caps.update(
         {
@@ -325,7 +321,7 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
             "file_upload": True,
             "web_search": True,
             "image_generation": False,
-            "code_interpreter": True,
+            "code_interpreter": False,
             "citations": True,
             "status_updates": True,
             "builtin_tools": True,
@@ -344,14 +340,14 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
             "channels": False,
             "web_search": True,
             "image_generation": False,
-            "code_interpreter": True,
+            "code_interpreter": False,
         }
     )
     meta["builtinTools"] = builtin
 
     info(
         f"updating sn97-king: function_calling=native, toolIds={tool_ids}, "
-        f"max_tokens={params['max_tokens']}, web_search=on, code_interpreter=on"
+        f"max_tokens={params['max_tokens']}, web_search=on, code_interpreter=off"
     )
     if dry:
         return
@@ -389,16 +385,22 @@ def _patch_global_config(conn: sqlite3.Connection, *, dry: bool) -> None:
     )
     web["loader"] = web.get("loader") or {"engine": "safe_web"}
 
-    # 4b. Code interpreter (Pyodide, runs in user's browser — no server cost).
+    # 4b. Code interpreter — globally disabled (see step 3e for why; the
+    # OWUI middleware keeps injecting Pyodide context even when the
+    # per-model row turns it off, because some code paths only check the
+    # global flag). Setting ``enable=False`` here too prevents the
+    # injection regardless of the per-model setting.
     code = cfg.setdefault("code", {})
     interpreter = code.setdefault("interpreter", {})
-    interpreter.update({"enable": True, "engine": "pyodide"})
+    interpreter.update({"enable": False, "engine": "pyodide"})
     execution = code.setdefault("execution", {})
-    execution.update({"enable": True, "engine": "pyodide"})
+    execution.update({"enable": False, "engine": "pyodide"})
 
-    # 4c. Make sure features that get gated globally are open.
+    # 4c. Feature gates. Code interpreter is OFF (see 4b); web search
+    # stays ON (works via the search_web/fetch_url function tools without
+    # injecting any prompt text).
     features = cfg.setdefault("features", {})
-    features["enable_code_interpreter"] = True
+    features["enable_code_interpreter"] = False
     features["enable_web_search"] = True
 
     # 4d. Kill the "Arena Model" experiment. Open-WebUI's PersistentConfig
@@ -420,16 +422,16 @@ def _patch_global_config(conn: sqlite3.Connection, *, dry: bool) -> None:
         ui["default_models"] = MODEL_ID
 
     # 4f. Code interpreter persistent path: PersistentConfig stores under
-    # ``code_interpreter.enable`` / ``code_interpreter.engine`` (singular, no
-    # second segment) — not the ``code.interpreter.*`` path I used before.
-    # Set both so the new path wins on rehydration; the old path is harmless
-    # but vestigial.
+    # ``code_interpreter.enable`` / ``code_interpreter.engine`` (singular,
+    # no second segment) — not the ``code.interpreter.*`` path. Set both
+    # so the new path wins on rehydration; the old path is harmless but
+    # vestigial.
     ci = cfg.setdefault("code_interpreter", {})
-    ci["enable"] = True
+    ci["enable"] = False
     ci["engine"] = "pyodide"
 
     info(
-        "global config: web_search=duckduckgo (html), code_interpreter=pyodide, "
+        "global config: web_search=duckduckgo (html), code_interpreter=OFF, "
         f"arena.enable=False, default_models={ui['default_models']}, "
         "image_generation left disabled"
     )
