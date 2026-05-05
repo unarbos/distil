@@ -5842,15 +5842,51 @@ def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
     return eos_set, pad_id
 
 
+# 2026-05-05 (axes/evals/benchmarks thinking rollout):
+# Single global toggle for thinking-mode on the bench battery (math,
+# code, reasoning, knowledge, ifeval, aime, mbpp, tool-use, multi-doc,
+# calibration, pragmatic, knowledge, ifeval, ARC, robustness, noise,
+# procedural, truthful, long-context). Defaults ON so SN97's published
+# benchmark scores reward kings that actually think before answering —
+# the existing ``_strip_thinking_probe`` cleanup already removes
+# ``<think>...</think>`` blocks from bench output before scoring, so
+# enabling thinking is "free correctness" for any model trained to use
+# it (and a no-op for kings that ignore the flag — the chat template
+# just renders an extra ``<think>`` token that never closes, which is
+# stripped by `_strip_thinking_probe` before grading).
+#
+# We deliberately make ``_bench_generate`` IGNORE the per-call
+# ``enable_thinking`` argument and always honor the global. The
+# argument is kept for back-compat with old call sites (~17 callers
+# pass ``enable_thinking=False`` explicitly; rather than churn each
+# one we just override here). To run the legacy "no thinking" battery,
+# set ``BENCH_ENABLE_THINKING=0`` on the eval pod.
+#
+# Other probe-shaped functions (chat_response_probe, capability_probe,
+# chat_turns_probe, judge probes) keep their own explicit
+# ``enable_thinking=False`` because they're testing specific axes
+# (length termination, fast factual recall, multi-turn coherence,
+# grading deterministically) where thinking would distort the signal.
+# The thinking-collapse_probe already runs with ``enable_thinking=True``
+# on its own.
+BENCH_ENABLE_THINKING = os.environ.get("BENCH_ENABLE_THINKING", "1") != "0"
+
+
 def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
                     device: str, enable_thinking: bool = False) -> tuple[str, int]:
     """Greedy generation for a single bench prompt. Returns (text, gen_tokens).
 
     Uses the same eos/pad setup as the existing probes so behavior is
     identical to capability_probe / chat_response_probe.
+
+    NOTE: ``enable_thinking`` is overridden by the global
+    ``BENCH_ENABLE_THINKING`` env-controlled flag (see comment above).
+    Pass-through callers don't need to change.
     """
     eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+    rendered = _render_chat_prompt(
+        tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+    )
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     # Apply the derail-budget multiplier. Floor at 64 tokens so even
     # short-answer probes (knowledge: 64 baseline → 16 with factor 0.25)
@@ -6916,9 +6952,15 @@ def _bench_generate_sampled(model, tokenizer, prompt: str, max_new_tokens: int,
     are reproducible across validators (deterministic given the same
     (prompt, seed, temperature, top_p)). Everything else matches the
     greedy variant for behavioral parity.
+
+    NOTE: ``enable_thinking`` is overridden by the global
+    ``BENCH_ENABLE_THINKING`` flag (same as ``_bench_generate``) so
+    self-consistency samples reward thinking-mode kings end-to-end.
     """
     eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+    rendered = _render_chat_prompt(
+        tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+    )
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     prev_state = None
     if seed is not None:

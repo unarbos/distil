@@ -18,30 +18,86 @@ EARLY_STOP_MIN = int(os.environ.get("DISTIL_EARLY_STOP_MIN", "0") or "0")
 logger = logging.getLogger("distillation.remote_validator")
 
 
-# Validator env vars that propagate into the pod's eval shell so a
-# systemd override can flip behaviour without redeploying the pod
-# bundle. Centralised here (vs inline in run_eval_on_pod) so a new
-# tunable is added in one place and the function body stays
-# scrollable. See ``scripts/pod_eval_vllm.py`` for the per-var
-# semantics; the comment groups below mirror the historical groupings
-# in case a quick visual scan is needed during incident triage.
+def _is_api_teacher_mode() -> bool:
+    """Return True iff DISTIL_TEACHER_MODE=api in the validator env.
+
+    Routed through one helper so the (lower-cased, env-driven) check stays
+    consistent across ETA computation, vLLM startup gating, and any future
+    caller. The pod-side equivalent lives in ``scripts/api_teacher.py``.
+    """
+    return os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+
+
+def _pod_exec_silent(pod, cmd: str, *, timeout: int = 30, label: str | None = None) -> None:
+    """Run ``pod.exec(cmd)`` swallowing any exception.
+
+    Used for best-effort cleanup / kill commands where a failure must not
+    abort the surrounding flow (network blip, pod just rebooted, target
+    process already gone, etc.). Optionally logs ``label: <exc>`` at debug
+    so we keep visibility without spamming WARN.
+    """
+    try:
+        pod.exec(cmd, timeout=timeout)
+    except Exception as exc:
+        if label:
+            logger.debug("%s: %s", label, exc)
+
+
+# Single source of truth for the per-run remote artifact filenames.
+# ``var_name`` matches the local that consumes it later in ``run_eval_on_pod``;
+# ``basename`` is appended to the run_dir. The resume branch honours
+# ``resume_pod_eval`` overrides per-key so a re-attached run keeps writing to
+# the existing files even if the basenames evolve.
+_POD_REMOTE_FILES: tuple[tuple[str, str], ...] = (
+    ("prompts_remote", "prompts.json"),
+    ("remote_eval_script", "pod_eval.py"),
+    ("progress_remote", "eval_progress.json"),
+    ("results_remote", "eval_results.json"),
+    ("done_marker_remote", "eval_done.marker"),
+    ("log_remote", "eval_output.log"),
+    ("eval_data_remote", "eval_data.json"),
+    ("teacher_cache_remote", "teacher_cache.pt"),
+    ("pid_remote", "pod_eval.pid"),
+)
+
+
+def _build_remote_paths(run_dir: str, resume: dict | None = None) -> dict[str, str]:
+    """Return ``{var_name: remote_path}`` for one pod-eval run.
+
+    ``resume`` (when truthy) provides explicit overrides — used by the
+    validator-restart resume path so a re-attached run keeps writing to the
+    same files even if the basename map evolves between releases.
+    """
+    overrides = resume or {}
+    return {
+        var_name: overrides.get(var_name) or f"{run_dir}/{basename}"
+        for var_name, basename in _POD_REMOTE_FILES
+    }
+
+
+# Validator-side env vars propagated to the pod inner_eval command. Listed
+# in one place so we don't have to dig through 90 lines of inline bash to
+# add a new tunable. The pod-side script (``scripts/pod_eval_vllm.py``)
+# documents each variable's semantics.
 _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
-    # Bench battery toggles
+    # ── Bench battery toggles + composite gates ──
     "BENCH_BATTERY_ENABLED",
     "BENCH_BATTERY_SHADOW_AXES",
     "BENCH_BATTERY_LITE",
     "POD_PER_MODEL_TIMEOUT",
     "ARENA_V3_AXES_IN_COMPOSITE",
     "REASONING_DENSITY_IN_COMPOSITE",
-    # Validator-authoritative composite gates (2026-04-26): without
-    # these the pod-side ``in_composite`` log labels lied vs the
-    # validator's actual scoring. See pod_eval_vllm.py
-    # JUDGE_PROBE_IN_COMPOSITE alignment patch.
+    # 2026-04-26 — propagate validator-authoritative composite gates so the
+    # pod-side ``pod_eval_vllm.py`` reports ``in_composite``/log labels that
+    # match what the validator will actually do downstream. Previously the
+    # pod read separate ``*_PROBE_IN_COMPOSITE`` variables that defaulted to
+    # "0" while these axes defaulted to "1" in composite.py, so the eval log
+    # lied about whether axes were in production.
     "JUDGE_AXIS_IN_COMPOSITE",
     "CHAT_TURNS_AXIS_IN_COMPOSITE",
     "PARETO_DOMINANCE_GATE",
     "KING_REGRESSION_GATE",
-    # Bench sample counts (per round)
+    # ── Bench sample counts ──
     "BENCH_MATH_PER_ROUND",
     "BENCH_CODE_PER_ROUND",
     "BENCH_REASONING_PER_ROUND",
@@ -60,9 +116,11 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "BENCH_ROBUSTNESS_PERTURB_K",
     "BENCH_NOISE_PER_ROUND",
     "BENCH_NOISE_PERTURB_K",
-    # Bench max-token budgets (added 2026-04-25 to cap wall time —
-    # the default 1024-token AIME budget alone burns ~120s/student
-    # even when the model can't solve a single problem).
+    # ── Bench max-token budgets ──
+    # Added 2026-04-25 17:00 UTC after live round wall-time observation pegged
+    # the bench battery at ~11 min/student. The default 1024-token AIME budget
+    # alone burns ~120s/student even when the model can't get a single problem
+    # right; tightening it (and the rest) is the single biggest lever.
     "BENCH_MATH_MAX_TOKENS",
     "BENCH_CODE_MAX_TOKENS",
     "BENCH_REASONING_MAX_TOKENS",
@@ -78,17 +136,25 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "BENCH_PROCEDURAL_MAX_TOKENS",
     "BENCH_ROBUSTNESS_MAX_TOKENS",
     "BENCH_NOISE_MAX_TOKENS",
-    # Probe knobs
+    # ── Thinking-mode toggle (2026-05-05) ──
+    # Defaults ON in the pod (BENCH_ENABLE_THINKING=1). Propagate so an
+    # emergency rollback ("BENCH_ENABLE_THINKING=0") set on the
+    # validator host immediately silences thinking on the next round
+    # without a code push. The pod-side default is also "1" so the
+    # absence of this env var has the intended effect (thinking on)
+    # without explicit propagation — listing it here is for the
+    # disable-it-fast scenario only.
+    "BENCH_ENABLE_THINKING",
+    # ── Probe knobs ──
     "JUDGE_PROBE_PER_ROUND",
     "JUDGE_PROBE_MAX_TOKENS",
     "CHAT_TURNS_PROBE_PER_ROUND",
     "CHAT_TURNS_PROBE_MAX_TOKENS",
     "CHAT_TURNS_PROBE",
-    # Cloud-API teacher path (2026-05-03 Kimi K2.6 cutover): when
-    # DISTIL_TEACHER_MODE=api the pod skips local vLLM/HF teacher
-    # entirely and fetches generation + top-K logprobs from an
-    # external OpenAI-compatible provider. See
-    # scripts/api_teacher.py for design.
+    # ── Cloud-API teacher path (2026-05-03 Kimi K2.6 cutover) ──
+    # When DISTIL_TEACHER_MODE=api the pod skips local vLLM/HF teacher entirely
+    # and fetches generation + top-K logprobs from an external OpenAI-compatible
+    # provider. See scripts/api_teacher.py for design.
     "DISTIL_TEACHER_MODE",
     "DISTIL_TEACHER_API_BASE",
     "DISTIL_TEACHER_API_KEY",
@@ -102,24 +168,13 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     "DISTIL_TEACHER_API_DISABLE_REASONING",
     "DISTIL_OPENROUTER_REFERER",
     "DISTIL_OPENROUTER_TITLE",
-    # 2026-05-04: student-side knobs propagated through to the pod.
-    # ``DISTIL_STUDENT_BATCH_SIZE`` activates the v30.4 batched-forward
-    # path (currently dormant unless set) which gives a 2-3x wall-time
-    # win on the per-prompt KL loop. Without propagation the pod env
-    # never sees it and the pod falls back to single-prompt forwards.
+    # ── Student-side knobs (2026-05-04) ──
+    # ``DISTIL_STUDENT_BATCH_SIZE`` activates the v30.4 batched-forward path
+    # (currently dormant unless set) which gives a 2-3x wall-time win on the
+    # per-prompt KL loop. Without propagation the pod env never sees it and
+    # the pod falls back to single-prompt forwards.
     "DISTIL_STUDENT_BATCH_SIZE",
 )
-
-
-def _is_api_teacher_mode() -> bool:
-    """Return True iff DISTIL_TEACHER_MODE=api in the validator env.
-
-    Routed through one helper so the (lower-cased, env-driven) check
-    is consistent across ETA computation, vLLM startup gating and
-    any future caller. The pod-side equivalent lives in
-    ``scripts/api_teacher.py``.
-    """
-    return os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
 
 
 def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None, resume_pod_eval: dict | None = None):
@@ -243,31 +298,25 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     state.save_progress(progress)
     if is_resuming:
         run_dir = str(resume_pod_eval.get("run_dir"))
-        prompts_remote = resume_pod_eval.get("prompts_remote") or f"{run_dir}/prompts.json"
-        remote_eval_script = resume_pod_eval.get("remote_eval_script") or f"{run_dir}/pod_eval.py"
-        progress_remote = resume_pod_eval.get("progress_remote") or f"{run_dir}/eval_progress.json"
-        results_remote = resume_pod_eval.get("results_remote") or f"{run_dir}/eval_results.json"
-        done_marker_remote = resume_pod_eval.get("done_marker_remote") or f"{run_dir}/eval_done.marker"
-        log_remote = resume_pod_eval.get("log_remote") or f"{run_dir}/eval_output.log"
-        eval_data_remote = resume_pod_eval.get("eval_data_remote") or f"{run_dir}/eval_data.json"
-        teacher_cache_remote = resume_pod_eval.get("teacher_cache_remote") or f"{run_dir}/teacher_cache.pt"
-        pid_remote = resume_pod_eval.get("pid_remote") or f"{run_dir}/pod_eval.pid"
+        _paths = _build_remote_paths(run_dir, resume=resume_pod_eval)
         logger.info(
             "run_eval_on_pod RESUME: attaching to existing pod eval "
             "run_dir=%s pid_remote=%s — skipping cleanup/upload/start.",
-            run_dir, pid_remote,
+            run_dir, _paths["pid_remote"],
         )
     else:
         run_dir = f"/home/distil_eval_{int(now)}_{os.getpid()}"
-        prompts_remote = f"{run_dir}/prompts.json"
-        remote_eval_script = f"{run_dir}/pod_eval.py"
-        progress_remote = f"{run_dir}/eval_progress.json"
-        results_remote = f"{run_dir}/eval_results.json"
-        done_marker_remote = f"{run_dir}/eval_done.marker"
-        log_remote = f"{run_dir}/eval_output.log"
-        eval_data_remote = f"{run_dir}/eval_data.json"
-        teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
-        pid_remote = f"{run_dir}/pod_eval.pid"
+        _paths = _build_remote_paths(run_dir)
+    prompts_remote = _paths["prompts_remote"]
+    remote_eval_script = _paths["remote_eval_script"]
+    progress_remote = _paths["progress_remote"]
+    results_remote = _paths["results_remote"]
+    done_marker_remote = _paths["done_marker_remote"]
+    log_remote = _paths["log_remote"]
+    eval_data_remote = _paths["eval_data_remote"]
+    teacher_cache_remote = _paths["teacher_cache_remote"]
+    pid_remote = _paths["pid_remote"]
+    if not is_resuming:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
             json.dump(prompt_texts, handle)
             handle.flush()
@@ -304,6 +353,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         # exists (didn't crash while the validator was down) and that the
         # done marker hasn't already been written. If either guard fails,
         # bail out so the caller can decide to start fresh.
+        def _retry_fresh(reason: str):
+            logger.warning("Resume aborted (%s) — falling back to fresh run", reason)
+            return run_eval_on_pod(
+                pod, models_to_eval, king_uid, n_prompts, prompt_texts,
+                state, is_full_eval, use_vllm, eval_script,
+                block_seed=block_seed, resume_pod_eval=None,
+            )
+
         try:
             pid_probe = pod.exec(
                 f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DONE; "
@@ -313,15 +370,11 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             )
             pid_status = (pid_probe.get("stdout") or "").strip()
         except Exception as exc:
-            logger.warning("Resume probe failed: %s — falling back to fresh run", exc)
-            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+            return _retry_fresh(f"resume probe failed: {exc}")
         if pid_status not in ("ALIVE", "DONE"):
-            logger.warning(
-                "Resume target pid_remote=%s reports status=%r (not ALIVE/DONE) — "
-                "falling back to fresh run.",
-                pid_remote, pid_status,
+            return _retry_fresh(
+                f"resume target pid_remote={pid_remote} reports status={pid_status!r} (not ALIVE/DONE)"
             )
-            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
         logger.info("Resume probe: pod eval is %s — skipping cleanup, attaching to existing process.", pid_status)
     if not is_resuming:
         try:
@@ -460,15 +513,14 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             logger.info("Killed existing eval/vllm processes (chat-king preserved) and removed stale /home files")
         except Exception as exc:
             logger.debug(f"Pre-eval cleanup: {exc}")
-        try:
-            pod.exec(
-                f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
-                f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
-                f"{shlex.quote(done_marker_remote)}"
-            )
-            logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
-        except Exception:
-            pass
+        _pod_exec_silent(
+            pod,
+            f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
+            f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
+            f"{shlex.quote(done_marker_remote)}",
+            label="clear pod artifacts",
+        )
+        logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
         try:
             disk_pct = pod.disk_cleanup(TEACHER_MODEL)
             if disk_pct is not None:
@@ -649,29 +701,36 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 pod_phase = pod_progress.get("phase", "scoring")
                 progress["phase"] = pod_phase
                 progress["pod"] = pod_progress
+                # Single source of truth for the dashboard "current student"
+                # field set. Both the populate and the clear paths iterate
+                # over this so they cannot drift (regression prior to this
+                # bind: current_se/current_ci/current_best were written into
+                # ``progress`` but never popped, leaving stale values on the
+                # dashboard between students).
+                _CURRENT_FIELD_MAP = (
+                    ("current_student", "student_name", None),
+                    ("current_prompt", "prompts_done", 0),
+                    ("current_kl", "kl_running_mean", None),
+                    ("current_se", "kl_running_se", None),
+                    ("current_ci", "ci_95", None),
+                    ("current_best", "best_kl_so_far", None),
+                    # 2026-05-04: per-stage progress so the dashboard shows
+                    # "running bench: aime_bench (6/17)" instead of a
+                    # static "0/60 prompts" while probes/bench run for
+                    # ~25 min. The pod writes these via _set_stage().
+                    ("current_stage", "stage", None),
+                    ("bench_axis_idx", "bench_axis_idx", None),
+                    ("bench_axis_total", "bench_axis_total", None),
+                )
                 if pod_progress.get("current"):
                     current = pod_progress["current"]
                     progress.update({
-                        "current_student": current.get("student_name"),
-                        "current_prompt": current.get("prompts_done", 0),
-                        "current_kl": current.get("kl_running_mean"),
-                        "current_se": current.get("kl_running_se"),
-                        "current_ci": current.get("ci_95"),
-                        "current_best": current.get("best_kl_so_far"),
-                        # 2026-05-04: per-stage progress so the dashboard shows
-                        # "running bench: aime_bench (6/17)" instead of a
-                        # static "0/60 prompts" while probes/bench run for
-                        # ~25 min. The pod writes these via _set_stage().
-                        "current_stage": current.get("stage"),
-                        "bench_axis_idx": current.get("bench_axis_idx"),
-                        "bench_axis_total": current.get("bench_axis_total"),
+                        out_key: current.get(in_key, default)
+                        for out_key, in_key, default in _CURRENT_FIELD_MAP
                     })
                 else:
-                    for key in (
-                        "current_student", "current_prompt", "current_kl",
-                        "current_stage", "bench_axis_idx", "bench_axis_total",
-                    ):
-                        progress.pop(key, None)
+                    for out_key, _, _ in _CURRENT_FIELD_MAP:
+                        progress.pop(out_key, None)
                 # Always propagate teacher_prompts_done so the dashboard's
                 # Phase A progress bar fills correctly even after we transition
                 # into student loading (the previous gate dropped the value
@@ -701,17 +760,15 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     gpu_log_path.write_text(sanitize_gpu_log(log_text))
             except Exception:
                 pass
-            try:
-                pod.exec(
-                    "for p in $(pgrep -f 'pod_eval' 2>/dev/null); do "
-                    "  cmdline=$(cat /proc/$p/cmdline 2>/dev/null | tr '\\0' ' '); "
-                    "  case \"$cmdline\" in *distil_eval_*) ;; *) kill -9 $p 2>/dev/null;; esac; "
-                    "done; "
-                    "rm -f /home/pod_eval.py /home/prompts.json /home/pod_eval_vllm.py 2>/dev/null",
-                    timeout=15,
-                )
-            except Exception:
-                pass
+            _pod_exec_silent(
+                pod,
+                "for p in $(pgrep -f 'pod_eval' 2>/dev/null); do "
+                "  cmdline=$(cat /proc/$p/cmdline 2>/dev/null | tr '\\0' ' '); "
+                "  case \"$cmdline\" in *distil_eval_*) ;; *) kill -9 $p 2>/dev/null;; esac; "
+                "done; "
+                "rm -f /home/pod_eval.py /home/prompts.json /home/pod_eval_vllm.py 2>/dev/null",
+                timeout=15,
+            )
             poll_stop.wait(15)
 
     poll_thread = threading.Thread(target=poll_pod_progress, daemon=True)
@@ -754,8 +811,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # shadow axes: aime/mbpp/tool_use/self_consistency/arc/truthful/long_context)
     # adds ~6 min/student (~84 min/round for 14 students). Propagate the
     # tunables from validator env so we can flip them via systemd override
-    # without redeploying code. See ``scripts/pod_eval_vllm.py`` for semantics
-    # and ``_POD_EVAL_ENV_ALLOWLIST`` (top of this module) for the full list.
+    # without redeploying code. The full list lives at module scope as
+    # ``_POD_EVAL_ENV_ALLOWLIST``; see ``scripts/pod_eval_vllm.py`` for the
+    # semantics of each variable.
     for _propagate in _POD_EVAL_ENV_ALLOWLIST:
         _v = os.environ.get(_propagate)
         if _v is not None:
@@ -835,10 +893,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             time.sleep(20)
         else:
             logger.error(f"Eval timed out after {eval_timeout}s — killing")
-            try:
-                pod.exec("pkill -9 -f pod_eval.py; echo killed", timeout=30)
-            except Exception:
-                pass
+            _pod_exec_silent(pod, "pkill -9 -f pod_eval.py; echo killed", timeout=30)
             try:
                 pod.reconnect()
             except Exception as exc:
