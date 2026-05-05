@@ -1831,6 +1831,53 @@ LONG_FORM_JUDGE_RUBRIC_TEMPLATE = (
 )
 
 
+def _collect_greedy_responses(model, tokenizer, device, prompts: list[str],
+                              max_new_tokens: int, log_tag: str) -> dict:
+    """Greedy ``model.generate`` over a list of prompts; collect text +
+    token counts. Used by judge / long-form-judge response probes (and
+    can be reused for any future ``one-prompt-in, one-string-out`` axis).
+
+    Returns ``{"prompts": [...], "responses": [...], "gen_tokens": [...]}``
+    where ``responses[i]`` has been ``_strip_thinking_probe``-cleaned,
+    and a missing tokenizer/model/chat_template/empty-prompts cleanly
+    falls back to empty lists (so Phase B teacher scoring sees an empty
+    rollout instead of crashing).
+
+    The per-prompt try/except mirrors the previous probe-by-probe
+    behaviour: a single bad generation is logged and slotted with empty
+    text so the rollout list stays index-aligned with ``prompts``.
+    """
+    out: dict = {
+        "prompts": list(prompts),
+        "responses": [],
+        "gen_tokens": [],
+    }
+    if tokenizer is None or model is None or not prompts:
+        return out
+    if not getattr(tokenizer, "chat_template", None):
+        return out
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    with _model_eval_no_grad(model):
+        for prompt in prompts:
+            try:
+                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=max_new_tokens,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[{log_tag}] student gen error: {str(e)[:120]}", flush=True)
+    return out
+
+
 def judge_response_probe(model, tokenizer, device="cuda"):
     """Collect greedy student responses to the current round's judge prompts.
 
@@ -1842,35 +1889,12 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     tokens. This matches the "user types a question and gets a response"
     deployment usage the judge axis is approximating.
     """
-    out = {
-        "prompts": list(JUDGE_PROBE_PROMPTS),
-        "responses": [],
-        "gen_tokens": [],
-    }
-    if tokenizer is None or model is None or not JUDGE_PROBE_PROMPTS:
-        return out
-    if not getattr(tokenizer, "chat_template", None):
-        return out
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    with _model_eval_no_grad(model):
-        for prompt in JUDGE_PROBE_PROMPTS:
-            try:
-                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                gen = model.generate(
-                    ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
-                    do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                )
-                new_ids = gen[0, ids.shape[1]:]
-                text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                out["responses"].append(_strip_thinking_probe(text))
-                out["gen_tokens"].append(int(new_ids.shape[0]))
-            except Exception as e:
-                out["responses"].append("")
-                out["gen_tokens"].append(0)
-                print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
-    return out
+    return _collect_greedy_responses(
+        model, tokenizer, device,
+        prompts=list(JUDGE_PROBE_PROMPTS),
+        max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
+        log_tag="judge-probe",
+    )
 
 
 def _parse_judge_score(text: str) -> int | None:
@@ -2094,35 +2118,13 @@ def long_form_judge_response_probe(model, tokenizer, device="cuda",
     emit EOS at ~500-1000 tokens are not affected by the cap.
     """
     cap = int(max_tokens_override) if max_tokens_override else LONG_FORM_JUDGE_MAX_TOKENS
-    out = {
-        "prompts": list(LONG_FORM_JUDGE_PROMPTS),
-        "responses": [],
-        "gen_tokens": [],
-        "max_tokens_cap": cap,
-    }
-    if tokenizer is None or model is None or not LONG_FORM_JUDGE_PROMPTS:
-        return out
-    if not getattr(tokenizer, "chat_template", None):
-        return out
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
-    with _model_eval_no_grad(model):
-        for prompt in LONG_FORM_JUDGE_PROMPTS:
-            try:
-                rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
-                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                gen = model.generate(
-                    ids, max_new_tokens=cap,
-                    do_sample=False, temperature=1.0, top_p=1.0,
-                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
-                )
-                new_ids = gen[0, ids.shape[1]:]
-                text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                out["responses"].append(_strip_thinking_probe(text))
-                out["gen_tokens"].append(int(new_ids.shape[0]))
-            except Exception as e:
-                out["responses"].append("")
-                out["gen_tokens"].append(0)
-                print(f"[long-form-judge] student gen error: {str(e)[:120]}", flush=True)
+    out = _collect_greedy_responses(
+        model, tokenizer, device,
+        prompts=list(LONG_FORM_JUDGE_PROMPTS),
+        max_new_tokens=cap,
+        log_tag="long-form-judge",
+    )
+    out["max_tokens_cap"] = cap
     return out
 
 
