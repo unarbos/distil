@@ -5967,8 +5967,14 @@ def _model_eval_no_grad(model):
         with torch.no_grad():
             yield
         return
-    with _model_eval_no_grad(model):
-        yield
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            yield
+    finally:
+        if was_training:
+            model.train()
 
 
 def _eos_pad_ids(tokenizer) -> tuple[list[int] | None, int]:
