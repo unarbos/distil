@@ -691,6 +691,524 @@ def _resolve_dethrone_winner(dethroners: list[dict]) -> int:
     return winner
 
 
+def _handle_eval_error_and_record_failure(
+    *, uid, model_name, student_result, models_to_eval, state,
+):
+    """Log eval error, record failure, fast-track CUDA poisoners to stale.
+
+    A device-side assert (or any CUDA error) in a student model isn't a
+    transient failure — it indicates bad weights (NaN/Inf) or invalid
+    embedding indexing. Worse, it poisons the GPU context for ~9 sibling
+    students this round (avg observed 2026-05-04). Fast-track to 3 strikes
+    so the stale-skip kicks in next round instead of after 3 cascades.
+    """
+    err_str = str(student_result["error"])
+    logger.warning(f"UID {uid} ({model_name}): eval error — {err_str}")
+    rev = models_to_eval.get(uid, {}).get("revision", "main")
+    record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
+    is_cuda_assert = (
+        "device-side assert" in err_str
+        or "CUDA error" in err_str
+        or "CUBLAS_STATUS_" in err_str
+        or "PRECHECK_BYPASS" in err_str
+    )
+    if is_cuda_assert:
+        state.failures[str(uid)] = max(state.failures.get(str(uid), 0), 3)
+        logger.info(
+            f"UID {uid} ({model_name}): CUDA-poisoner fast-track "
+            f"to stale (failures={state.failures[str(uid)]}); next "
+            f"round will skip without re-loading. Repeat poisoners "
+            f"waste ~30min of pod time per round via cascade."
+        )
+
+
+def _check_long_form_derail_dq(
+    *, uid, model_name, student_result, models_to_eval,
+    uid_to_hotkey, state, king_uid,
+) -> bool:
+    """Return True if the student was DQ'd for long-form incoherence.
+
+    2026-05-01 (v30.4 patch v3): if the long_form_judge probe found that
+    >50% of round responses scored below 0.3 coherence (statistical
+    detector — non-ASCII salad, word-list mode, compound gibberish, no
+    stop words), the model is permanently DQ'd. Soft-weight degradation
+    alone wasn't dethroning broken kings because their bench scores
+    compensated. Word-salad output is not a partial failure; the model
+    can't sustain coherent generation, which is core to assistant
+    deployment. The current king is exempt from this gate.
+    """
+    if uid == king_uid or not LONG_FORM_DERAIL_DQ_ENABLED:
+        return False
+    lf = student_result.get("long_form_judge_probe") or {}
+    per_prompt = lf.get("per_prompt") or []
+    if not per_prompt:
+        return False
+    derailed = sum(
+        1 for r in per_prompt
+        if isinstance(r, dict)
+        and isinstance(r.get("coherence"), (int, float))
+        and r["coherence"] < LONG_FORM_DERAIL_DQ_THRESHOLD
+    )
+    if derailed / len(per_prompt) <= LONG_FORM_DERAIL_DQ_RATIO:
+        return False
+    coh_factor = lf.get("coherence_factor")
+    sample_tail = ""
+    for r in per_prompt:
+        if (
+            isinstance(r, dict)
+            and isinstance(r.get("coherence"), (int, float))
+            and r["coherence"] < LONG_FORM_DERAIL_DQ_THRESHOLD
+            and r.get("response_preview")
+        ):
+            sample_tail = r["response_preview"][-120:]
+            break
+    coh_factor_str = (
+        f"{coh_factor:.3f}" if isinstance(coh_factor, (int, float)) else "n/a"
+    )
+    reason = (
+        f"long_form_incoherence: {derailed}/"
+        f"{len(per_prompt)} long-form responses derailed "
+        f"(coherence<{LONG_FORM_DERAIL_DQ_THRESHOLD:.2f}; aggregate "
+        f"coherence_factor={coh_factor_str}). Model "
+        f"cannot sustain coherent generation past ~500 "
+        f"tokens — produces word salad / multilingual "
+        f"mode / glossary loops. Sample tail: "
+        f"…{sample_tail!r}. DQ scope is per-hotkey: "
+        f"a new on-chain commit on the SAME hotkey will "
+        f"NOT clear this DQ. To re-eval, register a "
+        f"fresh hotkey on chain with a model that "
+        f"doesn't derail."
+    )
+    hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
+    _dq_student(
+        state=state, uid=uid, model_name=model_name,
+        hotkey=hotkey, commit_block=commit_block,
+        reason=reason, label="LONG_FORM_INCOHERENCE",
+        log_event_msg=(
+            f"UID {uid} ({model_name}) DQ: long_form_incoherence "
+            f"({derailed}/{len(per_prompt)} derailed)"
+        ),
+    )
+    return True
+
+
+def _check_activation_copy_dq(
+    *, uid, model_name, student_result, models_to_eval,
+    uid_to_hotkey, uid_to_coldkey, state,
+) -> bool:
+    """Return True if the student was DQ'd as an activation-space copy.
+
+    Logs a non-DQ "you committed first" notice when the match flags an
+    earlier-committed UID — that copy gets DQ'd when its row is processed.
+    """
+    fingerprint = student_result.get("activation_fingerprint")
+    if not fingerprint or not fingerprint.get("layer_fingerprints"):
+        return False
+    uid_to_commit_block = {
+        u: info.get("commit_block")
+        for u, info in models_to_eval.items()
+        if info.get("commit_block") is not None
+    }
+    uid_to_round_model = {
+        u: info.get("model") for u, info in models_to_eval.items()
+        if info.get("model")
+    }
+    uid_to_round_revision = {
+        u: info.get("revision", "main") for u, info in models_to_eval.items()
+        if info.get("model")
+    }
+    this_commit_block = models_to_eval.get(uid, {}).get("commit_block")
+    this_revision = models_to_eval.get(uid, {}).get("revision", "main")
+    is_copy, copy_uid, copy_model, orig_uid, orig_model, sim = check_activation_fingerprint(
+        model_name, uid, fingerprint, state.state_dir,
+        commit_block=this_commit_block,
+        uid_to_commit_block=uid_to_commit_block,
+        uid_to_coldkey=uid_to_coldkey,
+        evaluated_uids=state.evaluated_uids,
+        composite_scores=state.composite_scores,
+        revision=this_revision,
+        uid_to_model=uid_to_round_model,
+        uid_to_revision=uid_to_round_revision,
+    )
+    if not is_copy:
+        return False
+    if copy_uid == uid:
+        reason = (
+            f"copy: activation-space duplicate of UID {orig_uid} ({orig_model}) — "
+            f"cosine similarity {sim:.6f} > {ACTIVATION_COPY_THRESHOLD}, committed later"
+        )
+        hotkey, _ = _student_id(models_to_eval, uid, uid_to_hotkey)
+        _dq_student(
+            state=state, uid=uid, model_name=model_name,
+            hotkey=hotkey, commit_block=this_commit_block,
+            reason=reason, label="ACTIVATION COPY",
+            log_event_msg=(
+                f"Activation copy detected: UID {uid} is later-committed "
+                f"copy of UID {orig_uid} (sim={sim:.6f})"
+            ),
+        )
+        return True
+    logger.info(
+        f"UID {uid} ({model_name}): activation match with UID {copy_uid} ({copy_model}) "
+        f"(sim={sim:.6f}) — UID {uid} committed first, NOT disqualifying. UID {copy_uid} "
+        f"will be flagged as the copy when its turn is processed."
+    )
+    return False
+
+
+def _persist_student_score(
+    *, uid, model_name, kl, scored_prompts, early_stopped, n_prompts,
+    is_king, king_h2h_kl, state,
+):
+    """Persist a student's KL into ``state.scores`` + log the result.
+
+    The king and challenger paths share the early-stopped persistence
+    gate but diverge on logging tone, the "evaluated_uids" semantics
+    (king is always added; challenger only if it scored enough prompts
+    to count for dethronement), and the failure-counter reset (challenger
+    only). Returns nothing — mutates ``state``.
+    """
+    if is_king:
+        if _can_persist_kl_score(early_stopped, scored_prompts):
+            state.scores[str(uid)] = kl
+            logger.info(
+                f"UID {uid} ({model_name}): H2H KL={kl:.6f} "
+                f"(king — global score UPDATED)"
+            )
+        else:
+            logger.warning(
+                f"UID {uid} ({model_name}): king early-stopped at "
+                f"{scored_prompts}/{n_prompts} prompts — NOT persisting "
+                f"KL={kl:.6f}, preserving prior global score "
+                f"{state.scores.get(str(uid))}"
+            )
+        state.evaluated_uids.add(str(uid))
+        log_event(f"UID {uid}: KL={kl:.6f} (king)", state_dir=str(state.state_dir))
+        return
+    if _can_persist_kl_score(early_stopped, scored_prompts):
+        state.scores[str(uid)] = kl
+    else:
+        logger.info(
+            f"UID {uid} ({model_name}): NOT persisting KL={kl:.6f} "
+            f"(early-stopped at {scored_prompts}/{n_prompts} prompts, "
+            f"threshold={MIN_PROMPTS_FOR_SCORE_UPDATE}) — preserving prior score"
+        )
+    if early_stopped and scored_prompts < MIN_PROMPTS_DETHRONE:
+        logger.info(
+            f"UID {uid} ({model_name}): KL={kl:.6f} (early-stopped, "
+            f"{scored_prompts}/{n_prompts} prompts — NOT marking as evaluated, will retry)"
+        )
+    else:
+        state.evaluated_uids.add(str(uid))
+    reset_failures(uid, state.failures)
+    logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}")
+    vs_info = ""
+    if king_h2h_kl is not None and king_h2h_kl > 0:
+        pct = (king_h2h_kl - kl) / king_h2h_kl * 100
+        vs_info = f", {pct:+.2f}% vs king"
+    log_event(f"UID {uid}: KL={kl:.6f}{vs_info}", state_dir=str(state.state_dir))
+
+
+def _apply_resave_copy_gate(
+    *,
+    epsilon_dethroned_by, dethroners,
+    king_uid, uid_to_model, uid_to_hotkey, commitments, state,
+):
+    """Cascade-DQ any dethroner that's a bf16 re-save round-trip of the king.
+
+    The paired t-test + 3% epsilon margin can be defeated by a
+    save_pretrained() round-trip through bf16 (deterministic ~1% KL shift,
+    not training). Tensor-by-tensor weight diff is the only reliable
+    signal once a challenger has cleared the statistical bar.
+
+    If the top dethroner is a copy, DQ it and fall back to the next-best
+    dethroner; repeat until a non-copy passes (or the list is exhausted
+    and the king holds). Returns the (possibly updated) ``epsilon_dethroned_by``.
+    """
+    if king_uid is None or epsilon_dethroned_by is None:
+        return epsilon_dethroned_by
+    king_model_for_check = uid_to_model.get(king_uid)
+    king_commit = (commitments.get(king_uid, {}) or {}).get("block")
+    king_revision = (commitments.get(king_uid, {}) or {}).get("revision")
+    remaining = list(dethroners)
+    while epsilon_dethroned_by is not None and remaining:
+        current_entry = next(
+            (d for d in remaining if d["uid"] == epsilon_dethroned_by), None
+        )
+        if current_entry is None:
+            break
+        ch_uid = current_entry["uid"]
+        ch_model = uid_to_model.get(ch_uid)
+        ch_commit = (commitments.get(ch_uid, {}) or {}).get("block")
+        ch_revision = (commitments.get(ch_uid, {}) or {}).get("revision")
+        if not (ch_model and king_model_for_check):
+            break
+        # The copy must be the LATER commit — otherwise the king is
+        # the copy, which gets handled by the separate retro-audit
+        # path on startup, not here.
+        if king_commit is not None and ch_commit is not None and ch_commit <= king_commit:
+            break
+        try:
+            from eval.resave_check import detect_resave_copy
+            verdict = detect_resave_copy(
+                ch_model, ch_revision,
+                king_model_for_check, king_revision,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[resave-check] UID {ch_uid} vs king UID {king_uid}: "
+                f"check failed ({exc}); allowing dethrone through"
+            )
+            break
+        logger.info(
+            f"[resave-check] UID {ch_uid} ({ch_model}) vs king UID {king_uid} "
+            f"({king_model_for_check}): {verdict['reason']} "
+            f"[elapsed={verdict['elapsed_s']:.1f}s]"
+        )
+        if not verdict.get("is_copy"):
+            break
+        reason = (
+            f"copy: re-save of king UID {king_uid} ({king_model_for_check}) — "
+            f"{verdict['identical_count']}/{verdict['total_tensors']} "
+            f"bit-identical, {verdict['bf16_noise_count']}/{verdict['total_tensors']} "
+            f"within bf16 floor, max|Δ|={verdict['max_abs_diff']:.2e} "
+            f"(signature of save_pretrained() round-trip, NOT training)"
+        )
+        logger.info(f"UID {ch_uid} ({ch_model}): BLOCKED DETHRONE — {reason}")
+        log_event(
+            f"Re-save copy blocked dethrone: UID {ch_uid} is copy of king UID {king_uid}",
+            level="warning", state_dir=str(state.state_dir),
+        )
+        ch_hotkey = uid_to_hotkey.get(ch_uid, str(ch_uid))
+        disqualify(ch_hotkey, reason, state.dq_reasons, commit_block=ch_commit)
+        state.scores[str(ch_uid)] = MAX_KL_THRESHOLD + 1
+        state.evaluated_uids.add(str(ch_uid))
+        remaining = [d for d in remaining if d["uid"] != ch_uid]
+        if remaining:
+            epsilon_dethroned_by = _resolve_dethrone_winner(remaining)
+        else:
+            epsilon_dethroned_by = None
+            logger.info(
+                f"All {len(dethroners)} dethroner(s) were re-save copies; "
+                f"king UID {king_uid} retains crown"
+            )
+    return epsilon_dethroned_by
+
+
+def _evaluate_challenger_for_dethrone(
+    *,
+    uid, challenger_kl, challenger_per_prompt, challenger_model,
+    king_uid, king_model_name, king_new_kl, king_per_prompt,
+    epsilon_threshold, commitments, models_to_eval,
+    veto_kwargs,
+):
+    """Evaluate a single challenger against the king; return (kind, entry).
+
+    kind ∈ {"ttest", "legacy", "none"} — which dethroner list (if any)
+    the challenger should be appended to. ``entry`` is the dict to push
+    onto that list, or ``None`` for "none". All "why did/didn't this
+    challenger pass" log lines are emitted from here.
+    """
+    if king_per_prompt and challenger_per_prompt:
+        n_paired = min(len(king_per_prompt), len(challenger_per_prompt))
+        if n_paired < MIN_PROMPTS_DETHRONE:
+            logger.info(
+                f"UID {uid}: insufficient prompts for dethronement "
+                f"({n_paired} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}"
+            )
+            return "none", None
+        deltas = [king_per_prompt[i] - challenger_per_prompt[i] for i in range(n_paired)]
+        mean_delta = sum(deltas) / len(deltas)
+        t_stat, p_value, _ = _paired_t_stats(deltas)
+        pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
+        passes_epsilon = challenger_kl < epsilon_threshold
+        sig_better = p_value < PAIRED_TEST_ALPHA and mean_delta > 0
+        if not sig_better:
+            if mean_delta > 0:
+                logger.info(
+                    f"UID {uid}: better but not significant "
+                    f"(p={p_value:.4f}, delta={mean_delta:.6f}, n={len(deltas)})"
+                )
+            else:
+                logger.info(
+                    f"UID {uid}: worse than king "
+                    f"(delta={mean_delta:.6f}, p={p_value:.4f}, n={len(deltas)})"
+                )
+            return "none", None
+        if not passes_epsilon:
+            logger.info(
+                f"UID {uid}: significant but fails epsilon "
+                f"(p={p_value:.4f}, KL={challenger_kl:.6f} >= "
+                f"eps={epsilon_threshold:.6f}, delta={mean_delta:.6f})"
+            )
+            return "none", None
+        if _run_dethrone_vetos(
+            challenger_uid=uid,
+            challenger_model=challenger_model,
+            king_model=king_model_name,
+            path_label="t-test",
+            extra_context=(
+                f"(KL passed: p={p_value:.4f}, "
+                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
+            ),
+            **veto_kwargs,
+        ):
+            return "none", None
+        logger.info(
+            f"UID {uid} DETHRONED king UID {king_uid}! "
+            f"p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), "
+            f"t={t_stat:.3f}, n={len(deltas)}, KL={challenger_kl:.6f} < "
+            f"eps={epsilon_threshold:.6f}"
+        )
+        return "ttest", {
+            "uid": uid,
+            "kl": challenger_kl,
+            "per_prompt": challenger_per_prompt[:n_paired],
+            "commit_block": (commitments.get(uid, {}) or {}).get("block")
+                or models_to_eval.get(uid, {}).get("commit_block"),
+            "p_vs_king": p_value,
+            "n_paired_vs_king": n_paired,
+        }
+    challenger_n = len(challenger_per_prompt) if challenger_per_prompt else 0
+    if challenger_n < MIN_PROMPTS_DETHRONE:
+        logger.info(
+            f"UID {uid}: insufficient prompts for legacy epsilon "
+            f"({challenger_n} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}"
+        )
+        return "none", None
+    if challenger_kl >= epsilon_threshold:
+        return "none", None
+    if _run_dethrone_vetos(
+        challenger_uid=uid,
+        challenger_model=challenger_model,
+        king_model=king_model_name,
+        path_label="legacy epsilon",
+        extra_context=f"[KL={challenger_kl:.6f}]",
+        **veto_kwargs,
+    ):
+        return "none", None
+    logger.info(
+        f"UID {uid} DETHRONED king UID {king_uid}! "
+        f"KL={challenger_kl:.6f} < {epsilon_threshold:.6f} "
+        f"[legacy epsilon, n={challenger_n}]"
+    )
+    return "legacy", {
+        "uid": uid,
+        "kl": challenger_kl,
+        "commit_block": (commitments.get(uid, {}) or {}).get("block")
+            or models_to_eval.get(uid, {}).get("commit_block"),
+    }
+
+
+def _collect_dethroners(
+    *,
+    challengers, results, state, uid_to_model, commitments, models_to_eval,
+    king_uid, king_model_name, king_new_kl, king_per_prompt,
+    epsilon_threshold, prompt_texts_for_dp, private_start,
+    veto_kwargs,
+):
+    """Loop every scored challenger and collect dethrone candidates.
+
+    Returns ``(dethroners, legacy_dethroners)`` — paired-t-test passers
+    (with per-prompt vectors) and legacy-epsilon passers (no per-prompt
+    comparison possible). The outer ``process_results`` loop is the only
+    caller; this exists purely to flatten its nesting.
+    """
+    dethroners: list[dict] = []
+    legacy_dethroners: list[dict] = []
+    if king_uid is None or not challengers:
+        return dethroners, legacy_dethroners
+    for uid in challengers:
+        score = state.scores.get(str(uid))
+        if score is None or score <= 0 or score > MAX_KL_THRESHOLD:
+            continue
+        challenger_model = uid_to_model.get(uid)
+        challenger_per_prompt = (
+            results["students"][challenger_model].get("kl_per_prompt")
+            if challenger_model and challenger_model in results.get("students", {})
+            else None
+        )
+        if challenger_per_prompt is not None and private_start is not None:
+            challenger_per_prompt = _apply_dp_noise_to_per_prompt(
+                challenger_per_prompt, prompt_texts_for_dp, private_start,
+            )
+        kind, entry = _evaluate_challenger_for_dethrone(
+            uid=uid,
+            challenger_kl=score,
+            challenger_per_prompt=challenger_per_prompt,
+            challenger_model=challenger_model,
+            king_uid=king_uid,
+            king_model_name=king_model_name,
+            king_new_kl=king_new_kl,
+            king_per_prompt=king_per_prompt,
+            epsilon_threshold=epsilon_threshold,
+            commitments=commitments,
+            models_to_eval=models_to_eval,
+            veto_kwargs=veto_kwargs,
+        )
+        if kind == "ttest":
+            dethroners.append(entry)
+        elif kind == "legacy":
+            legacy_dethroners.append(entry)
+    return dethroners, legacy_dethroners
+
+
+def _promote_best_challenger_on_king_failure(
+    results, models_to_eval, king_uid, king_kl, state, uid_to_model,
+):
+    """Fall back when the king failed to produce a score this round.
+
+    Picks the lowest-KL challenger that DID produce a fresh score this round
+    and promotes them. Returns the same 6-tuple shape as ``process_results``
+    so the caller can ``return`` directly. If no challenger qualifies, the
+    king retains the crown by default with empty h2h_results.
+    """
+    this_round_scored = set()
+    for model_name, student_data in results.get("students", {}).items():
+        if "error" in student_data or student_data.get("kl_global_avg") is None:
+            continue
+        for uid, info in models_to_eval.items():
+            if info.get("model") == model_name:
+                this_round_scored.add(uid)
+                break
+    best_challenger_uid = None
+    best_challenger_kl = float("inf")
+    for uid in (uid for uid in models_to_eval if uid != king_uid and uid in this_round_scored):
+        uid_str = str(uid)
+        score = state.scores.get(uid_str)
+        if score is not None and 0 < score <= MAX_KL_THRESHOLD and score < best_challenger_kl:
+            best_challenger_kl = score
+            best_challenger_uid = uid
+    if best_challenger_uid is not None:
+        logger.info(
+            f"King failed eval — promoting best challenger UID {best_challenger_uid} "
+            f"(KL={best_challenger_kl:.6f}) [fresh score this round]"
+        )
+        log_event(
+            f"King UID {king_uid} failed to produce score — promoting UID {best_challenger_uid}",
+            level="warning", state_dir=str(state.state_dir),
+        )
+        king_fail_results = []
+        for uid in this_round_scored:
+            kl = state.scores.get(str(uid))
+            if kl and kl > 0:
+                king_fail_results.append({
+                    "uid": uid,
+                    "model": uid_to_model.get(uid, ""),
+                    "kl": round(kl, 6),
+                    "is_king": False,
+                    "vs_king": "king_failed",
+                })
+        king_fail_results.sort(key=lambda item: item["kl"])
+        return best_challenger_uid, best_challenger_kl, king_fail_results, None, None, set(models_to_eval.keys())
+    logger.error("King failed eval and no valid challengers produced fresh scores — king retains crown by default")
+    log_event(
+        f"King UID {king_uid} failed and no valid challengers with fresh scores",
+        level="error", state_dir=str(state.state_dir),
+    )
+    return king_uid, king_kl, [], None, None, set(models_to_eval.keys())
+
+
 def _paired_t_stats(deltas: list[float]):
     n = len(deltas)
     if n < 2:
@@ -791,43 +1309,23 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             )
             continue
         if "error" in student_result:
-            err_str = str(student_result["error"])
-            logger.warning(f"UID {uid} ({model_name}): eval error — {err_str}")
-            rev = models_to_eval.get(uid, {}).get("revision", "main")
-            # 2026-05-04 — CUDA poisoners get fast-tracked to stale.
-            # A device-side assert in a student model isn't a transient
-            # failure: the model has either bad weights (NaN/Inf) or an
-            # invalid token in its embedding indexing. Worse, every
-            # CUDA assert poisons the GPU context for ~9 sibling
-            # students this round (avg observed); UID 73 alone burned
-            # 3 round-cycles + ~30 deferred attempts before reaching the
-            # 3-strike stale gate. Bump to 3 strikes immediately so the
-            # stale-skip kicks in next round instead of after 3 cascades.
-            is_cuda_assert = (
-                "device-side assert" in err_str
-                or "CUDA error" in err_str
-                or "CUBLAS_STATUS_" in err_str
-                or "PRECHECK_BYPASS" in err_str
+            _handle_eval_error_and_record_failure(
+                uid=uid, model_name=model_name,
+                student_result=student_result,
+                models_to_eval=models_to_eval, state=state,
             )
-            record_failure(
-                uid, state.failures, state.failure_models,
-                f"{model_name}@{rev}",
-            )
-            if is_cuda_assert:
-                state.failures[str(uid)] = max(
-                    state.failures.get(str(uid), 0), 3
-                )
-                logger.info(
-                    f"UID {uid} ({model_name}): CUDA-poisoner fast-track "
-                    f"to stale (failures={state.failures[str(uid)]}); next "
-                    f"round will skip without re-loading. Repeat poisoners "
-                    f"waste ~30min of pod time per round via cascade."
-                )
             continue
         if student_result.get("functional_copy"):
             copy_of = student_result.get("copy_of", "unknown")
-            copy_uid = next((u for u, info in models_to_eval.items() if info["model"] == copy_of), None)
-            reason = f"copy: functional copy of {copy_of}" + (f" (UID {copy_uid})" if copy_uid else "") + " — identical logit distribution"
+            copy_uid = next(
+                (u for u, info in models_to_eval.items() if info["model"] == copy_of),
+                None,
+            )
+            reason = (
+                f"copy: functional copy of {copy_of}"
+                + (f" (UID {copy_uid})" if copy_uid else "")
+                + " — identical logit distribution"
+            )
             hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
             _dq_student(
                 state=state, uid=uid, model_name=model_name,
@@ -835,69 +1333,28 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 reason=reason, label="FUNCTIONAL COPY",
             )
             continue
-        fingerprint = student_result.get("activation_fingerprint")
-        if fingerprint and fingerprint.get("layer_fingerprints"):
-            uid_to_commit_block = {
-                u: info.get("commit_block")
-                for u, info in models_to_eval.items()
-                if info.get("commit_block") is not None
-            }
-            uid_to_round_model = {
-                u: info.get("model") for u, info in models_to_eval.items()
-                if info.get("model")
-            }
-            uid_to_round_revision = {
-                u: info.get("revision", "main") for u, info in models_to_eval.items()
-                if info.get("model")
-            }
-            this_commit_block = models_to_eval.get(uid, {}).get("commit_block")
-            this_revision = models_to_eval.get(uid, {}).get("revision", "main")
-            is_copy, copy_uid, copy_model, orig_uid, orig_model, sim = check_activation_fingerprint(
-                model_name, uid, fingerprint, state.state_dir,
-                commit_block=this_commit_block,
-                uid_to_commit_block=uid_to_commit_block,
-                uid_to_coldkey=uid_to_coldkey,
-                evaluated_uids=state.evaluated_uids,
-                composite_scores=state.composite_scores,
-                revision=this_revision,
-                uid_to_model=uid_to_round_model,
-                uid_to_revision=uid_to_round_revision,
-            )
-            if is_copy:
-                if copy_uid == uid:
-                    reason = (
-                        f"copy: activation-space duplicate of UID {orig_uid} ({orig_model}) — "
-                        f"cosine similarity {sim:.6f} > {ACTIVATION_COPY_THRESHOLD}, committed later"
-                    )
-                    hotkey, _ = _student_id(models_to_eval, uid, uid_to_hotkey)
-                    _dq_student(
-                        state=state, uid=uid, model_name=model_name,
-                        hotkey=hotkey, commit_block=this_commit_block,
-                        reason=reason, label="ACTIVATION COPY",
-                        log_event_msg=(
-                            f"Activation copy detected: UID {uid} is later-committed "
-                            f"copy of UID {orig_uid} (sim={sim:.6f})"
-                        ),
-                    )
-                    continue
-                logger.info(
-                    f"UID {uid} ({model_name}): activation match with UID {copy_uid} ({copy_model}) "
-                    f"(sim={sim:.6f}) — UID {uid} committed first, NOT disqualifying. UID {copy_uid} "
-                    f"will be flagged as the copy when its turn is processed."
-                )
+        if _check_activation_copy_dq(
+            uid=uid, model_name=model_name, student_result=student_result,
+            models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
+            uid_to_coldkey=uid_to_coldkey, state=state,
+        ):
+            continue
         if student_result.get("status") == "fraud_vram":
-            reason = student_result.get("reason", "VRAM fraud detected")
             hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
             _dq_student(
                 state=state, uid=uid, model_name=model_name,
                 hotkey=hotkey, commit_block=commit_block,
-                reason=reason, label="FRAUD",
+                reason=student_result.get("reason", "VRAM fraud detected"),
+                label="FRAUD",
             )
             continue
         if student_result.get("status") == "anti_finetune":
             probe = student_result.get("finetune_probe", {}) or {}
             raw_reason = student_result.get("reason") or probe.get("reason") or "anti_finetune"
-            detail = raw_reason.split("anti_finetune:", 1)[-1] if "anti_finetune:" in raw_reason else raw_reason
+            detail = (
+                raw_reason.split("anti_finetune:", 1)[-1]
+                if "anti_finetune:" in raw_reason else raw_reason
+            )
             reason = (
                 f"anti-finetune: {detail} "
                 f"(loss={probe.get('loss','?')}, "
@@ -915,81 +1372,23 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 log_event_msg=f"UID {uid} ({model_name}) DQ: anti-finetune ({detail})",
             )
             continue
-        # 2026-05-01 (v30.4 patch v3): hard-DQ on long-form derail.
-        # If the long_form_judge probe found that >50 percent of the
-        # round's responses scored below 0.3 coherence (statistical
-        # detector — non-ASCII salad, word-list mode, compound
-        # gibberish, no stop words), the model is permanently DQ'd.
-        # Soft-weight degradation alone wasn't dethroning broken kings
-        # because their bench scores compensated. Word-salad output
-        # is not a partial failure; the model can't sustain coherent
-        # generation, which is core to assistant deployment.
-        if uid != king_uid and LONG_FORM_DERAIL_DQ_ENABLED:
-            lf = student_result.get("long_form_judge_probe") or {}
-            per_prompt = lf.get("per_prompt") or []
-            if per_prompt:
-                derailed = sum(
-                    1 for r in per_prompt
-                    if isinstance(r, dict)
-                    and isinstance(r.get("coherence"), (int, float))
-                    and r["coherence"] < LONG_FORM_DERAIL_DQ_THRESHOLD
-                )
-                ratio = derailed / len(per_prompt)
-                if ratio > LONG_FORM_DERAIL_DQ_RATIO:
-                    coh_factor = lf.get("coherence_factor")
-                    sample_tail = ""
-                    for r in per_prompt:
-                        if (
-                            isinstance(r, dict)
-                            and isinstance(r.get("coherence"), (int, float))
-                            and r["coherence"] < LONG_FORM_DERAIL_DQ_THRESHOLD
-                            and r.get("response_preview")
-                        ):
-                            sample_tail = r["response_preview"][-120:]
-                            break
-                    coh_factor_str = (
-                        f"{coh_factor:.3f}"
-                        if isinstance(coh_factor, (int, float))
-                        else "n/a"
-                    )
-                    reason = (
-                        f"long_form_incoherence: {derailed}/"
-                        f"{len(per_prompt)} long-form responses derailed "
-                        f"(coherence<{LONG_FORM_DERAIL_DQ_THRESHOLD:.2f}; aggregate "
-                        f"coherence_factor={coh_factor_str}). Model "
-                        f"cannot sustain coherent generation past ~500 "
-                        f"tokens — produces word salad / multilingual "
-                        f"mode / glossary loops. Sample tail: "
-                        f"…{sample_tail!r}. DQ scope is per-hotkey: "
-                        f"a new on-chain commit on the SAME hotkey will "
-                        f"NOT clear this DQ. To re-eval, register a "
-                        f"fresh hotkey on chain with a model that "
-                        f"doesn't derail."
-                    )
-                    hotkey, commit_block = _student_id(
-                        models_to_eval, uid, uid_to_hotkey,
-                    )
-                    _dq_student(
-                        state=state, uid=uid, model_name=model_name,
-                        hotkey=hotkey, commit_block=commit_block,
-                        reason=reason, label="LONG_FORM_INCOHERENCE",
-                        log_event_msg=(
-                            f"UID {uid} ({model_name}) DQ: long_form_incoherence "
-                            f"({derailed}/{len(per_prompt)} derailed)"
-                        ),
-                    )
-                    continue
+        if _check_long_form_derail_dq(
+            uid=uid, model_name=model_name, student_result=student_result,
+            models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
+            state=state, king_uid=king_uid,
+        ):
+            continue
         speed_flag = student_result.get("speed_flag")
         if speed_flag:
             logger.warning(f"UID {uid} ({model_name}): ⚠️ {speed_flag}")
         kl = student_result.get("kl_global_avg", float("inf"))
         if kl <= 1e-6:
-            reason = f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher"
             hotkey, commit_block = _student_id(models_to_eval, uid, uid_to_hotkey)
             _dq_student(
                 state=state, uid=uid, model_name=model_name,
                 hotkey=hotkey, commit_block=commit_block,
-                reason=reason, label="FRAUD",
+                reason=f"FRAUD: KL={kl:.10f} — model produces identical outputs to teacher",
+                label="FRAUD",
             )
             continue
         if kl == float("inf") or kl < 0:
@@ -1000,101 +1399,55 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         this_round_uids.add(uid)
         scored_prompts = student_result.get("prompts_scored", n_prompts) or 0
         early_stopped = bool(student_result.get("early_stopped", False))
-        if uid == king_uid:
+        is_king_row = uid == king_uid
+        if is_king_row:
             king_h2h_kl = kl
-            if _can_persist_kl_score(early_stopped, scored_prompts):
-                state.scores[str(uid)] = kl
-                logger.info(f"UID {uid} ({model_name}): H2H KL={kl:.6f} (king — global score UPDATED)")
-            else:
-                logger.warning(
-                    f"UID {uid} ({model_name}): king early-stopped at "
-                    f"{scored_prompts}/{n_prompts} prompts — NOT persisting "
-                    f"KL={kl:.6f}, preserving prior global score "
-                    f"{state.scores.get(str(uid))}"
-                )
-            state.evaluated_uids.add(str(uid))
-            log_event(f"UID {uid}: KL={kl:.6f} (king)", state_dir=str(state.state_dir))
-        else:
-            if _can_persist_kl_score(early_stopped, scored_prompts):
-                state.scores[str(uid)] = kl
-            else:
-                logger.info(
-                    f"UID {uid} ({model_name}): NOT persisting KL={kl:.6f} "
-                    f"(early-stopped at {scored_prompts}/{n_prompts} prompts, "
-                    f"threshold={MIN_PROMPTS_FOR_SCORE_UPDATE}) — preserving prior score"
-                )
-            if early_stopped and scored_prompts < MIN_PROMPTS_DETHRONE:
-                logger.info(f"UID {uid} ({model_name}): KL={kl:.6f} (early-stopped, {scored_prompts}/{n_prompts} prompts — NOT marking as evaluated, will retry)")
-            else:
-                state.evaluated_uids.add(str(uid))
-            reset_failures(uid, state.failures)
-            logger.info(f"UID {uid} ({model_name}): KL={kl:.6f}")
-            vs_info = ""
-            if king_h2h_kl is not None and king_h2h_kl > 0:
-                pct = (king_h2h_kl - kl) / king_h2h_kl * 100
-                vs_info = f", {pct:+.2f}% vs king"
-            log_event(f"UID {uid}: KL={kl:.6f}{vs_info}", state_dir=str(state.state_dir))
+        _persist_student_score(
+            uid=uid, model_name=model_name, kl=kl,
+            scored_prompts=scored_prompts, early_stopped=early_stopped,
+            n_prompts=n_prompts, is_king=is_king_row,
+            king_h2h_kl=king_h2h_kl, state=state,
+        )
     if king_uid is not None and king_h2h_kl is None:
-        logger.warning(f"King UID {king_uid} did not produce a score — will lose crown to best challenger")
-        this_round_scored = set()
-        for model_name, student_data in results.get("students", {}).items():
-            if "error" not in student_data and student_data.get("kl_global_avg") is not None:
-                for uid, info in models_to_eval.items():
-                    if info.get("model") == model_name:
-                        this_round_scored.add(uid)
-                        break
-        best_challenger_uid = None
-        best_challenger_kl = float("inf")
-        for uid in (uid for uid in models_to_eval if uid != king_uid and uid in this_round_scored):
-            uid_str = str(uid)
-            if uid_str in state.scores and 0 < state.scores[uid_str] <= MAX_KL_THRESHOLD and state.scores[uid_str] < best_challenger_kl:
-                best_challenger_kl = state.scores[uid_str]
-                best_challenger_uid = uid
-        if best_challenger_uid is not None:
-            logger.info(f"King failed eval — promoting best challenger UID {best_challenger_uid} (KL={best_challenger_kl:.6f}) [fresh score this round]")
-            log_event(f"King UID {king_uid} failed to produce score — promoting UID {best_challenger_uid}", level="warning", state_dir=str(state.state_dir))
-            king_fail_results = []
-            for uid in this_round_scored:
-                uid_str = str(uid)
-                model_name = uid_to_model.get(uid, "")
-                kl = state.scores.get(uid_str)
-                if kl and kl > 0:
-                    king_fail_results.append({"uid": uid, "model": model_name, "kl": round(kl, 6), "is_king": False, "vs_king": "king_failed"})
-            king_fail_results.sort(key=lambda item: item["kl"])
-            return best_challenger_uid, best_challenger_kl, king_fail_results, None, None, set(models_to_eval.keys())
-        logger.error("King failed eval and no valid challengers produced fresh scores — king retains crown by default")
-        log_event(f"King UID {king_uid} failed and no valid challengers with fresh scores", level="error", state_dir=str(state.state_dir))
-        return king_uid, king_kl, [], king_h2h_kl, None, set(models_to_eval.keys())
+        logger.warning(
+            f"King UID {king_uid} did not produce a score — will lose crown to best challenger"
+        )
+        return _promote_best_challenger_on_king_failure(
+            results, models_to_eval, king_uid, king_kl, state, uid_to_model,
+        )
     king_new_kl = king_h2h_kl if king_h2h_kl is not None else state.scores.get(str(king_uid), king_kl) if king_uid else float("inf")
     epsilon_threshold = king_new_kl * (1.0 - EPSILON) if king_uid else float("inf")
     epsilon_dethroned_by = None
     king_model_name = uid_to_model.get(king_uid)
     king_per_prompt = results["students"][king_model_name].get("kl_per_prompt") if king_model_name and king_model_name in results.get("students", {}) else None
 
-    # Resolve the RKL anchor now so the dethronement loop below can apply
-    # the composite-floor veto (COMPOSITE_DETHRONE_FLOOR) with the same
-    # normalization that ``annotate_h2h_with_composite`` will use later.
-    # Kept best-effort: missing / errored RKL data just means the composite
-    # veto falls through for that axis without blocking legit dethroners.
-    students_data_early = results.get("students", {}) or {}
+    # Resolve KL/RKL anchors and the reference model name once. Both the
+    # dethronement loop (composite-floor veto, COMPOSITE_DETHRONE_FLOOR)
+    # and the late composite ranking need the same anchors and apply the
+    # same normalization that ``annotate_h2h_with_composite`` uses, so
+    # computing them once avoids drift between the two passes.
+    #
+    # Cold-start (``king_h2h_kl`` is None / no king): the resolvers fall
+    # back to the round-wide minimum kl_global_avg / on_policy_rkl so the
+    # axes stay meaningful and the new winner naturally scores 1.0 — the
+    # next round inherits them as the anchor (Sebastian's dashboard fix,
+    # 2026-05-04). All three resolvers fail open: anchor stays None /
+    # falls through to king_h2h_kl and the affected veto silently
+    # disables for that axis without blocking legit dethroners.
+    students_data = results.get("students", {}) or {}
     try:
-        _early_h2h_stub = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []
-        king_rkl_ref_early = _resolve_king_rkl(king_h2h_kl, students_data_early, _early_h2h_stub)
+        _h2h_stub = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []
+        king_rkl_ref = _resolve_king_rkl(king_h2h_kl, students_data, _h2h_stub)
     except Exception:
-        king_rkl_ref_early = None
-    # 2026-05-04 — same cold-start fix as the late ranking path: when
-    # ``king_h2h_kl`` is None (no king this round), use the round-wide
-    # minimum kl_global_avg as the kl-axis anchor so dethronement
-    # vetos don't silently mis-score the kl axis as None.
+        king_rkl_ref = None
     try:
-        king_kl_ref_early = _resolve_king_kl(king_h2h_kl, students_data_early)
+        king_kl_ref = _resolve_king_kl(king_h2h_kl, students_data)
     except Exception:
-        king_kl_ref_early = king_h2h_kl
+        king_kl_ref = king_h2h_kl
     # Reference (Qwen 4B base) model name for the baseline-floor veto.
     # When INCLUDE_REFERENCE_IN_ROUND=1 the reference is in models_to_eval
-    # at REFERENCE_UID, so we resolve its model name once here. If the
-    # reference isn't seated this round, _ref_model_name stays None and
-    # the baseline-floor veto silently fails open.
+    # at REFERENCE_UID. If the reference isn't seated this round
+    # ``_ref_model_name`` stays None and the baseline-floor veto fails open.
     try:
         from eval.runtime import REFERENCE_UID as _REF_UID
         _ref_model_name = uid_to_model.get(_REF_UID)
@@ -1122,88 +1475,30 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     # same model), the earliest commit_block wins. A genuinely-better outlier
     # still wins on its own merit because pairwise it'll be significantly
     # better than the rest.
-    dethroners: list[dict] = []  # passed paired-t-test vs king
-    legacy_dethroners: list[dict] = []  # passed legacy epsilon (no per-prompt)
-    if king_uid is not None and challengers:
-        for uid in challengers:
-            uid_str = str(uid)
-            if uid_str not in state.scores or state.scores[uid_str] <= 0 or state.scores[uid_str] > MAX_KL_THRESHOLD:
-                continue
-            challenger_kl = state.scores[uid_str]
-            challenger_model = uid_to_model.get(uid)
-            challenger_per_prompt = results["students"][challenger_model].get("kl_per_prompt") if challenger_model and challenger_model in results.get("students", {}) else None
-            if challenger_per_prompt is not None and private_start is not None:
-                challenger_per_prompt = _apply_dp_noise_to_per_prompt(challenger_per_prompt, prompt_texts_for_dp, private_start)
-            if king_per_prompt and challenger_per_prompt:
-                n_paired = min(len(king_per_prompt), len(challenger_per_prompt))
-                if n_paired >= MIN_PROMPTS_DETHRONE:
-                    deltas = [king_per_prompt[i] - challenger_per_prompt[i] for i in range(n_paired)]
-                    mean_delta = sum(deltas) / len(deltas)
-                    t_stat, p_value, _ = _paired_t_stats(deltas)
-                    pct_better = (mean_delta / king_new_kl * 100) if king_new_kl > 0 else 0
-                    passes_epsilon = challenger_kl < epsilon_threshold
-                    if p_value < PAIRED_TEST_ALPHA and mean_delta > 0 and passes_epsilon:
-                        if _run_dethrone_vetos(
-                            challenger_uid=uid,
-                            challenger_model=challenger_model,
-                            king_model=king_model_name,
-                            reference_model=_ref_model_name,
-                            students_data=students_data_early,
-                            king_kl_ref=king_h2h_kl,
-                            king_rkl_ref=king_rkl_ref_early,
-                            king_floor_waived=king_floor_waived,
-                            state_dir=str(state.state_dir),
-                            path_label="t-test",
-                            extra_context=(
-                                f"(KL passed: p={p_value:.4f}, "
-                                f"delta={mean_delta:.6f}, KL={challenger_kl:.6f})"
-                            ),
-                        ):
-                            continue
-                        logger.info(f"UID {uid} DETHRONED king UID {king_uid}! p={p_value:.6f}, delta={mean_delta:.6f} ({pct_better:.2f}%), t={t_stat:.3f}, n={len(deltas)}, KL={challenger_kl:.6f} < eps={epsilon_threshold:.6f}")
-                        dethroners.append({
-                            "uid": uid,
-                            "kl": challenger_kl,
-                            "per_prompt": challenger_per_prompt[:n_paired],
-                            "commit_block": (commitments.get(uid, {}) or {}).get("block")
-                                or models_to_eval.get(uid, {}).get("commit_block"),
-                            "p_vs_king": p_value,
-                            "n_paired_vs_king": n_paired,
-                        })
-                    elif p_value < PAIRED_TEST_ALPHA and mean_delta > 0 and not passes_epsilon:
-                        logger.info(f"UID {uid}: significant but fails epsilon (p={p_value:.4f}, KL={challenger_kl:.6f} >= eps={epsilon_threshold:.6f}, delta={mean_delta:.6f})")
-                    elif mean_delta > 0:
-                        logger.info(f"UID {uid}: better but not significant (p={p_value:.4f}, delta={mean_delta:.6f}, n={len(deltas)})")
-                    else:
-                        logger.info(f"UID {uid}: worse than king (delta={mean_delta:.6f}, p={p_value:.4f}, n={len(deltas)})")
-                else:
-                    logger.info(f"UID {uid}: insufficient prompts for dethronement ({n_paired} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}")
-            else:
-                challenger_n = len(challenger_per_prompt) if challenger_per_prompt else 0
-                if challenger_n < MIN_PROMPTS_DETHRONE:
-                    logger.info(f"UID {uid}: insufficient prompts for legacy epsilon ({challenger_n} < {MIN_PROMPTS_DETHRONE}), KL={challenger_kl:.6f}")
-                elif challenger_kl < epsilon_threshold:
-                    if _run_dethrone_vetos(
-                        challenger_uid=uid,
-                        challenger_model=challenger_model,
-                        king_model=king_model_name,
-                        reference_model=_ref_model_name,
-                        students_data=students_data_early,
-                        king_kl_ref=king_h2h_kl,
-                        king_rkl_ref=king_rkl_ref_early,
-                        king_floor_waived=king_floor_waived,
-                        state_dir=str(state.state_dir),
-                        path_label="legacy epsilon",
-                        extra_context=f"[KL={challenger_kl:.6f}]",
-                    ):
-                        continue
-                    logger.info(f"UID {uid} DETHRONED king UID {king_uid}! KL={challenger_kl:.6f} < {epsilon_threshold:.6f} [legacy epsilon, n={challenger_n}]")
-                    legacy_dethroners.append({
-                        "uid": uid,
-                        "kl": challenger_kl,
-                        "commit_block": (commitments.get(uid, {}) or {}).get("block")
-                            or models_to_eval.get(uid, {}).get("commit_block"),
-                    })
+    veto_kwargs = {
+        "reference_model": _ref_model_name,
+        "students_data": students_data,
+        "king_kl_ref": king_h2h_kl,
+        "king_rkl_ref": king_rkl_ref,
+        "king_floor_waived": king_floor_waived,
+        "state_dir": str(state.state_dir),
+    }
+    dethroners, legacy_dethroners = _collect_dethroners(
+        challengers=challengers,
+        results=results,
+        state=state,
+        uid_to_model=uid_to_model,
+        commitments=commitments,
+        models_to_eval=models_to_eval,
+        king_uid=king_uid,
+        king_model_name=king_model_name,
+        king_new_kl=king_new_kl,
+        king_per_prompt=king_per_prompt,
+        epsilon_threshold=epsilon_threshold,
+        prompt_texts_for_dp=prompt_texts_for_dp,
+        private_start=private_start,
+        veto_kwargs=veto_kwargs,
+    )
 
     # Resolve epsilon_dethroned_by from the collected candidates.
     # Preferred path: paired-t-test dethroners with per-prompt vectors.
@@ -1219,90 +1514,15 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             f"per-prompt vectors — picking lowest KL UID {epsilon_dethroned_by}"
         )
 
-    # ── Re-save copy gate ────────────────────────────────────────────────
-    # Before promoting the challenger, do a tensor-by-tensor weight-diff
-    # vs the current king. The paired t-test + 3% epsilon margin can be
-    # defeated by a save_pretrained() round-trip through bf16 (2026-04-22
-    # `abacada/ea` vs `tom9491/distil-32`, also 2026-04-21 `olive5/train-1`
-    # vs `best26/sn97-best900`): the bf16 rounding is deterministic, not
-    # random, so it creates a systematic ~1% KL shift that passes the
-    # t-test and squeaks under 3% epsilon. A direct weight comparison is
-    # the only reliable signal at this point because neither the raw
-    # activation cosine check nor the KL statistics distinguish a
-    # round-trip copy from a lightly-tuned fine-tune.
-    #
-    # Cascade logic: if the top dethroner is a copy, DQ it and fall back
-    # to the next-best dethroner. Repeat until either (a) we find a
-    # non-copy dethroner or (b) the list is exhausted and the king holds.
-    if king_uid is not None:
-        king_model_for_check = uid_to_model.get(king_uid)
-        king_commit = (commitments.get(king_uid, {}) or {}).get("block")
-        king_revision = (commitments.get(king_uid, {}) or {}).get("revision")
-        remaining = list(dethroners)
-        while epsilon_dethroned_by is not None and remaining:
-            current_entry = next(
-                (d for d in remaining if d["uid"] == epsilon_dethroned_by), None
-            )
-            if current_entry is None:
-                break
-            ch_uid = current_entry["uid"]
-            ch_model = uid_to_model.get(ch_uid)
-            ch_commit = (commitments.get(ch_uid, {}) or {}).get("block")
-            ch_revision = (commitments.get(ch_uid, {}) or {}).get("revision")
-            if not (ch_model and king_model_for_check):
-                break
-            # The copy must be the LATER commit — otherwise the king is
-            # the copy, which gets handled by the separate retro-audit
-            # path on startup, not here.
-            if king_commit is not None and ch_commit is not None and ch_commit <= king_commit:
-                break
-            try:
-                from eval.resave_check import detect_resave_copy
-
-                verdict = detect_resave_copy(
-                    ch_model, ch_revision,
-                    king_model_for_check, king_revision,
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"[resave-check] UID {ch_uid} vs king UID {king_uid}: "
-                    f"check failed ({exc}); allowing dethrone through"
-                )
-                break
-            logger.info(
-                f"[resave-check] UID {ch_uid} ({ch_model}) vs king UID {king_uid} "
-                f"({king_model_for_check}): {verdict['reason']} "
-                f"[elapsed={verdict['elapsed_s']:.1f}s]"
-            )
-            if not verdict.get("is_copy"):
-                break
-            reason = (
-                f"copy: re-save of king UID {king_uid} ({king_model_for_check}) — "
-                f"{verdict['identical_count']}/{verdict['total_tensors']} "
-                f"bit-identical, {verdict['bf16_noise_count']}/{verdict['total_tensors']} "
-                f"within bf16 floor, max|Δ|={verdict['max_abs_diff']:.2e} "
-                f"(signature of save_pretrained() round-trip, NOT training)"
-            )
-            logger.info(f"UID {ch_uid} ({ch_model}): BLOCKED DETHRONE — {reason}")
-            log_event(
-                f"Re-save copy blocked dethrone: UID {ch_uid} is copy of king UID {king_uid}",
-                level="warning", state_dir=str(state.state_dir),
-            )
-            ch_hotkey = uid_to_hotkey.get(ch_uid, str(ch_uid))
-            disqualify(
-                ch_hotkey, reason, state.dq_reasons, commit_block=ch_commit,
-            )
-            state.scores[str(ch_uid)] = MAX_KL_THRESHOLD + 1
-            state.evaluated_uids.add(str(ch_uid))
-            remaining = [d for d in remaining if d["uid"] != ch_uid]
-            if remaining:
-                epsilon_dethroned_by = _resolve_dethrone_winner(remaining)
-            else:
-                epsilon_dethroned_by = None
-                logger.info(
-                    f"All {len(dethroners)} dethroner(s) were re-save copies; "
-                    f"king UID {king_uid} retains crown"
-                )
+    epsilon_dethroned_by = _apply_resave_copy_gate(
+        epsilon_dethroned_by=epsilon_dethroned_by,
+        dethroners=dethroners,
+        king_uid=king_uid,
+        uid_to_model=uid_to_model,
+        uid_to_hotkey=uid_to_hotkey,
+        commitments=commitments,
+        state=state,
+    )
     h2h_candidates = []
     all_round_uids = set([king_uid] + list(challengers.keys())) if king_uid is not None else set(challengers.keys())
     for uid in all_round_uids:
@@ -1321,23 +1541,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     # (``epsilon_dethroned_by``) is unchanged — it still enforces
     # statistical significance before a crown changes hands — but which
     # challenger is considered the canonical winner, and what we display
-    # as #1, is now driven by composite.worst.
-    students_data = results.get("students", {}) or {}
-    try:
-        _tmp_h2h = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []
-        king_rkl_ref = _resolve_king_rkl(king_h2h_kl, students_data, _tmp_h2h)
-    except Exception:
-        king_rkl_ref = None
-    # 2026-05-04 (Sebastian's dashboard report): in cold-start rounds
-    # ``king_h2h_kl`` is ``None`` because there's no king to compare
-    # against, which made every student's composite ``kl`` axis null.
-    # Fall back to the round-wide minimum kl_global_avg so the axis
-    # is meaningful for everyone — the new winner scores 1.0 on kl,
-    # subsequent rounds inherit them as the natural anchor.
-    try:
-        king_kl_ref = _resolve_king_kl(king_h2h_kl, students_data)
-    except Exception:
-        king_kl_ref = king_h2h_kl
+    # as #1, is now driven by composite.worst. ``students_data``,
+    # ``king_kl_ref`` and ``king_rkl_ref`` were resolved earlier (above
+    # the dethronement loop) and are reused here unchanged.
 
     # 2026-04-28 (v29.1): resolve same-round reference axis values once
     # so the dethroner ranking applies the same per-axis baseline-relative

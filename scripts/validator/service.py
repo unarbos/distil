@@ -993,14 +993,17 @@ def apply_results_and_weights(
     if winner_uid is not None:
         # 2026-05-01 (v30.4): record the crown change in
         # ``state.recent_kings`` BEFORE building weights so the new
-        # king appears in the multi-king payout queue. If the same
-        # UID re-takes the crown it gets refreshed (moved to front)
-        # rather than duplicated.
-        if king_uid is None or winner_uid != king_uid:
-            _record_king_change(state, winner_uid)
-        elif winner_uid not in (state.recent_kings or []):
-            # First crown for an existing king (boot phase). Add
-            # them to the history.
+        # king appears in the multi-king payout queue. Three trigger
+        # cases collapsed into one condition: (1) no prior king,
+        # (2) crown changed hands, (3) same king as last round but
+        # not yet in the history (boot phase). _record_king_change
+        # de-dupes internally so re-recording the same king moves
+        # them to the front rather than duplicating.
+        if (
+            king_uid is None
+            or winner_uid != king_uid
+            or winner_uid not in (state.recent_kings or [])
+        ):
             _record_king_change(state, winner_uid)
         _safe_set_weights(
             subtensor, wallet, netuid, n_uids,
