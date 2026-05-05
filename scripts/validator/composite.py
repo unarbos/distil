@@ -1505,30 +1505,27 @@ def get_effective_axis_weights() -> dict[str, float]:
     weights: dict[str, float] = {k: w for k, w in AXIS_WEIGHTS.items() if w > 0}
     if not TOP_K_OVERLAP_AXIS_IN_COMPOSITE:
         weights.pop("top_k_overlap", None)
-    if JUDGE_AXIS_IN_COMPOSITE and JUDGE_AXIS_WEIGHT > 0:
-        weights["judge_probe"] = JUDGE_AXIS_WEIGHT
-    if BENCH_AXES_IN_COMPOSITE:
-        weights.update(
-            {k: w for k, w in BENCH_AXIS_WEIGHTS.items() if w > 0},
-        )
-    if ARENA_V3_AXES_IN_COMPOSITE:
-        weights.update(
-            {k: w for k, w in ARENA_V3_AXIS_WEIGHTS.items() if w > 0},
-        )
-    weights.update(
-        {k: w for k, w in BENCH_GROUP_AXIS_WEIGHTS.items() if w > 0},
-    )
-    if REASONING_DENSITY_IN_COMPOSITE and REASONING_DENSITY_WEIGHT > 0:
-        weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
-    if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
-        weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
-    if LONG_FORM_JUDGE_AXIS_IN_COMPOSITE and LONG_FORM_JUDGE_AXIS_WEIGHT > 0:
-        weights["long_form_judge"] = LONG_FORM_JUDGE_AXIS_WEIGHT
-    if (
-        LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE
-        and LONG_GEN_COHERENCE_AXIS_WEIGHT > 0
+    # Group/registry axes whose gate is "weight > 0" only.
+    weights.update({k: w for k, w in BENCH_GROUP_AXIS_WEIGHTS.items() if w > 0})
+    # Bench/arena registries that are gated by an extra ``*_IN_COMPOSITE`` flag.
+    for gate, registry in (
+        (BENCH_AXES_IN_COMPOSITE, BENCH_AXIS_WEIGHTS),
+        (ARENA_V3_AXES_IN_COMPOSITE, ARENA_V3_AXIS_WEIGHTS),
     ):
-        weights["long_gen_coherence"] = LONG_GEN_COHERENCE_AXIS_WEIGHT
+        if gate:
+            weights.update({k: w for k, w in registry.items() if w > 0})
+    # Single-axis gates: each entry is (gate, axis_name, weight). Adding
+    # a new gated axis is now a one-line registry edit instead of a 2-3
+    # line ``if … : weights[…] = …`` block.
+    for gate, axis_name, weight in (
+        (JUDGE_AXIS_IN_COMPOSITE, "judge_probe", JUDGE_AXIS_WEIGHT),
+        (REASONING_DENSITY_IN_COMPOSITE, "reasoning_density", REASONING_DENSITY_WEIGHT),
+        (CHAT_TURNS_AXIS_IN_COMPOSITE, "chat_turns_probe", CHAT_TURNS_AXIS_WEIGHT),
+        (LONG_FORM_JUDGE_AXIS_IN_COMPOSITE, "long_form_judge", LONG_FORM_JUDGE_AXIS_WEIGHT),
+        (LONG_GEN_COHERENCE_AXIS_IN_COMPOSITE, "long_gen_coherence", LONG_GEN_COHERENCE_AXIS_WEIGHT),
+    ):
+        if gate and weight > 0:
+            weights[axis_name] = weight
     return weights
 
 
@@ -1705,23 +1702,34 @@ def compute_composite(student: dict, king_kl: float | None = None,
         k: v for k, v in axes.items()
         if v is not None and k in effective_weights
     }
+    # The ``_in_composite`` env-gate flags are duplicated on every
+    # composite payload so the dashboard / API can show which axes are
+    # currently scored. Single source of truth so the early-empty
+    # branch and the main return don't drift.
+    in_composite_flags = {
+        "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
+        "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
+        "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
+        "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
+        "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE,
+        "top_k_overlap_in_composite": TOP_K_OVERLAP_AXIS_IN_COMPOSITE,
+        "long_form_judge_in_composite": LONG_FORM_JUDGE_AXIS_IN_COMPOSITE,
+    }
+    raw_axes_rounded = (
+        {k: (round(v, 4) if v is not None else None) for k, v in raw_axes.items()}
+        if reference_axes else None
+    )
+
     if not ranked:
-        return {"version": COMPOSITE_SHADOW_VERSION, "axes": axes,
-                "axes_raw": (
-                    {k: (round(v, 4) if v is not None else None) for k, v in raw_axes.items()}
-                    if reference_axes else None
-                ),
-                "baseline_penalty": None,
-                "worst": None, "worst_3_mean": None, "final": None,
-                "weighted": None, "present_count": 0,
-                "broken_axes": sorted(broken_axes) if broken_axes else [],
-                "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
-                "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
-                "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
-                "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
-                "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE,
-                "top_k_overlap_in_composite": TOP_K_OVERLAP_AXIS_IN_COMPOSITE,
-                "long_form_judge_in_composite": LONG_FORM_JUDGE_AXIS_IN_COMPOSITE}
+        return {
+            "version": COMPOSITE_SHADOW_VERSION, "axes": axes,
+            "axes_raw": raw_axes_rounded,
+            "baseline_penalty": None,
+            "worst": None, "worst_3_mean": None, "final": None,
+            "weighted": None, "present_count": 0,
+            "broken_axes": sorted(broken_axes) if broken_axes else [],
+            **in_composite_flags,
+        }
     worst = min(ranked.values())
     # v30.2 — bottom-K mean (default K=3). Smooths the single-axis-min
     # noise pathology while preserving anti-Goodhart pressure. Drops
@@ -1822,10 +1830,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
     return {
         "version": COMPOSITE_SHADOW_VERSION,
         "axes": {k: (round(v, 4) if v is not None else None) for k, v in axes.items()},
-        "axes_raw": (
-            {k: (round(v, 4) if v is not None else None) for k, v in raw_axes.items()}
-            if reference_axes else None
-        ),
+        "axes_raw": raw_axes_rounded,
         "baseline_penalty": baseline_penalty_summary,
         # v30.2 — ``final`` is the canonical ranking key (was ``worst``).
         # ``worst`` (single-axis min) and ``worst_3_mean`` are kept for
@@ -1839,13 +1844,7 @@ def compute_composite(student: dict, king_kl: float | None = None,
         "bench_vs_rel_gap": round(bench_vs_rel_gap, 4) if bench_vs_rel_gap is not None else None,
         "present_count": len(ranked),
         "broken_axes": sorted(broken_axes) if broken_axes else [],
-        "judge_in_composite": JUDGE_AXIS_IN_COMPOSITE,
-        "bench_in_composite": BENCH_AXES_IN_COMPOSITE,
-        "arena_v3_in_composite": ARENA_V3_AXES_IN_COMPOSITE,
-        "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
-        "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE,
-        "top_k_overlap_in_composite": TOP_K_OVERLAP_AXIS_IN_COMPOSITE,
-        "long_form_judge_in_composite": LONG_FORM_JUDGE_AXIS_IN_COMPOSITE,
+        **in_composite_flags,
     }
 
 
