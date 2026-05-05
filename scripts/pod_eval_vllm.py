@@ -6250,11 +6250,36 @@ def math_bench_probe(model, tokenizer, device="cuda"):
     )
 
 
-# ── code_bench ─────────────────────────────────────────────────────────
+# ── sandbox-graded code probes (code/debug/correction/mbpp) ───────────
 
-def code_bench_probe(model, tokenizer, device="cuda"):
+
+def _run_sandbox_bench(model, tokenizer, device, *, sample_key: str,
+                       max_tokens: int, prompt_fn,
+                       sandbox_input_fn, item_extras_fn=None) -> dict:
+    """Scaffolding for the 4 humaneval-sandbox-graded code probes.
+
+    code/debug/correction/mbpp all share the same two-pass pattern:
+      1. Generate per-item Python under model.eval() / no_grad().
+      2. Drop the generations into ``humaneval_sandbox.run_batch`` (4
+         worker subprocesses) and pair the results back with items.
+
+    The per-bench variation is all squeezed into closures:
+      * ``prompt_fn(item) -> str`` — render the user prompt.
+      * ``sandbox_input_fn(item, generation) -> tuple`` — assemble the
+        ``(prompt, generation, test, entry_point)`` tuple the sandbox
+        runner expects (mbpp wraps the test in ``def check(candidate):``;
+        the others pass the original prompt + test verbatim).
+      * ``item_extras_fn(item) -> dict`` (optional) — extra per-item
+        record fields beyond the standard {task_id, entry_point, ok,
+        gen_tokens, reason, tail} (currently just ``src`` for
+        correction_bench).
+
+    A missing ``humaneval_sandbox`` import drops the bench cleanly with
+    an ``error`` set so composite skips it instead of taking the round
+    down — same fail-soft behaviour as before.
+    """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("code") or []
+    samples = _BENCH_SAMPLES.get(sample_key) or []
     if not samples or model is None or tokenizer is None:
         return out
     try:
@@ -6262,25 +6287,21 @@ def code_bench_probe(model, tokenizer, device="cuda"):
     except ImportError:
         out["error"] = "humaneval_sandbox not importable on pod"
         return out
+    extras = item_extras_fn or (lambda _it: {})
     try:
-        generations: list[tuple[str, dict]] = []
+        generations: list[tuple[str, int, dict]] = []
         with _model_eval_no_grad(model):
             for it in samples:
                 try:
-                    prompt_text = (
-                        "Complete the following Python function. "
-                        "Output only the function body (no extra explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
                     gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
+                        model, tokenizer, prompt_fn(it),
+                        max_tokens, device, enable_thinking=False,
                     )
                     generations.append((gen, int(tok), it))
                 except Exception as e:
                     generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
         sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
+            sandbox_input_fn(it, _strip_thinking_probe(gen or ""))
             for gen, _tok, it in generations if "gen_error" not in it
         ]
         sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
@@ -6288,13 +6309,16 @@ def code_bench_probe(model, tokenizer, device="cuda"):
         for gen, tok, it in generations:
             if "gen_error" in it:
                 out["items"].append({
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
+                    **extras(it),
+                    "task_id": it.get("task_id"),
+                    "error": it["gen_error"],
                 })
                 continue
             r = sandbox_results[idx] if idx < len(sandbox_results) else None
             idx += 1
             ok = bool(r and r.passed)
             out["items"].append({
+                **extras(it),
                 "task_id": it.get("task_id"),
                 "entry_point": it.get("entry_point"),
                 "ok": ok,
@@ -6309,6 +6333,21 @@ def code_bench_probe(model, tokenizer, device="cuda"):
     except Exception as e:
         out["error"] = str(e)[:200]
     return out
+
+
+# ── code_bench ─────────────────────────────────────────────────────────
+
+def code_bench_probe(model, tokenizer, device="cuda"):
+    return _run_sandbox_bench(
+        model, tokenizer, device, sample_key="code",
+        max_tokens=BENCH_CODE_MAX_TOKENS,
+        prompt_fn=lambda it: (
+            "Complete the following Python function. "
+            "Output only the function body (no extra explanation, no markdown fences).\n\n"
+            f"{it['prompt']}"
+        ),
+        sandbox_input_fn=lambda it, gen: (it["prompt"], gen, it["test"], it["entry_point"]),
+    )
 
 
 def debug_bench_probe(model, tokenizer, device="cuda"):
@@ -6323,63 +6362,17 @@ def debug_bench_probe(model, tokenizer, device="cuda"):
     apply because the prompt ends mid-``def`` block exactly like
     ``code_bench``.
     """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("debug") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, dict]] = []
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Fix the bug in the following Python function. "
-                        "Output only the function body (no extra "
-                        "explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_DEBUG_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    return _run_sandbox_bench(
+        model, tokenizer, device, sample_key="debug",
+        max_tokens=BENCH_DEBUG_MAX_TOKENS,
+        prompt_fn=lambda it: (
+            "Fix the bug in the following Python function. "
+            "Output only the function body (no extra "
+            "explanation, no markdown fences).\n\n"
+            f"{it['prompt']}"
+        ),
+        sandbox_input_fn=lambda it, gen: (it["prompt"], gen, it["test"], it["entry_point"]),
+    )
 
 
 # ── correction_bench (v29.4) ─────────────────────────────────────────────
@@ -6393,65 +6386,18 @@ def correction_bench_probe(model, tokenizer, device="cuda"):
     body. Item-level pass = sandbox runs the corrected function and all
     asserts pass.
     """
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("correction") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Read the test failure trace and fix the bug. "
-                        "Output only the corrected function body (no extra "
-                        "explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_CORRECTION_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        sandbox_input = [
-            (it["prompt"], _strip_thinking_probe(gen or ""), it["test"], it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "src": it.get("src", ""),
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "src": it.get("src", ""),
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    return _run_sandbox_bench(
+        model, tokenizer, device, sample_key="correction",
+        max_tokens=BENCH_CORRECTION_MAX_TOKENS,
+        prompt_fn=lambda it: (
+            "Read the test failure trace and fix the bug. "
+            "Output only the corrected function body (no extra "
+            "explanation, no markdown fences).\n\n"
+            f"{it['prompt']}"
+        ),
+        sandbox_input_fn=lambda it, gen: (it["prompt"], gen, it["test"], it["entry_point"]),
+        item_extras_fn=lambda it: {"src": it.get("src", "")},
+    )
 
 
 # ── multi_doc_synthesis_bench (v29.4) ───────────────────────────────────
@@ -7209,83 +7155,33 @@ def _mbpp_build_prompt(item: dict) -> str:
     )
 
 
+def _mbpp_wrap_test_for_sandbox(test: str) -> str:
+    """Wrap raw MBPP asserts in a ``def check(candidate):`` body so the
+    humaneval_sandbox runner (which calls ``check({entry_point})``)
+    can run them. The asserts reference the target by name and Python
+    resolves it from module scope where the generation defined it, so
+    no rebinding is needed — we only need to indent into ``check``.
+    """
+    indented = "\n".join(
+        (f"    {line}" if line.strip() else "")
+        for line in test.splitlines()
+    )
+    return f"def check(candidate):\n{indented}\n    return True\n"
+
+
 def mbpp_bench_probe(model, tokenizer, device="cuda"):
-    out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
-    samples = _BENCH_SAMPLES.get("mbpp") or []
-    if not samples or model is None or tokenizer is None:
-        return out
-    try:
-        import humaneval_sandbox as hs  # type: ignore
-    except ImportError:
-        out["error"] = "humaneval_sandbox not importable on pod"
-        return out
-    try:
-        generations: list[tuple[str, int, dict]] = []
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    prompt_text = _mbpp_build_prompt(it)
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MBPP_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
-        # MBPP solutions often don't stub the function signature at the
-        # top of the prompt the way HumanEval does (which uses signature
-        # + docstring). To reuse the sandbox runner, we:
-        #   1. Pass an empty prompt (generation defines the function).
-        #   2. Wrap the standalone assert lines in a ``check(candidate)``
-        #      function the sandbox expects. MBPP ``test`` fields are
-        #      either raw assertions (preferred, from ``test_list``) or
-        #      a helper module that still calls the target by name —
-        #      either way, wrapping in ``def check(candidate):`` and
-        #      binding ``candidate`` to the entry_point makes it work.
-        def _wrap_for_sandbox(test: str, entry_point: str) -> str:
-            # The sandbox calls ``check({entry_point})`` after running
-            # the generation. The generation defines the target function
-            # in module scope. Inside ``check``, the test body references
-            # the function by name and Python looks it up in the
-            # enclosing module scope, so no rebinding is needed — we
-            # only need to indent the asserts into the ``check`` body.
-            indented = "\n".join(
-                (f"    {line}" if line.strip() else "")
-                for line in test.splitlines()
-            )
-            return f"def check(candidate):\n{indented}\n    return True\n"
-        sandbox_input = [
-            ("", _strip_thinking_probe(gen or ""),
-             _wrap_for_sandbox(it["test"], it["entry_point"]),
-             it["entry_point"])
-            for gen, _tok, it in generations if "gen_error" not in it
-        ]
-        sandbox_results = hs.run_batch(sandbox_input, max_workers=4) if sandbox_input else []
-        idx = 0
-        for gen, tok, it in generations:
-            if "gen_error" in it:
-                out["items"].append({
-                    "task_id": it.get("task_id"), "error": it["gen_error"],
-                })
-                continue
-            r = sandbox_results[idx] if idx < len(sandbox_results) else None
-            idx += 1
-            ok = bool(r and r.passed)
-            out["items"].append({
-                "task_id": it.get("task_id"),
-                "entry_point": it.get("entry_point"),
-                "ok": ok,
-                "gen_tokens": int(tok),
-                "reason": (r.reason if r else "no_result")[:120],
-                "tail": (gen or "")[-160:],
-            })
-            out["n"] += 1
-            out["correct"] += int(ok)
-        out["pass_frac"] = out["correct"] / max(1, out["n"])
-        _bench_finalize_token_stats(out)
-    except Exception as e:
-        out["error"] = str(e)[:200]
-    return out
+    return _run_sandbox_bench(
+        model, tokenizer, device, sample_key="mbpp",
+        max_tokens=BENCH_MBPP_MAX_TOKENS,
+        prompt_fn=_mbpp_build_prompt,
+        # MBPP solutions don't stub the function signature like
+        # HumanEval does; we pass an empty prompt (generation defines
+        # the function) and wrap the asserts in ``def check`` so the
+        # shared sandbox runner can use them unchanged.
+        sandbox_input_fn=lambda it, gen: (
+            "", gen, _mbpp_wrap_test_for_sandbox(it["test"]), it["entry_point"],
+        ),
+    )
 
 
 # ── tool_use_bench (Session 3, agentic) ────────────────────────────────
