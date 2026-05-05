@@ -851,6 +851,117 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
     return models_to_eval, challengers
 
 
+def _resolve_single_eval_winner(
+    *, winner_uid, winner_kl, king_uid, models_to_eval,
+    uid_to_hotkey, commitments, state,
+):
+    """SINGLE_EVAL_MODE override: pick the cross-round composite king.
+
+    The round only contained never-evaluated commitments plus the
+    reference baseline; ``process_results`` refreshed
+    ``state.composite_scores`` for every UID it scored, but the
+    canonical king is decided cross-round against ``state.composite_scores``.
+    Override the round-local winner so weights are set on the actual
+    cross-round king before ``post_round`` persists H2H state.
+
+    Kingship pool restriction (mrchen 2026-04-27): the eligible set is
+    THIS ROUND's participants only, NOT every UID in
+    ``state.composite_scores``. Cross-sample leak previously let stale
+    composites from earlier rounds beat fresh ones (round 8062909
+    repro). The prior king is normally seated as a student per
+    ``f7c786c``; the defensive fallback below covers DQ / OOM / load-fail.
+
+    Returns ``(winner_uid, winner_kl)`` — possibly unchanged when the
+    round has no usable composite king AND the prior king isn't a
+    valid fallback.
+    """
+    composite_king_uid, composite_record = None, None
+    try:
+        kingship_models: dict = {
+            uid_i: info
+            for uid_i, info in (models_to_eval or {}).items()
+            if not info.get("is_reference")
+        }
+        # Defensive: if the prior king isn't in models_to_eval (shouldn't
+        # happen post f7c786c, but kept as a safety net) AND has a
+        # stored composite, include them so they can hold the crown via
+        # stability bias rather than being dropped silently.
+        if (
+            king_uid is not None
+            and king_uid not in kingship_models
+            and str(king_uid) in (getattr(state, "composite_scores", {}) or {})
+        ):
+            commit = (commitments or {}).get(king_uid)
+            if commit:
+                kingship_models[king_uid] = {
+                    "model": commit.get("model"),
+                    "revision": commit.get("revision"),
+                    "commit_block": commit.get("block"),
+                    "hotkey": (uid_to_hotkey or {}).get(king_uid, ""),
+                    "is_reference": False,
+                }
+                logger.warning(
+                    f"single-eval: prior king UID {king_uid} not in "
+                    f"models_to_eval — falling back to stored composite "
+                    f"for kingship eligibility"
+                )
+        composite_king_uid, composite_record = select_king_by_composite(
+            state, kingship_models, uid_to_hotkey=uid_to_hotkey,
+            commitments=commitments,
+        )
+        if composite_king_uid is not None:
+            logger.info(
+                f"single-eval: kingship pool restricted to {len(kingship_models)} "
+                f"round participants (was network-wide, fixed 2026-04-27 to "
+                f"prevent cross-sample leak)"
+            )
+    except Exception as exc:
+        logger.warning(f"single-eval king-by-composite failed (non-fatal): {exc}")
+        composite_king_uid, composite_record = None, None
+    if composite_king_uid is None:
+        # If process_results couldn't find a winner either, hold the prior
+        # king's weights rather than dropping to zero.
+        try:
+            from eval.scoring import is_disqualified as _isdq
+            composite_scores = getattr(state, "composite_scores", {}) or {}
+            if king_uid is not None and str(king_uid) in composite_scores:
+                hk = uid_to_hotkey.get(king_uid, "")
+                cb = (commitments.get(king_uid, {}) or {}).get("block")
+                if not _isdq(king_uid, hk, state.dq_reasons, commit_block=cb):
+                    composite_king_uid = king_uid
+                    composite_record = composite_scores.get(str(king_uid))
+        except Exception:
+            pass
+    if composite_king_uid is None:
+        return winner_uid, winner_kl
+    if composite_king_uid != winner_uid:
+        logger.info(
+            f"single-eval: overriding round-local winner UID {winner_uid} "
+            f"with cross-round composite king UID {composite_king_uid}"
+        )
+    # Keep winner_kl as the global KL (state.scores entry) instead of
+    # composite-worst — the worst axis frequently bottoms at 0.0 because
+    # miners haven't built mbpp/aime yet, which made every single-eval
+    # announcement read "KL: 0.000000" (impossible) and broke trust with
+    # miners (#distil-97, 2026-04-26 02:14 UTC). The dashboard already
+    # exposes composite scores separately, so the announcement KL should
+    # be the actual distillation distance.
+    new_kl = winner_kl
+    winner_kl_global = state.scores.get(str(composite_king_uid))
+    if winner_kl_global is not None and winner_kl_global > 0:
+        new_kl = float(winner_kl_global)
+    else:
+        # Fall back to composite weighted (≠ 0 in practice) before
+        # composite worst as a last-ditch placeholder.
+        weighted = (composite_record or {}).get("weighted")
+        worst = (composite_record or {}).get("worst")
+        if weighted is not None and float(weighted) > 0:
+            new_kl = float(weighted)
+        elif worst is not None:
+            new_kl = float(worst)
+    return composite_king_uid, new_kl
+
+
 def apply_results_and_weights(
     subtensor, wallet, netuid, n_uids,
     results, models_to_eval, king_uid, king_kl,
@@ -872,124 +983,12 @@ def apply_results_and_weights(
             uid_to_coldkey=uid_to_coldkey,
         )
     )
-    # SINGLE_EVAL_MODE: the round only contained never-evaluated commitments
-    # plus the reference baseline. The canonical king is decided cross-round
-    # against state.composite_scores, which process_results just refreshed
-    # for every UID it scored. Override the round-local winner_uid here so
-    # weights get set on the actual cross-round king before the H2H state
-    # persistence step runs in post_round.
     if is_single_eval_mode():
-        try:
-            # Dethrone candidates = THIS ROUND's participants only.
-            #
-            # 2026-04-27 (mrchen) caught the bug: previously we built
-            # ``kingship_models`` from every UID in ``state.composite_scores``,
-            # which is network-wide and includes UIDs scored on prior
-            # rounds' prompts. That cross-sample leak meant a UID with a
-            # stale composite from a different prompt sample could
-            # "win" against a fresh challenger in this round, even
-            # though they weren't actually evaluated head-to-head.
-            #
-            # Round 8062909 reproduction: king UID 123 fresh
-            # worst=0.600 (on this round's prompts) lost to UID 144
-            # stale worst=0.667 (from an earlier round's prompts).
-            # UID 144 wasn't even in the round.
-            #
-            # The whole point of seating the king as a student was to
-            # restore paired evaluation — but that paired evaluation
-            # only meaningfully ranks UIDs that were ALSO in the same
-            # round. UIDs scored on different prompts can't fairly
-            # compete head-to-head against this round's miners.
-            #
-            # Fix: kingship pool = (king_uid, this round's challengers).
-            # The prior king is in models_to_eval too (king-in-round
-            # change from commit f7c786c) so this naturally includes
-            # them when present. If the king somehow couldn't be
-            # evaluated this round (DQ, OOM, load fail), the stored
-            # composite fallback below kicks in to hold the prior
-            # king rather than crowning a stale candidate.
-            kingship_models: dict = {}
-            for uid_i, info in (models_to_eval or {}).items():
-                if info.get("is_reference"):
-                    continue
-                kingship_models[uid_i] = info
-            # Defensive: if the prior king isn't in models_to_eval
-            # (shouldn't happen post f7c786c, but kept as a safety
-            # net) AND has a stored composite, include them so they
-            # can hold the crown via stability bias rather than
-            # being dropped silently.
-            if (
-                king_uid is not None
-                and king_uid not in kingship_models
-                and str(king_uid) in (getattr(state, "composite_scores", {}) or {})
-            ):
-                commit = (commitments or {}).get(king_uid)
-                if commit:
-                    kingship_models[king_uid] = {
-                        "model": commit.get("model"),
-                        "revision": commit.get("revision"),
-                        "commit_block": commit.get("block"),
-                        "hotkey": (uid_to_hotkey or {}).get(king_uid, ""),
-                        "is_reference": False,
-                    }
-                    logger.warning(
-                        f"single-eval: prior king UID {king_uid} not in "
-                        f"models_to_eval — falling back to stored composite "
-                        f"for kingship eligibility"
-                    )
-            composite_king_uid, composite_record = select_king_by_composite(
-                state, kingship_models, uid_to_hotkey=uid_to_hotkey,
-                commitments=commitments,
-            )
-            if composite_king_uid is not None:
-                logger.info(
-                    f"single-eval: kingship pool restricted to {len(kingship_models)} "
-                    f"round participants (was network-wide, fixed 2026-04-27 to "
-                    f"prevent cross-sample leak)"
-                )
-        except Exception as exc:
-            logger.warning(f"single-eval king-by-composite failed (non-fatal): {exc}")
-            composite_king_uid, composite_record = None, None
-        if composite_king_uid is None:
-            # If process_results couldn't find a winner either, hold the prior
-            # king's weights rather than dropping to zero.
-            try:
-                from eval.scoring import is_disqualified as _isdq
-                composite_scores = getattr(state, "composite_scores", {}) or {}
-                if king_uid is not None and str(king_uid) in composite_scores:
-                    hk = uid_to_hotkey.get(king_uid, "")
-                    cb = (commitments.get(king_uid, {}) or {}).get("block")
-                    if not _isdq(king_uid, hk, state.dq_reasons, commit_block=cb):
-                        composite_king_uid = king_uid
-                        composite_record = composite_scores.get(str(king_uid))
-            except Exception:
-                pass
-        if composite_king_uid is not None:
-            if composite_king_uid != winner_uid:
-                logger.info(
-                    f"single-eval: overriding round-local winner UID {winner_uid} "
-                    f"with cross-round composite king UID {composite_king_uid}"
-                )
-            winner_uid = composite_king_uid
-            # Keep winner_kl as the global KL (state.scores entry) instead of
-            # composite-worst — the worst axis frequently bottoms at 0.0
-            # because miners haven't built mbpp/aime yet, which made every
-            # single-eval announcement read "KL: 0.000000" (impossible) and
-            # broke trust with miners (#distil-97, 2026-04-26 02:14 UTC).
-            # The dashboard already exposes composite scores separately, so
-            # the announcement KL should be the actual distillation distance.
-            winner_kl_global = state.scores.get(str(composite_king_uid))
-            if winner_kl_global is not None and winner_kl_global > 0:
-                winner_kl = float(winner_kl_global)
-            else:
-                # Fall back to composite weighted (≠ 0 in practice) before
-                # composite worst as a last-ditch placeholder.
-                weighted = (composite_record or {}).get("weighted")
-                worst = (composite_record or {}).get("worst")
-                if weighted is not None and float(weighted) > 0:
-                    winner_kl = float(weighted)
-                elif worst is not None:
-                    winner_kl = float(worst)
+        winner_uid, winner_kl = _resolve_single_eval_winner(
+            winner_uid=winner_uid, winner_kl=winner_kl, king_uid=king_uid,
+            models_to_eval=models_to_eval, uid_to_hotkey=uid_to_hotkey,
+            commitments=commitments, state=state,
+        )
     if winner_uid is not None:
         # 2026-05-01 (v30.4): record the crown change in
         # ``state.recent_kings`` BEFORE building weights so the new
