@@ -1884,6 +1884,55 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     return out
 
 
+def long_form_judge_response_probe(
+    model, tokenizer, device="cuda", max_tokens_override: int | None = None,
+):
+    """Collect student responses for the long-form judge axis.
+
+    Phase B scores these stored responses after the student is unloaded, so
+    this mirrors ``judge_response_probe`` but uses the long-form prompt pool and
+    the long-form token budget.
+    """
+    out = {
+        "prompts": list(LONG_FORM_JUDGE_PROMPTS),
+        "responses": [],
+        "gen_tokens": [],
+    }
+    if tokenizer is None or model is None or not LONG_FORM_JUDGE_PROMPTS:
+        return out
+    if not getattr(tokenizer, "chat_template", None):
+        return out
+
+    max_new = (
+        int(max_tokens_override)
+        if max_tokens_override is not None
+        else int(LONG_FORM_JUDGE_MAX_TOKENS)
+    )
+    max_new = max(64, max_new)
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    with _model_eval_no_grad(model):
+        for prompt in LONG_FORM_JUDGE_PROMPTS:
+            try:
+                rendered = _render_chat_prompt(
+                    tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
+                )
+                ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
+                gen = model.generate(
+                    ids, max_new_tokens=max_new,
+                    do_sample=False, temperature=1.0, top_p=1.0,
+                    pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
+                )
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                out["responses"].append(_strip_thinking_probe(text))
+                out["gen_tokens"].append(int(new_ids.shape[0]))
+            except Exception as e:
+                out["responses"].append("")
+                out["gen_tokens"].append(0)
+                print(f"[long-form-judge] student gen error: {str(e)[:120]}", flush=True)
+    return out
+
+
 def _parse_judge_score(text: str) -> int | None:
     """Extract an integer 1-5 score from the teacher's judge output.
 
