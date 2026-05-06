@@ -245,6 +245,10 @@ _FIB_INDEX_RE = re.compile(
     r".{0,40}\b(?:fib(?:onacci)?|fibonacci)\b",
     re.IGNORECASE,
 )
+_FACTORIAL_RE = re.compile(
+    r"(?:factorial\s*(?:of)?|(\d{1,6})\s*!)\s*(\d{1,6})?",
+    re.IGNORECASE,
+)
 _DERAIL_MARKERS = (
     "Use the tool ",
     "get_model_info",
@@ -538,10 +542,35 @@ def _extract_python_code(user_text: str) -> tuple[str | None, str]:
         expr = inline.group(1).strip()
         return f"print({expr})", "inline arithmetic expression"
 
+    factorial = _FACTORIAL_RE.search(user_text)
+    if factorial:
+        n_txt = factorial.group(1) or factorial.group(2)
+        try:
+            n = int(n_txt)
+        except (TypeError, ValueError):
+            n = -1
+        if 0 <= n <= 100_000:
+            return (
+                "import math, sys\n"
+                "if hasattr(sys, 'set_int_max_str_digits'):\n"
+                "    sys.set_int_max_str_digits(0)\n"
+                f"n = {n}\n"
+                "value = math.factorial(n)\n"
+                "s = str(value)\n"
+                "print('n =', n)\n"
+                "print('digits =', len(s))\n"
+                "if len(s) <= 1000:\n"
+                "    print('value =', s)\n"
+                "else:\n"
+                "    print('value_head_80 =', s[:80])\n"
+                "    print('value_tail_80 =', s[-80:])",
+                "factorial runtime",
+            )
+
     # Conservative expression extraction for requests like
     # "calculate ((88+43)**(2-2))//9".
     expr_match = re.search(
-        r"(?:calculate|compute|evaluate|what is|math)\s+([0-9\s+\-*/%().,_<>=!&|^~]+)",
+        r"(?:calculate|compute|evaluate|what is|what's|solve|result of|math)\s+([0-9\s+\-*/%().,_<>=!&|^~]+)",
         user_text,
         re.IGNORECASE,
     )
@@ -695,14 +724,17 @@ async def _call_quality_fallback(messages: list[dict], *, max_tokens: int = 700)
         return None
 
 
-async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_model: str | None) -> dict:
-    """Transparent tool runtime around fast vLLM.
+async def _prepare_orchestrated_chat(
+    body: dict,
+    king_uid: int | None,
+    king_model: str | None,
+    *,
+    stream: bool = False,
+) -> tuple[dict, list[str], list[str]]:
+    """Build the vLLM request plus deterministic runtime tool context.
 
-    This function may execute tools and add their outputs to the model context,
-    but it must not quality-filter, rewrite, or replace the model's final text.
-    chat.arbos.life is intentionally a window into the current king's behavior;
-    if the king derails after seeing useful tool results, that failure should
-    remain visible.
+    Tool execution happens before the model call. The streaming path uses this
+    to emit tool output immediately, then streams the raw vLLM answer.
     """
     messages = list(body.get("messages") or [])
     user_text = _latest_user_text(messages)
@@ -782,7 +814,7 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
     vllm_body = {
         "model": CHAT_POD_SERVED_MODEL,
         "messages": clean_messages,
-        "stream": False,
+        "stream": stream,
         "max_tokens": body.get("max_tokens") or 700,
         "temperature": body.get("temperature", 0.6),
         "top_p": body.get("top_p", 0.9),
@@ -791,6 +823,21 @@ async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_m
         "repetition_penalty": body.get("repetition_penalty", 1.0),
         "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
     }
+    return vllm_body, tool_context, runtime_trace
+
+
+async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_model: str | None) -> dict:
+    """Transparent tool runtime around fast vLLM.
+
+    This function may execute tools and add their outputs to the model context,
+    but it must not quality-filter, rewrite, or replace the model's final text.
+    chat.arbos.life is intentionally a window into the current king's behavior;
+    if the king derails after seeing useful tool results, that failure should
+    remain visible.
+    """
+    vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
+        body, king_uid, king_model, stream=False,
+    )
     try:
         raw = await _local_chat_post(vllm_body, timeout=120.0)
         msg = (raw.get("choices") or [{}])[0].get("message") or {}
@@ -882,6 +929,223 @@ def _stream_openai_response(data: dict):
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }) + "\n\n"
         yield "data: [DONE]\n\n"
+    return _sse_response(generate())
+
+
+def _openai_sse_chunk(base: dict, delta: dict, *, finish_reason=None) -> str:
+    return "data: " + json.dumps({
+        **base,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    }) + "\n\n"
+
+
+def _delta_reasoning(delta: dict, msg: dict | None = None) -> str:
+    msg = msg or {}
+    return (
+        delta.get("reasoning")
+        or delta.get("reasoning_content")
+        or delta.get("thinking")
+        or msg.get("reasoning")
+        or msg.get("reasoning_content")
+        or msg.get("thinking")
+        or ""
+    )
+
+
+def _stream_orchestrated_openai_response(body: dict, king_uid: int | None, king_model: str | None):
+    """True SSE streaming for the OpenAI-compatible endpoint.
+
+    Runtime tools execute first and are emitted immediately as visible content;
+    then the raw king answer is streamed from vLLM token-by-token. This keeps
+    chat transparent while avoiding the previous "wait for full completion,
+    then chunk a finished string" behavior.
+    """
+    async def generate():
+        response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+        created = int(time.time())
+        base = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": king_model or CHAT_POD_SERVED_MODEL,
+            "king_uid": king_uid,
+        }
+        acc = ""
+        reasoning_acc: list[str] = []
+        finish_sent = False
+        vllm_body: dict | None = None
+
+        try:
+            vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
+                body, king_uid, king_model, stream=True,
+            )
+        except Exception as exc:
+            yield "data: " + json.dumps({
+                "error": {"message": f"chat orchestration failed: {str(exc)[:200]}"},
+            }) + "\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        trace = "\n".join(runtime_trace)
+        if trace:
+            reasoning_acc.append(trace)
+            yield _openai_sse_chunk(
+                base,
+                {
+                    "role": "assistant",
+                    "reasoning": trace,
+                    "reasoning_content": trace,
+                },
+            )
+        else:
+            yield _openai_sse_chunk(base, {"role": "assistant"})
+
+        if tool_context:
+            prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
+            acc += prefix
+            yield _openai_sse_chunk(base, {"content": prefix})
+
+        client = _get_http_client()
+        try:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json=_normalize_chat_payload(vllm_body),
+                timeout=httpx.Timeout(connect=3.0, read=300.0, write=10.0, pool=5.0),
+            ) as resp:
+                if resp.status_code >= 400:
+                    detail = (await resp.aread()).decode("utf-8", "replace")[:300]
+                    yield "data: " + json.dumps({
+                        "error": {
+                            "message": f"chat server returned {resp.status_code}",
+                            "detail": detail,
+                        },
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    line = line.strip()
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[6:]
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (parsed.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    msg = choice.get("message") or {}
+                    out_delta = {}
+                    content = delta.get("content") or msg.get("content") or ""
+                    if content:
+                        acc += content
+                        out_delta["content"] = content
+                    reasoning = _delta_reasoning(delta, msg)
+                    if reasoning:
+                        reasoning_acc.append(reasoning)
+                        out_delta["reasoning"] = reasoning
+                        out_delta["reasoning_content"] = reasoning
+                    if delta.get("tool_calls"):
+                        out_delta["tool_calls"] = delta.get("tool_calls")
+                    finish_reason = choice.get("finish_reason")
+                    if out_delta or finish_reason:
+                        yield _openai_sse_chunk(base, out_delta, finish_reason=finish_reason)
+                    if finish_reason:
+                        finish_sent = True
+            if not finish_sent:
+                yield _openai_sse_chunk(base, {}, finish_reason="stop")
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            yield 'data: {"error": {"message": "chat server unavailable"}}\n\n'
+        except Exception as exc:
+            yield "data: " + json.dumps({
+                "error": {"message": f"stream interrupted: {str(exc)[:200]}"},
+            }) + "\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+            try:
+                _log_chat_turn(vllm_body or body, acc, king_uid, king_model, {
+                    "choices": [{
+                        "message": {
+                            "content": acc,
+                            "reasoning": "\n".join(reasoning_acc),
+                        }
+                    }]
+                })
+            except Exception:
+                pass
+
+    return _sse_response(generate())
+
+
+def _stream_orchestrated_chat_response(payload: dict, king_uid: int | None, king_model: str | None):
+    """Streaming variant for the legacy `/api/chat` endpoint."""
+    async def generate():
+        acc = ""
+        vllm_body: dict | None = None
+        try:
+            vllm_body, tool_context, runtime_trace = await _prepare_orchestrated_chat(
+                payload, king_uid, king_model, stream=True,
+            )
+            trace = "\n".join(runtime_trace)
+            if trace:
+                yield f"data: {json.dumps({'thinking': trace})}\n\n"
+            if tool_context:
+                prefix = _format_tool_context_for_display(tool_context) + "Raw model answer:\n\n"
+                acc += prefix
+                yield f"data: {json.dumps({'response': prefix, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+
+            client = _get_http_client()
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json=_normalize_chat_payload(vllm_body),
+                timeout=httpx.Timeout(connect=3.0, read=300.0, write=10.0, pool=5.0),
+            ) as resp:
+                if resp.status_code >= 400:
+                    yield f"data: {json.dumps({'error': f'chat server returned {resp.status_code}'})}\n\n"
+                    return
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    line = line.strip()
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[6:]
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (parsed.get("choices") or [{}])[0]
+                    delta = choice.get("delta") or {}
+                    msg = choice.get("message") or {}
+                    reasoning = _delta_reasoning(delta, msg)
+                    if reasoning:
+                        yield f"data: {json.dumps({'thinking': reasoning, 'delta': True})}\n\n"
+                    content = delta.get("content") or msg.get("content") or ""
+                    if content:
+                        acc += content
+                        yield f"data: {json.dumps({'response': content, 'delta': True, 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            yield f"data: {json.dumps({'error': 'chat server unavailable', 'detail': str(exc)[:200]})}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'error': str(exc)[:200]})}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+            try:
+                _log_chat_turn(vllm_body or payload, acc, king_uid, king_model, None)
+            except Exception:
+                pass
+
     return _sse_response(generate())
 
 
@@ -1082,15 +1346,7 @@ async def _sync_chat(payload, king_uid, king_model):
 def _stream_chat(payload, king_uid, king_model):
     payload["stream"] = True
     if _CHAT_ORCHESTRATION_ENABLED:
-        async def generate_orchestrated():
-            data = await _orchestrated_chat_completion(payload, king_uid, king_model)
-            message = data["choices"][0]["message"]
-            if message.get("reasoning"):
-                yield f"data: {json.dumps({'thinking': message.get('reasoning')})}\n\n"
-            yield f"data: {json.dumps({'response': message.get('content') or '', 'king_uid': king_uid, 'king_model': king_model})}\n\n"
-            yield "data: [DONE]\n\n"
-            _log_chat_turn(payload, message.get("content") or "", king_uid, king_model, data)
-        return _sse_response(generate_orchestrated())
+        return _stream_orchestrated_chat_response(payload, king_uid, king_model)
     norm = _normalize_chat_payload(payload)
 
     async def generate():
@@ -1472,9 +1728,9 @@ async def openai_chat_completions(request: Request):
 
     stream = body.get("stream", False)
     if _CHAT_ORCHESTRATION_ENABLED:
-        data = await _orchestrated_chat_completion(body, king_uid, king_model)
         if stream:
-            return _stream_openai_response(data)
+            return _stream_orchestrated_openai_response(body, king_uid, king_model)
+        data = await _orchestrated_chat_completion(body, king_uid, king_model)
         return JSONResponse(content=data)
 
     if stream:

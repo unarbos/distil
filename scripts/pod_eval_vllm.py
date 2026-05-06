@@ -69,6 +69,15 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+try:
+    from scripts.eval_benchmarks import NOISE_PERTURBATION_TEMPLATES
+except Exception:
+    from eval_benchmarks import NOISE_PERTURBATION_TEMPLATES
+try:
+    from scripts.eval_items import _rot_text
+except Exception:
+    from eval_items import _rot_text
+
 # 2026-05-04: Suppress the spammy ``GenerationMixin`` warning that
 # transformers emits on EVERY ``model.generate()`` call when both
 # ``max_new_tokens`` and ``max_length`` are present in the merged
@@ -7719,13 +7728,6 @@ def _generate_long_context_items(block_seed: int, n_items: int, n_distractors: i
 _PROC_NAMES: tuple = ()
 
 
-def _rot_text(s: str, n: int) -> str:
-    if not s:
-        return s
-    n = n % len(s)
-    return s[n:] + s[:n]
-
-
 # ── v27 (Session 3.20) — fully-procedural skill probes ─────────────────────
 #
 # Pre-v27 the bench battery sampled from public HuggingFace datasets
@@ -13615,135 +13617,7 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
 # arithmetic operators. The math is the same; we only perturb the
 # narrative/instructional text around it. Otherwise we'd be changing
 # the answer, not testing surface-noise robustness.
-def _noise_safe_letter_swap(text: str, rate: float, rng_seed: int) -> str:
-    """Substitute alpha chars with adjacent QWERTY keys at ``rate``.
-
-    Skips digits, punctuation, whitespace, and non-ASCII. Bounded so
-    we never mangle the actual numerical content of a math problem.
-    """
-    import random
-    rng = random.Random(rng_seed)
-    qwerty = {
-        "q": "wa", "w": "qes", "e": "wrd", "r": "etf", "t": "ryg",
-        "y": "tuh", "u": "yij", "i": "uok", "o": "ipl", "p": "o",
-        "a": "qsz", "s": "awdz", "d": "sefx", "f": "drgc", "g": "fthv",
-        "h": "gybn", "j": "hkun", "k": "jlim", "l": "ko",
-        "z": "asx", "x": "zsdc", "c": "xdfv", "v": "cfgb", "b": "vghn",
-        "n": "bhjm", "m": "njk",
-    }
-    out_chars = []
-    for ch in text:
-        if ch.isalpha() and ch.isascii() and rng.random() < rate:
-            low = ch.lower()
-            if low in qwerty:
-                sub = rng.choice(qwerty[low])
-                out_chars.append(sub.upper() if ch.isupper() else sub)
-                continue
-        out_chars.append(ch)
-    return "".join(out_chars)
-
-
-def _noise_case_jitter(text: str, rate: float, rng_seed: int) -> str:
-    import random
-    rng = random.Random(rng_seed)
-    return "".join(
-        (ch.swapcase() if ch.isalpha() and ch.isascii() and rng.random() < rate else ch)
-        for ch in text
-    )
-
-
-def _noise_extra_whitespace(text: str, rng_seed: int) -> str:
-    """Replace some single spaces with 2-3 spaces, sprinkle a few blank lines."""
-    import random
-    rng = random.Random(rng_seed)
-    out = []
-    for ch in text:
-        if ch == " " and rng.random() < 0.10:
-            out.append(" " * rng.randint(2, 3))
-        elif ch == "\n" and rng.random() < 0.15:
-            out.append("\n\n")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def _noise_common_misspellings(text: str) -> str:
-    """Apply common chat-typo replacements on whole-word boundaries."""
-    import re
-    table = [
-        (r"\bthe\b", "teh"),
-        (r"\byour\b", "youre"),
-        (r"\bbecause\b", "becuase"),
-        (r"\bdefinitely\b", "definately"),
-        (r"\bseparate\b", "seperate"),
-        (r"\bachieve\b", "acheive"),
-        (r"\boccur\b", "occure"),
-        (r"\bweird\b", "wierd"),
-        (r"\breceive\b", "recieve"),
-    ]
-    for pat, rep in table:
-        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
-    return text
-
-
-def _noise_drop_sentence_periods(text: str, rng_seed: int) -> str:
-    """Drop ~50% of sentence-ending periods; never touch decimal points.
-
-    A decimal point is a period flanked by digits (e.g. ``3.14``); we
-    only drop periods followed by whitespace, end-of-string, or a
-    capital letter (sentence-end). Question marks are left alone so
-    the question semantics are preserved.
-    """
-    import random
-    import re
-    rng = random.Random(rng_seed)
-
-    def _maybe_drop(m):
-        return "" if rng.random() < 0.5 else m.group(0)
-
-    return re.sub(r"\.(?=\s|$|[A-Z])", _maybe_drop, text)
-
-
-_NOISE_PERTURBATION_TEMPLATES: tuple[tuple[str, "callable[[str, int], str]"], ...] = (
-    (
-        "light_typos",
-        lambda p, s: _noise_safe_letter_swap(p, rate=0.025, rng_seed=s),
-    ),
-    (
-        "case_jitter",
-        lambda p, s: _noise_case_jitter(p, rate=0.04, rng_seed=s),
-    ),
-    (
-        "chatter_prefix",
-        lambda p, s: (
-            "Hey! I'm working through some practice problems — "
-            "could you take a look at this one?\n\n" + p
-        ),
-    ),
-    (
-        "chatter_suffix",
-        lambda p, s: p.rstrip() + "\n\nThanks in advance, really appreciate it!",
-    ),
-    (
-        "extra_whitespace",
-        lambda p, s: _noise_extra_whitespace(p, rng_seed=s),
-    ),
-    (
-        "common_misspellings",
-        lambda p, s: _noise_common_misspellings(p),
-    ),
-    (
-        "drop_periods",
-        lambda p, s: _noise_drop_sentence_periods(p, rng_seed=s),
-    ),
-    (
-        "polite_distractor",
-        lambda p, s: (
-            "(My cat just walked across the keyboard, sorry if anything "
-            "looks weird.)\n\n" + p
-        ),
-    ),
-)
+_NOISE_PERTURBATION_TEMPLATES = NOISE_PERTURBATION_TEMPLATES
 
 
 def _pick_noise_perturbations(
@@ -16999,6 +16873,33 @@ def main():
 
         # Roll API results into the same lists the existing logits-aware
         # downstream code consumes.
+        #
+        # 2026-05-06: OpenRouter/Inceptron sometimes returns valid text but
+        # omits ``logprobs`` for individual prompts. Those entries cannot
+        # contribute to KL, but they should not abort the whole eval after
+        # an hour of API generation. Keep only prompts with sparse teacher
+        # logprobs and align ``prompts`` to the surviving sequence rows.
+        api_logprob_rows = [
+            (idx, data)
+            for idx, data in enumerate(sequences_data)
+            if "sparse_logprobs" in data
+        ]
+        n_missing_api_logprobs = len(sequences_data) - len(api_logprob_rows)
+        if n_missing_api_logprobs:
+            print(
+                f"[eval] API teacher omitted logprobs for "
+                f"{n_missing_api_logprobs}/{len(sequences_data)} prompts; "
+                f"dropping those prompts from KL scoring.",
+                flush=True,
+            )
+        if not api_logprob_rows:
+            raise RuntimeError(
+                "API teacher returned no prompts with sparse_logprobs; "
+                "cannot compute KL for this round"
+            )
+        prompts = [prompts[idx] for idx, _data in api_logprob_rows]
+        sequences_data = [data for _idx, data in api_logprob_rows]
+
         for data in sequences_data:
             full_ids = data["full_ids"].to(device)
             prompt_lens.append(data["prompt_len"])

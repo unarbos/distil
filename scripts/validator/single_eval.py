@@ -32,6 +32,7 @@ import os
 import time
 from typing import Any
 
+from scripts.eval_policy import policy_env
 from scripts.validator.composite import (
     COMPOSITE_SHADOW_VERSION,
     _blended_final_score,
@@ -46,14 +47,14 @@ def is_single_eval_mode() -> bool:
     Read each call rather than at import time so we can unit-test the on/off
     paths via ``monkeypatch.setenv`` without re-importing the module.
     """
-    return os.environ.get("SINGLE_EVAL_MODE", "0") == "1"
+    return policy_env("SINGLE_EVAL_MODE", "0") == "1"
 
 
 # Composite-worst margin a challenger must clear to dethrone the current king
 # in single-eval mode. Mirrors ``EPSILON`` in the legacy KL-paired path so
 # defaults stay symmetric: 3% margin = clearly better, not noise.
 SINGLE_EVAL_DETHRONE_MARGIN = float(
-    os.environ.get("SINGLE_EVAL_DETHRONE_MARGIN", "0.03")
+    policy_env("SINGLE_EVAL_DETHRONE_MARGIN", "0.03")
 )
 
 
@@ -70,7 +71,7 @@ SINGLE_EVAL_DETHRONE_MARGIN = float(
 # Default 10 keeps round target around 60–75 min on H200 with shadow axes
 # off. Override per-deployment with ``SINGLE_EVAL_MAX_PER_ROUND`` env.
 SINGLE_EVAL_MAX_PER_ROUND = int(
-    os.environ.get("SINGLE_EVAL_MAX_PER_ROUND", "10")
+    policy_env("SINGLE_EVAL_MAX_PER_ROUND", "10")
 )
 
 
@@ -82,7 +83,7 @@ SINGLE_EVAL_MAX_PER_ROUND = int(
 # saturated-floor challenger even if the challenger has a much higher
 # weighted score across the other 19 axes.
 SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
-    os.environ.get("SINGLE_EVAL_WORST_FLOOR_EPSILON", "0.005")
+    policy_env("SINGLE_EVAL_WORST_FLOOR_EPSILON", "0.005")
 )
 
 

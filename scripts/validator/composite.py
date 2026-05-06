@@ -80,7 +80,34 @@ import logging
 import os
 from typing import Any
 
+from scripts.eval_policy import policy_env
+
 logger = logging.getLogger(__name__)
+
+
+class _PolicyEnvironProxy:
+    def __init__(self, real_environ):
+        self._real_environ = real_environ
+
+    def get(self, name, default=None):
+        return policy_env(name, default)
+
+    def __getattr__(self, name):
+        return getattr(self._real_environ, name)
+
+
+class _PolicyOSProxy:
+    """Route legacy ``os.environ.get`` policy reads through eval_policy."""
+
+    def __init__(self, real_os):
+        self._real_os = real_os
+        self.environ = _PolicyEnvironProxy(real_os.environ)
+
+    def __getattr__(self, name):
+        return getattr(self._real_os, name)
+
+
+os = _PolicyOSProxy(os)
 
 
 # Five-axis composite (T1.3). On-policy RKL is the primary distillation

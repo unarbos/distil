@@ -9,7 +9,14 @@ from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 
 from config import NETUID
-from state_store import eval_progress, h2h_latest, progress_value, scores, disqualified
+from state_store import (
+    disqualified,
+    eval_progress,
+    h2h_latest,
+    normalize_eval_progress,
+    progress_value,
+    scores,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _REVISION_FILE_CANDIDATES = (
@@ -117,7 +124,7 @@ def health():
             king_kl = score_data[str(king_uid)]
         dq = disqualified()
         n_dq = len(dq)
-        prog = eval_progress()
+        prog = normalize_eval_progress(eval_progress())
         eval_active = prog.get("active", False)
         if eval_active:
             eval_students_done = prog.get("students_done")
@@ -147,6 +154,10 @@ def health():
             "students_total": prog.get("students_total"),
             "students_done": eval_students_done,
             "prompts_total": prog.get("prompts_total"),
+            "phase_detail": prog.get("phase_detail"),
+            "progress_fraction": prog.get("progress_fraction"),
+            "elapsed_s": prog.get("elapsed_s"),
+            "phase_eta_s": prog.get("phase_eta_s"),
             "current_student": progress_value(prog, "current_student", "student_name"),
             "current_prompt": progress_value(prog, "current_prompt", "prompts_done"),
             "current_kl": progress_value(prog, "current_kl", "kl_running_mean"),

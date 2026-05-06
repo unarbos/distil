@@ -2,6 +2,11 @@ import json
 import os
 from pathlib import Path
 
+try:
+    from scripts.eval_policy import policy_env
+except Exception:
+    policy_env = None
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SUBNET_CONFIG_PATH = REPO_ROOT / "frontend" / "src" / "lib" / "subnet-config.json"
 ENV_PATH = REPO_ROOT / ".env"
@@ -66,6 +71,7 @@ _ENV_MAX_NEW_TOKENS = (
     os.environ.get("TEACHER_MAX_NEW_TOKENS")
     or os.environ.get("EVAL_MAX_NEW_TOKENS")
     or os.environ.get("MAX_NEW_TOKENS")
+    or (policy_env("TEACHER_MAX_NEW_TOKENS") if policy_env else None)
 )
 try:
     MAX_NEW_TOKENS = int(_ENV_MAX_NEW_TOKENS) if _ENV_MAX_NEW_TOKENS else int(VALIDATOR["maxNewTokens"])

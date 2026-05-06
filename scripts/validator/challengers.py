@@ -1,8 +1,11 @@
 import logging
+import json
 import os
+import time
 
 from eval.scoring import disqualify
 from eval.state import ValidatorState
+from scripts.eval_policy import policy_env
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 from scripts.validator import single_eval as single_eval_mod
 from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
@@ -13,6 +16,41 @@ from scripts.validator.single_eval import (
 )
 
 logger = logging.getLogger("distillation.remote_validator")
+
+
+def _write_eval_backlog(state: ValidatorState, *, cap: int, pending: dict, kept: dict, deferred: list[int]) -> None:
+    try:
+        state_dir = getattr(state, "state_dir", None)
+        if state_dir is None:
+            return
+        kept_set = {int(uid) for uid in kept.keys()}
+        pending_rows = []
+        for uid, info in sorted(
+            pending.items(),
+            key=lambda kv: (int((kv[1] or {}).get("commit_block") or 0), int(kv[0])),
+        ):
+            pending_rows.append({
+                "uid": int(uid),
+                "model": (info or {}).get("model"),
+                "revision": (info or {}).get("revision"),
+                "commit_block": (info or {}).get("commit_block"),
+                "status": "queued" if int(uid) in kept_set else "deferred",
+            })
+        payload = {
+            "updated_at": time.time(),
+            "round_cap": cap,
+            "pending_total": len(pending),
+            "queued_uids": [int(uid) for uid in kept.keys()],
+            "deferred_uids": [int(uid) for uid in deferred],
+            "pending": pending_rows,
+        }
+        path = state_dir / "eval_backlog.json"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w") as handle:
+            json.dump(payload, handle, indent=2)
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("single-eval: failed to persist eval backlog: %s", exc)
 
 
 # 2026-04-24 (distil-97): once the subnet enters steady-state (all ~65
@@ -31,15 +69,15 @@ logger = logging.getLogger("distillation.remote_validator")
 # king's h2h_kl (so we only spend compute on candidates who could
 # plausibly win). Default 2 = ~16 extra minutes per round with
 # shadow axes off, fits inside the 60-75min target.
-DORMANT_ROTATION_N = int(os.environ.get("DORMANT_ROTATION_N", "2"))
+DORMANT_ROTATION_N = int(policy_env("DORMANT_ROTATION_N", "2"))
 
 # Maintenance rounds should keep the crown under pressure without turning every
 # block into a multi-hour full sweep. The first few H2H contenders are sticky;
 # lower leaderboard slots still enter the candidate pool, but new submissions
 # and high-scoring dormant models can beat them for capped slots.
-MAINTENANCE_CHALLENGER_CAP = int(os.environ.get("MAINTENANCE_CHALLENGER_CAP", "12"))
+MAINTENANCE_CHALLENGER_CAP = int(policy_env("MAINTENANCE_CHALLENGER_CAP", "12"))
 PROTECTED_H2H_CONTENDERS = int(
-    os.environ.get("PROTECTED_H2H_CONTENDERS", str(min(4, max(1, TOP_N_ALWAYS_INCLUDE - 1))))
+    policy_env("PROTECTED_H2H_CONTENDERS", str(min(4, max(1, TOP_N_ALWAYS_INCLUDE - 1))))
 )
 
 
@@ -52,7 +90,7 @@ PROTECTED_H2H_CONTENDERS = int(
 # After this many consecutive precheck failures we drop the entry from the
 # persisted leaderboard. The counter resets the moment precheck passes again,
 # so transient HF blips (see 60317bb) don't evict anyone unfairly.
-LB_PRECHECK_EVICTION_STREAK = int(os.environ.get("LB_PRECHECK_EVICTION_STREAK", "3"))
+LB_PRECHECK_EVICTION_STREAK = int(policy_env("LB_PRECHECK_EVICTION_STREAK", "3"))
 
 
 def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
@@ -143,6 +181,8 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
         # (and operators editing the env at runtime) can override it
         # without restarting the planner.
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
+        pending_before_cap = dict(challengers)
+        deferred: list[int] = []
         if challengers and cap > 0 and len(challengers) > cap:
             ordered = sorted(
                 challengers.items(),
@@ -159,6 +199,13 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 f"to next round: {deferred}"
             )
             challengers = kept
+        _write_eval_backlog(
+            state,
+            cap=cap,
+            pending=pending_before_cap,
+            kept=challengers,
+            deferred=deferred,
+        )
         if challengers:
             n_king = 1 if (king_uid is not None and str(king_uid) in {str(u) for u in challengers}) else 0
             n_others = len(challengers) - n_king

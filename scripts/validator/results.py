@@ -5,6 +5,7 @@ import os
 import time
 from pathlib import Path
 
+from scripts.eval_policy import policy_env
 from eval.private_pool import dp_noise_for
 from eval.scoring import disqualify, is_disqualified, record_failure, reset_failures
 from eval.state import ValidatorState, log_event
@@ -64,8 +65,8 @@ MIN_PROMPTS_FOR_SCORE_UPDATE = 150
 # If the composite isn't populated on enough axes (e.g. chat_probe and
 # think_probe both errored) the gate fails open. The SOTA pressure is in
 # the composite weights/ranking, not a hard per-axis king-quality floor.
-COMPOSITE_DETHRONE_FLOOR = float(os.environ.get("COMPOSITE_DETHRONE_FLOOR", "0.20"))
-COMPOSITE_DETHRONE_MIN_AXES = int(os.environ.get("COMPOSITE_DETHRONE_MIN_AXES", "3"))
+COMPOSITE_DETHRONE_FLOOR = float(policy_env("COMPOSITE_DETHRONE_FLOOR", "0.20"))
+COMPOSITE_DETHRONE_MIN_AXES = int(policy_env("COMPOSITE_DETHRONE_MIN_AXES", "3"))
 
 
 def _log_finetune_probe_telemetry(
@@ -203,8 +204,8 @@ def _baseline_floor_dethrone_veto(
     r_data = students_data.get(reference_model) or {}
     if not c_data or not r_data:
         return None
-    margin = float(os.environ.get("BASELINE_FLOOR_MARGIN", "0.10"))
-    min_comparable = int(os.environ.get("BASELINE_FLOOR_MIN_AXES_COMPARABLE", "2"))
+    margin = float(policy_env("BASELINE_FLOOR_MARGIN", "0.10"))
+    min_comparable = int(policy_env("BASELINE_FLOOR_MIN_AXES_COMPARABLE", "2"))
     if margin <= 0:
         return None
     transfer_axes = (

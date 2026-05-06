@@ -8,12 +8,14 @@ import time
 from eval.pod import PodManager, sanitize_gpu_log
 from eval.state import ValidatorState, log_event
 from eval.runtime import TEACHER_CONFIG_VOCAB_SIZE
+from scripts.eval_policy import as_env as eval_policy_env
+from scripts.eval_policy import policy_env, policy_path
 from scripts.validator.config import MAX_NEW_TOKENS, TEACHER_MODEL, VLLM_CONCURRENCY
 
 # Opt-in teacher tensor-parallel size. 0 = let pod autodetect from torch.cuda.device_count().
-TP_SIZE = int(os.environ.get("DISTIL_TP_SIZE", "0") or "0")
+TP_SIZE = int(policy_env("DISTIL_TP_SIZE", "0") or "0")
 # Same-point early-stop floor; 0 disables (matches legacy behaviour).
-EARLY_STOP_MIN = int(os.environ.get("DISTIL_EARLY_STOP_MIN", "0") or "0")
+EARLY_STOP_MIN = int(policy_env("DISTIL_EARLY_STOP_MIN", "0") or "0")
 
 logger = logging.getLogger("distillation.remote_validator")
 
@@ -25,7 +27,7 @@ def _is_api_teacher_mode() -> bool:
     consistent across ETA computation, vLLM startup gating, and any future
     caller. The pod-side equivalent lives in ``scripts/api_teacher.py``.
     """
-    return os.environ.get("DISTIL_TEACHER_MODE", "").lower() == "api"
+    return (policy_env("DISTIL_TEACHER_MODE", "") or "").lower() == "api"
 
 
 def _pod_exec_silent(pod, cmd: str, *, timeout: int = 30, label: str | None = None) -> None:
@@ -269,7 +271,23 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # a 10-student round. Bake that into the ETA so miners' "stuck"
     # complaints stop spiking on every round restart.
     _api_mode = _is_api_teacher_mode()
-    est_teacher_s = 515 if _api_mode else 180
+    if _api_mode:
+        try:
+            api_concurrency = max(1, int(policy_env("DISTIL_TEACHER_API_CONCURRENCY", "8") or "8"))
+        except (TypeError, ValueError):
+            api_concurrency = 8
+        try:
+            teacher_max_new = int(policy_env("TEACHER_MAX_NEW_TOKENS", str(MAX_NEW_TOKENS)) or MAX_NEW_TOKENS)
+        except (TypeError, ValueError):
+            teacher_max_new = MAX_NEW_TOKENS
+        # API teacher wall time scales with prompt count and provider
+        # concurrency. Use live Kimi-K2.6/OpenRouter telemetry rather
+        # than the old 60-prompt constant so the dashboard does not
+        # advertise a stale ETA on 300-prompt rounds.
+        per_prompt_s = 42.0 if teacher_max_new <= 768 else 52.0
+        est_teacher_s = int((n_prompts * per_prompt_s) / api_concurrency + 420)
+    else:
+        est_teacher_s = 180
     # Mixed-fleet average: weight 70% derailed × 19 min + 30%
     # healthy × 45 min = ~27 min/student post-cap. Use 1700s as the
     # honest mid-point so the dashboard ETA doesn't promise anything
@@ -329,6 +347,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         finally:
             os.unlink(prompts_file)
         pod.upload(eval_script, remote_eval_script, max_attempts=5)
+        active_policy = policy_path()
+        if active_policy and os.path.isfile(active_policy):
+            try:
+                pod.upload(active_policy, f"{run_dir}/eval_policy.json", max_attempts=3)
+            except Exception as exc:
+                logger.warning("Failed to upload eval policy (using env/defaults only): %s", exc)
     # 2026-04-24 — Pareto holistic eval v2 ships two small helper modules
     # alongside pod_eval.py: a vendored IFEval verifier set and a HumanEval
     # subprocess sandbox. They live next to pod_eval.py so the bench
@@ -342,6 +366,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             # neutral name) when DISTIL_TEACHER_MODE=api. Without this the
             # API path falls back to local vLLM with an ImportError noise.
             ("scripts/api_teacher.py", "api_teacher.py"),
+            ("scripts/eval_policy.py", "eval_policy.py"),
+            ("scripts/eval_benchmarks.py", "eval_benchmarks.py"),
+            ("scripts/eval_items.py", "eval_items.py"),
         ]
         for local_aux, remote_name in _aux_modules:
             if os.path.isfile(local_aux):
@@ -588,7 +615,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         # 95.5 GiB free → teacher crash on init. 0.65 * 139.8 = 90.9 GiB
         # fits with ~4.6 GiB headroom. Eval throughput is barely affected
         # since KV cache is <5% in practice.
-        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.65")
+        eval_gpu_util = policy_env("VLLM_EVAL_GPU_UTIL", "0.65")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
@@ -791,7 +818,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # all that's needed. Saves ~30s/round on student model downloads
     # (10 students × ~8GB × 80MB/s = 1000s; with hf_transfer 10 × 8GB ×
     # 500MB/s = 160s). Tunable via DISTIL_HF_TRANSFER=0 to disable.
-    if os.environ.get("DISTIL_HF_TRANSFER", "1") == "1":
+    if policy_env("DISTIL_HF_TRANSFER", "1") == "1":
         eval_env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     # 2026-05-01 (v30.4): enable hf_xet HIGH_PERFORMANCE mode. The
     # Rust-based XET (Content-Addressable Storage) downloader is the
@@ -800,7 +827,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # cores per download but pushes throughput closer to the link
     # ceiling. The eval pod (256GB RAM, 24+ cores) has the slack —
     # tunable via DISTIL_HF_XET_HIPERF=0 to disable.
-    if os.environ.get("DISTIL_HF_XET_HIPERF", "1") == "1":
+    if policy_env("DISTIL_HF_XET_HIPERF", "1") == "1":
         eval_env["HF_XET_HIGH_PERFORMANCE"] = "1"
     # Bump default 10s timeout — fine for tiny config.json fetches
     # but flaky on multi-GB safetensors when the link is saturated
@@ -815,8 +842,11 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # without redeploying code. The full list lives at module scope as
     # ``_POD_EVAL_ENV_ALLOWLIST``; see ``scripts/pod_eval_vllm.py`` for the
     # semantics of each variable.
+    eval_env.update(eval_policy_env())
+    if not is_resuming:
+        eval_env["DISTIL_EVAL_POLICY"] = f"{run_dir}/eval_policy.json"
     for _propagate in _POD_EVAL_ENV_ALLOWLIST:
-        _v = os.environ.get(_propagate)
+        _v = policy_env(_propagate)
         if _v is not None:
             eval_env[_propagate] = _v
     try:

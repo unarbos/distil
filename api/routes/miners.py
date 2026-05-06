@@ -15,6 +15,8 @@ from state_store import (
     disqualified,
     h2h_latest,
     h2h_tested_against_king,
+    current_round,
+    eval_progress,
     last_eval,
     read_state,
     scores as load_scores,
@@ -210,6 +212,23 @@ def get_miner(uid: int):
     failure_models_map = _safe_json_load(os.path.join(STATE_DIR, "failure_models.json"), default={})
     fail_count = int(failures_map.get(uid_str, 0) or 0)
     fail_model = failure_models_map.get(uid_str)
+    composite_scores = read_state("composite_scores.json", {})
+    comp_record = composite_scores.get(uid_str) if isinstance(composite_scores, dict) else None
+    evaluated_uids = set(read_state("evaluated_uids.json", []) or [])
+    prog = eval_progress() or {}
+    rnd = current_round() or {}
+    active_slot = None
+    for idx, entry in enumerate(prog.get("eval_order") or [], start=1):
+        if str(entry.get("uid")) == uid_str:
+            active_slot = dict(entry)
+            active_slot["position"] = idx
+            break
+    backlog = read_state("eval_backlog.json", {})
+    backlog_row = None
+    for row in backlog.get("pending") or []:
+        if isinstance(row, dict) and str(row.get("uid")) == uid_str:
+            backlog_row = row
+            break
     if result.get("disqualified"):
         eval_status["status"] = "disqualified"
         eval_status["reason"] = "Model is disqualified and won't be evaluated"
@@ -223,6 +242,43 @@ def get_miner(uid: int):
             f"({fail_model}). Push a new HuggingFace revision, or commit a new model_repo on-chain, to reset."
         )
         eval_status["failure_count"] = fail_count
+    elif active_slot:
+        current_model = prog.get("current_model")
+        completed = {str(u) for u in (prog.get("completed") or [])}
+        if uid_str in completed:
+            slot_status = "done"
+        elif active_slot.get("model") and active_slot.get("model") == current_model:
+            slot_status = "running"
+        else:
+            slot_status = "queued_active_round"
+        info = (rnd.get("models_to_eval") or {}).get(uid_str) or {}
+        eval_status["status"] = slot_status
+        eval_status["reason"] = (
+            f"In the active eval round at slot {active_slot['position']}"
+            + (f" ({prog.get('phase')})" if prog.get("phase") else "")
+        )
+        eval_status["position"] = active_slot["position"]
+        eval_status["round_block"] = rnd.get("block") or prog.get("block")
+        eval_status["commit_block"] = info.get("commit_block")
+        eval_status["revision"] = info.get("revision")
+    elif backlog_row and backlog_row.get("status") == "deferred":
+        eval_status["status"] = "deferred"
+        eval_status["reason"] = (
+            "Deferred by the single-eval round cap; FIFO order by commit_block "
+            "will put it into a later round."
+        )
+        eval_status["round_cap"] = backlog.get("round_cap")
+        eval_status["commit_block"] = backlog_row.get("commit_block")
+        eval_status["revision"] = backlog_row.get("revision")
+    elif isinstance(comp_record, dict):
+        eval_status["status"] = "scored"
+        eval_status["reason"] = "Already evaluated; composite score is available."
+        eval_status["composite_final"] = comp_record.get("final")
+        eval_status["composite_version"] = comp_record.get("version")
+        eval_status["scored_at"] = comp_record.get("ts")
+    elif uid_str in evaluated_uids:
+        eval_status["status"] = "evaluated_no_composite"
+        eval_status["reason"] = "Marked evaluated, but no composite score is currently available."
     elif not result.get("kl_score"):
         eval_status["status"] = "queued"
         eval_status["reason"] = "Waiting for first evaluation - new submissions get priority"

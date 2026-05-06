@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import sys
 
 from config import DISK_CACHE_DIR, STATE_DIR
@@ -239,6 +240,38 @@ def normalize_eval_progress(progress):
     if normalized.get("students_done") is None:
         completed = normalized.get("completed")
         normalized["students_done"] = len(completed) if isinstance(completed, list) else 0
+    try:
+        now = time.time()
+        started_at = float(normalized.get("started_at") or 0.0)
+        elapsed_s = max(0.0, now - started_at) if started_at > 0 else None
+        if elapsed_s is not None:
+            normalized.setdefault("elapsed_s", round(elapsed_s, 1))
+
+        phase = str(normalized.get("phase") or "")
+        teacher_done = normalized.get("teacher_prompts_done")
+        prompts_total = normalized.get("prompts_total")
+        if isinstance(normalized.get("pod"), dict):
+            pod = normalized["pod"]
+            teacher_done = teacher_done if teacher_done is not None else pod.get("teacher_prompts_done")
+            prompts_total = prompts_total if prompts_total is not None else pod.get("prompts_total")
+
+        if phase in {"api_generating", "teacher_generation", "vllm_generating"} and teacher_done is not None and prompts_total:
+            done = max(0, int(teacher_done or 0))
+            total = max(1, int(prompts_total or 0))
+            normalized.setdefault("phase_detail", f"teacher API generation {done}/{total}")
+            normalized.setdefault("progress_fraction", min(1.0, done / total))
+            if elapsed_s and done > 0:
+                rate = done / elapsed_s
+                remaining_s = max(0.0, (total - done) / rate) if rate > 0 else None
+                normalized.setdefault("teacher_prompts_per_min", round(rate * 60.0, 2))
+                if remaining_s is not None:
+                    normalized.setdefault("phase_eta_s", round(remaining_s, 1))
+        elif normalized.get("students_total"):
+            done = int(normalized.get("students_done") or 0)
+            total = max(1, int(normalized.get("students_total") or 0))
+            normalized.setdefault("progress_fraction", min(1.0, done / total))
+    except Exception:
+        pass
     return normalized
 
 

@@ -77,7 +77,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 DEFAULT_BASE_URL = "https://openrouter.ai/api"
 DEFAULT_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_ENDPOINT = "chat"
-DEFAULT_CONCURRENCY = 8
+DEFAULT_CONCURRENCY = 12
 DEFAULT_TOP_LOGPROBS = 20
 DEFAULT_TIMEOUT_S = 120
 # OpenRouter routes through 14 providers for kimi-k2.6 — but only ONE
@@ -139,10 +139,11 @@ class APIConfig:
         else:
             providers = ()
 
-        # Reasoning toggle. Default ON so API-teacher generations match the
-        # thinking-enabled student bench/chat probes unless explicitly rolled
-        # back by the validator env.
-        dr_env = env("DISTIL_TEACHER_API_DISABLE_REASONING", "0")
+        # Reasoning toggle. Default OFF for the API-teacher KL path. The
+        # provider often omits visible content/logprobs when it spends the
+        # budget in hidden reasoning, which wastes calls and shrinks the KL
+        # prompt set. Chat/probe quality is tested separately in pod_eval.py.
+        dr_env = env("DISTIL_TEACHER_API_DISABLE_REASONING", "1")
         disable_reasoning = overrides.get("disable_reasoning",
                                           dr_env not in ("0", "false", "False", "no", ""))
 
