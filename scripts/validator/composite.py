@@ -150,8 +150,8 @@ AXIS_WEIGHTS = {
         os.environ.get("TAIL_DECOUPLED_KL_WEIGHT", "0.0")
     ),
     "capability":     float(os.environ.get("BENCH_CAPABILITY_WEIGHT", "0.25")),
-    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.10")),
-    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.15")),
+    "length":         float(os.environ.get("BENCH_LENGTH_WEIGHT", "0.12")),
+    "degeneracy":     float(os.environ.get("BENCH_DEGENERACY_WEIGHT", "0.22")),
 }
 
 # v30 — top-K overlap axis gate. Defaults ON; env-flippable for fast
@@ -223,9 +223,9 @@ BENCH_AXIS_WEIGHTS = {
 #   chat_turns_probe 0.08 (unchanged — multi-turn distinct)
 #   shadow axes (kl_is etc.) 0.02 → 0.05 each
 BENCH_GROUP_AXIS_WEIGHTS = {
-    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.20")),
+    "code_skill_group":      float(os.environ.get("CODE_SKILL_GROUP_WEIGHT", "0.24")),
     "math_skill_group":      float(os.environ.get("MATH_SKILL_GROUP_WEIGHT", "0.20")),
-    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.14")),
+    "reasoning_skill_group": float(os.environ.get("REASONING_SKILL_GROUP_WEIGHT", "0.18")),
     "knowledge_skill_group": float(os.environ.get("KNOWLEDGE_SKILL_GROUP_WEIGHT", "0.10")),
     # 2026-05-02 (v30.5): super_teacher axis REMOVED.
     # Rationale: the axis was conceptually wrong for distillation — by
@@ -306,7 +306,7 @@ ARENA_V3_AXIS_WEIGHTS = {
     #     (in BENCH_AXIS_WEIGHTS above, not here)
     "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.0")),  # in math_skill_group
     "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.0")),  # in code_skill_group
-    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.06")),
+    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.12")),
     "self_consistency_bench":   float(os.environ.get("BENCH_SC_WEIGHT", "0.0")),
     "arc_bench":                float(os.environ.get("BENCH_ARC_WEIGHT", "0.0")),
     "truthful_bench":           float(os.environ.get("BENCH_TRUTHFUL_WEIGHT", "0.0")),

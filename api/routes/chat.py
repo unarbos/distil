@@ -28,10 +28,17 @@ down, ``chat-keeper.timer`` (every 3 min) re-establishes it and
 heals vLLM via ``scripts.validator.chat_pod_admin``.
 """
 
+import ast
+import html
 import json
 import os
+import re
+import subprocess
+import tempfile
 import threading
 import time
+import urllib.parse
+import uuid
 
 import httpx
 from fastapi import APIRouter, Request
@@ -42,9 +49,17 @@ from config import (
     CHAT_POD_PORT,
     STATE_DIR,
 )
+from external import get_model_info as fetch_model_info_data
 from helpers.rate_limit import _chat_rate_limiter, _openai_api_rate_limiter
 from helpers.sanitize import _safe_json_load
-from state_store import h2h_latest, read_cache, read_state, uid_hotkey_map
+from state_store import (
+    eval_progress,
+    h2h_latest,
+    read_cache,
+    read_state,
+    top4_leaderboard,
+    uid_hotkey_map,
+)
 
 router = APIRouter()
 
@@ -194,6 +209,680 @@ def _normalize_chat_payload(payload: dict) -> dict:
             {"role": "system", "content": formatting_guide}
         ] + msgs
     return payload
+
+
+# ── Product-grade chat orchestration ─────────────────────────────────────────
+
+_CHAT_ORCHESTRATION_ENABLED = (
+    os.environ.get("DISTIL_CHAT_ORCHESTRATION", "1") != "0"
+)
+_CHAT_QUALITY_FALLBACK_ENABLED = (
+    os.environ.get("DISTIL_CHAT_QUALITY_FALLBACK", "1") != "0"
+)
+
+_SN97_RE = re.compile(
+    r"\b(sn\s?97|sn-97|subnet|king|leaderboard|miner|uid|eval|round|"
+    r"validator|arbos|distil)\b",
+    re.IGNORECASE,
+)
+_CODE_RE = re.compile(
+    r"\b(run|execute|python|script|code|calculate|compute|evaluate|math|"
+    r"fibonacci|fib(?:onacci)?_?sequence)\b",
+    re.IGNORECASE,
+)
+_UID_RE = re.compile(r"\buid\s*[:=#]?\s*(\d{1,3})\b", re.IGNORECASE)
+_MODEL_PATH_RE = re.compile(
+    r'"model_path"\s*:\s*"([^"]+)"|'
+    r"\b([A-Za-z0-9._-]{2,40}/[A-Za-z0-9._-]{2,100})\b"
+)
+_WEB_SEARCH_RE = re.compile(
+    r"\b(search (?:the )?web|web search|look up|google|duckduckgo|latest news|"
+    r"current (?:news|price|weather|release|version))\b",
+    re.IGNORECASE,
+)
+_FIB_INDEX_RE = re.compile(
+    r"(?:(\d+)\s*\^\s*(\d+)(?:st|nd|rd|th)?|\b(\d{1,8})(?:st|nd|rd|th)?)"
+    r".{0,40}\b(?:fib(?:onacci)?|fibonacci)\b",
+    re.IGNORECASE,
+)
+_DERAIL_MARKERS = (
+    "Use the tool ",
+    "get_model_info",
+    "get_subnet_overview",
+    "get_leaderboard",
+    "knowledge base",
+    "Update knowledge base",
+    "outlook steady",
+    "Outlook steady",
+    "steady demand for clear",
+    "Persistent File System",
+    "Pyodide",
+)
+
+
+def _latest_user_text(messages: list[dict]) -> str:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content") or ""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        parts.append(str(part.get("text") or ""))
+                return "\n".join(parts)
+    return ""
+
+
+def _clean_client_messages(messages: list[dict], *, system: str, max_history: int = 8) -> list[dict]:
+    """Keep recent user/assistant text only; never forward tool specs/messages.
+
+    Open-WebUI native function calling sends ``tools`` outside the messages,
+    but failed turns can leave tool-like prose in assistant history. The weak
+    king tends to imitate that, so the proxy feeds vLLM a clean chat transcript
+    and handles tools itself.
+    """
+    cleaned = [{"role": "system", "content": system}]
+    for msg in (messages or [])[-max_history:]:
+        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if any(marker in content for marker in _DERAIL_MARKERS):
+            continue
+        cleaned.append({"role": msg["role"], "content": content[:4000]})
+    return cleaned
+
+
+def _detect_repeated_line_run(text: str) -> bool:
+    lines = [ln.strip().lower() for ln in (text or "").splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return False
+    seen = {}
+    for line in lines:
+        if len(line) < 18:
+            continue
+        seen[line] = seen.get(line, 0) + 1
+        if seen[line] >= 3:
+            return True
+    return False
+
+
+def _detect_repeated_short_tokens(text: str) -> bool:
+    tokens = re.findall(r"[A-Za-z]{3,24}", text.lower())
+    if len(tokens) < 24:
+        return False
+    for n in (1, 2, 3):
+        grams = {}
+        for i in range(0, len(tokens) - n + 1):
+            gram = tuple(tokens[i:i + n])
+            grams[gram] = grams.get(gram, 0) + 1
+            if grams[gram] >= 8:
+                return True
+    return False
+
+
+def _answer_looks_bad(text: str) -> bool:
+    if not text or len(text.strip()) < 8:
+        return True
+    if sum(1 for c in text if ord(c) > 127) / max(1, len(text)) > 0.03:
+        return True
+    if "</return>" in text or "```text\nsteady" in text.lower():
+        return True
+    if any(marker.lower() in text.lower() for marker in _DERAIL_MARKERS):
+        return True
+    if _detect_repeated_substring(text, win=60, step=20) >= 2:
+        return True
+    if _detect_repeated_line_run(text):
+        return True
+    if _detect_repeated_short_tokens(text):
+        return True
+    # The current weak kings often drift into all-caps first-person snippets.
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    if len(words) >= 20:
+        upper = sum(1 for w in words if w.isupper())
+        if upper / max(1, len(words)) > 0.35:
+            return True
+    return False
+
+
+def _trim_derail(text: str, *, max_chars: int = 2400) -> str:
+    text = (text or "").strip()
+    for marker in _DERAIL_MARKERS:
+        idx = text.lower().find(marker.lower())
+        if idx > 80:
+            text = text[:idx].rstrip()
+    # Drop repeated lines while preserving the first occurrence.
+    out = []
+    seen = set()
+    for line in text.splitlines():
+        key = line.strip().lower()
+        if len(key) > 20 and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        out.append(line.rstrip())
+    text = "\n".join(out).strip()
+    if len(text) > max_chars:
+        cut = text[:max_chars]
+        stop = max(cut.rfind("\n"), cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+        text = (cut[: stop + 1] if stop > 400 else cut).rstrip()
+    return text
+
+
+def _live_sn97_context(user_text: str, king_uid: int | None, king_model: str | None) -> tuple[str, str | None]:
+    """Return (thinking, deterministic answer if obvious)."""
+    top4 = top4_leaderboard() or {}
+    progress = eval_progress() or {}
+    h2h = h2h_latest() or {}
+    king = dict(top4.get("king") or {})
+    if king_uid is not None:
+        king.setdefault("uid", king_uid)
+    if king_model:
+        king.setdefault("model", king_model)
+    contenders = [dict(c) for c in (top4.get("contenders") or [])[:4]]
+    eval_active = bool(progress.get("active") or progress.get("phase") not in (None, "", "idle"))
+
+    thought_lines = [
+        "I checked the live SN97 state before answering.",
+        f"Current king: UID {king.get('uid', king_uid)}, model {king.get('model') or king_model or 'unknown'}.",
+    ]
+    if progress:
+        stage = progress.get("phase") or progress.get("stage") or progress.get("status")
+        thought_lines.append(f"Eval status: active={eval_active}, stage={stage or 'unknown'}.")
+
+    lower = user_text.lower()
+    answer = None
+    if "leaderboard" in lower or "top" in lower:
+        rows = [king] + contenders
+        lines = ["Current SN97 leaderboard:"]
+        for i, row in enumerate(rows[:5], start=1):
+            comp = row.get("composite") or {}
+            score = comp.get("final") or row.get("score") or row.get("h2h_kl")
+            score_txt = f", score {score:.4f}" if isinstance(score, (int, float)) else ""
+            label = "king" if i == 1 else "contender"
+            lines.append(
+                f"{i}. UID {row.get('uid')} ({label}): {row.get('model') or 'unknown'}{score_txt}"
+            )
+        answer = "\n".join(lines)
+    elif "king" in lower or "who" in lower:
+        answer = (
+            f"The current SN97 king is UID {king.get('uid', king_uid)}"
+            f" running `{king.get('model') or king_model or 'unknown'}`."
+        )
+    elif "eval" in lower or "round" in lower or "status" in lower:
+        stage = progress.get("phase") or progress.get("stage") or progress.get("status") or "unknown"
+        done = progress.get("students_done")
+        total = progress.get("students_total")
+        block = progress.get("completed_block") or h2h.get("block")
+        bits = [f"Eval active: {eval_active}", f"stage: {stage}"]
+        if done is not None and total is not None:
+            bits.append(f"students: {done}/{total}")
+        if block is not None:
+            bits.append(f"block: {block}")
+        answer = "Current SN97 eval status: " + ", ".join(bits) + "."
+    else:
+        m = _UID_RE.search(user_text)
+        if m:
+            uid = int(m.group(1))
+            commitments_data = read_cache("commitments", {}) or {}
+            commitments = commitments_data.get("commitments", commitments_data)
+            hotkey = uid_hotkey_map().get(str(uid))
+            model = None
+            if hotkey and isinstance(commitments, dict):
+                c = commitments.get(hotkey) or {}
+                if isinstance(c, dict):
+                    model = c.get("model") or c.get("repo")
+            answer = (
+                f"UID {uid} is registered as `{model or 'unknown model'}`. "
+                "For the full score/history view, use the dashboard miner page."
+            )
+
+    return "\n".join(thought_lines), answer
+
+
+def _model_info_answer(user_text: str) -> tuple[str, str] | None:
+    if "get_model_info" not in user_text and "model_path" not in user_text:
+        return None
+    m = _MODEL_PATH_RE.search(user_text)
+    if not m:
+        return (
+            "I recognized a model-info request but did not find a valid HuggingFace repo path.",
+            "I need a HuggingFace repo path like `owner/repo` to look up model info.",
+        )
+    model_path = (m.group(1) or m.group(2) or "").strip()
+    info = fetch_model_info_data(model_path)
+    thought = f"I executed the model-info lookup for `{model_path}` via the Distil API helper."
+    if not isinstance(info, dict) or info.get("error"):
+        return thought, f"I could not fetch reliable model info for `{model_path}`: {info.get('error') if isinstance(info, dict) else 'unknown error'}"
+    fields = []
+    for key in ("params_b", "is_moe", "num_experts", "num_active_experts", "pipeline_tag", "license", "downloads", "likes"):
+        if info.get(key) is not None:
+            fields.append(f"- `{key}`: {info.get(key)}")
+    if not fields:
+        fields.append("- No detailed metadata was available in the cache/provider response.")
+    return thought, f"Model info for `{model_path}`:\n" + "\n".join(fields)
+
+
+def _format_tool_context_for_display(tool_context: list[str], *, max_chars: int = 5000) -> str:
+    if not tool_context:
+        return ""
+    text = "\n\n".join(tool_context).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n... [tool output truncated]"
+    return (
+        "Runtime tool output (not model text):\n\n"
+        "```text\n"
+        f"{text}\n"
+        "```\n\n"
+    )
+
+
+def _strip_html_tags(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def _web_search_tool(query: str, *, limit: int = 5) -> str:
+    q = query.strip()
+    q = re.sub(r"^\s*(search (?:the )?web for|web search for|look up|google)\s+", "", q, flags=re.I)
+    if not q:
+        return "No search query detected."
+    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": q})
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DistilSN97Chat/1.0)"}
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=4.0),
+            headers=headers,
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            body = resp.text
+    except Exception as exc:
+        return f"Web search failed: {type(exc).__name__}: {str(exc)[:200]}"
+
+    results = []
+    for m in re.finditer(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        body,
+        flags=re.I | re.S,
+    ):
+        href = html.unescape(m.group(1))
+        title = _strip_html_tags(m.group(2))
+        if href.startswith("//duckduckgo.com/l/?uddg="):
+            parsed = urllib.parse.urlparse("https:" + href)
+            href = urllib.parse.parse_qs(parsed.query).get("uddg", [href])[0]
+        if title:
+            results.append((title, href))
+        if len(results) >= limit:
+            break
+    if not results:
+        return f"No web results parsed for query: {q}"
+    lines = [f"query = {q}"]
+    for i, (title, href) in enumerate(results, 1):
+        lines.append(f"{i}. {title}\n   {href}")
+    return "\n".join(lines)
+
+
+def _extract_python_code(user_text: str) -> tuple[str | None, str]:
+    fenced = re.search(r"```(?:python|py)?\s*(.*?)```", user_text, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip(), "python code block"
+
+    inline = re.search(r"`([^`]{3,400})`", user_text)
+    if inline and any(ch in inline.group(1) for ch in "+-*/()%"):
+        expr = inline.group(1).strip()
+        return f"print({expr})", "inline arithmetic expression"
+
+    # Conservative expression extraction for requests like
+    # "calculate ((88+43)**(2-2))//9".
+    expr_match = re.search(
+        r"(?:calculate|compute|evaluate|what is|math)\s+([0-9\s+\-*/%().,_<>=!&|^~]+)",
+        user_text,
+        re.IGNORECASE,
+    )
+    if expr_match:
+        expr = expr_match.group(1).strip(" .?\n\t")
+        if expr:
+            return f"print({expr})", "arithmetic expression"
+    return None, ""
+
+
+def _python_code_is_reasonable(code: str) -> bool:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    banned = {"socket", "subprocess", "shutil", "pathlib", "requests", "httpx", "urllib"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                root = (alias.name or "").split(".", 1)[0]
+                if root in banned:
+                    return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in {"open", "exec", "eval", "compile", "__import__"}:
+                return False
+    return True
+
+
+def _run_python_code(code: str) -> tuple[str, str | None]:
+    if not _python_code_is_reasonable(code):
+        return "", "I refused to run that code because it uses unsafe imports or dynamic execution."
+    wrapper = (
+        "import math, statistics, fractions, decimal, itertools, functools, collections\n"
+        + code.strip()
+        + "\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="distil_chat_py_") as td:
+        path = os.path.join(td, "snippet.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(wrapper)
+        try:
+            proc = subprocess.run(
+                ["python3", "-I", path],
+                cwd=td,
+                text=True,
+                capture_output=True,
+                timeout=4,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "", "Python execution timed out after 4 seconds."
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return out, f"Python exited with code {proc.returncode}: {err[-800:]}"
+    return out[:4000], None
+
+
+def _extract_fibonacci_tool(user_text: str) -> tuple[str | None, str]:
+    if "fib" not in user_text.lower():
+        return None, ""
+    m = _FIB_INDEX_RE.search(user_text)
+    if not m:
+        return None, ""
+    if m.group(1) and m.group(2):
+        n = int(m.group(1)) ** int(m.group(2))
+        desc = f"Fibonacci index {m.group(1)}^{m.group(2)} = {n}"
+    else:
+        n = int(m.group(3))
+        desc = f"Fibonacci index {n}"
+    if n < 0 or n > 1_000_000:
+        return None, f"Requested Fibonacci index {n} is outside the runtime limit (0..1,000,000)."
+    code = f"""
+import sys
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+
+def fib_pair(n):
+    if n == 0:
+        return (0, 1)
+    a, b = fib_pair(n // 2)
+    c = a * (2 * b - a)
+    d = a * a + b * b
+    if n % 2:
+        return (d, c + d)
+    return (c, d)
+
+n = {n}
+value = fib_pair(n)[0]
+s = str(value)
+print("index =", n)
+print("digits =", len(s))
+if len(s) <= 1000:
+    print("value =", s)
+else:
+    print("value_head_80 =", s[:80])
+    print("value_tail_80 =", s[-80:])
+"""
+    return code.strip(), desc
+
+
+async def _call_quality_fallback(messages: list[dict], *, max_tokens: int = 700) -> str | None:
+    if not _CHAT_QUALITY_FALLBACK_ENABLED:
+        return None
+    key = (
+        os.environ.get("CHAT_FALLBACK_API_KEY")
+        or os.environ.get("DISTIL_TEACHER_API_KEY")
+        or os.environ.get("OPENROUTER_API_KEY")
+    )
+    if not key:
+        return None
+    base = (
+        os.environ.get("CHAT_FALLBACK_API_BASE")
+        or os.environ.get("DISTIL_TEACHER_API_BASE")
+        or "https://openrouter.ai/api"
+    ).rstrip("/")
+    model = (
+        os.environ.get("CHAT_FALLBACK_API_MODEL")
+        or os.environ.get("DISTIL_TEACHER_API_MODEL")
+        or "moonshotai/kimi-k2.6"
+    )
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.25,
+        "top_p": 0.9,
+    }
+    if "openrouter" in base:
+        providers = tuple(
+            p.strip()
+            for p in os.environ.get("DISTIL_TEACHER_API_PROVIDERS", "").split(",")
+            if p.strip()
+        )
+        if providers:
+            payload["provider"] = {"only": list(providers)}
+        payload["reasoning"] = {"enabled": False}
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
+            resp = await client.post(f"{base}/v1/chat/completions", json=payload, headers=headers)
+            if resp.status_code >= 400:
+                return None
+            data = resp.json()
+            msg = (data.get("choices") or [{}])[0].get("message") or {}
+            return msg.get("content") or None
+    except Exception:
+        return None
+
+
+async def _orchestrated_chat_completion(body: dict, king_uid: int | None, king_model: str | None) -> dict:
+    """Transparent tool runtime around fast vLLM.
+
+    This function may execute tools and add their outputs to the model context,
+    but it must not quality-filter, rewrite, or replace the model's final text.
+    chat.arbos.life is intentionally a window into the current king's behavior;
+    if the king derails after seeing useful tool results, that failure should
+    remain visible.
+    """
+    messages = list(body.get("messages") or [])
+    user_text = _latest_user_text(messages)
+    runtime_trace = ["Runtime trace, not hidden model reasoning: inspected the latest user request."]
+    tool_context: list[str] = []
+
+    model_info = _model_info_answer(user_text or "")
+    if model_info:
+        t, answer = model_info
+        runtime_trace.append(t)
+        tool_context.append(f"MODEL_INFO_RESULT:\n{answer}")
+
+    if _WEB_SEARCH_RE.search(user_text or ""):
+        result = await _web_search_tool(user_text or "")
+        runtime_trace.append("Executed a DuckDuckGo web search from the chat runtime.")
+        tool_context.append(f"WEB_SEARCH_RESULT:\n{result}")
+
+    # Tool execution: SN97 live state.
+    if _SN97_RE.search(user_text or ""):
+        t, answer = _live_sn97_context(user_text, king_uid, king_model)
+        runtime_trace.append(t)
+        if answer:
+            tool_context.append(f"SN97_LIVE_RESULT:\n{answer}")
+
+    fib_code, fib_desc = _extract_fibonacci_tool(user_text or "")
+    if fib_desc and not fib_code:
+        runtime_trace.append(f"Fibonacci runtime rejected the request: {fib_desc}")
+        tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{fib_desc}")
+    elif fib_code:
+        out, err = _run_python_code(fib_code)
+        runtime_trace.append(f"Executed Python for {fib_desc}.")
+        if err:
+            result = f"Python failed:\n{err}"
+            if out:
+                result += f"\nPartial stdout:\n{out}"
+        else:
+            result = f"Python stdout:\n{out or '(no stdout)'}"
+        tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{result}")
+
+    # Tool execution: Python code / arithmetic.
+    code, code_kind = _extract_python_code(user_text or "")
+    if code and _CODE_RE.search(user_text or "") and not fib_code:
+        out, err = _run_python_code(code)
+        runtime_trace.append(f"Executed a {code_kind} in a short-lived Python sandbox.")
+        if err:
+            result = f"Python failed:\n{err}"
+            if out:
+                result += f"\nPartial stdout:\n{out}"
+        else:
+            result = f"Python stdout:\n{out or '(no stdout)'}"
+        tool_context.append(f"PYTHON_EXECUTION_RESULT:\n{result}")
+    elif _CODE_RE.search(user_text or "") and "python" in (user_text or "").lower():
+        runtime_trace.append("The user asked for Python execution but no runnable code/expression was detected.")
+        tool_context.append(
+            "PYTHON_EXECUTION_RESULT:\nNo runnable Python code or arithmetic expression was detected."
+        )
+
+    system = (
+        "You are SN97 chat. Answer the user directly. If tool results are "
+        "provided, use them as authoritative context and do not invent another "
+        "tool name. Do not claim you used a tool unless a tool result is "
+        "present in the context."
+    )
+    clean_messages = _clean_client_messages(messages, system=system)
+    if tool_context:
+        clean_messages.insert(
+            1,
+            {
+                "role": "system",
+                "content": (
+                    "Tool results from the chat runtime:\n\n"
+                    + "\n\n".join(tool_context)
+                    + "\n\nUse these results when relevant. The final answer should still be your own model output."
+                ),
+            },
+        )
+    vllm_body = {
+        "model": CHAT_POD_SERVED_MODEL,
+        "messages": clean_messages,
+        "stream": False,
+        "max_tokens": body.get("max_tokens") or 700,
+        "temperature": body.get("temperature", 0.6),
+        "top_p": body.get("top_p", 0.9),
+        "frequency_penalty": body.get("frequency_penalty", 0.0),
+        "presence_penalty": body.get("presence_penalty", 0.0),
+        "repetition_penalty": body.get("repetition_penalty", 1.0),
+        "chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+    }
+    try:
+        raw = await _local_chat_post(vllm_body, timeout=120.0)
+        msg = (raw.get("choices") or [{}])[0].get("message") or {}
+        content = msg.get("content") or ""
+        model_reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+        usage = raw.get("usage")
+    except _ChatPodUnavailable as exc:
+        content = f"chat server unavailable: {str(exc)[:200]}"
+        model_reasoning = ""
+        usage = None
+    runtime_trace.append("Forwarded the final prompt to the fast local vLLM king and returned its raw answer.")
+    if tool_context:
+        content = (
+            _format_tool_context_for_display(tool_context)
+            + "Raw model answer:\n\n"
+            + (content or "(empty)")
+        )
+    reasoning_parts = []
+    if model_reasoning:
+        reasoning_parts.append(model_reasoning)
+    if tool_context:
+        reasoning_parts.append("Tool outputs supplied to the model:\n" + _format_tool_context_for_display(tool_context))
+    reasoning_parts.append("\n".join(runtime_trace))
+    reasoning = "\n\n".join(reasoning_parts)
+    now = int(time.time())
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+    usage = usage or {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+    return {
+        "id": response_id,
+        "object": "chat.completion",
+        "created": now,
+        "model": king_model or CHAT_POD_SERVED_MODEL,
+        "king_uid": king_uid,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning": reasoning,
+                    "reasoning_content": reasoning,
+                    "tool_calls": [],
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": usage,
+    }
+
+
+def _stream_openai_response(data: dict):
+    async def generate():
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        base = {
+            "id": data.get("id"),
+            "object": "chat.completion.chunk",
+            "created": data.get("created"),
+            "model": data.get("model"),
+        }
+        reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+        if reasoning:
+            yield "data: " + json.dumps({
+                **base,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning": reasoning,
+                        "reasoning_content": reasoning,
+                    },
+                    "finish_reason": None,
+                }],
+            }) + "\n\n"
+        content = msg.get("content") or ""
+        # Coarse chunks keep the implementation simple while preserving
+        # streaming semantics for Open-WebUI.
+        for i in range(0, len(content), 240):
+            yield "data: " + json.dumps({
+                **base,
+                "choices": [{"index": 0, "delta": {"content": content[i:i + 240]}, "finish_reason": None}],
+            }) + "\n\n"
+        yield "data: " + json.dumps({
+            **base,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }) + "\n\n"
+        yield "data: [DONE]\n\n"
+    return _sse_response(generate())
 
 
 # ── Local chat helpers ───────────────────────────────────────────────────────
@@ -346,6 +1035,18 @@ def _extract_message_content(message: dict) -> tuple[str, str | None]:
 
 async def _sync_chat(payload, king_uid, king_model):
     payload["stream"] = False
+    if _CHAT_ORCHESTRATION_ENABLED:
+        data = await _orchestrated_chat_completion(payload, king_uid, king_model)
+        message = data["choices"][0]["message"]
+        resp = {
+            "response": message.get("content") or "",
+            "model": king_model,
+            "king_uid": king_uid,
+            "thinking": message.get("reasoning") or "",
+            "usage": data.get("usage"),
+        }
+        _log_chat_turn(payload, resp["response"], king_uid, king_model, data)
+        return resp
     try:
         data = await _local_chat_post(payload, timeout=90.0)
     except _ChatPodUnavailable as e:
@@ -380,6 +1081,16 @@ async def _sync_chat(payload, king_uid, king_model):
 
 def _stream_chat(payload, king_uid, king_model):
     payload["stream"] = True
+    if _CHAT_ORCHESTRATION_ENABLED:
+        async def generate_orchestrated():
+            data = await _orchestrated_chat_completion(payload, king_uid, king_model)
+            message = data["choices"][0]["message"]
+            if message.get("reasoning"):
+                yield f"data: {json.dumps({'thinking': message.get('reasoning')})}\n\n"
+            yield f"data: {json.dumps({'response': message.get('content') or '', 'king_uid': king_uid, 'king_model': king_model})}\n\n"
+            yield "data: [DONE]\n\n"
+            _log_chat_turn(payload, message.get("content") or "", king_uid, king_model, data)
+        return _sse_response(generate_orchestrated())
     norm = _normalize_chat_payload(payload)
 
     async def generate():
@@ -713,14 +1424,22 @@ def openai_models():
     """OpenAI-compatible models list. Returns the current king model."""
     king_uid, king_model = _get_king_info()
     model_id = king_model or "distil-king"
-    return {
-        "object": "list",
-        "data": [{
+    models = [{
+        "id": CHAT_POD_SERVED_MODEL,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": f"distil-sn97-uid{king_uid}" if king_uid else "distil-sn97",
+    }]
+    if model_id != CHAT_POD_SERVED_MODEL:
+        models.append({
             "id": model_id,
             "object": "model",
             "created": int(time.time()),
             "owned_by": f"distil-sn97-uid{king_uid}" if king_uid else "distil-sn97",
-        }],
+        })
+    return {
+        "object": "list",
+        "data": models,
     }
 
 
@@ -752,6 +1471,12 @@ async def openai_chat_completions(request: Request):
         return JSONResponse(status_code=503, content={"error": {"message": "no king model available"}})
 
     stream = body.get("stream", False)
+    if _CHAT_ORCHESTRATION_ENABLED:
+        data = await _orchestrated_chat_completion(body, king_uid, king_model)
+        if stream:
+            return _stream_openai_response(data)
+        return JSONResponse(content=data)
+
     if stream:
         norm = _normalize_chat_payload(body)
 

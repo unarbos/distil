@@ -2934,8 +2934,8 @@ CHAT_TURNS_PROBE_POOL = (
         "Boil your phrasing down to a single one-sentence message I can use as the opening line.",
     ),
 )
-CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "6"))
-CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "200"))
+CHAT_TURNS_PROBE_PER_ROUND = int(os.environ.get("CHAT_TURNS_PROBE_PER_ROUND", "10"))
+CHAT_TURNS_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_TURNS_PROBE_MAX_TOKENS", "260"))
 # v29.6 (2026-04-29): N-turn chain length for procedural synthesis.
 # Default 3 matches the historical legacy pool.
 CHAT_TURNS_PROBE_TURNS_PER_PROMPT = int(
@@ -4720,8 +4720,8 @@ BENCH_BATTERY_SHADOW_AXES = (
 #                                  math_bench at no extra wall-time).
 #   * ifeval_bench:    10 →  8 (instruction-following, weight 0.05 → 0.07).
 BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "12"))
-BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "8"))
-BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "10"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "12"))
+BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "14"))
 BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "0"))
 BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 
@@ -4734,7 +4734,7 @@ BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
 #                                       no marginal signal).
 BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "8"))
 BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "8"))
-BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "6"))
+BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "12"))
 BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "0"))
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
@@ -7200,7 +7200,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                     )
                     text1, tok1 = _bench_generate(
                         model, tokenizer, pass1_prompt,
-                        BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=False,
+                        BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=BENCH_ENABLE_THINKING,
                     )
                     tok_total = int(tok1)
                     m = _TOOL_CALL_RE.search(text1)
@@ -7227,7 +7227,7 @@ def tool_use_bench_probe(model, tokenizer, device="cuda"):
                         )
                         text2, tok2 = _bench_generate(
                             model, tokenizer, pass2_prompt,
-                            BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=False,
+                            BENCH_TOOL_USE_MAX_TOKENS, device, enable_thinking=BENCH_ENABLE_THINKING,
                         )
                         tok_total += int(tok2)
                         combined_text = (

@@ -61,10 +61,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_DIR = REPO_ROOT / "scripts" / "chat_pod" / "openwebui_tools"
+FILTERS_DIR = REPO_ROOT / "scripts" / "chat_pod" / "openwebui_filters"
 DB_PATH = Path(os.environ.get("WEBUI_DB", "/opt/distil/chat/webui-data/webui.db"))
 CONTAINER = os.environ.get("WEBUI_CONTAINER", "open-webui")
 MODEL_ID = "sn97-king"
 TOOL_ID = "sn97_status"
+# Filter id used in the ``function`` table; matches the module file name.
+FILTER_ID = "sn97_grounding"
 
 ADMIN_EMAIL = "admin@localhost"
 NOW = int(time.time())
@@ -95,11 +98,10 @@ NOW_ISO = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:
 #    that injection. The current king is too weak to use the code
 #    interpreter productively anyway — re-enable per-king when we get
 #    a stronger king.
-SYSTEM_PROMPT_MARKER = "<!--sn97-system-v7-minimal-->"
+SYSTEM_PROMPT_MARKER = "<!--sn97-system-v8-api-orchestrated-->"
 SYSTEM_PROMPT = (
     f"{SYSTEM_PROMPT_MARKER}\n"
-    "You are the SN97 (Distil) chat assistant. Be concise, accurate, "
-    "and helpful. Use tools when available."
+    "You are the SN97 (Distil) chat assistant. Be concise, accurate, and helpful."
 )
 
 
@@ -289,10 +291,12 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
     # if it doesn't (answer is at least visible).
     params["chat_template_kwargs"] = {"thinking": True}
 
-    # 3d. Attach the SN97 status toolkit (always-on) + keep any existing.
-    tool_ids = list(meta.get("toolIds") or [])
-    if TOOL_ID not in tool_ids:
-        tool_ids.insert(0, TOOL_ID)
+    # 3d. Do NOT attach Open-WebUI tools to the model row. The current
+    # distilled kings imitate tool specs instead of emitting valid native
+    # calls ("Use the tool get_model_info..." in plain content). The Distil
+    # API proxy at /v1/chat/completions owns SN97 tools and Python execution
+    # deterministically, then feeds grounded context into vLLM/sglang.
+    tool_ids: list[str] = []
     meta["toolIds"] = tool_ids
 
     # 3e. Capabilities + builtinTools.
@@ -319,12 +323,12 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
             "file_context": True,
             "vision": False,
             "file_upload": True,
-            "web_search": True,
+            "web_search": False,
             "image_generation": False,
             "code_interpreter": False,
             "citations": True,
             "status_updates": True,
-            "builtin_tools": True,
+            "builtin_tools": False,
         }
     )
     meta["capabilities"] = caps
@@ -338,7 +342,7 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
             "notes": False,
             "knowledge": False,
             "channels": False,
-            "web_search": True,
+            "web_search": False,
             "image_generation": False,
             "code_interpreter": False,
         }
@@ -347,7 +351,7 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
 
     info(
         f"updating sn97-king: function_calling=native, toolIds={tool_ids}, "
-        f"max_tokens={params['max_tokens']}, web_search=on, code_interpreter=off"
+        f"max_tokens={params['max_tokens']}, web_search=off, code_interpreter=off"
     )
     if dry:
         return
@@ -355,6 +359,74 @@ def _update_model(conn: sqlite3.Connection, *, dry: bool) -> None:
         "UPDATE model SET meta=?, params=?, updated_at=? WHERE id=?",
         (json.dumps(meta), json.dumps(params), NOW, MODEL_ID),
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 3.5: install the SN97 grounding filter (Open-WebUI ``function`` row)
+#
+# This filter is now installed but DISABLED. We initially used an OWUI
+# global filter to ground SN97 answers, but that hid how bad the current
+# king was in some chats. chat.arbos.life should be transparent: tool/code
+# execution lives in the Distil API proxy, while the final text remains the
+# model's raw vLLM output.
+# ---------------------------------------------------------------------------
+def _upsert_filter(conn: sqlite3.Connection, *, user_id: str, content: str, dry: bool) -> None:
+    meta = {
+        "description": (
+            "Live SN97 grounding for chat. Detects subnet-related questions, "
+            "fetches authoritative data from distil-api, and injects it as a "
+            "system message so the king answers from facts instead of "
+            "hallucinating UIDs/scores. Also writes a synthetic Thinking "
+            "trace so the UI shows what was looked up."
+        ),
+        "manifest": {
+            "title": "SN97 Subnet Grounding",
+            "author": "distil",
+            "author_url": "https://arbos.life",
+            "version": "1.1.0",
+        },
+    }
+    existing = conn.execute("SELECT id FROM function WHERE id=?", (FILTER_ID,)).fetchone()
+    if existing:
+        info(f"updating existing filter '{FILTER_ID}' (DISABLED: is_global=0, is_active=0)")
+        if dry:
+            return
+        conn.execute(
+            "UPDATE function SET name=?, type=?, content=?, meta=?, "
+            "updated_at=?, is_active=?, is_global=? WHERE id=?",
+            (
+                "SN97 Subnet Grounding",
+                "filter",
+                content,
+                json.dumps(meta),
+                NOW,
+                0,
+                0,
+                FILTER_ID,
+            ),
+        )
+    else:
+        info(f"inserting new filter '{FILTER_ID}'")
+        if dry:
+            return
+        conn.execute(
+            "INSERT INTO function(id, user_id, name, type, content, meta, "
+            "created_at, updated_at, valves, is_active, is_global) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                FILTER_ID,
+                user_id,
+                "SN97 Subnet Grounding",
+                "filter",
+                content,
+                json.dumps(meta),
+                NOW,
+                NOW,
+                None,
+                0,
+                0,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +457,17 @@ def _patch_global_config(conn: sqlite3.Connection, *, dry: bool) -> None:
     )
     web["loader"] = web.get("loader") or {"engine": "safe_web"}
 
+    # 4a.1 Route Open-WebUI through the Distil API proxy, not directly to
+    # raw vLLM. The proxy still uses the fast local vLLM/sglang server for
+    # generation, but it owns deterministic thinking/tool/code orchestration
+    # and strips tool specs before weak kings can imitate them.
+    openai = cfg.setdefault("openai", {})
+    openai["enable"] = True
+    openai["api_base_urls"] = ["http://127.0.0.1:3710/v1"]
+    openai["api_keys"] = ["EMPTY"]
+    api_configs = openai.setdefault("api_configs", {})
+    api_configs["0"] = {"enable": True}
+
     # 4b. Code interpreter — globally disabled (see step 3e for why; the
     # OWUI middleware keeps injecting Pyodide context even when the
     # per-model row turns it off, because some code paths only check the
@@ -401,7 +484,7 @@ def _patch_global_config(conn: sqlite3.Connection, *, dry: bool) -> None:
     # injecting any prompt text).
     features = cfg.setdefault("features", {})
     features["enable_code_interpreter"] = False
-    features["enable_web_search"] = True
+    features["enable_web_search"] = False
 
     # 4d. Kill the "Arena Model" experiment. Open-WebUI's PersistentConfig
     # routes ENABLE_EVALUATION_ARENA_MODELS to ``evaluation.arena.enable``
@@ -431,7 +514,7 @@ def _patch_global_config(conn: sqlite3.Connection, *, dry: bool) -> None:
     ci["engine"] = "pyodide"
 
     info(
-        "global config: web_search=duckduckgo (html), code_interpreter=OFF, "
+        "global config: OpenAI base=http://127.0.0.1:3710/v1, web_search=OFF, code_interpreter=OFF, "
         f"arena.enable=False, default_models={ui['default_models']}, "
         "image_generation left disabled"
     )
@@ -453,10 +536,18 @@ def main() -> None:
         fail(f"webui DB not found at {DB_PATH}")
     if not TOOLS_DIR.is_dir():
         fail(f"tools dir not found at {TOOLS_DIR}")
+    if not FILTERS_DIR.is_dir():
+        fail(f"filters dir not found at {FILTERS_DIR}")
 
     tool_src_path = TOOLS_DIR / "sn97_status.py"
     info(f"reading tool source from {tool_src_path}")
     tool_content = tool_src_path.read_text(encoding="utf-8")
+
+    filter_src_path = FILTERS_DIR / "sn97_grounding.py"
+    info(f"reading filter source from {filter_src_path}")
+    if not filter_src_path.is_file():
+        fail(f"filter source not found: {filter_src_path}")
+    filter_content = filter_src_path.read_text(encoding="utf-8")
 
     info("generating OpenAI specs via Open-WebUI helper inside the container")
     specs = _generate_specs(tool_src_path)
@@ -472,6 +563,7 @@ def main() -> None:
         info(f"using admin user id {admin_id}")
 
         _upsert_tool(conn, user_id=admin_id, content=tool_content, specs=specs, dry=args.dry_run)
+        _upsert_filter(conn, user_id=admin_id, content=filter_content, dry=args.dry_run)
         _update_model(conn, dry=args.dry_run)
         _patch_global_config(conn, dry=args.dry_run)
 
