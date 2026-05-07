@@ -19,6 +19,7 @@ jobs:
       - name: Compile critical Python modules
         run: |
           python -m py_compile \
+            api/progress.py \
             api/state_store.py \
             api/routes/evaluation.py \
             api/routes/health.py \

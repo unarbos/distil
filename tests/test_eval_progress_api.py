@@ -10,11 +10,12 @@ for path in (str(API_ROOT), str(REPO_ROOT)):
         sys.path.insert(0, path)
 
 import state_store  # noqa: E402
+import progress as progress_helpers  # noqa: E402
 from routes import evaluation  # noqa: E402
 
 
 def test_normalize_eval_progress_surfaces_effective_prompt_total(monkeypatch):
-    monkeypatch.setattr(state_store.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(progress_helpers.time, "time", lambda: 2000.0)
 
     progress = state_store.normalize_eval_progress({
         "active": True,
@@ -44,7 +45,7 @@ def test_normalize_eval_progress_surfaces_effective_prompt_total(monkeypatch):
 
 
 def test_normalize_eval_progress_recomputes_stale_derived_fields(monkeypatch):
-    monkeypatch.setattr(state_store.time, "time", lambda: 1120.0)
+    monkeypatch.setattr(progress_helpers.time, "time", lambda: 1120.0)
 
     progress = state_store.normalize_eval_progress({
         "active": True,
@@ -65,7 +66,7 @@ def test_normalize_eval_progress_recomputes_stale_derived_fields(monkeypatch):
 
 
 def test_normalize_eval_progress_uses_student_elapsed_for_eta(monkeypatch):
-    monkeypatch.setattr(state_store.time, "time", lambda: 2000.0)
+    monkeypatch.setattr(progress_helpers.time, "time", lambda: 2000.0)
 
     progress = state_store.normalize_eval_progress({
         "active": True,
@@ -136,9 +137,11 @@ def test_queue_accepts_uid_completion_and_deferred_backlog(monkeypatch):
 
     def fake_read_state(filename, default=None):
         if filename == "eval_backlog.json":
-            return {"pending": [
-                {"uid": 167, "model": "best26/sn97-vs-v3", "status": "deferred"},
-            ]}
+            return {
+                "pending": [
+                    {"uid": 167, "model": "best26/sn97-vs-v3", "status": "deferred"},
+                ],
+            }
         return default or {}
 
     monkeypatch.setattr(evaluation, "read_state", fake_read_state)
