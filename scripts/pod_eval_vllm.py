@@ -78,6 +78,10 @@ try:
 except Exception:
     from eval_items import _rot_text
 try:
+    from scripts.eval_prompt_accounting import validate_teacher_logprob_coverage
+except Exception:
+    from eval_prompt_accounting import validate_teacher_logprob_coverage
+try:
     from scripts.eval_progress_io import (
         DebouncedProgressWriter,
         atomic_json_write as _shared_atomic_json_write,
@@ -17033,14 +17037,22 @@ def main():
                 "API teacher returned no prompts with sparse_logprobs; "
                 "cannot compute KL for this round"
             )
+        coverage_stats = validate_teacher_logprob_coverage(
+            len(sequences_data), len(api_logprob_rows)
+        )
+        print(
+            f"[eval] API teacher logprob coverage: "
+            f"{coverage_stats['n_teacher_prompts_with_logprobs']}/"
+            f"{coverage_stats['n_teacher_prompts_total']} "
+            f"({coverage_stats['teacher_logprob_coverage']:.1%})",
+            flush=True,
+        )
         prompts = [prompts[idx] for idx, _data in api_logprob_rows]
         sequences_data = [data for _idx, data in api_logprob_rows]
         prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
         progress_common["effective_prompts_total"] = len(prompts)
         progress_common["effective_prompts_hash"] = prompts_hash
-        progress_common["n_teacher_prompts_total"] = n_api_logprob_prompts_total
-        progress_common["n_teacher_prompts_with_logprobs"] = len(api_logprob_rows)
-        progress_common["n_teacher_prompts_dropped_missing_logprobs"] = n_missing_api_logprobs
+        progress_common.update(coverage_stats)
 
         for data in sequences_data:
             full_ids = data["full_ids"].to(device)
@@ -17654,6 +17666,7 @@ def main():
         "n_teacher_prompts_total": n_api_logprob_prompts_total or original_prompts_total,
         "n_teacher_prompts_with_logprobs": len(prompts),
         "n_teacher_prompts_dropped_missing_logprobs": n_missing_api_logprobs,
+        "teacher_logprob_coverage": progress_common.get("teacher_logprob_coverage"),
         "n_prompts": len(prompts),
         "n_prompts_filtered": n_filtered,
         "min_completion_tokens": MIN_COMPLETION_TOKENS,

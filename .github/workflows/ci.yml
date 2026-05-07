@@ -24,13 +24,17 @@ jobs:
             api/routes/evaluation.py \
             api/routes/health.py \
             scripts/api_teacher.py \
+            scripts/eval_prompt_accounting.py \
             scripts/eval_policy.py \
             scripts/eval_progress_io.py \
+            scripts/validator/pod_runtime.py \
             scripts/validator/pod_session.py \
             tests/test_api_teacher.py \
-            tests/test_eval_progress_api.py
+            tests/test_eval_prompt_accounting.py \
+            tests/test_eval_progress_api.py \
+            tests/test_validator_pod_runtime.py
       - name: Run focused regression tests
-        run: pytest -q tests/test_api_teacher.py tests/test_eval_progress_api.py
+        run: pytest -q tests/test_api_teacher.py tests/test_eval_prompt_accounting.py tests/test_eval_progress_api.py tests/test_validator_pod_runtime.py
 
   frontend-build:
     runs-on: ubuntu-latest

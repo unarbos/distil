@@ -11,6 +11,11 @@ from eval.runtime import TEACHER_CONFIG_VOCAB_SIZE
 from scripts.eval_policy import as_env as eval_policy_env
 from scripts.eval_policy import policy_env, policy_path
 from scripts.validator.config import MAX_NEW_TOKENS, TEACHER_MODEL, VLLM_CONCURRENCY
+from scripts.validator.pod_runtime import (
+    CURRENT_FIELD_MAP,
+    POD_PROGRESS_METADATA_KEYS,
+    upload_aux_modules,
+)
 
 # Opt-in teacher tensor-parallel size. 0 = let pod autodetect from torch.cuda.device_count().
 TP_SIZE = int(policy_env("DISTIL_TP_SIZE", "0") or "0")
@@ -353,30 +358,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 pod.upload(active_policy, f"{run_dir}/eval_policy.json", max_attempts=3)
             except Exception as exc:
                 logger.warning("Failed to upload eval policy (using env/defaults only): %s", exc)
-    # 2026-04-24 — Pareto holistic eval v2 ships two small helper modules
-    # alongside pod_eval.py: a vendored IFEval verifier set and a HumanEval
-    # subprocess sandbox. They live next to pod_eval.py so the bench
-    # probes can import them without touching sys.path.
     if not is_resuming:
-        _aux_modules = [
-            ("scripts/ifeval_vendor.py", "ifeval_vendor.py"),
-            ("scripts/humaneval_sandbox.py", "humaneval_sandbox.py"),
-            # 2026-05-03: cloud-API teacher module. Imported by
-            # ``pod_eval.py`` (= scripts/pod_eval_vllm.py uploaded under a
-            # neutral name) when DISTIL_TEACHER_MODE=api. Without this the
-            # API path falls back to local vLLM with an ImportError noise.
-            ("scripts/api_teacher.py", "api_teacher.py"),
-            ("scripts/eval_progress_io.py", "eval_progress_io.py"),
-            ("scripts/eval_policy.py", "eval_policy.py"),
-            ("scripts/eval_benchmarks.py", "eval_benchmarks.py"),
-            ("scripts/eval_items.py", "eval_items.py"),
-        ]
-        for local_aux, remote_name in _aux_modules:
-            if os.path.isfile(local_aux):
-                try:
-                    pod.upload(local_aux, f"{run_dir}/{remote_name}", max_attempts=3)
-                except Exception as exc:
-                    logger.warning(f"Failed to upload {local_aux} (bench probes will skip): {exc}")
+        upload_aux_modules(pod, run_dir, logger)
     if is_resuming:
         # On resume, double-check the in-flight pod process actually still
         # exists (didn't crash while the validator was down) and that the
@@ -730,57 +713,21 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 pod_phase = pod_progress.get("phase", "scoring")
                 progress["phase"] = pod_phase
                 progress["pod"] = pod_progress
-                # Single source of truth for the dashboard "current student"
-                # field set. Both the populate and the clear paths iterate
-                # over this so they cannot drift (regression prior to this
-                # bind: current_se/current_ci/current_best were written into
-                # ``progress`` but never popped, leaving stale values on the
-                # dashboard between students).
-                _CURRENT_FIELD_MAP = (
-                    ("current_student", "student_name", None),
-                    ("current_prompt", "prompts_done", 0),
-                    ("current_kl", "kl_running_mean", None),
-                    ("current_se", "kl_running_se", None),
-                    ("current_ci", "ci_95", None),
-                    ("current_best", "best_kl_so_far", None),
-                    # 2026-05-04: per-stage progress so the dashboard shows
-                    # "running bench: aime_bench (6/17)" instead of a
-                    # static "0/60 prompts" while probes/bench run for
-                    # ~25 min. The pod writes these via _set_stage().
-                    ("current_stage", "stage", None),
-                    ("bench_axis_idx", "bench_axis_idx", None),
-                    ("bench_axis_total", "bench_axis_total", None),
-                    ("current_student_started_at", "student_started_at", None),
-                )
                 if pod_progress.get("current"):
                     current = pod_progress["current"]
                     progress.update({
                         out_key: current.get(in_key, default)
-                        for out_key, in_key, default in _CURRENT_FIELD_MAP
+                        for out_key, in_key, default in CURRENT_FIELD_MAP
                     })
                 else:
-                    for out_key, _, _ in _CURRENT_FIELD_MAP:
+                    for out_key, _, _ in CURRENT_FIELD_MAP:
                         progress.pop(out_key, None)
                 # Always propagate teacher_prompts_done so the dashboard's
                 # Phase A progress bar fills correctly even after we transition
                 # into student loading (the previous gate dropped the value
                 # the moment loading_student began, leaving the bar at 0).
                 progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
-                for key in (
-                    "run_started_at",
-                    "teacher_started_at",
-                    "teacher_finished_at",
-                    "original_prompts_total",
-                    "effective_prompts_total",
-                    "effective_prompts_hash",
-                    "teacher_mode",
-                    "teacher_api",
-                    "policy",
-                    "script_revision",
-                    "n_teacher_prompts_total",
-                    "n_teacher_prompts_with_logprobs",
-                    "n_teacher_prompts_dropped_missing_logprobs",
-                ):
+                for key in POD_PROGRESS_METADATA_KEYS:
                     if key in pod_progress:
                         progress[key] = pod_progress[key]
                 pod_completed = pod_progress.get("completed", [])
