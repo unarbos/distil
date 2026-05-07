@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -62,10 +63,31 @@ def load_policy(*, force: bool = False) -> dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[eval_policy] failed to load {path}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         data = {}
     _POLICY_CACHE = data if isinstance(data, dict) else {}
     return _POLICY_CACHE
+
+
+def policy_metadata() -> dict[str, Any]:
+    """Small, serializable identity block for progress/results payloads."""
+    path = policy_path()
+    policy = load_policy()
+    return {
+        "policy_path": path,
+        "policy_version": policy.get("policy_version") if isinstance(policy, dict) else None,
+        "schema_version": policy.get("schema_version") if isinstance(policy, dict) else None,
+    }
+
+
+def policy_version(default: str | None = None) -> str | None:
+    meta = policy_metadata()
+    return meta.get("policy_version") or default
 
 
 def _walk_scalars(value: Any) -> dict[str, Any]:

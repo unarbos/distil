@@ -349,6 +349,10 @@ export interface EvalProgress {
   students_total?: number;
   prompts_done?: number;
   prompts_total?: number;
+  phase_detail?: string | null;
+  phase_eta_s?: number | null;
+  progress_fraction?: number | null;
+  current_student_started_at?: number | null;
   current_prompt?: number;
   current_kl?: number;
   current_se?: number;

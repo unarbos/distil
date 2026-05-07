@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  python-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install focused Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install pytest torch fastapi httpx requests numpy
+      - name: Compile critical Python modules
+        run: |
+          python -m py_compile \
+            api/state_store.py \
+            api/routes/evaluation.py \
+            api/routes/health.py \
+            scripts/api_teacher.py \
+            scripts/eval_policy.py \
+            scripts/eval_progress_io.py \
+            scripts/validator/pod_session.py \
+            tests/test_api_teacher.py \
+            tests/test_eval_progress_api.py
+      - name: Run focused regression tests
+        run: pytest -q tests/test_api_teacher.py tests/test_eval_progress_api.py
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build frontend
+        run: npm run build

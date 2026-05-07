@@ -77,6 +77,56 @@ try:
     from scripts.eval_items import _rot_text
 except Exception:
     from eval_items import _rot_text
+try:
+    from scripts.eval_progress_io import (
+        DebouncedProgressWriter,
+        atomic_json_write as _shared_atomic_json_write,
+    )
+except Exception:
+    try:
+        from eval_progress_io import (  # type: ignore
+            DebouncedProgressWriter,
+            atomic_json_write as _shared_atomic_json_write,
+        )
+    except Exception:
+        def _shared_atomic_json_write(path, data):
+            tmp = f"{path}.tmp.{os.getpid()}"
+            try:
+                with open(tmp, "w") as handle:
+                    json.dump(data, handle, default=str, allow_nan=True)
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+        class DebouncedProgressWriter:  # type: ignore[no-redef]
+            def __init__(self, path, min_interval_s=0.5):
+                self.path = path
+                self.min_interval_s = max(0.0, float(min_interval_s))
+                self._last_write = 0.0
+
+            def write(self, data, *, force=False):
+                now = time.monotonic()
+                if not force and now - self._last_write < self.min_interval_s:
+                    return False
+                _shared_atomic_json_write(self.path, data)
+                self._last_write = now
+                return True
+try:
+    from scripts.eval_policy import policy_metadata
+except Exception:
+    try:
+        from eval_policy import policy_metadata  # type: ignore
+    except Exception:
+        policy_metadata = None  # type: ignore
 
 # 2026-05-04: Suppress the spammy ``GenerationMixin`` warning that
 # transformers emits on EVERY ``model.generate()`` call when both
@@ -16547,46 +16597,19 @@ def _atomic_json_write(path, data):
     On any failure (serialization, disk, etc.) we log a one-line stderr
     message (rate-limited per process) and return — the previous
     version of the file stays intact."""
-    import os as _os
-    import sys as _sys
-    tmp = f"{path}.tmp.{_os.getpid()}"
-    try:
-        with open(tmp, "w") as pf:
-            json.dump(data, pf, default=str, allow_nan=True)
-            pf.flush()
-            try:
-                _os.fsync(pf.fileno())
-            except OSError:
-                pass
-        _os.replace(tmp, path)
-    except Exception as exc:
-        try:
-            _os.unlink(tmp)
-        except OSError:
-            pass
-        # Key on (path, exception type, str(exception)) so distinct failure
-        # modes all get reported once, but we don't spam the log at 1Hz.
-        err_key = f"_atomic_json_write_err_{path}_{type(exc).__name__}_{str(exc)[:80]}"
-        if not globals().get(err_key):
-            globals()[err_key] = True
-            try:
-                import traceback as _tb
-                print(f"[progress] {path} write failed: "
-                      f"{type(exc).__name__}: {exc}", file=_sys.stderr, flush=True)
-                try:
-                    print(f"[progress]   data keys: {list(data.keys()) if hasattr(data, 'keys') else type(data).__name__}",
-                          file=_sys.stderr, flush=True)
-                    print(f"[progress]   data repr: {repr(data)[:400]}",
-                          file=_sys.stderr, flush=True)
-                except Exception:
-                    pass
-                print("[progress] traceback (most recent call last):",
-                      file=_sys.stderr, flush=True)
-                for frame_line in _tb.format_exception(type(exc), exc, exc.__traceback__)[-6:]:
-                    for ln in frame_line.rstrip().splitlines():
-                        print(f"[progress]   {ln}", file=_sys.stderr, flush=True)
-            except Exception:
-                pass
+    _shared_atomic_json_write(path, data)
+
+
+_PROGRESS_WRITERS = {}
+_PROGRESS_LAST_PHASE = {}
+
+
+def _progress_writer(progress_path):
+    writer = _PROGRESS_WRITERS.get(progress_path)
+    if writer is None:
+        writer = DebouncedProgressWriter(progress_path, min_interval_s=0.5)
+        _PROGRESS_WRITERS[progress_path] = writer
+    return writer
 
 
 def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
@@ -16600,7 +16623,29 @@ def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
         "completed": extra.get("completed", []),
         "current": extra.get("current", None),
     }
-    _atomic_json_write(progress_path, data)
+    common = globals().get("_EVAL_PROGRESS_COMMON")
+    if isinstance(common, dict):
+        data.update(common)
+    for key in (
+        "run_started_at",
+        "teacher_started_at",
+        "teacher_finished_at",
+        "original_prompts_total",
+        "effective_prompts_total",
+        "teacher_mode",
+        "policy",
+    ):
+        if key in extra:
+            data[key] = extra[key]
+    force = bool(extra.get("force"))
+    last_phase = _PROGRESS_LAST_PHASE.get(progress_path)
+    if last_phase != phase:
+        force = True
+        _PROGRESS_LAST_PHASE[progress_path] = phase
+    total = data.get("prompts_total") or 0
+    if teacher_done in (0, total):
+        force = True
+    _progress_writer(progress_path).write(data, force=force)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -16740,6 +16785,31 @@ def main():
 
     # Progress file path
     progress_path = os.path.join(os.path.dirname(args.output), "eval_progress.json")
+    run_started_at = time.time()
+    original_prompts_total = len(prompts)
+    original_prompts_hash = prompts_hash
+    n_missing_api_logprobs = 0
+    n_api_logprob_prompts_total = None
+    try:
+        policy_meta = policy_metadata() if policy_metadata else {}
+    except Exception:
+        policy_meta = {}
+    script_revision = (
+        os.environ.get("DISTIL_CODE_REVISION")
+        or os.environ.get("GIT_COMMIT")
+        or os.environ.get("REVISION")
+    )
+    progress_common = {
+        "run_started_at": run_started_at,
+        "original_prompts_total": original_prompts_total,
+        "teacher_mode": args.teacher_mode,
+        "policy": policy_meta,
+        "script_revision": script_revision,
+    }
+    globals()["_EVAL_PROGRESS_COMMON"] = progress_common
+    teacher_started_at = None
+    teacher_finished_at = None
+    teacher_api_meta = None
 
     print(f"[eval] {len(prompts)} prompts (hash={prompts_hash}), {len(students)} students", flush=True)
     print(f"[eval] Teacher: {args.teacher}", flush=True)
@@ -16795,6 +16865,10 @@ def main():
                       f"method={cache.get('generation_method', '?')}, "
                       f"probe_refs={'yes' if cache.get('teacher_probe_samples') else 'no'})", flush=True)
                 teacher_cache_loaded = True
+                teacher_started_at = run_started_at
+                teacher_finished_at = time.time()
+                progress_common["teacher_started_at"] = teacher_started_at
+                progress_common["teacher_finished_at"] = teacher_finished_at
             else:
                 print(f"[eval] ✗ Cache stale — regenerating", flush=True)
         except Exception as e:
@@ -16831,6 +16905,16 @@ def main():
         if args.api_top_logprobs:
             cfg_kwargs["top_logprobs"] = args.api_top_logprobs
         api_cfg = APIConfig.from_env(**cfg_kwargs)
+        teacher_api_meta = {
+            "base_url": api_cfg.base_url,
+            "model": api_cfg.model,
+            "endpoint": api_cfg.endpoint,
+            "top_logprobs": api_cfg.top_logprobs,
+            "concurrency": api_cfg.concurrency,
+            "providers": list(api_cfg.providers),
+            "disable_reasoning": api_cfg.disable_reasoning,
+        }
+        progress_common["teacher_api"] = teacher_api_meta
 
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1: API teacher generation", flush=True)
@@ -16860,7 +16944,9 @@ def main():
 
         token_to_id = _build_token_to_id_map(tokenizer)
 
-        _write_phase(progress_path, students, "api_generating", prompts_total=len(prompts))
+        teacher_started_at = time.time()
+        progress_common["teacher_started_at"] = teacher_started_at
+        _write_phase(progress_path, students, "api_generating", prompts_total=len(prompts), force=True)
         t0 = time.time()
 
         def _api_progress(done, total):
@@ -16933,6 +17019,7 @@ def main():
             for idx, data in enumerate(sequences_data)
             if "sparse_logprobs" in data
         ]
+        n_api_logprob_prompts_total = len(sequences_data)
         n_missing_api_logprobs = len(sequences_data) - len(api_logprob_rows)
         if n_missing_api_logprobs:
             print(
@@ -16948,6 +17035,12 @@ def main():
             )
         prompts = [prompts[idx] for idx, _data in api_logprob_rows]
         sequences_data = [data for _idx, data in api_logprob_rows]
+        prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
+        progress_common["effective_prompts_total"] = len(prompts)
+        progress_common["effective_prompts_hash"] = prompts_hash
+        progress_common["n_teacher_prompts_total"] = n_api_logprob_prompts_total
+        progress_common["n_teacher_prompts_with_logprobs"] = len(api_logprob_rows)
+        progress_common["n_teacher_prompts_dropped_missing_logprobs"] = n_missing_api_logprobs
 
         for data in sequences_data:
             full_ids = data["full_ids"].to(device)
@@ -16977,6 +17070,11 @@ def main():
                         "prompt_lens": prompt_lens,
                         "block_seed": args.block_seed,
                         "prompts_hash": prompts_hash,
+                        "requested_prompts_hash": original_prompts_hash,
+                        "effective_prompts_hash": prompts_hash,
+                        "n_teacher_prompts_total": n_api_logprob_prompts_total,
+                        "n_teacher_prompts_with_logprobs": len(full_sequences),
+                        "n_teacher_prompts_dropped_missing_logprobs": n_missing_api_logprobs,
                         "generation_method": f"api:{api_cfg.model}",
                         "logprobs_k": api_cfg.top_logprobs,
                         "sparse": True,
@@ -17014,7 +17112,9 @@ def main():
         print(f"PHASE 1a: vLLM teacher generation", flush=True)
         print(f"{'='*60}", flush=True)
 
-        _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts))
+        teacher_started_at = time.time()
+        progress_common["teacher_started_at"] = teacher_started_at
+        _write_phase(progress_path, students, "vllm_starting", prompts_total=len(prompts), force=True)
         t0 = time.time()
         vllm_ok = start_vllm_server(
             args.teacher, args.vllm_gpu_util, args.vllm_max_model_len,
@@ -17335,6 +17435,8 @@ def main():
         stop_vllm_server()
         time.sleep(3)
         free_gpu()
+        teacher_started_at = time.time()
+        progress_common["teacher_started_at"] = teacher_started_at
 
         print(f"\n{'='*60}", flush=True)
         print(f"PHASE 1 FALLBACK: HF teacher generation + logit extraction", flush=True)
@@ -17477,6 +17579,12 @@ def main():
         else:
             print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens — no filtering needed", flush=True)
 
+    effective_prompts_hash = hashlib.md5(json.dumps(prompts).encode()).hexdigest()[:8]
+    teacher_finished_at = time.time()
+    progress_common["teacher_finished_at"] = teacher_finished_at
+    progress_common["effective_prompts_total"] = len(prompts)
+    progress_common["effective_prompts_hash"] = effective_prompts_hash
+
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1e: Save eval data for reproducibility
     # ═══════════════════════════════════════════════════════════════════
@@ -17530,9 +17638,22 @@ def main():
 
     results = {
         "teacher": args.teacher,
+        "teacher_mode": args.teacher_mode,
+        "teacher_api": teacher_api_meta,
         "max_new_tokens": args.max_new_tokens,
         "block_seed": args.block_seed,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "policy": policy_meta,
+        "script_revision": script_revision,
+        "run_started_at": run_started_at,
+        "teacher_started_at": teacher_started_at,
+        "teacher_finished_at": teacher_finished_at,
+        "original_prompts_total": original_prompts_total,
+        "original_prompts_hash": original_prompts_hash,
+        "effective_prompts_hash": effective_prompts_hash,
+        "n_teacher_prompts_total": n_api_logprob_prompts_total or original_prompts_total,
+        "n_teacher_prompts_with_logprobs": len(prompts),
+        "n_teacher_prompts_dropped_missing_logprobs": n_missing_api_logprobs,
         "n_prompts": len(prompts),
         "n_prompts_filtered": n_filtered,
         "min_completion_tokens": MIN_COMPLETION_TOKENS,
@@ -17558,9 +17679,11 @@ def main():
         # validator's pod_session.py poller reads None and miners read
         # the empty bar as "we lost the teacher cache".
         "teacher_prompts_done": len(prompts),
+        **progress_common,
         "completed": [], "current": None,
     }
-    def _write_progress():
+    student_started_at = None
+    def _write_progress(force: bool = False):
         """Write current live progress to disk for dashboard consumption.
         Uses atomic tmp+rename via _atomic_json_write so partial writes
         can't leave a zero-byte file that the validator then fails to
@@ -17571,8 +17694,8 @@ def main():
                 snapshot["current"] = dict(snapshot["current"])
             if "completed" in snapshot and isinstance(snapshot["completed"], list):
                 snapshot["completed"] = list(snapshot["completed"])
-        _atomic_json_write(progress_path, snapshot)
-    _write_progress()
+        _progress_writer(progress_path).write(snapshot, force=force)
+    _write_progress(force=True)
 
     # Early stopping state. args.early_stop_min <= 0 disables it outright.
     best_kl_so_far = None
@@ -17652,10 +17775,12 @@ def main():
             except Exception:
                 pass
             live_progress["completed"].append({
-                "student_name": student_name, "status": "deferred_cuda_poisoned",
+                "student_name": student_name,
+                "status": "deferred_cuda_poisoned",
+                "finished_at": time.time(),
             })
             live_progress["current"] = None
-            _write_progress()
+            _write_progress(force=True)
             continue
         # Skip already scored
         if student_name in results["students"]:
@@ -17679,6 +17804,7 @@ def main():
               (" (KING — stays in VRAM)" if student_name == king_name else ""), flush=True)
 
         model_start = time.time()
+        student_started_at = model_start
         ensure_disk_space(args.teacher)
 
         # Prefetch next student
@@ -17690,8 +17816,14 @@ def main():
 
         # Load student (or reuse king)
         live_progress["phase"] = "loading_student"
-        live_progress["current"] = {"student_name": student_name, "student_idx": student_idx, "prompts_done": 0, "stage": "loading_weights"}
-        _write_progress()
+        live_progress["current"] = {
+            "student_name": student_name,
+            "student_idx": student_idx,
+            "prompts_done": 0,
+            "stage": "loading_weights",
+            "student_started_at": student_started_at,
+        }
+        _write_progress(force=True)
 
         # 2026-05-04: ``_set_stage`` lets the dashboard show what's
         # actually happening between "loading_student" and "kl scoring
@@ -17706,11 +17838,12 @@ def main():
             cur = live_progress.get("current") or {}
             if not isinstance(cur, dict):
                 return
+            force = cur.get("stage") != name
             cur["stage"] = name
             for k, v in extra.items():
                 cur[k] = v
             live_progress["current"] = cur
-            _write_progress()
+            _write_progress(force=force)
 
         is_king = (student_name == king_name)
 
@@ -17736,9 +17869,16 @@ def main():
                 results["timings"] = {k: round(v, 1) for k, v in timings.items()}
                 with open(args.output, "w") as f:
                     json.dump(results, f, indent=2)
-                live_progress["completed"].append({"student_name": student_name, "status": "load_failed"})
+                _finished_at = time.time()
+                live_progress["completed"].append({
+                    "student_name": student_name,
+                    "status": "load_failed",
+                    "started_at": student_started_at,
+                    "finished_at": _finished_at,
+                    "elapsed_s": round(_finished_at - student_started_at, 1),
+                })
                 live_progress["current"] = None
-                _write_progress()
+                _write_progress(force=True)
                 try: del student
                 except: pass
                 free_gpu()
@@ -18763,6 +18903,7 @@ def main():
                         "kl_running_mean": round(running_mean, 6),
                         "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
                         "stage": "kl_scoring",
+                        "student_started_at": student_started_at,
                     }
                     _write_progress()
 
@@ -19102,6 +19243,7 @@ def main():
         with open(args.output, "w") as f:
             json.dump(results, f, indent=2)
 
+        student_finished_at = time.time()
         live_progress["completed"].append({
             "student_name": student_name,
             "status": results["students"].get(student_name, {}).get("status", "unknown"),
@@ -19109,9 +19251,12 @@ def main():
             "prompts_scored": len(kl_per_prompt),
             "prompts_total": effective_total,
             "early_stop_reason": early_stop_reason,
+            "started_at": student_started_at,
+            "finished_at": student_finished_at,
+            "elapsed_s": round(student_finished_at - student_started_at, 1),
         })
         live_progress["current"] = None
-        _write_progress()
+        _write_progress(force=True)
 
         # Cleanup — DON'T unload king
         if not is_king:

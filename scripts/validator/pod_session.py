@@ -281,18 +281,18 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         except (TypeError, ValueError):
             teacher_max_new = MAX_NEW_TOKENS
         # API teacher wall time scales with prompt count and provider
-        # concurrency. Use live Kimi-K2.6/OpenRouter telemetry rather
-        # than the old 60-prompt constant so the dashboard does not
-        # advertise a stale ETA on 300-prompt rounds.
-        per_prompt_s = 42.0 if teacher_max_new <= 768 else 52.0
-        est_teacher_s = int((n_prompts * per_prompt_s) / api_concurrency + 420)
+        # concurrency. With reasoning disabled by default, live Kimi-K2.6
+        # rounds are substantially faster than the old reasoning-mode
+        # budget that produced 5h+ dashboard ETAs for 10-student rounds.
+        per_prompt_s = 20.0 if teacher_max_new <= 768 else 26.0
+        est_teacher_s = int((n_prompts * per_prompt_s) / api_concurrency + 300)
     else:
         est_teacher_s = 180
-    # Mixed-fleet average: weight 70% derailed × 19 min + 30%
-    # healthy × 45 min = ~27 min/student post-cap. Use 1700s as the
-    # honest mid-point so the dashboard ETA doesn't promise anything
-    # the eval cannot deliver.
-    est_per_student_s = 1700
+    # Current post-cap student rounds are dominated by probes + bench
+    # battery and have been landing around 12-16 min/student after the
+    # LFJ derail cap and batched KL path. Keep a modest buffer without
+    # advertising a stale 5h full-round ETA.
+    est_per_student_s = 900
     est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
     eval_order = []
     if king_uid is not None and king_uid in models_to_eval:
@@ -366,6 +366,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             # neutral name) when DISTIL_TEACHER_MODE=api. Without this the
             # API path falls back to local vLLM with an ImportError noise.
             ("scripts/api_teacher.py", "api_teacher.py"),
+            ("scripts/eval_progress_io.py", "eval_progress_io.py"),
             ("scripts/eval_policy.py", "eval_policy.py"),
             ("scripts/eval_benchmarks.py", "eval_benchmarks.py"),
             ("scripts/eval_items.py", "eval_items.py"),
@@ -749,6 +750,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     ("current_stage", "stage", None),
                     ("bench_axis_idx", "bench_axis_idx", None),
                     ("bench_axis_total", "bench_axis_total", None),
+                    ("current_student_started_at", "student_started_at", None),
                 )
                 if pod_progress.get("current"):
                     current = pod_progress["current"]
@@ -764,6 +766,23 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 # into student loading (the previous gate dropped the value
                 # the moment loading_student began, leaving the bar at 0).
                 progress["teacher_prompts_done"] = pod_progress.get("teacher_prompts_done", 0)
+                for key in (
+                    "run_started_at",
+                    "teacher_started_at",
+                    "teacher_finished_at",
+                    "original_prompts_total",
+                    "effective_prompts_total",
+                    "effective_prompts_hash",
+                    "teacher_mode",
+                    "teacher_api",
+                    "policy",
+                    "script_revision",
+                    "n_teacher_prompts_total",
+                    "n_teacher_prompts_with_logprobs",
+                    "n_teacher_prompts_dropped_missing_logprobs",
+                ):
+                    if key in pod_progress:
+                        progress[key] = pod_progress[key]
                 pod_completed = pod_progress.get("completed", [])
                 progress["completed"] = pod_completed
                 progress["students_done"] = len(pod_completed)

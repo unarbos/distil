@@ -318,7 +318,11 @@ def get_queue():
 
     eval_order = prog.get("eval_order") or []
     models_done = prog.get("models") if isinstance(prog.get("models"), dict) else {}
-    current_model = prog.get("current_model")
+    current_model = (
+        prog.get("current_model")
+        or prog.get("current_student")
+        or ((prog.get("current") or {}).get("student_name") if isinstance(prog.get("current"), dict) else None)
+    )
     models_to_eval = rnd.get("models_to_eval") if isinstance(rnd.get("models_to_eval"), dict) else {}
     backlog = read_state("eval_backlog.json", {})
     backlog_pending = {
@@ -327,8 +331,18 @@ def get_queue():
         if isinstance(row, dict) and str(row.get("uid", "")).lstrip("-").isdigit()
     }
     completed_uids = set()
+    completed_models = set()
     if isinstance(prog.get("completed"), list):
-        completed_uids = {int(u) for u in prog["completed"] if isinstance(u, (int, str)) and str(u).lstrip("-").isdigit()}
+        for completed in prog["completed"]:
+            if isinstance(completed, (int, str)) and str(completed).lstrip("-").isdigit():
+                completed_uids.add(int(completed))
+            elif isinstance(completed, dict):
+                student_name = completed.get("student_name") or completed.get("model")
+                if student_name:
+                    completed_models.add(student_name)
+                uid = completed.get("uid")
+                if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit():
+                    completed_uids.add(int(uid))
 
     slots = []
     slot_uids = set()
@@ -338,8 +352,13 @@ def get_queue():
         role = entry.get("role")
         slot_uids.add(uid)
         info = models_to_eval.get(str(uid)) or models_to_eval.get(uid) or {}
-        backlog_row = backlog_pending.get(int(uid)) if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit() else {}
-        if uid in completed_uids:
+        backlog_row = (
+            backlog_pending.get(int(uid))
+            if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit()
+            else {}
+        ) or {}
+        normalized_uid = int(uid) if isinstance(uid, (int, str)) and str(uid).lstrip("-").isdigit() else uid
+        if normalized_uid in completed_uids or (model and model in completed_models):
             status = "done"
         elif model and model == current_model:
             status = "running"
@@ -401,12 +420,16 @@ def get_queue():
         "students_total": prog.get("students_total"),
         "students_done": prog.get("students_done"),
         "prompts_total": prog.get("prompts_total"),
+        "effective_prompts_total": prog.get("effective_prompts_total"),
         "prompts_done": prog.get("prompts_done"),
         "phase_detail": prog.get("phase_detail"),
         "progress_fraction": prog.get("progress_fraction"),
         "elapsed_s": prog.get("elapsed_s"),
         "phase_eta_s": prog.get("phase_eta_s"),
         "teacher_prompts_per_min": prog.get("teacher_prompts_per_min"),
+        "teacher_started_at": prog.get("teacher_started_at"),
+        "teacher_finished_at": prog.get("teacher_finished_at"),
+        "current_student_started_at": prog.get("current_student_started_at"),
         "current_stage": current_stage,
         "bench_axis_idx": bench_axis_idx,
         "bench_axis_total": bench_axis_total,
@@ -913,9 +936,16 @@ def get_dashboard():
                 "students_done": prog.get("students_done"),
                 "students_total": prog.get("students_total"),
                 "prompts_total": prog.get("prompts_total"),
+                "effective_prompts_total": prog.get("effective_prompts_total"),
+                "phase_detail": prog.get("phase_detail"),
+                "progress_fraction": prog.get("progress_fraction"),
+                "phase_eta_s": prog.get("phase_eta_s"),
+                "teacher_started_at": prog.get("teacher_started_at"),
+                "teacher_finished_at": prog.get("teacher_finished_at"),
+                "current_student_started_at": prog.get("current_student_started_at"),
                 "current_student": prog.get("current_student") or (prog.get("current") or {}).get("student_name"),
                 "current_kl": prog.get("current_kl") or (prog.get("current") or {}).get("kl_running_mean"),
-                "current_stage": (prog.get("current") or {}).get("stage"),
+                "current_stage": prog.get("current_stage") or (prog.get("current") or {}).get("stage"),
                 "bench_axis_idx": (prog.get("current") or {}).get("bench_axis_idx"),
                 "bench_axis_total": (prog.get("current") or {}).get("bench_axis_total"),
                 "eval_order": prog.get("eval_order"),

@@ -29,6 +29,10 @@ interface EvalProgress {
   students_total?: number;
   prompts_done?: number;
   prompts_total?: number;
+  phase_detail?: string | null;
+  phase_eta_s?: number | null;
+  progress_fraction?: number | null;
+  current_student_started_at?: number | null;
   current_prompt?: number;
   current_kl?: number;
   // 2026-05-04: name of the per-student stage in flight (e.g.
@@ -67,6 +71,8 @@ const PHASE_LABELS: Record<string, string> = {
   copy_check: "Duplicate detection",
   fingerprint: "Logit fingerprinting",
   vllm_starting: "Starting vLLM teacher pod",
+  api_generating: "Teacher API generation",
+  vllm_generating: "Teacher continuations",
   teacher_warmup: "Teacher vLLM warmup",
   teacher_generation: "Teacher continuations",
   teacher_generate: "Teacher continuations",
@@ -93,6 +99,10 @@ const PHASE_EXPLAINERS: Record<string, string> = {
     "Pre-checks (architecture / duplicate / integrity). No GPU yet. Models that fail here are skipped.",
   vllm_starting:
     "Spinning up the teacher vLLM pod (~30s). After this we'll generate teacher continuations on every prompt.",
+  api_generating:
+    "Calling the teacher API for the round's block-seeded prompts. Students start after these continuations are ready.",
+  vllm_generating:
+    "Teacher generating continuations on the round's block-seeded prompts.",
   teacher_warmup:
     "Warming up the teacher (~30s). After this we'll generate teacher continuations on every prompt.",
   teacher_generation:
@@ -315,28 +325,25 @@ function EvalQueue({ progress }: EvalQueueProps) {
     completed[c.student_name] = c;
   }
   const currentName = progress?.current_student;
-  const totalDone = Object.keys(completed).length;
-  const eta = progress?.estimated_completion;
-  const etaText = (() => {
-    if (!eta || eta < Date.now() / 1000) return null;
-    const dt = Math.max(0, eta - Date.now() / 1000);
-    if (dt < 60) return `~${Math.round(dt)}s`;
-    const m = Math.floor(dt / 60);
-    if (m < 60) return `~${m}m`;
-    const h = Math.floor(m / 60);
-    const rm = m % 60;
-    return `~${h}h ${rm}m`;
+  const totalDone = progress?.students_done ?? Object.keys(completed).length;
+  const etaText = formatEta(progress);
+  const teacherDone = progress?.teacher_prompts_done ?? 0;
+  const promptsTotal = progress?.prompts_total ?? 0;
+  const queueMeta = (() => {
+    if (TEACHER_PHASES.has(progress?.phase ?? "") && promptsTotal > 0) {
+      return `teacher ${teacherDone}/${promptsTotal}${etaText ? ` · phase ETA ${etaText}` : ""}`;
+    }
+    if (queue.length > 0) {
+      return `${totalDone} of ${queue.length} done${etaText ? ` · phase ETA ${etaText}` : ""}`;
+    }
+    return `ETA ${etaText ?? "—"}`;
   })();
 
   return (
     <div>
       <HeadRow
         title="Eval queue"
-        meta={
-          queue.length > 0
-            ? `${totalDone} of ${queue.length} done${etaText ? ` · ETA ${etaText}` : ""}`
-            : `ETA ${etaText ?? "—"}`
-        }
+        meta={queueMeta}
       />
       <div className="mt-3 flex flex-col">
         {queue.map((item, idx) => {
@@ -476,12 +483,36 @@ interface PhaseEntry {
 // pipeline step. Source of truth: ``state/eval_progress.json`` updates
 // in pod_eval_vllm.py.
 const TEACHER_PHASES = new Set([
+  "api_generating",
+  "vllm_generating",
   "vllm_starting",
   "teacher_warmup",
   "teacher_generation",
   "teacher_generate",
   "teacher_logits",
 ]);
+
+function formatDuration(seconds: number): string {
+  const dt = Math.max(0, seconds);
+  if (dt < 60) return `~${Math.round(dt)}s`;
+  const m = Math.floor(dt / 60);
+  if (m < 60) return `~${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `~${h}h ${rm}m`;
+}
+
+function formatEta(progress: EvalProgress | null): string | null {
+  const phaseEta = progress?.phase_eta_s;
+  if (typeof phaseEta === "number" && Number.isFinite(phaseEta) && phaseEta >= 0) {
+    return formatDuration(phaseEta);
+  }
+  if (progress?.active) return null;
+  const eta = progress?.estimated_completion;
+  if (!eta || eta < Date.now() / 1000) return null;
+  return formatDuration(eta - Date.now() / 1000);
+}
+
 const STUDENT_PHASES = new Set(["loading_student", "scoring"]);
 const BENCH_PHASES = new Set(["bench"]);
 const POST_PHASES = new Set([

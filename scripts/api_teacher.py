@@ -88,6 +88,10 @@ DEFAULT_TIMEOUT_S = 120
 DEFAULT_OPENROUTER_PROVIDERS = ("Inceptron",)
 
 
+class EmptyLogprobsError(RuntimeError):
+    """Provider returned HTTP 200 but no per-token logprobs."""
+
+
 @dataclass
 class APIConfig:
     base_url: str
@@ -363,6 +367,16 @@ def _generate_single_prompt_api(
             }
 
             top_lp_list = api_out["top_logprobs_list"]
+            if token_to_id is not None and not top_lp_list:
+                last_err = EmptyLogprobsError(
+                    "API returned no top_logprobs; retrying as transient provider miss"
+                )
+                if attempt < 5:
+                    time.sleep(min(2.0 ** attempt, 30.0))
+                    continue
+                result["api_missing_logprobs"] = True
+                result["api_missing_logprobs_reason"] = "empty_top_logprobs_after_retries"
+                return idx, result
             if top_lp_list and token_to_id is not None:
                 result["sparse_logprobs"] = sparse_converter(
                     top_lp_list, token_to_id, tokenizer, k=cfg.top_logprobs,
@@ -722,6 +736,11 @@ def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK a
         top_lp_list = (choice.get("logprobs") or {}).get("top_logprobs") or []
         n_lp = len(top_lp_list)
         per_pos_topk = len(top_lp_list[0]) if n_lp else 0
+    if n_lp <= 0 or per_pos_topk <= 0:
+        raise RuntimeError(
+            "API health check returned no logprobs; KL teacher path is not usable "
+            f"(endpoint={cfg.endpoint}, model={cfg.model})"
+        )
     return {
         "ok": True,
         "text": text,
