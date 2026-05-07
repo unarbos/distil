@@ -20,6 +20,7 @@ jobs:
         run: |
           python -m py_compile \
             api/eval_queue.py \
+            api/eval_status.py \
             api/progress.py \
             api/state_store.py \
             api/routes/evaluation.py \
@@ -32,11 +33,12 @@ jobs:
             scripts/validator/pod_session.py \
             tests/test_api_teacher.py \
             tests/test_eval_queue.py \
+            tests/test_eval_status.py \
             tests/test_eval_prompt_accounting.py \
             tests/test_eval_progress_api.py \
             tests/test_validator_pod_runtime.py
       - name: Run focused regression tests
-        run: pytest -q tests/test_api_teacher.py tests/test_eval_queue.py tests/test_eval_prompt_accounting.py tests/test_eval_progress_api.py tests/test_validator_pod_runtime.py
+        run: pytest -q tests/test_api_teacher.py tests/test_eval_queue.py tests/test_eval_status.py tests/test_eval_prompt_accounting.py tests/test_eval_progress_api.py tests/test_validator_pod_runtime.py
 
   frontend-build:
     runs-on: ubuntu-latest

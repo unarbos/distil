@@ -80,7 +80,36 @@ except Exception:
 try:
     from scripts.eval_prompt_accounting import validate_teacher_logprob_coverage
 except Exception:
-    from eval_prompt_accounting import validate_teacher_logprob_coverage
+    try:
+        from eval_prompt_accounting import validate_teacher_logprob_coverage
+    except Exception:
+        def validate_teacher_logprob_coverage(total_prompts, usable_prompts):
+            total = max(0, int(total_prompts or 0))
+            usable = max(0, int(usable_prompts or 0))
+            coverage = (usable / total) if total > 0 else 0.0
+            try:
+                min_coverage = float(os.environ.get("DISTIL_MIN_TEACHER_LOGPROB_COVERAGE", "0.5"))
+            except (TypeError, ValueError):
+                min_coverage = 0.5
+            try:
+                min_prompts = int(os.environ.get("DISTIL_MIN_EFFECTIVE_TEACHER_PROMPTS", "30"))
+            except (TypeError, ValueError):
+                min_prompts = 30
+            min_coverage = min(1.0, max(0.0, min_coverage))
+            min_prompts = max(1, min_prompts)
+            stats = {
+                "n_teacher_prompts_total": total,
+                "n_teacher_prompts_with_logprobs": usable,
+                "n_teacher_prompts_dropped_missing_logprobs": max(0, total - usable),
+                "teacher_logprob_coverage": round(coverage, 6),
+            }
+            if usable < min_prompts or coverage < min_coverage:
+                raise RuntimeError(
+                    "API teacher logprob coverage below quality floor: "
+                    f"{usable}/{total} usable ({coverage:.1%}); require at least "
+                    f"{min_prompts} prompts and {min_coverage:.0%} coverage"
+                )
+            return stats
 try:
     from scripts.eval_progress_io import (
         DebouncedProgressWriter,

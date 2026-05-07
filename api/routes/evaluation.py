@@ -16,6 +16,7 @@ from helpers.cache import _get_stale
 from helpers.dq import _dq_reason_for_commitment
 from helpers.sanitize import _sanitize_floats, _safe_json_load
 from eval_queue import build_queue_slots
+from eval_status import build_eval_statuses
 from state_store import (
     benchmarks,
     current_round,
@@ -35,18 +36,6 @@ from state_store import (
 )
 
 router = APIRouter()
-
-
-def _failure_matches_commitment(fail_entry: str, commitment: dict) -> bool:
-    repo = (commitment or {}).get("model")
-    rev = (commitment or {}).get("revision")
-    if not repo or not fail_entry:
-        return False
-    if "@" in fail_entry:
-        f_repo, f_rev = fail_entry.split("@", 1)
-        return f_repo == repo and (f_rev == rev or not rev)
-    return fail_entry == repo
-
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
          description="Returns the top-4 leaderboard - current king and contenders. Under SINGLE_EVAL_MODE (v30.2+) the king is selected cross-round from `state/composite_scores.json` by highest `composite.final` (= 0.7·worst_3_mean + 0.3·weighted; v28-and-earlier records still ranked by `composite.worst`). A challenger dethrones only when its final beats the incumbent's by `SINGLE_EVAL_DETHRONE_MARGIN` (default 3%). The legacy paired t-test on KL is retired. The composite axis surface includes group axes (code/math/reasoning/knowledge skill groups) and shadow axes (top_k_overlap, kl_is, forking_rkl, teacher_trace_plausibility, entropy_aware_kl, tail_decoupled_kl).")
@@ -578,98 +567,31 @@ def get_eval_status():
     dq = read_state("disqualified.json", {})
     failures_map = read_state("failures.json", {}) or {}
     failure_models_map = read_state("failure_models.json", {}) or {}
-    evaluated_uids = {str(uid) for uid in (read_state("evaluated_uids.json", []) or [])}
+    evaluated_uids = read_state("evaluated_uids.json", []) or []
     uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
     h2h_tracker = h2h_tested_against_king()
     latest = h2h_latest()
-    current_king_uid = latest.get("king_uid")
-    current_block = latest.get("block", 0)
     composite_scores = read_state("composite_scores.json", {})
     prog = normalize_eval_progress(eval_progress())
     backlog = read_state("eval_backlog.json", {})
-    active_slots = {
-        str(entry.get("uid")): {"position": idx, **entry}
-        for idx, entry in enumerate(prog.get("eval_order") or [], start=1)
-        if entry.get("uid") is not None
-    }
-    backlog_rows = {
-        str(row.get("uid")): row
-        for row in (backlog.get("pending") or [])
-        if isinstance(row, dict) and row.get("uid") is not None
-    }
-
-    result = {}
-    uid_keys = set(scores_data) | set(uid_map) | set(composite_scores or {}) | set(active_slots) | set(backlog_rows)
-    for uid_str in sorted(uid_keys, key=lambda v: int(v) if str(v).lstrip("-").isdigit() else 10**9):
-        if not str(uid_str).lstrip("-").isdigit():
-            continue
-        uid = int(uid_str)
-        hotkey = uid_map.get(uid_str)
-        commitment = commitments.get(hotkey) if hotkey else None
-        dq_reason = _dq_reason_for_commitment(uid, hotkey, commitment, dq)
-        fail_count = int(failures_map.get(uid_str, 0) or 0)
-        fail_model = failure_models_map.get(uid_str)
-        if dq_reason is not None:
-            result[uid_str] = {"status": "disqualified", "reason": dq_reason}
-            continue
-        if current_king_uid is not None and uid == current_king_uid:
-            result[uid_str] = {"status": "king"}
-            continue
-        if fail_count >= 3 and fail_model and _failure_matches_commitment(fail_model, commitment or {}):
-            result[uid_str] = {
-                "status": "skipped_stale",
-                "failure_count": fail_count,
-                "failure_model": fail_model,
-            }
-            continue
-        if uid_str in active_slots:
-            result[uid_str] = {
-                "status": "queued_active_round",
-                "position": active_slots[uid_str].get("position"),
-                "phase": prog.get("phase"),
-            }
-            if active_slots[uid_str].get("model") == prog.get("current_model"):
-                result[uid_str]["status"] = "running"
-            continue
-        if (backlog_rows.get(uid_str) or {}).get("status") == "deferred":
-            result[uid_str] = {
-                "status": "deferred",
-                "round_cap": backlog.get("round_cap"),
-                "commit_block": backlog_rows[uid_str].get("commit_block"),
-            }
-            continue
-        if uid >= 0 and not commitment:
-            result[uid_str] = {"status": "no_commitment"}
-            continue
-        if uid_str in (composite_scores or {}):
-            comp = composite_scores.get(uid_str) if isinstance(composite_scores, dict) else {}
-            result[uid_str] = {
-                "status": "scored",
-                "composite_final": comp.get("final") if isinstance(comp, dict) else None,
-                "composite_version": comp.get("version") if isinstance(comp, dict) else None,
-                "scored_at": comp.get("ts") if isinstance(comp, dict) else None,
-            }
-            continue
-        if uid_str in evaluated_uids:
-            result[uid_str] = {"status": "evaluated_no_composite"}
-            continue
-        tracker_entry = h2h_tracker.get(uid_str, {})
-        if tracker_entry.get("king_uid") == current_king_uid and tracker_entry.get("block"):
-            last_block = tracker_entry["block"]
-            epochs_since = (current_block - last_block) // EPOCH_BLOCKS if current_block > last_block else 0
-            # 2026-04-28 (Discord): single-eval mode has no time-based "stale"
-            # re-test — UIDs are re-evaluated only on commitment change. The
-            # previous "stale after 50 epochs" status was misleading; the
-            # ``epochs_ago`` field stays for clients that filter on it, but
-            # the discrete status is just ``tested`` until a new commit moves
-            # the UID back into the queue.
-            result[uid_str] = {"status": "tested", "epochs_ago": epochs_since}
-        elif uid_str not in scores_data:
-            result[uid_str] = {"status": "queued"}
-        else:
-            result[uid_str] = {"status": "untested"}
+    current_king_uid, current_block, result = build_eval_statuses(
+        scores_data=scores_data,
+        dq_data=dq,
+        failures_map=failures_map,
+        failure_models_map=failure_models_map,
+        evaluated_uids=evaluated_uids,
+        uid_map=uid_map,
+        commitments=commitments,
+        h2h_tracker=h2h_tracker,
+        latest=latest,
+        composite_scores=composite_scores,
+        progress=prog,
+        backlog=backlog,
+        epoch_blocks=EPOCH_BLOCKS,
+        dq_reason_for_commitment=_dq_reason_for_commitment,
+    )
     return JSONResponse(
         content={"king_uid": current_king_uid, "block": current_block, "statuses": result},
         headers={"Cache-Control": "public, max-age=10, stale-while-revalidate=30"},
