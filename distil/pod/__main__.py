@@ -84,19 +84,41 @@ def _phase_teacher(spec: dict, progress_path: Path) -> dict:
         logger.info("teacher cache HIT — skipping Phase 1 generation")
         return cached
 
-    write_progress(progress_path, phase="teacher_starting", round_id=spec["round_id"])
-    teacher = start_teacher(spec["teacher_repo"], spec.get("vllm") or {})
-
     from distil.eval.dataset import sample_prompts
 
     prompts = sample_prompts(spec.get("n_prompts", 300), block_hash=spec.get("block_hash"))
-    write_progress(progress_path, phase="teacher_generating", n_prompts=len(prompts))
-    outs = generate_continuations(
-        teacher,
-        prompts,
-        max_new_tokens=spec.get("max_new_tokens", 512),
-        top_k=spec.get("teacher_top_k", 5),
-    )
+    max_new = spec.get("max_new_tokens", 512)
+    top_k = spec.get("teacher_top_k", 5)
+
+    # Production path: Kimi-K2.6 is 1T params and does NOT fit in vLLM
+    # on the 8xB200 pod, so we route teacher inference through an
+    # OpenAI-compatible cloud API (default: OpenRouter / Inceptron).
+    # The same env var the legacy validator uses controls this:
+    # DISTIL_TEACHER_MODE=api  →  distil.pod.teacher_api
+    # DISTIL_TEACHER_MODE=vllm →  distil.pod.teacher (local vLLM)
+    teacher_mode = os.environ.get("DISTIL_TEACHER_MODE", "vllm").lower().strip()
+    if teacher_mode == "api":
+        from distil.pod.teacher_api import generate_continuations_api
+
+        write_progress(
+            progress_path,
+            phase="teacher_generating",
+            round_id=spec["round_id"],
+            n_prompts=len(prompts),
+            mode="api",
+        )
+        outs = generate_continuations_api(prompts, max_new_tokens=max_new, top_k=top_k)
+    else:
+        write_progress(progress_path, phase="teacher_starting", round_id=spec["round_id"])
+        teacher = start_teacher(spec["teacher_repo"], spec.get("vllm") or {})
+        write_progress(
+            progress_path,
+            phase="teacher_generating",
+            n_prompts=len(prompts),
+            mode="vllm",
+        )
+        outs = generate_continuations(teacher, prompts, max_new_tokens=max_new, top_k=top_k)
+
     payload = {
         "round_id": spec["round_id"],
         "block_hash": spec.get("block_hash"),
@@ -106,8 +128,9 @@ def _phase_teacher(spec: dict, progress_path: Path) -> dict:
         "teacher_token_ids": [o.completion_token_ids for o in outs],
     }
     tc.save(spec["round_id"], payload)
-    del teacher
-    free_gpu()
+    if teacher_mode != "api":
+        del teacher  # noqa: F821 — only bound on the vllm branch
+        free_gpu()
     return payload
 
 
