@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from distil.pod import cache as hf_cache
 from distil.pod import teacher_cache as tc
 from distil.pod.axes import run_all_axes
 from distil.pod.dq_floors import dq_response
@@ -254,12 +255,33 @@ def _length_penalty(bench_results: dict) -> float:
     return sum(deltas) / len(deltas) if deltas else 1.0
 
 
+def _filter_students_for_shard(students: list[dict], shard_idx: int, n_shards: int) -> list[dict]:
+    """Round-robin shard slice (preserves king position 0 on shard 0)."""
+    return students[shard_idx::n_shards]
+
+
 def main(argv: list[str] | None = None) -> int:
     global _OUT_PATH
     parser = argparse.ArgumentParser()
     parser.add_argument("spec_path")
     parser.add_argument("--out", default="/home/results.json")
     parser.add_argument("--progress", default="/home/eval_progress.json")
+    parser.add_argument(
+        "--phase",
+        choices=("all", "teacher", "students", "judge"),
+        default="all",
+        help="Run a single phase (used by the multi-GPU orchestrator).",
+    )
+    parser.add_argument(
+        "--shard",
+        default="0/1",
+        help="Shard ``idx/n`` for --phase=students (e.g. ``3/8``).",
+    )
+    parser.add_argument(
+        "--raw-in",
+        default=None,
+        help="For --phase=judge: path to a merged raw_responses.json from shards.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -273,46 +295,83 @@ def main(argv: list[str] | None = None) -> int:
     _OUT_PATH = Path(args.out)
     progress_path = Path(args.progress)
     spec = json.loads(Path(args.spec_path).read_text())
-    write_progress(progress_path, phase="bootstrap", round_id=spec.get("round_id"))
 
-    wall = WallClock(60 * 60 * 4)  # 4-hour hard ceiling
+    # ── Phase 0: pre-round HF cache broom (any phase except judge) ──
+    if args.phase in ("all", "teacher", "students"):
+        keep_repos = [spec["teacher_repo"]] + [s["repo"] for s in spec.get("students", [])]
+        try:
+            hf_cache.sweep(keep_repos)
+        except Exception as exc:
+            logger.warning(f"pre-round cache sweep failed: {exc}")
+
+    write_progress(progress_path, phase="bootstrap", round_id=spec.get("round_id"))
+    wall = WallClock(60 * 60 * 4)
 
     # ── Phase 1: teacher continuations ──────────────────────────────
-    teacher_payload = _phase_teacher(spec, progress_path)
-    wall.check("after_teacher")
+    if args.phase in ("all", "teacher"):
+        _phase_teacher(spec, progress_path)
+        wall.check("after_teacher")
+    if args.phase == "teacher":
+        write_progress(progress_path, phase="finished")
+        return 0
 
     # ── Phase 2: per-student scoring + raw probe collection ─────────
-    raw_by_student: dict[str, dict] = {}
-    for student_spec in spec["students"]:
-        if not cuda_alive():
-            logger.error("CUDA poisoned — quarantining round")
-            break
-        try:
-            row, raw = _phase_student(student_spec, teacher_payload, spec, progress_path)
-        except Exception as exc:
-            logger.exception(f"student {student_spec['name']} crashed: {exc}")
-            row = {
-                "name": student_spec["name"],
-                "uid": student_spec.get("uid"),
-                "hotkey": student_spec.get("hotkey"),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            raw = None
-        _PARTIAL[student_spec["name"]] = row
-        if raw is not None and "error" not in row:
-            raw_by_student[student_spec["name"]] = raw
-        _flush_partial()
-        wall.check(f"after_student_{student_spec['name']}")
+    if args.phase in ("all", "students"):
+        teacher_payload = _phase_teacher(spec, progress_path)  # cache hit on shards
+        shard_idx, n_shards = (int(x) for x in args.shard.split("/"))
+        my_students = _filter_students_for_shard(spec["students"], shard_idx, n_shards)
+        logger.info(f"shard {shard_idx}/{n_shards}: {len(my_students)} students")
+        raw_by_student: dict[str, dict] = {}
+        for student_spec in my_students:
+            if not cuda_alive():
+                logger.error("CUDA poisoned — quarantining round")
+                break
+            try:
+                row, raw = _phase_student(student_spec, teacher_payload, spec, progress_path)
+            except Exception as exc:
+                logger.exception(f"student {student_spec['name']} crashed: {exc}")
+                row = {
+                    "name": student_spec["name"],
+                    "uid": student_spec.get("uid"),
+                    "hotkey": student_spec.get("hotkey"),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                raw = None
+            _PARTIAL[student_spec["name"]] = row
+            if raw is not None and "error" not in row:
+                raw_by_student[student_spec["name"]] = raw
+            _flush_partial()
+            try:
+                hf_cache.clean_model(
+                    student_spec["repo"], keep_repos=(spec["teacher_repo"],)
+                )
+            except Exception as exc:
+                logger.warning(f"post-student cache clean failed: {exc}")
+            wall.check(f"after_student_{student_spec['name']}")
+
+        if args.phase == "students":
+            # Side-car the raw responses so the orchestrator can merge them.
+            raw_path = _OUT_PATH.with_suffix(".raw.json")
+            raw_path.write_text(json.dumps(raw_by_student, indent=2))
+            write_progress(progress_path, phase="finished")
+            return 0
 
     # ── Phase 3: teacher reload + judge grading ─────────────────────
-    try:
-        graded = _phase_judge(spec, raw_by_student, progress_path)
-    except Exception as exc:
-        logger.exception(f"judge phase crashed: {exc}")
-        graded = {}
-    for name, scores in graded.items():
-        if name in _PARTIAL and isinstance(_PARTIAL[name], dict):
-            _PARTIAL[name].update(scores)
+    if args.phase in ("all", "judge"):
+        if args.phase == "judge":
+            raw_path = Path(args.raw_in) if args.raw_in else _OUT_PATH.with_suffix(".raw.json")
+            raw_by_student = json.loads(raw_path.read_text()) if raw_path.exists() else {}
+            # In --phase=judge mode, the _PARTIAL we'll merge into comes from --out (the merged shards).
+            if _OUT_PATH.exists():
+                _PARTIAL.update(json.loads(_OUT_PATH.read_text()))
+        try:
+            graded = _phase_judge(spec, raw_by_student, progress_path)
+        except Exception as exc:
+            logger.exception(f"judge phase crashed: {exc}")
+            graded = {}
+        for name, scores in graded.items():
+            if name in _PARTIAL and isinstance(_PARTIAL[name], dict):
+                _PARTIAL[name].update(scores)
 
     _PARTIAL["__finished_at__"] = time.time()
     _flush_partial()

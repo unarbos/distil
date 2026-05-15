@@ -162,6 +162,23 @@ class Settings(BaseSettings):
     lium_api_key: str = Field(default="", validation_alias="LIUM_API_KEY")
     lium_default_pod_size: str = "B200x1"
     lium_chat_pod_size: str = "B200x1"
+    lium_pod_name: str = Field(
+        default="",
+        validation_alias="DISTIL_LIUM_POD_NAME",
+        description="Persistent pod name. When set, `attach_pod()` reuses this "
+        "pod every round instead of provisioning a fresh one (prod default).",
+    )
+    eval_n_gpus: int = Field(
+        default=8,
+        validation_alias="DISTIL_N_GPUS",
+        description="GPUs to fan student shards across; 1 = serial.",
+    )
+    eval_persistent_pod: bool = Field(
+        default=True,
+        validation_alias="DISTIL_PERSISTENT_POD",
+        description="If true, the validator reuses `lium_pod_name`; otherwise "
+        "it provisions a fresh ephemeral pod per round.",
+    )
 
     @field_validator(
         "repo_root",
