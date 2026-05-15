@@ -17,25 +17,15 @@ from __future__ import annotations
 
 import random
 import string
-import sys
-from pathlib import Path
 
-# Make sure we can import the vendor grader from the repo root regardless
-# of where we're called from.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-# Guarded import so unit tests can run without the validator's heavy
-# bench infra; we only need the supported-verifier registry + the
-# evaluate_item function from the vendored grader.
-try:
-    from scripts.ifeval_vendor import SUPPORTED_VERIFIERS, evaluate_item
-except ImportError:  # pragma: no cover - dev environment
-    SUPPORTED_VERIFIERS = {}
-
-    def evaluate_item(*_args, **_kwargs):
-        return False, []
+# Vendor grader is colocated with this module under ``distil/`` so the
+# import works on both the validator host AND the eval pod (the pod
+# upload includes ``distil/`` but NOT ``scripts/``). Previously this
+# module fell back to ``scripts.ifeval_vendor`` which silently
+# returned ``False, []`` for every IFEval grade whenever ``scripts/``
+# wasn't on sys.path — a quiet zero-score regression that would have
+# tanked every miner's reasoning_density axis on the pod.
+from distil.pod.axes.v31._ifeval_vendor import SUPPORTED_VERIFIERS, evaluate_item
 
 
 # ─────────────────────────────────────────────────────────────────────
