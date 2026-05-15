@@ -102,10 +102,20 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     # i.e. every round would dethrone the current king. The legacy
     # validator never did that, and the dashboard would have flipped
     # on every cutover round.
+    # ``king_name`` is the dethrone-gate's "current king" string (the
+    # downstream resolve_king() call uses it as
+    # ``current_king_model=``). Distil's composite_scores is UID-keyed,
+    # so by convention king_name here is ``str(uid)`` — the UID-as-
+    # string — matching what ``select_king`` returns. Both branches
+    # MUST bind king_name (or the f-string log_event below and the
+    # downstream dethrone-gate call hit UnboundLocalError, which was
+    # crashing every distil round at this exact line until 22:46 UTC).
+    king_name: str | None = None
     king_uid: int | None = None
     h2h_king_uid = (state.h2h_latest or {}).get("king_uid")
     if h2h_king_uid is not None and int(h2h_king_uid) in commitments:
         king_uid = int(h2h_king_uid)
+        king_name = str(king_uid)
         _king_reason = "h2h_latest"
     else:
         king_name, _king_reason = resolve_king(
