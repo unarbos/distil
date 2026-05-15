@@ -118,7 +118,13 @@ class Settings(BaseSettings):
 
     # ── Activation fingerprinting ──────────────────────────────────
     activation_fp_dim: int = 512
-    activation_fp_threshold: float = 0.985
+    activation_fp_threshold: float = 0.985  # cosine sim above this = near-copy DQ
+
+    # ── DQ thresholds ─────────────────────────────────────────────
+    long_form_derail_dq_enabled: bool = True
+    long_form_derail_dq_threshold: float = 0.30  # coherence below = derailed
+    long_form_derail_dq_ratio: float = 0.50  # fraction derailed → DQ
+    composite_dethrone_floor: float = 0.20  # worst-axis floor; below = no dethrone
 
     # ── HF / dataset ────────────────────────────────────────────────
     eval_dataset: str = "karpathy/climbmix-400b-shuffle"

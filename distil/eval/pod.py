@@ -162,6 +162,20 @@ def install_runtime(pod: Pod) -> None:
         logger.warning(f"pod install rc={code}\n{out[-2000:]}")
 
 
+def _pod_run_state(pod: Pod, remote_run: str) -> str:
+    """Probe ``remote_run`` on the pod. Returns one of: ``"absent"``,
+    ``"in_progress"``, ``"complete"``."""
+    code, out = pod.run(
+        f"if [ -f {remote_run}/results.json ]; then echo complete; "
+        f"elif [ -f {remote_run}/round_spec.json ]; then echo in_progress; "
+        f"else echo absent; fi",
+        timeout=20,
+    )
+    if code != 0:
+        return "absent"
+    return (out or "absent").strip().splitlines()[-1].strip()
+
+
 def run_eval_on_pod(
     *,
     pod: Pod,
@@ -169,6 +183,7 @@ def run_eval_on_pod(
     out_dir: Path,
     timeout_s: int | None = None,
     n_gpus: int | None = None,
+    resume: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Upload spec, invoke the parallel orchestrator on the pod, return merged results.
 
@@ -179,6 +194,18 @@ def run_eval_on_pod(
             --out /home/distil_eval/<round_id>/results.json \\
             --progress /home/distil_eval/<round_id>/eval_progress.json \\
             --n-gpus 8
+
+    Resume semantics (``resume=True``, default):
+
+    * If ``remote_run/results.json`` already exists, the round is already
+      done — pull the artefacts and return immediately. This lets a
+      crashed-then-restarted validator pick up a completed round without
+      re-running the eval.
+    * If ``remote_run/round_spec.json`` exists but no results, the round
+      is in progress (the orchestrator subprocess survived the SSH
+      disconnect inside ``tmux``/``setsid``). Tail the log and wait for
+      results to appear.
+    * Otherwise: upload spec, start fresh.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     spec_local = out_dir / "round_spec.json"
@@ -188,20 +215,45 @@ def run_eval_on_pod(
     remote_run = f"{REMOTE_WORKDIR}/round_{round_id}"
     n = int(n_gpus or settings.eval_n_gpus or 8)
 
-    pod.run(f"mkdir -p {remote_run}", timeout=30)
-    pod.rsync_up(str(spec_local), f"{remote_run}/round_spec.json")
-
-    cmd = (
-        f"cd /home && {os.environ.get('DISTIL_PYTHON_REMOTE', 'python3')} "
-        f"-u -m distil.pod.orchestrator {remote_run}/round_spec.json "
-        f"--workdir {remote_run} "
-        f"--out {remote_run}/results.json "
-        f"--progress {remote_run}/eval_progress.json "
-        f"--n-gpus {n} 2>&1 | tee {remote_run}/orchestrator.log"
-    )
-    code, out = pod.run(cmd, timeout=timeout_s)
-    if code != 0:
-        logger.warning(f"orchestrator rc={code} (last 2k):\n{out[-2000:]}")
+    pre = _pod_run_state(pod, remote_run) if resume else "absent"
+    if pre == "complete":
+        logger.info(f"resume: pod has results for round {round_id}; downloading")
+    elif pre == "in_progress":
+        logger.info(f"resume: pod has in-progress round {round_id}; waiting for completion")
+        deadline = time.time() + (timeout_s or settings.eval_round_max_minutes * 60)
+        while time.time() < deadline:
+            time.sleep(20)
+            state = _pod_run_state(pod, remote_run)
+            if state == "complete":
+                break
+        else:
+            raise RuntimeError(f"resume: round {round_id} did not complete within deadline")
+    else:
+        pod.run(f"mkdir -p {remote_run}", timeout=30)
+        pod.rsync_up(str(spec_local), f"{remote_run}/round_spec.json")
+        # Launch orchestrator under ``setsid`` so it survives an SSH
+        # disconnect — resume can find it on next attach.
+        cmd = (
+            f"cd /home && setsid -f {os.environ.get('DISTIL_PYTHON_REMOTE', 'python3')} "
+            f"-u -m distil.pod.orchestrator {remote_run}/round_spec.json "
+            f"--workdir {remote_run} "
+            f"--out {remote_run}/results.json "
+            f"--progress {remote_run}/eval_progress.json "
+            f"--n-gpus {n} > {remote_run}/orchestrator.log 2>&1 < /dev/null && "
+            f"echo launched"
+        )
+        code, _ = pod.run(cmd, timeout=60)
+        if code != 0:
+            raise RuntimeError(f"orchestrator launch failed (rc={code})")
+        # Wait for completion by polling for results.json.
+        deadline = time.time() + (timeout_s or settings.eval_round_max_minutes * 60)
+        while time.time() < deadline:
+            time.sleep(20)
+            state = _pod_run_state(pod, remote_run)
+            if state == "complete":
+                break
+        else:
+            raise RuntimeError(f"round {round_id} did not complete within deadline")
 
     # Pull artefacts back to the validator host.
     pod.rsync_down(f"{remote_run}/results.json", str(out_dir))

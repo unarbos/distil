@@ -96,16 +96,51 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         logger.info("no challengers and no king; skipping round")
         return
 
-    spec = build_round_spec(
-        block=block,
-        block_hash=block_hash,
-        teacher_repo=settings.teacher_repo,
-        reference_repo=settings.reference_repo,
-        king=king_commitment,
-        challengers=challengers,
-    )
+    # Resume-on-attach: if we have an in-progress round and the chain block
+    # hasn't advanced past the round-completion deadline, re-use the prior
+    # round_spec rather than building a fresh one. Lets a crashed-restarted
+    # validator continue an eval that's still running on the persistent pod.
+    in_progress = state.current_round or {}
+    if in_progress.get("round_id") and not in_progress.get("completed"):
+        age_min = (time.time() - in_progress.get("started_at", 0)) / 60
+        if age_min < settings.eval_round_max_minutes * 2:
+            logger.info(
+                f"resume: reusing in-progress round {in_progress['round_id']} "
+                f"(age {age_min:.1f} min)"
+            )
+            spec = in_progress["spec"]
+        else:
+            logger.warning(
+                f"in-progress round {in_progress['round_id']} is {age_min:.1f} min old; "
+                f"abandoning and starting fresh"
+            )
+            spec = build_round_spec(
+                block=block, block_hash=block_hash,
+                teacher_repo=settings.teacher_repo,
+                reference_repo=settings.reference_repo,
+                king=king_commitment, challengers=challengers,
+            )
+    else:
+        spec = build_round_spec(
+            block=block, block_hash=block_hash,
+            teacher_repo=settings.teacher_repo,
+            reference_repo=settings.reference_repo,
+            king=king_commitment, challengers=challengers,
+        )
+
     out_dir = Path(settings.state_dir) / "_rounds" / f"round_{spec['round_id']}"
     log_event(f"starting round block={block} king={king_name} challengers={len(challengers)}")
+
+    state.current_round = {
+        "round_id": spec["round_id"],
+        "block": block,
+        "king_name": king_name,
+        "n_challengers": len(challengers),
+        "started_at": time.time(),
+        "completed": False,
+        "spec": spec,
+    }
+    state.save()
 
     t_round_start = time.time()
     with _pod_context(spec["round_id"]) as pod:
@@ -121,6 +156,15 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     dur_min = (time.time() - t_round_start) / 60
     logger.info(f"round {spec['round_id']} eval finished in {dur_min:.1f} min")
 
+    uid_index = {
+        c.key: {
+            "uid": c.uid, "hotkey": uid_to_hotkey.get(c.uid),
+            "coldkey": getattr(c, "coldkey", None),
+            "commit_block": getattr(c, "commit_block", None),
+            "revision": getattr(c, "revision", "main"),
+        }
+        for c in commitments.values()
+    }
     record = process_round(
         state=state,
         pod_results=results,
@@ -129,8 +173,11 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         teacher_name=spec["reference_repo"],
         block=block,
         block_hash=block_hash,
+        uid_index=uid_index,
         timings=results.get("__per_bench_timing__"),
     )
+    state.current_round = {**state.current_round, "completed": True, "completed_at": time.time()}
+    state.save()
     new_king, why = resolve_king(state.composite_scores, current_king_model=king_name)
     record["king_after"] = new_king
     record["king_reason"] = why
