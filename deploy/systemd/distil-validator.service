@@ -1,5 +1,5 @@
 [Unit]
-Description=Distil SN97 Validator
+Description=Distil SN97 Validator (rewrite-v2 cutover)
 After=network-online.target
 Wants=network-online.target
 
@@ -13,7 +13,11 @@ Environment=DISTIL_PYTHON=/opt/distil/venv/bin/python
 Environment=DISTIL_STATE_DIR=/opt/distil/repo/state
 Environment=DISTIL_ENV_FILE=/home/distil/.secrets/distil.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/bash /opt/distil/repo/scripts/run_validator.sh
+# Distil CLI entrypoint. The legacy drop-ins under
+# /etc/systemd/system/distil-validator.service.d/ still apply and forward
+# DISTIL_LIUM_POD_NAME / DISTIL_TEACHER_MODE / HF_HOME / vLLM tunables —
+# the rewrite reads all of those via distil/settings.py:Settings.
+ExecStart=/opt/distil/venv/bin/distil validate --wallet-name affine --hotkey-name validator
 Restart=always
 RestartSec=10
 StandardOutput=journal

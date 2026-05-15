@@ -75,15 +75,19 @@ def create_app() -> FastAPI:
         response.headers["x-response-ms"] = f"{int((time.time() - start) * 1000)}"
         return response
 
-    # Native distil routes win (defined first → first match in FastAPI).
-    app.include_router(api_router)
-    app.include_router(chat_router)
-    # Compat layer: include prod routers for routes not yet ported (queue,
-    # announcement, composite-scores, miner/{uid}/rounds, telemetry/*,
-    # chat/*, debugging/*, etc.). Skipped silently if the prod ``api/``
-    # package isn't on the filesystem (e.g. minimal distil-only deploy).
+    # Mount prod routers FIRST so they win first-match on any overlapping
+    # path. This guarantees zero response-shape regression for the live
+    # frontend during the rewrite cutover — the prod implementations remain
+    # the source of truth for every endpoint the dashboard already calls.
+    # Skipped silently if the prod ``api/`` package isn't on the filesystem.
     for r in load_prod_routers():
         app.include_router(r)
+    # Native distil routers are mounted last and only "win" for new paths
+    # that prod doesn't define (e.g. /api/miner/{uid}, /api/telemetry/*,
+    # /api/incidents, /api/model-info/{owner}/{name}). Existing prod paths
+    # are unaffected.
+    app.include_router(api_router)
+    app.include_router(chat_router)
     return app
 
 
