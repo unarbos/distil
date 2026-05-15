@@ -370,7 +370,12 @@ def process_round(
             comp["disqualified"] = True
             comp["dq_reason"] = state.dq_reason(hotkey, uid=int(uid) if uid is not None else None)
         composites[name] = comp
-        state.composite_scores[name] = comp
+        # ``state.composite_scores`` is UID-keyed to match the legacy
+        # writer (scripts/validator/single_eval.py:
+        # ``state.composite_scores[uid_str] = record``). The in-memory
+        # ``composites`` dict above stays model-name-keyed because the
+        # h2h record + DQ logic below indexes by name.
+        state.composite_scores[str(uid) if uid is not None else name] = comp
 
         # Update the cross-round fingerprint store so future rounds see this uid.
         if isinstance(fp, dict) and fp.get("layer_fingerprints"):
@@ -384,11 +389,32 @@ def process_round(
                 "updated": time.time(),
             }
 
+    # ``king_uid`` / ``king_model`` are required for next-round king
+    # resolution (the validator service reads h2h_latest.king_uid as
+    # the PRIMARY source for the seated king — see ``_round`` in
+    # ``distil.eval.service``). Without them, every restart falls
+    # back to the composite-scores top scorer and silently dethrones
+    # the seated king. The legacy ``h2h_latest`` schema also exposed
+    # both fields to the dashboard.
+    king_uid_resolved: int | None = None
+    king_model_resolved: str | None = None
+    if king_name:
+        idx = uid_index.get(king_name) or {}
+        if idx.get("uid") is not None:
+            king_uid_resolved = int(idx["uid"])
+        elif (students.get(king_name) or {}).get("uid") is not None:
+            king_uid_resolved = int(students[king_name]["uid"])
+        # Strip the @revision suffix to get the bare model id for
+        # the dashboard's "king_model" widget.
+        king_model_resolved = king_name.split("@", 1)[0]
+
     record = {
         "block": block,
         "block_hash": block_hash,
         "ts": time.time(),
+        "king_uid": king_uid_resolved,
         "king_name": king_name,
+        "king_model": king_model_resolved,
         "reference_name": reference_name,
         "teacher_name": teacher_name,
         "broken_axes": sorted(broken),
