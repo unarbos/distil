@@ -91,6 +91,18 @@ POD_PROGRESS_METADATA_KEYS: tuple[str, ...] = (
     "n_teacher_prompts_with_logprobs",
     "n_teacher_prompts_dropped_missing_logprobs",
     "teacher_logprob_coverage",
+    # 2026-05-15: parallel orchestrator fields. ``shards`` is the
+    # per-GPU view (one entry per worker shard) the dashboard uses to
+    # render "N students scoring simultaneously". ``n_gpus`` is the
+    # total worker count so the UI can size the row without
+    # iterating. ``orchestrator`` is "parallel" or unset; the
+    # frontend reads it as a feature flag so old single-shard runs
+    # don't try to render the multi-GPU layout. Forwarding these is
+    # cheap (a few hundred bytes) and lets the frontend render the
+    # parallel view without a separate endpoint.
+    "shards",
+    "n_gpus",
+    "orchestrator",
 )
 
 

@@ -374,6 +374,27 @@ export interface EvalProgress {
     prompts_total?: number;
     scoring_time_s?: number;
   }>;
+  // 2026-05-15: when the validator runs ``parallel_orchestrator.py``
+  // (DISTIL_USE_PARALLEL_ORCH=1) the pod-side eval_progress.json
+  // includes a per-GPU shard view. The dashboard renders the live
+  // panel's "Scoring" row as one tile per shard so users can see
+  // that N students are evaluating concurrently on N GPUs.
+  shards?: Array<{
+    gpu: number;
+    pid?: number;
+    alive?: boolean;
+    current_student?: string | null;
+    current_stage?: string | null;
+    current_prompts_done?: number;
+    current_prompts_total?: number;
+    stage_line?: string;
+    stale_s?: number;
+    repeat_tail?: number;
+    exit_code?: number | null;
+    shard_result_bytes?: number;
+  }>;
+  n_gpus?: number;
+  orchestrator?: string;
 }
 
 export async function fetchEvalProgress(): Promise<EvalProgress | null> {

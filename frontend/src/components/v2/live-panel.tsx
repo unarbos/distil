@@ -56,6 +56,28 @@ interface EvalProgress {
   king_uid?: number;
   completed?: CompletedStudent[];
   models?: Record<string, string>;
+  // 2026-05-15: parallel orchestrator (DISTIL_USE_PARALLEL_ORCH=1)
+  // multi-GPU shard view. Each entry is one worker GPU; the live
+  // panel renders these stacked so the user can confirm N students
+  // are scoring in parallel rather than the legacy sequential mode.
+  shards?: ShardProgress[];
+  n_gpus?: number;
+  orchestrator?: string;
+}
+
+interface ShardProgress {
+  gpu: number;
+  pid?: number;
+  alive?: boolean;
+  current_student?: string | null;
+  current_stage?: string | null;
+  current_prompts_done?: number;
+  current_prompts_total?: number;
+  stage_line?: string;
+  stale_s?: number;
+  repeat_tail?: number;
+  exit_code?: number | null;
+  shard_result_bytes?: number;
 }
 
 interface LogLine {
@@ -227,9 +249,19 @@ export function LivePanel() {
 
   const phases = derivePhases(progress);
   const phase = progress?.phase ?? (progress?.active ? "running" : "idle");
-  const explainer =
-    PHASE_EXPLAINERS[phase] ??
-    (progress?.active ? "Validator running…" : PHASE_EXPLAINERS.idle);
+  // 2026-05-15: when DISTIL_USE_PARALLEL_ORCH=1 the pod fans the
+  // round across N GPUs. The single-shard "score sequentially" copy
+  // is then wrong: students score in parallel. Swap in a parallel-
+  // aware explainer + show which shards are live.
+  const activeShards =
+    progress?.shards?.filter((s) => s.alive && s.current_student) ?? [];
+  const isParallel =
+    (progress?.orchestrator === "parallel") ||
+    (progress?.shards?.length ?? 0) > 1;
+  const explainer = isParallel && progress?.active
+    ? `Parallel scoring across ${progress?.n_gpus ?? progress?.shards?.length ?? 0} GPUs — ${activeShards.length} student${activeShards.length === 1 ? "" : "s"} evaluating concurrently.`
+    : (PHASE_EXPLAINERS[phase] ??
+       (progress?.active ? "Validator running…" : PHASE_EXPLAINERS.idle));
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
@@ -265,6 +297,10 @@ export function LivePanel() {
             <ChatKingPill variant="block" />
           </div>
         </div>
+
+        {isParallel && (progress?.shards?.length ?? 0) > 0 && (
+          <ShardsPanel shards={progress!.shards!} />
+        )}
 
         <div className="flex flex-col gap-3">
           {phases.map((p) => (
@@ -635,6 +671,77 @@ function buildMetaText(p: EvalProgress): string {
   if (BENCH_PHASES.has(phase)) return "bench battery running";
   if (POST_PHASES.has(phase)) return PHASE_LABELS[phase] ?? phase;
   return p.phase ?? "running";
+}
+
+/**
+ * Per-GPU shard view for parallel-orchestrator runs.
+ *
+ * Each row is one worker GPU. We show the GPU index, the model the
+ * worker is currently scoring, the stage it's in, and either a
+ * progress fraction (during KL scoring) or the last log line (during
+ * probes/bench — when ``prompts_done`` is 0).
+ *
+ * The watchdog stall flag (``repeat_tail`` ≥ 100) is rendered in
+ * orange — operators see at a glance when a shard's tokenizer
+ * hung on the v4-style encode loop before the SIGKILL fires.
+ */
+function ShardsPanel({ shards }: { shards: ShardProgress[] }) {
+  const sorted = [...shards].sort((a, b) => (a.gpu ?? 0) - (b.gpu ?? 0));
+  return (
+    <div className="-mt-1">
+      <HeadRow
+        title="Parallel shards"
+        meta={`${sorted.filter((s) => s.alive).length} of ${sorted.length} active`}
+      />
+      <div className="mt-3 flex flex-col gap-1.5">
+        {sorted.map((s) => (
+          <ShardRow key={s.gpu} shard={s} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ShardRow({ shard }: { shard: ShardProgress }) {
+  const pd = shard.current_prompts_done ?? 0;
+  const pt = shard.current_prompts_total ?? 0;
+  const pct = pt > 0 ? Math.min(100, Math.round((pd / pt) * 100)) : 0;
+  const stalled = (shard.repeat_tail ?? 0) >= 100;
+  const dotClass = !shard.alive
+    ? "bg-[var(--border-strong)]"
+    : stalled
+      ? "bg-warning"
+      : "bg-ok";
+  const detail = (() => {
+    if (!shard.alive) {
+      return shard.exit_code === 0 ? "done" : `exited rc=${shard.exit_code ?? "?"}`;
+    }
+    if (pt > 0 && pd > 0) {
+      return `${pd}/${pt} prompts · ${pct}%`;
+    }
+    if (shard.current_stage) {
+      return shard.current_stage.replace(/_/g, " ");
+    }
+    return shard.stage_line?.slice(0, 60) || "running";
+  })();
+  return (
+    <div className="grid grid-cols-[16px_48px_1fr_auto] items-center gap-2.5 py-1.5 text-[12.5px] border-b border-border last:border-b-0">
+      <span
+        className={[
+          "w-1.5 h-1.5 rounded-full justify-self-center",
+          dotClass,
+          shard.alive && !stalled ? "ring-2 ring-ok/15" : "",
+        ].join(" ")}
+      />
+      <span className="num text-meta">gpu{shard.gpu}</span>
+      <span className="truncate text-foreground min-w-0" title={shard.current_student ?? ""}>
+        {shard.current_student ?? "(idle)"}
+      </span>
+      <span className="text-[11px] text-meta num text-right whitespace-nowrap">
+        {detail}
+      </span>
+    </div>
+  );
 }
 
 function HeadRow({ title, meta }: { title: string; meta: string }) {
