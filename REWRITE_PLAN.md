@@ -34,6 +34,21 @@ End state target: **\~12k LoC of organized prod code** (down from ~50k+).
 
 ## Remaining gaps before cutover
 
+> **2026-05-15 parity snapshot:** with all Phase A+B work landed, distil's
+> composite still scores only **21 axes** vs prod's **49** on a real prod round
+> (see `docs/CUTOVER_PARITY_2026-05-15.md`). On most students the absolute
+> composite diff is < 0.05 (5%), but on at least one UID the diff is 0.46
+> (composite goes from 0.46 → 0.00 because every axis it scored on is v30 and
+> distil has no v30 axes). **A blind cutover today would visibly shift the
+> leaderboard.**
+>
+> The 28-axis gap is structural: distil only scores the v31 procedural axes +
+> the always-on probes; prod still applies ~30 v30 axes that `scripts/v31/`
+> was designed to deprecate via the promotion gate
+> (`scripts/v31/__init__.py:_PROMOTION_GATE`). Closing the gap means either
+> (a) waiting for the v31 promotion gate to fire upstream, (b) accepting the
+> leaderboard shift, or (c) porting the missing v30 axes into `distil/`.
+
 Most of what blocked a cutover on 2026-05-14 is **now ported** (Phase A + B, see
 "Cleanup landed" below). What's still missing:
 
@@ -66,11 +81,20 @@ Most of what blocked a cutover on 2026-05-14 is **now ported** (Phase A + B, see
    `scripts/validator/pod_session.py:StageStallWatchdog` does this.
 
 5. **Snapshot regression test against prod**
-   The 848-test suite still targets `scripts.validator.*`. We have not
-   yet pinned `distil.eval.results.process_round` to produce the same
-   composite vectors as `scripts.validator.results.process_results` for
-   a fixed `pod_results.json`. Until this test exists, we can't promise
-   the leaderboard won't move on cutover.
+   The 795-test suite still targets `scripts.validator.*`. A first parity
+   harness (`/tmp/parity_check.py`) was run on 2026-05-15 against a real
+   prod round (`state/incoming/round_20260514T053302Z/`) and produced the
+   parity diff captured in `docs/CUTOVER_PARITY_2026-05-15.md`. We have
+   **not** yet baked that harness into the test suite as a regression
+   guard — that's still TODO.
+
+6. **API route gap**
+   `distil/api/routes.py` exposes **15 routes**; the production
+   `api/server.py + api/routes/` graph exposes **~45 routes** the
+   frontend actually consumes (chat, queue, announcement, eval-stats,
+   composite-scores, commitments, model-info, pod-logs, telemetry/*, and
+   more). Cutting the API to `distil.api.server:app` today would
+   500-out half the dashboard.
 
 ## Promotion checklist (path to retire `scripts/`)
 
@@ -150,6 +174,16 @@ Do these in order; each is independently shippable:
 - [x] `.pre-commit-config.yaml` and `deploy/` tracked in git.
 - [x] `distil/` tracked in git as WIP (this file is its roadmap).
 - [x] systemd unit files committed under `scripts/systemd/`.
+- [x] **Security fix:** `LIUM_API_KEY` no longer visible via `ps auxf`
+      (was passed as `--lium-api-key <key>` in `scripts/run_validator.sh`;
+      now passed via env only — see commit `4a19eb4`).
+- [x] **6 dead python files** removed from `scripts/` (~1,500 LoC, no
+      callers, tarballed to `/var/backups/distil-cleanup-2026-05-15/dead-scripts/`):
+      `bootstrap_weight_hashes`, `on_policy_rkl_probe`, `retroactive_probe`,
+      `run_king_benchmark`, `verify_round`, `reproduce_prompts`.
+- [x] **`distil/` is a real package** (`pyproject.toml` v0.9.0,
+      `pip install -e .` installs it, `distil` CLI registered).
+- [x] **Parity snapshot** captured (`docs/CUTOVER_PARITY_2026-05-15.md`).
 
 ## In-place cleanup of `scripts/` (parallel track to the rewrite)
 
