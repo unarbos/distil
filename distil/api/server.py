@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
 
 from distil.api.chat import router as chat_router
+from distil.api.compat import load_prod_routers
 from distil.api.helpers import _Bucket, client_real_ip
 from distil.api.routes import router as api_router
 from distil.settings import settings
@@ -74,8 +75,15 @@ def create_app() -> FastAPI:
         response.headers["x-response-ms"] = f"{int((time.time() - start) * 1000)}"
         return response
 
+    # Native distil routes win (defined first → first match in FastAPI).
     app.include_router(api_router)
     app.include_router(chat_router)
+    # Compat layer: include prod routers for routes not yet ported (queue,
+    # announcement, composite-scores, miner/{uid}/rounds, telemetry/*,
+    # chat/*, debugging/*, etc.). Skipped silently if the prod ``api/``
+    # package isn't on the filesystem (e.g. minimal distil-only deploy).
+    for r in load_prod_routers():
+        app.include_router(r)
     return app
 
 

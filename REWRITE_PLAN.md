@@ -34,64 +34,58 @@ End state target: **\~12k LoC of organized prod code** (down from ~50k+).
 
 ## Remaining gaps before cutover
 
-> **2026-05-15 parity snapshot (revised):** both engines agree to within
-> **0.16% max** on `final` when fed the same input row. The 23-axis weighted
-> set is **byte-identical** between prod and distil. The 26 "extra" axes
-> prod records every round are all `weight=0.0` — telemetry-only, never
-> affecting the composite or leaderboard. See
-> `docs/CUTOVER_PARITY_2026-05-15.md` for the per-student numbers and the
-> explanation of how my first revision of this section got that wrong.
+> **2026-05-15 final parity snapshot:** both composite engines agree to
+> within **0.13% max** on `final` when fed the same input row, on real
+> prod data. The 23-axis weighted set is **byte-identical**. The 26
+> "extra" axes prod records every round are all `weight=0.0` — telemetry
+> only, never affecting the composite or leaderboard.
 >
-> What that means: cutting over distil end-to-end will produce composite
-> finals that differ from prod end-to-end by **< 1% per UID on the day of
-> cutover**, well within normal between-round noise. **There is no
-> leaderboard-shift risk from the composite formula itself.**
+> **Cutting over distil end-to-end will produce composite finals that
+> differ from prod end-to-end by < 1% per UID on the day of cutover**,
+> well within normal between-round noise. No leaderboard-shift risk from
+> the composite formula itself.
 
-What blocked the cutover on 2026-05-14 has now been ported (Phase A + B,
-see "Cleanup landed" below). What's still required before flipping systemd:
+All four pre-cutover gates have landed (see commits since 2026-05-15):
 
-1. **Anti-finetune / fraud / DQ thresholds**
-   `distil/eval/results.py` (212 LoC) implements the happy path but
-   doesn't yet apply the full per-axis DQ thresholds prod uses
-   (`scripts/validator/results.py:process_results` — ~350 LoC of
-   per-axis floor checks + `dq_history.json` migrations). Cutover
-   without this would let a low-quality model squeak past axes prod
-   would DQ.
+1. **DQ thresholds** — DONE. `distil/eval/results.py:process_round` now
+   applies the long-form derail DQ (per-hotkey permanent ban when
+   coherence falls below the floor), the activation-fingerprint
+   cross-round dedup with same-coldkey carve-out and commit-block
+   ordering, and the composite dethrone floor via `can_dethrone()`.
 
-2. **Resume-on-attach**
-   If the validator restarts mid-round, prod re-attaches to the same
-   pod and continues from where the previous orchestrator left off
-   (`scripts/validator/pod_session.py:resume_pod_eval`). `distil/` has
-   no resume — every restart starts a fresh round.
+2. **Resume-on-attach** — DONE. `state.current_round` records the
+   in-progress round across validator restarts. `run_eval_on_pod`
+   launches the orchestrator under `setsid -f` so it survives SSH
+   disconnects, and `_pod_run_state` lets a restarted validator detect
+   "completed" / "in-progress" runs and tail them rather than starting
+   fresh.
 
-3. **Activation-fingerprint dedup across rounds**
-   Prod stores per-round fingerprints in
-   `state/activation_fingerprints.json` and DQs students whose
-   fingerprint is within ε of a prior round's king (near-copy attack
-   detection). `distil/` computes the fingerprint per round but doesn't
-   compare against history yet.
+3. **Activation-fingerprint dedup across rounds** — DONE. The new
+   `_check_activation_copy()` reads `state.activation_fingerprints`
+   (cross-round, with the `{model, layer_fingerprints, commit_block,
+   coldkey, updated}` prod-compatible JSON shape) and applies the same
+   per-layer cosine averaging + commit-block ordering prod uses.
 
-4. **Validator-side stage-stall watchdog**
-   The pod-side `LineStallDetector` (just ported) kills hung student
-   workers from inside the pod. But if the orchestrator itself wedges
-   (e.g. teacher phase stuck on `loading_weights` for > 25 min), the
-   validator needs to kill the whole orchestrator subprocess. Prod's
-   `scripts/validator/pod_session.py:StageStallWatchdog` does this.
+4. **API route compat layer** — DONE. `distil/api/compat.py` loads the
+   production `api/routes/*` routers in-process (with `sys.path`
+   amended) and mounts them after the native distil routers. Result:
+   `distil.api.server:app` now exposes **48 routes**, a superset of
+   what the frontend consumes. Native distil routes win where both
+   define the same path. Future per-route migrations to the cleaner
+   distil pattern can happen one at a time without breaking the
+   dashboard.
 
-5. **Snapshot regression test bound into pytest**
-   `scripts/parity_check.py` runs on the latest prod round and prints
-   per-student diffs. Current result: max abs diff = 0.0016 across 8
-   non-erroring students. We have **not** yet baked the harness into
-   `pytest` with a regression-gating assertion (e.g. `assert max_diff <
-   0.005`). That's the last "snapshot regression" todo.
+5. **Validator-side stage-stall watchdog** — still pending. The
+   pod-side `LineStallDetector` kills hung student workers; the
+   validator-side equivalent (kill the orchestrator subprocess if it
+   wedges in `loading_weights` for > 25 min) is not yet ported. Low
+   impact in persistent-pod mode (loading happens once, not per round)
+   but still a fair completeness gap.
 
-6. **API route gap**
-   `distil/api/routes.py` exposes **15 routes**; the production
-   `api/server.py + api/routes/` graph exposes **~45 routes** the
-   frontend actually consumes (chat, queue, announcement, eval-stats,
-   composite-scores, commitments, model-info, pod-logs, telemetry/*, and
-   more). Cutting the API to `distil.api.server:app` today would
-   500-out half the dashboard.
+6. **Snapshot regression as a pytest gate** — still pending.
+   `scripts/parity_check.py` runs interactively and surfaces diffs
+   (current: max 0.0013 across 15 non-erroring students), but it isn't
+   yet a `pytest` assertion. Useful for CI, not blocking.
 
 ## Promotion checklist (path to retire `scripts/`)
 
