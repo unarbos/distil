@@ -55,14 +55,40 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Internal (localhost / no-proxy) traffic — the Next.js SSR loop and
+    # systemd healthchecks — MUST bypass rate limits or the dashboard
+    # self-DoSes within seconds. Chat endpoints carry their own stricter
+    # per-handler limiter (see api/routes/chat.py), so the global one
+    # must skip them too. These two carve-outs are the legacy behavior
+    # the frontend has relied on for >6 months.
+    _PROXY_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+    _RATE_LIMIT_SKIP_PATHS = {
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/api/chat",
+        "/v1/chat/completions",
+        "/v1/models",
+    }
+
+    def _request_is_internal(request: Request) -> bool:
+        for h in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+            if request.headers.get(h):
+                return False
+        peer = request.client.host if request.client else ""
+        return peer in _PROXY_LOCAL_HOSTS
+
     @app.middleware("http")
     async def rate_limit_mw(request: Request, call_next):
-        if request.url.path.startswith("/api/") or request.url.path.startswith("/v1/"):
+        path = request.url.path
+        is_api = path.startswith("/api/") or path.startswith("/v1/")
+        if is_api and path not in _RATE_LIMIT_SKIP_PATHS and not _request_is_internal(request):
             ip = client_real_ip(request)
             if not _global_bucket.hit(ip):
                 return JSONResponse(
                     {"error": "rate limit exceeded"},
                     status_code=429,
+                    headers={"Retry-After": "30"},
                 )
         start = time.time()
         try:
