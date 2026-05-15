@@ -83,12 +83,44 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     if n_evict:
         logger.info(f"evicted {n_evict} stale composite rows (schema bump)")
 
-    # Resolve seated king from current composite_scores.
-    king_name, _king_reason = resolve_king(state.composite_scores, current_king_model=None)
-    king_uid = next(
-        (c.uid for c in commitments.values() if c.key == king_name),
-        None,
-    )
+    # Resolve seated king. Mirrors the legacy
+    # ``scripts/validator/service._resolve_king`` precedence rules so
+    # the cutover doesn't inadvertently dethrone the king every round:
+    #
+    #   1) PRIMARY  — ``state.h2h_latest.king_uid`` if that uid is
+    #      still a valid commitment on the chain. The seated king
+    #      keeps the crown until the paired-test dethrone gate
+    #      decides otherwise, which happens AFTER scoring this round
+    #      (see ``distil.eval.results.publish_round``), NOT at round-
+    #      spec build time.
+    #   2) FALLBACK — best ``final`` in composite_scores (UID-keyed).
+    #      Only used on a cold-start validator with no h2h_latest yet.
+    #
+    # The previous code called ``resolve_king`` with
+    # ``current_king_model=None`` which short-circuits the dethrone
+    # gate and unconditionally returns the highest composite scorer —
+    # i.e. every round would dethrone the current king. The legacy
+    # validator never did that, and the dashboard would have flipped
+    # on every cutover round.
+    king_uid: int | None = None
+    h2h_king_uid = (state.h2h_latest or {}).get("king_uid")
+    if h2h_king_uid is not None and int(h2h_king_uid) in commitments:
+        king_uid = int(h2h_king_uid)
+        _king_reason = "h2h_latest"
+    else:
+        king_name, _king_reason = resolve_king(
+            state.composite_scores, current_king_model=None
+        )
+        if king_name is not None:
+            try:
+                # composite_scores is UID-keyed (matches legacy writer
+                # ``single_eval.py:state.composite_scores[uid_str] = record``).
+                king_uid = int(king_name)
+            except (TypeError, ValueError):
+                king_uid = next(
+                    (c.uid for c in commitments.values() if c.key == king_name),
+                    None,
+                )
     king_commitment = commitments.get(king_uid) if king_uid is not None else None
 
     challengers = select_challengers(commitments, state, king_uid=king_uid)

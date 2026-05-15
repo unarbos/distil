@@ -20,7 +20,18 @@ from distil.state.files import ValidatorState
 
 logger = logging.getLogger("distil.eval.round")
 
-MAX_CHALLENGERS_PER_ROUND = 1
+# Per-round challenger cap. Matches the legacy
+# ``scripts/validator/single_eval.SINGLE_EVAL_MAX_PER_ROUND`` default
+# (10) so the distil cutover doesn't regress how many miners get
+# scored per round. Override via env ``DISTIL_MAX_CHALLENGERS_PER_ROUND``
+# (or the legacy alias ``SINGLE_EVAL_MAX_PER_ROUND``) without code change.
+import os as _os
+
+MAX_CHALLENGERS_PER_ROUND = int(
+    _os.environ.get("DISTIL_MAX_CHALLENGERS_PER_ROUND")
+    or _os.environ.get("SINGLE_EVAL_MAX_PER_ROUND")
+    or 10
+)
 
 
 def _model_key(c: Commitment) -> str:
