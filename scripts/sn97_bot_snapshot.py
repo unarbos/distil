@@ -12,12 +12,33 @@ from pathlib import Path
 
 BASE = "http://127.0.0.1:3710"
 # Eval pod name; validator's systemd unit exports DISTIL_LIUM_POD_NAME.
+# 2026-05-15: default updated to "8xb200" (current eval pod) and the
+# legacy "distil-eval" fallback REMOVED. The fallback was matching the
+# unrelated ``distil-eval-b200`` decommissioned pod on the Lium account,
+# so when the bot's systemd unit had a stale Environment= override the
+# snapshot would silently SSH into a B300 single-GPU pod and report
+# stale run_dir / GPU / disk numbers in LIVE_STATUS.md (miners then got
+# wrong "Currently scoring" answers via the Discord bot). If we ever
+# need a different pod, set DISTIL_LIUM_POD_NAME explicitly.
 POD_NAME = os.environ.get("DISTIL_LIUM_POD_NAME") or os.environ.get(
     "LIUM_POD_NAME"
-) or "distil-kimi-cutover"
-POD_NAME_FALLBACKS = ("distil-eval",)
+) or "8xb200"
+POD_NAME_FALLBACKS: tuple[str, ...] = ()
 POD_SSH_KEY = "/root/.ssh/id_ed25519"
+# Best-effort: pick up DISTIL_LIUM_POD_NAME from the validator's env file
+# even when this script is invoked outside systemd (cron, manual run, etc.)
+# so behaviour matches the validator service.
 LIUM_ENV_FILE = "/home/distil/.secrets/distil.env"
+if "DISTIL_LIUM_POD_NAME" not in os.environ and os.path.exists(LIUM_ENV_FILE):
+    try:
+        with open(LIUM_ENV_FILE) as _fh:
+            for _ln in _fh:
+                _ln = _ln.strip()
+                if _ln.startswith("DISTIL_LIUM_POD_NAME="):
+                    POD_NAME = _ln.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    except Exception:
+        pass
 WORKSPACE = Path("/root/.openclaw/agents/sn97-bot/workspace")
 OUT = WORKSPACE / "LIVE_STATUS.md"
 JSON_OUT = WORKSPACE / "LIVE_STATUS.json"
