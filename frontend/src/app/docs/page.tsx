@@ -4,7 +4,7 @@ import { Footer } from "@/components/footer";
 
 async function fetchKingKl(): Promise<number | null> {
   try {
-    const res = await fetch(`${API_SETTINGS.publicUrl}/api/h2h/latest`, { cache: "no-store" });
+    const res = await fetch(`${API_SETTINGS.publicUrl}/api/h2h-latest`, { cache: "no-store" });
     if (!res.ok) return null;
     const json = await res.json();
     const v = json?.king_h2h_kl;
