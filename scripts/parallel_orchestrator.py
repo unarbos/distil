@@ -533,6 +533,38 @@ def main():
         if os.path.exists(king_path):
             os.remove(king_path)
         pid = run_phase1_and_king(workdir, args.prompts, args.teacher_cache, king_n, king_path)
+        # 2026-05-15: Phase 1 progress was invisible to the dashboard
+        # because pod_eval.py writes eval_progress.json next to its
+        # ``--output`` (now ``gpu0/king_result.json`` after the
+        # eval_done.marker race fix), but the validator polls
+        # ``<workdir>/eval_progress.json``. Forward the gpu0 progress
+        # to the top-level path on every poll-loop tick so miners and
+        # operators can see the teacher_prompts_done counter climb.
+        gpu0_progress = os.path.join(os.path.dirname(king_path), "eval_progress.json")
+        top_progress = args.unified_progress or os.path.join(workdir, "eval_progress.json")
+
+        def _forward_phase1_progress():
+            try:
+                if not os.path.exists(gpu0_progress):
+                    return
+                with open(gpu0_progress, "rb") as src:
+                    blob = src.read()
+                if not blob.strip():
+                    return
+                # Atomic-ish write: temp file + rename, so any consumer
+                # (the validator's poll thread) never sees a zero-byte
+                # eval_progress.json mid-write.
+                tmp = top_progress + ".tmp"
+                with open(tmp, "wb") as dst:
+                    dst.write(blob)
+                os.replace(tmp, top_progress)
+            except Exception as _fwd_exc:
+                # Forwarding is best-effort; the dashboard just shows
+                # stale data for a tick if this fails.
+                print(f"[orch] phase1 progress forward failed: "
+                      f"{type(_fwd_exc).__name__}: {str(_fwd_exc)[:120]}",
+                      flush=True)
+
         # Wait until teacher_cache hits disk (Phase 1 done), then move on
         # to fan-out IMMEDIATELY — don't wait for king's bench battery.
         # King keeps running on GPU 0; challengers fan across the remaining GPUs.
@@ -542,11 +574,13 @@ def main():
                 if ret != (0, 0):
                     exit_code = os.WEXITSTATUS(ret[1])
                     print(f"[orch] phase1+king exit_code={exit_code}", flush=True)
+                    _forward_phase1_progress()
                     break
             except ChildProcessError:
                 print("[orch] phase1+king child gone", flush=True)
                 break
             time.sleep(30)
+            _forward_phase1_progress()
             tc_size = os.path.getsize(args.teacher_cache) if os.path.exists(args.teacher_cache) else 0
             kr_size = os.path.getsize(king_path) if os.path.exists(king_path) else 0
             if tc_size > 1_000_000 and not _CHALLENGERS_SPAWNED.get("done"):
