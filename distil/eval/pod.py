@@ -173,17 +173,41 @@ def install_runtime(pod) -> None:
 
 
 def _pod_run_state(pod, remote_run: str) -> str:
-    """Returns 'absent' | 'in_progress' | 'complete' by probing the pod."""
+    """Returns 'absent' | 'in_progress' | 'complete' by probing the pod.
+
+    A round counts as ``in_progress`` ONLY when ``round_spec.json`` is
+    present AND a ``distil.pod.orchestrator`` process is still alive
+    on the pod. Without the process check we'd wait forever on a stale
+    spec left behind by a crashed orchestrator (Phase 1 import error,
+    OOM, GPU init failure, etc.) — the polling loop would otherwise
+    spin until the eval_round_max_minutes deadline before failing.
+    """
     res = pod.exec(
-        f"if [ -f {remote_run}/results.json ]; then echo complete; "
-        f"elif [ -f {remote_run}/round_spec.json ]; then echo in_progress; "
-        f"else echo absent; fi",
+        f"if [ -f {remote_run}/results.json ]; then echo complete; exit 0; fi; "
+        f"if [ -f {remote_run}/round_spec.json ]; then "
+        f"  if pgrep -f 'distil.pod.orchestrator' >/dev/null 2>&1; then "
+        f"    echo in_progress; "
+        f"  else "
+        f"    echo stale; "
+        f"  fi; "
+        f"  exit 0; "
+        f"fi; "
+        f"echo absent",
         timeout=20,
     )
     if not res.get("success"):
         return "absent"
     out = (res.get("stdout") or "absent").strip()
-    return out.splitlines()[-1].strip() if out else "absent"
+    state = out.splitlines()[-1].strip() if out else "absent"
+    # ``stale`` is treated as ``absent`` by callers (re-launch fresh),
+    # but the caller logs the case so we don't lose forensic context.
+    if state == "stale":
+        logger.warning(
+            f"pod has round_spec at {remote_run} but no live orchestrator "
+            f"— previous attempt crashed; restarting"
+        )
+        return "absent"
+    return state
 
 
 def run_eval_on_pod(
