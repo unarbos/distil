@@ -1,0 +1,25 @@
+[Unit]
+Description=Distil SN97 API + dashboard backend (rewrite-v2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=distil
+Group=distil
+WorkingDirectory=/opt/distil/repo
+EnvironmentFile=-/home/distil/.secrets/distil.env
+ExecStart=/usr/bin/python3 -m uvicorn distil.api.server:app \
+    --host 127.0.0.1 \
+    --port 3710 \
+    --workers 2 \
+    --log-level info
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
