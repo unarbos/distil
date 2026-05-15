@@ -53,6 +53,82 @@ POD_UPLOAD_PATHS: tuple[str, ...] = ("distil", "pyproject.toml")
 REMOTE_WORKDIR = "/home/distil_eval"
 
 
+# Env vars forwarded from the validator host to the pod orchestrator
+# command line. This is the same whitelist the legacy
+# ``scripts/validator/pod_session.py`` uses (minus the legacy-only
+# DISTIL_USE_PARALLEL_ORCH knob which has no analogue here — distil
+# always parallelizes). The most critical entries are the cloud-teacher
+# API key (``DISTIL_TEACHER_API_KEY`` / ``OPENROUTER_API_KEY``) and the
+# vLLM tunables for student scoring; without those forwarded the pod
+# Phase 1 fails fast and Phase 2 silently regresses to slow defaults.
+_REMOTE_ENV_WHITELIST: tuple[str, ...] = (
+    # Cloud-teacher path (Kimi-K2.6 cutover, 2026-05-03)
+    "DISTIL_TEACHER_MODE",
+    "DISTIL_TEACHER_REPO",
+    "DISTIL_TEACHER_API_BASE",
+    "DISTIL_TEACHER_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DISTIL_TEACHER_API_MODEL",
+    "DISTIL_TEACHER_API_ENDPOINT",
+    "DISTIL_TEACHER_API_PROVIDERS",
+    "DISTIL_TEACHER_API_CONCURRENCY",
+    "DISTIL_TEACHER_API_TOP_LOGPROBS",
+    "DISTIL_TEACHER_API_TIMEOUT_S",
+    "DISTIL_TEACHER_API_DISABLE_REASONING",
+    "DISTIL_OPENROUTER_REFERER",
+    "DISTIL_OPENROUTER_TITLE",
+    # Student vLLM (2026-05-14 8xB200 pivot)
+    "DISTIL_STUDENT_BATCH_SIZE",
+    "DISTIL_STUDENT_USE_VLLM",
+    "DISTIL_STUDENT_VLLM_TOKENIZER",
+    "DISTIL_STUDENT_VLLM_MAX_LEN",
+    "DISTIL_STUDENT_VLLM_GPU_UTIL",
+    "DISTIL_STUDENT_VLLM_TP",
+    "DISTIL_STUDENT_VLLM_TRC",
+    "DISTIL_STUDENT_VLLM_EAGER",
+    # vLLM 0.20.2 needs deep_gemm disabled for Kimi-K2.6 MoE on B200
+    "VLLM_USE_DEEP_GEMM",
+    "VLLM_USE_DEEP_GEMM_E8M0",
+    # Vocab override for K2.6 (163840) — pod precheck refuses without it.
+    "ACTIVATION_FP_VOCAB_SIZE",
+    "TEACHER_CONFIG_VOCAB_SIZE",
+    # Watchdog tuning (2026-05-15 fan-out)
+    "DISTIL_ORCH_WATCHDOG_S",
+    "DISTIL_ORCH_WATCHDOG_REPEAT_N",
+    "DISTIL_CACHE_KEEP_MODELS",
+    # HF auth for tokenizer/model pulls
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN",
+)
+
+
+def _shell_quote(value: str) -> str:
+    """Single-quote for POSIX shell (escape inner single quotes)."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _build_remote_env_prefix(extra: dict[str, str] | None = None) -> str:
+    """Return ``KEY=val KEY=val `` (trailing space) to prepend to a remote cmd.
+
+    Values are POSIX-shell quoted. Only forwards env vars whose name is
+    in ``_REMOTE_ENV_WHITELIST`` AND is non-empty in the validator
+    process. An empty whitelisted var is treated as "operator wants
+    the pod default" (consistent with legacy behavior).
+    """
+    parts: list[str] = []
+    for key in _REMOTE_ENV_WHITELIST:
+        val = os.environ.get(key)
+        if val is None or val == "":
+            continue
+        parts.append(f"{key}={_shell_quote(val)}")
+    if extra:
+        for k, v in extra.items():
+            if v is None or v == "":
+                continue
+            parts.append(f"{k}={_shell_quote(str(v))}")
+    return (" ".join(parts) + " ") if parts else ""
+
+
 def _make_lium():
     """Construct a Lium SDK client using the same Config layout the legacy
     validator uses (api_key + ssh_key_path).
@@ -260,10 +336,19 @@ def run_eval_on_pod(
     else:
         pod.exec(f"mkdir -p {remote_run}", timeout=30)
         pod.upload(str(spec_local), f"{remote_run}/round_spec.json")
+        # Forward configuration/secrets from the validator env to the pod.
+        # The orchestrator inherits ``cd /home`` env only, so anything our
+        # phase subprocesses need (API key for the cloud-teacher path,
+        # vLLM/HF knobs, bench budgets, …) MUST be injected explicitly.
+        # We re-use the legacy ``scripts/validator/pod_session.py`` env
+        # whitelist verbatim — anything not in there is a deliberate
+        # "pod-side default" knob that operators tune in the pod's own
+        # systemd unit, not the host's.
+        env_prefix = _build_remote_env_prefix()
         # Launch orchestrator under ``setsid -f`` so it survives an SSH
         # disconnect — resume can find it on next attach.
         cmd = (
-            f"cd /home && setsid -f python3 "
+            f"cd /home && {env_prefix}setsid -f python3 "
             f"-u -m distil.pod.orchestrator {remote_run}/round_spec.json "
             f"--workdir {remote_run} "
             f"--out {remote_run}/results.json "

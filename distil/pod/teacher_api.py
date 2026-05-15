@@ -1,31 +1,43 @@
 """Cloud-API teacher path (OpenRouter / OpenAI-compatible).
 
-The 1T-parameter Kimi-K2.6 teacher does NOT fit on a single B200 (or
-even a single 8xB200 pod in bf16 — the model is ~2 TB while the pod
-has ~500 GB usable VRAM). Production has been running the teacher
-through OpenRouter for months, with student scoring still local on
-the pod.
+The 1T-parameter Kimi-K2.6 teacher does NOT fit in vLLM on the
+8xB200 pod (~500 GB usable VRAM vs ~2 TB needed in bf16), so the
+production validator has run the teacher through OpenRouter for
+months while keeping student scoring local. This module is the
+distil-stack equivalent of ``scripts/api_teacher.py`` (669 LoC,
+coupled to the legacy pod_eval_vllm sparse-tensor format).
 
-This module is the distil-stack equivalent of the legacy
-``scripts/api_teacher.py`` (669 LoC, tightly coupled to pod_eval_vllm's
-sparse-logprobs encoding). Here we return :class:`TeacherOutput`
-directly — the same shape ``distil/pod/teacher.py:generate_continuations``
-produces — so the rest of the pipeline is mode-agnostic.
+Distil's KL/RKL/top-K scoring keys on ``dict[int, float]`` per
+position with real Kimi vocab IDs. The OpenRouter API returns
+tokens as decoded strings, so this module:
+
+1. loads the local Kimi-K2.6 tokenizer once;
+2. builds a ``token_to_id`` map (vocab entries + decoded fallback);
+3. for each prompt: chat-completions call, then maps API token
+   strings → vocab IDs using the same fallback chain the legacy
+   ``vllm_logprobs_to_sparse`` used;
+4. tokenizes ``prompt + continuation`` locally and slices off the
+   prompt via ``_align_prompt_boundary`` so ``completion_token_ids``
+   are EXACTLY the IDs the student's vLLM will see when it
+   re-tokenizes the same full string — KL stays meaningful even
+   when BPE merges across the prompt/continuation join.
 
 Activated by ``DISTIL_TEACHER_MODE=api``. Required env:
 
 * ``DISTIL_TEACHER_API_KEY`` (or ``OPENROUTER_API_KEY``)
-* ``DISTIL_TEACHER_API_MODEL``  (default: moonshotai/kimi-k2.6)
-* ``DISTIL_TEACHER_API_BASE``   (default: https://openrouter.ai/api)
+* ``DISTIL_TEACHER_API_MODEL``  (default: ``moonshotai/kimi-k2.6``)
+* ``DISTIL_TEACHER_API_BASE``   (default: ``https://openrouter.ai/api``)
 * ``DISTIL_TEACHER_API_PROVIDERS``  comma list; default ``Inceptron``
-  (the only K2.6 endpoint on OpenRouter that exposes logprobs)
+  (the only OpenRouter provider that returns logprobs for K2.6)
+* ``DISTIL_TEACHER_REPO``       (default: ``moonshotai/Kimi-K2.6``)
+  — used to load the local tokenizer for vocab-ID alignment.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -37,19 +49,21 @@ logger = logging.getLogger("distil.pod.teacher_api")
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api"
 DEFAULT_MODEL = "moonshotai/kimi-k2.6"
+DEFAULT_TOKENIZER_REPO = "moonshotai/Kimi-K2.6"
 DEFAULT_CONCURRENCY = 12
 DEFAULT_TIMEOUT_S = 120
-# Inceptron is the only OpenRouter provider that returns per-token
-# logprobs for K2.6 — other providers respond with ``logprobs: null``
-# which would zero our KL signal.
 DEFAULT_PROVIDERS = ("Inceptron",)
+
+_TOKENIZER = None
+_TOKEN_TO_ID: dict[str, int] | None = None
+_LOCK = threading.Lock()
 
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default) or default
 
 
-def _config():
+def _config() -> dict:
     api_key = _env("DISTIL_TEACHER_API_KEY") or _env("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -66,32 +80,134 @@ def _config():
         "base_url": _env("DISTIL_TEACHER_API_BASE", DEFAULT_BASE_URL),
         "api_key": api_key,
         "model": _env("DISTIL_TEACHER_API_MODEL", DEFAULT_MODEL),
+        "tokenizer_repo": _env("DISTIL_TEACHER_REPO", DEFAULT_TOKENIZER_REPO),
         "concurrency": int(_env("DISTIL_TEACHER_API_CONCURRENCY", str(DEFAULT_CONCURRENCY))),
         "timeout_s": int(_env("DISTIL_TEACHER_API_TIMEOUT_S", str(DEFAULT_TIMEOUT_S))),
         "providers": providers,
     }
 
 
+def _load_tokenizer(repo: str):
+    """Lazy-load + cache the local Kimi tokenizer (thread-safe).
+
+    The tokenizer is the same one the student vLLM uses to tokenize
+    ``prompt + continuation``. Sharing it here is what keeps teacher
+    vocab IDs aligned with the IDs the student sees, so KL is meaningful.
+    """
+    global _TOKENIZER, _TOKEN_TO_ID
+    if _TOKENIZER is not None:
+        return _TOKENIZER
+    with _LOCK:
+        if _TOKENIZER is not None:
+            return _TOKENIZER
+        from transformers import AutoTokenizer
+
+        logger.info(f"loading tokenizer for vocab-ID alignment: {repo}")
+        tok = AutoTokenizer.from_pretrained(repo, trust_remote_code=True)
+        vocab = tok.get_vocab()
+        mapping: dict[str, int] = {}
+        for tok_str, tok_id in vocab.items():
+            mapping[tok_str] = tok_id
+            decoded = tok.decode([tok_id])
+            mapping.setdefault(decoded, tok_id)
+        _TOKENIZER = tok
+        _TOKEN_TO_ID = mapping
+        logger.info(f"tokenizer loaded: {len(vocab)} vocab entries, {len(mapping)} keys w/ decoded fallback")
+        return _TOKENIZER
+
+
+def _str_to_vocab_id(token_str: str) -> int:
+    """API token string → Kimi vocab ID, with encode() fallback."""
+    assert _TOKEN_TO_ID is not None
+    tid = _TOKEN_TO_ID.get(token_str)
+    if tid is not None:
+        return int(tid)
+    assert _TOKENIZER is not None
+    try:
+        encoded = _TOKENIZER.encode(token_str, add_special_tokens=False)
+        return int(encoded[0]) if encoded else 0
+    except Exception:
+        return 0
+
+
+def _align_prompt_boundary(full_text: str, prompt_text: str, full_ids) -> int:
+    """Return the index in ``full_ids`` that separates prompt from continuation.
+
+    Ported from ``scripts/pod_eval_vllm._align_prompt_boundary``. BPE
+    tokenizers can merge characters across the prompt/continuation
+    join (e.g. "Hello " + "world" → ["Hello", " world"]), so a naive
+    ``len(tokenizer(prompt))`` drifts from the true boundary inside
+    ``tokenizer(prompt + cont)``. Wrong boundary leaks prompt tokens
+    into the KL slice (or vice versa) and inflates KL on the
+    mismatched side.
+    """
+    prompt_char_len = len(prompt_text)
+    if prompt_char_len == 0:
+        return 0
+    n_full = full_ids.shape[1]
+    if prompt_char_len >= len(full_text):
+        return n_full
+    try:
+        assert _TOKENIZER is not None
+        enc = _TOKENIZER(
+            full_text,
+            return_tensors="pt",
+            truncation=False,
+            return_offsets_mapping=True,
+        )
+        offsets = enc["offset_mapping"][0].tolist()
+        last_prompt_tok = None
+        for k, (start, end) in enumerate(offsets):
+            if end <= prompt_char_len:
+                last_prompt_tok = k
+            elif start >= prompt_char_len:
+                break
+            else:
+                break
+        return 0 if last_prompt_tok is None else last_prompt_tok + 1
+    except Exception:
+        ids_list = full_ids[0].tolist()
+        assert _TOKENIZER is not None
+        for k in range(1, len(ids_list) + 1):
+            try:
+                decoded = _TOKENIZER.decode(ids_list[:k], skip_special_tokens=False)
+            except Exception:
+                continue
+            if decoded == prompt_text:
+                return k
+            if len(decoded) > prompt_char_len:
+                return max(k - 1, 0)
+        return len(ids_list)
+
+
 def _call_once(prompt: str, max_new_tokens: int, top_k: int, cfg: dict) -> TeacherOutput:
-    """One chat-completions call returning a TeacherOutput."""
     body = {
         "model": cfg["model"],
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_new_tokens,
         "temperature": 0.0,
         "logprobs": True,
-        "top_logprobs": min(top_k, 20),
-        "reasoning": {"enabled": False},
+        # OpenRouter caps top_logprobs at 20.
+        "top_logprobs": min(max(top_k, 1), 20),
     }
     if cfg["providers"]:
-        body["provider"] = {"order": list(cfg["providers"]), "allow_fallbacks": False}
+        body["provider"] = {"only": list(cfg["providers"])}
+    if "openrouter" in cfg["base_url"]:
+        # Raw next-token logprobs (skip K2.6's reasoning loop).
+        body["reasoning"] = {"enabled": False}
 
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://distil.sn97.io",
-        "X-Title": "distil-sn97-validator",
     }
+    if "openrouter" in cfg["base_url"]:
+        headers["HTTP-Referer"] = _env(
+            "DISTIL_OPENROUTER_REFERER", "https://chat.arbos.life"
+        )
+        headers["X-Title"] = _env(
+            "DISTIL_OPENROUTER_TITLE", "Bittensor SN97 distil validator"
+        )
+
     r = requests.post(
         f"{cfg['base_url']}/v1/chat/completions",
         json=body,
@@ -100,70 +216,88 @@ def _call_once(prompt: str, max_new_tokens: int, top_k: int, cfg: dict) -> Teach
     )
     r.raise_for_status()
     data = r.json()
+    if "error" in data and not data.get("choices"):
+        raise RuntimeError(f"API error: {data['error']}")
     choice = data["choices"][0]
-    text = choice["message"]["content"] or ""
+    msg = choice.get("message") or {}
+    # K2.6 sometimes returns ``content: null`` if reasoning ate the
+    # token budget — treat as empty continuation rather than crash.
+    cont_text = msg.get("content") or ""
     lp_payload = choice.get("logprobs") or {}
     content_tokens = lp_payload.get("content") or []
 
-    # Tokenization detail: OpenRouter / OpenAI logprobs report tokens
-    # as decoded strings (e.g. " the", "ization"), not int IDs. The
-    # downstream KL/RKL pipeline keys on integer token IDs, so we hash
-    # token strings into a deterministic dense ID space [0, 2**31).
-    # This loses identity with the local tokenizer, BUT the comparison
-    # is teacher-vs-student where BOTH sides use the same hashed IDs
-    # (we hash the student's predicted-string tokens through the same
-    # function before comparing). For top-K overlap & KL the only
-    # property we need is consistent identity within a single round.
-    token_ids: list[int] = []
-    completion_logprobs: list[dict[int, float]] = []
-    for entry in content_tokens:
-        tok_str = entry.get("token", "")
-        tok_lp = float(entry.get("logprob", 0.0) or 0.0)
-        token_ids.append(_str_id(tok_str))
-        per_pos: dict[int, float] = {_str_id(tok_str): tok_lp}
-        for alt in entry.get("top_logprobs") or []:
-            alt_str = alt.get("token", "")
-            alt_lp = float(alt.get("logprob", 0.0) or 0.0)
-            per_pos.setdefault(_str_id(alt_str), alt_lp)
-        completion_logprobs.append(per_pos)
+    full_text = prompt + cont_text
+    enc = _TOKENIZER(full_text, return_tensors="pt", truncation=False)  # type: ignore[misc]
+    full_ids = enc.input_ids
+    prompt_len = _align_prompt_boundary(full_text, prompt, full_ids)
+    completion_token_ids = full_ids[0][prompt_len:].tolist()
 
+    per_pos_logprobs: list[dict[int, float]] = []
+    for entry in content_tokens:
+        chosen = entry.get("token", "")
+        chosen_lp = entry.get("logprob")
+        d: dict[int, float] = {}
+        if chosen_lp is not None and chosen != "":
+            d[_str_to_vocab_id(chosen)] = float(chosen_lp)
+        for alt in entry.get("top_logprobs") or []:
+            t = alt.get("token", "")
+            lp = alt.get("logprob")
+            if lp is not None and t != "":
+                d.setdefault(_str_to_vocab_id(t), float(lp))
+        per_pos_logprobs.append(d)
+
+    # Length harmonization: KL keys on min(len) positions, but mid-stream
+    # nan or empty positions are fine — distil.eval.scoring tolerates
+    # missing keys per-position.
     return TeacherOutput(
         prompt=prompt,
-        continuation=text,
-        completion_token_ids=token_ids,
-        completion_logprobs=completion_logprobs,
+        continuation=cont_text,
+        completion_token_ids=[int(x) for x in completion_token_ids],
+        completion_logprobs=per_pos_logprobs,
     )
 
 
-def _str_id(s: str) -> int:
-    """Deterministic non-negative 31-bit hash of a token string.
-
-    Same hash function on both the teacher (here) and the student
-    (distil.pod.student._encode_str_token) so KL / top-K overlap can
-    key on a shared integer ID space when the underlying tokenizers
-    differ between sides.
-    """
-    import hashlib
-
-    h = hashlib.blake2b(s.encode("utf-8"), digest_size=4).digest()
-    return int.from_bytes(h, "big") & 0x7FFFFFFF
-
-
 def _call_with_retry(
-    prompt: str, max_new_tokens: int, top_k: int, cfg: dict, max_attempts: int = 5
+    prompt: str, max_new_tokens: int, top_k: int, cfg: dict, max_attempts: int = 6
 ) -> TeacherOutput:
+    """Retry transient 429/5xx with exp backoff, honoring Retry-After."""
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
             return _call_once(prompt, max_new_tokens, top_k, cfg)
-        except Exception as exc:
+        except requests.HTTPError as exc:
             last_exc = exc
-            wait = min(2**attempt, 30)
+            sc = getattr(exc.response, "status_code", None)
+            transient = sc == 429 or (sc is not None and 500 <= sc < 600)
+            if not transient or attempt >= max_attempts - 1:
+                if attempt < max_attempts - 1:
+                    time.sleep(min(2**attempt, 30))
+                    continue
+                raise
+            retry_after = None
+            try:
+                ra_hdr = exc.response.headers.get("Retry-After")
+                if ra_hdr:
+                    retry_after = float(ra_hdr)
+            except Exception:
+                retry_after = None
+            wait = max(min(retry_after or (2**attempt), 30), 1)
             logger.warning(
-                f"api teacher attempt {attempt + 1}/{max_attempts} failed: "
-                f"{type(exc).__name__}: {exc} — retrying in {wait}s"
+                f"api teacher HTTP {sc} (attempt {attempt + 1}/{max_attempts}); "
+                f"retrying in {wait:.1f}s"
             )
             time.sleep(wait)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                wait = min(2**attempt, 30)
+                logger.warning(
+                    f"api teacher attempt {attempt + 1}/{max_attempts} failed: "
+                    f"{type(exc).__name__}: {exc} — retrying in {wait}s"
+                )
+                time.sleep(wait)
+            else:
+                raise
     raise RuntimeError(f"api teacher exhausted retries: {last_exc}") from last_exc
 
 
@@ -175,9 +309,15 @@ def generate_continuations_api(
 ) -> list[TeacherOutput]:
     """Drop-in for ``teacher.generate_continuations`` running via API.
 
-    Concurrent execution preserving prompt order in the output list.
+    Loads the local tokenizer once (vocab-ID alignment), then fans out
+    one chat-completions call per prompt across a ThreadPoolExecutor.
+    Output order matches input order; raises on any unrecoverable prompt
+    (no silent holes — the round is poisoned if even one prompt is
+    missing, which is detectable at the validator and triggers a
+    deterministic retry rather than a corrupted leaderboard write).
     """
     cfg = _config()
+    _load_tokenizer(cfg["tokenizer_repo"])
     logger.info(
         f"teacher mode=api model={cfg['model']!r} concurrency={cfg['concurrency']} "
         f"providers={cfg['providers']!r}"
