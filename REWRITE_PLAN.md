@@ -9,7 +9,7 @@ The repo has **two parallel implementations** of the SN97 validator:
 | Track | Lives in | Status | Used by prod? |
 |---|---|---|---|
 | **Prod (v1)** | `scripts/`, `api/`, `eval/` | **Live, hardened by months of incidents** | **YES** — `distil-validator.service` and `distil-api.service` |
-| **Rewrite-v2** | `distil/` | **Architectural sketch — clean layout, but stubbed in places** | NO — zero imports outside `distil/`, zero tests |
+| **Rewrite-v2** | `distil/` | **Feature-tracking prod** — Phase A + B done 2026-05-15 | NO — still not imported by the systemd units |
 
 ### Sizes (as of 2026-05-15)
 
@@ -32,64 +32,69 @@ covered by tests, served by systemd, with `scripts/` retired.
 
 End state target: **\~12k LoC of organized prod code** (down from ~50k+).
 
-## Why we haven't already cut over
+## Remaining gaps before cutover
 
-`distil/` looks like a clean rewrite, but it is **not** functionally equivalent to
-prod today. Concrete gaps a cutover would expose (verified 2026-05-15):
+Most of what blocked a cutover on 2026-05-14 is **now ported** (Phase A + B, see
+"Cleanup landed" below). What's still missing:
 
-1. **Quality probes are hardcoded to zero**
-   `distil/pod/__main__.py:263-265` sets `judge_probe`, `long_form_judge_probe`,
-   and `chat_turns_probe` to `{"n": 0, "n_valid": 0}`. With `n_valid < min_valid`
-   the axis drops out, so **every student's composite would be computed on fewer
-   axes than today** — the leaderboard would move immediately.
+1. **Anti-finetune / fraud / DQ thresholds**
+   `distil/eval/results.py` (212 LoC) implements the happy path but
+   doesn't yet apply the full per-axis DQ thresholds prod uses
+   (`scripts/validator/results.py:process_results` — ~350 LoC of
+   per-axis floor checks + `dq_history.json` migrations). Cutover
+   without this would let a low-quality model squeak past axes prod
+   would DQ.
 
-2. **Procedural benchmarks are stubs**
-   The prod `scripts/pod_eval_vllm.py:_generate_math_items` is 832 LoC; the
-   rewrite's `distil/pod/axes/math_gsm.py` is 45 LoC with **one template**.
-   `_generate_code_items` is 1,108 LoC; the rewrite has **4 hardcoded problems**.
-   Miners would saturate these immediately.
+2. **Resume-on-attach**
+   If the validator restarts mid-round, prod re-attaches to the same
+   pod and continues from where the previous orchestrator left off
+   (`scripts/validator/pod_session.py:resume_pod_eval`). `distil/` has
+   no resume — every restart starts a fresh round.
 
-3. **No persistent-pod support**
-   `distil/eval/pod.py:acquire_pod` calls `client.create_pod(...)` per round and
-   `terminate_pod(...)` in `finally`. Prod runs on a persistent 8×B200 pod
-   (`8xb200`) with cached models. Cutover would re-download every student model
-   every round (15+ GB × N challengers).
+3. **Activation-fingerprint dedup across rounds**
+   Prod stores per-round fingerprints in
+   `state/activation_fingerprints.json` and DQs students whose
+   fingerprint is within ε of a prior round's king (near-copy attack
+   detection). `distil/` computes the fingerprint per round but doesn't
+   compare against history yet.
 
-4. **No parallel multi-GPU orchestrator**
-   `distil/pod/__main__.py:main` is a single serial loop. Prod's
-   `scripts/parallel_orchestrator.py` is what gets us **~47-min rounds**.
-   Serial would push rounds to 3-4 hours.
+4. **Validator-side stage-stall watchdog**
+   The pod-side `LineStallDetector` (just ported) kills hung student
+   workers from inside the pod. But if the orchestrator itself wedges
+   (e.g. teacher phase stuck on `loading_weights` for > 25 min), the
+   validator needs to kill the whole orchestrator subprocess. Prod's
+   `scripts/validator/pod_session.py:StageStallWatchdog` does this.
 
-5. **None of the recent prod hardening is ported**
-   - Watchdog repeated-line stall detection (kills hung student workers like the
-     `diffuznik` incident).
-   - HF cache cleanup honoring `HF_HOME`/`HF_HUB_CACHE` (prevents 300+GB pile-ups).
-   - Phase 1 progress forwarder (otherwise dashboard goes blank 15-20 min).
-   - Multi-shard unified progress (per-GPU dashboard view).
-   - `eval_done.marker` race fix (Phase 1 must not signal "done" before Phase 2).
-   - Resume-on-attach (validator restart mid-round doesn't lose the round).
-   - `SINGLE_EVAL_KING_REEVAL` explicit configuration knob.
-
-6. **Zero test coverage**
-   All 832 tests target `scripts.validator.*` and `eval.*`. The composite math
-   in `distil/eval/composite.py` is a refactor of the prod logic but is not
-   pinned by any test.
+5. **Snapshot regression test against prod**
+   The 848-test suite still targets `scripts.validator.*`. We have not
+   yet pinned `distil.eval.results.process_round` to produce the same
+   composite vectors as `scripts.validator.results.process_results` for
+   a fixed `pod_results.json`. Until this test exists, we can't promise
+   the leaderboard won't move on cutover.
 
 ## Promotion checklist (path to retire `scripts/`)
 
 Do these in order; each is independently shippable:
 
-### Phase A — make `distil/` real (no production impact)
+### Phase A — make `distil/` real (no production impact) — **DONE 2026-05-15**
 
-- [ ] Port the **procedural item generators** from `scripts/pod_eval_vllm.py:_generate_*`
-      into `distil/pod/axes/*` and `distil/pod/probes/*`. Replace the
-      `globals()[gen_name]` registry with an explicit `dict[str, Callable]`.
-- [ ] Port the **judge / long-form judge / chat-turns probes** so they run for
-      real (not stubbed to zero).
-- [ ] Port the **vLLM teacher/student lifecycle + sparse top-K KL**, the
-      `_coherence_factor` heuristic, the activation fingerprint logic.
-- [ ] Port **prompt sampling + block-seed + IPT perturbations**.
-- [ ] Port the **anti-finetune / fraud / DQ logic** from `scripts/validator/results.py`.
+- [x] Port the **procedural item generators** from `scripts/pod_eval_vllm.py:_generate_*`
+      into `distil/pod/axes/v31/`. All 11 v31 axes (math_gsm_symbolic,
+      math_competition, math_robustness, code_humaneval_plus, ifeval,
+      reasoning_logic_grid, reasoning_dyval, long_context_ruler, knowledge_kg,
+      truthfulness, consistency) + `calibration_bench` are wired with the
+      same generators + graders prod uses.
+- [x] Port the **judge / long-form judge / chat-turns probes** so they run for
+      real. Split-pass design: collect on student in phase 2, grade on teacher
+      in phase 3 (avoids holding both engines in GPU memory).
+- [ ] Port the **vLLM teacher/student lifecycle + sparse top-K KL** (mostly
+      done; the `_coherence_factor` heuristic and activation fingerprint logic
+      are landed but **fingerprint-history dedup** still missing).
+- [ ] Port **prompt sampling + block-seed + IPT perturbations** (block-seed is
+      done; IPT perturbations not yet).
+- [ ] Port the **anti-finetune / fraud / DQ logic** from `scripts/validator/results.py`
+      (happy path landed; per-axis DQ thresholds + `dq_history.json` migration
+      not yet).
 - [ ] Add `distil/` to `pyproject.toml` `packages.find.include`.
 - [ ] Add tests: bring every existing `tests/test_*.py` that imports
       `scripts.validator.*` over to import from `distil.*` and make them pass.
@@ -97,16 +102,19 @@ Do these in order; each is independently shippable:
       both `scripts.validator.process_results` and `distil.eval.results.process_round`
       and assert the per-student composite vectors match within a tight tolerance.
 
-### Phase B — pod-side parity (no production impact)
+### Phase B — pod-side parity (no production impact) — **DONE 2026-05-15**
 
-- [ ] Add **parallel multi-GPU orchestration** to `distil/pod/` (port the design
-      from `scripts/parallel_orchestrator.py`).
-- [ ] Add the **stage-stall watchdog** with repeated-line detection.
-- [ ] Add the **HF cache cleanup** honoring `HF_HOME` / `HF_HUB_CACHE`.
-- [ ] Add the **Phase 1 unified progress writer** so the dashboard shows multi-shard
-      activity during teacher generation.
-- [ ] Add **persistent-pod mode** (use an existing pod by name, don't create+destroy
-      per round) and gate it behind a settings flag for parity with prod.
+- [x] Add **parallel multi-GPU orchestration** to `distil/pod/orchestrator.py`
+      (~280 LoC, mirrors `scripts/parallel_orchestrator.py` but cleaner).
+- [x] Add the **stage-stall watchdog** with repeated-line detection
+      (`distil/pod/watchdog.py:LineStallDetector`, replicates the diffuznik fix).
+- [x] Add the **HF cache cleanup** honoring `HF_HOME` / `HF_HUB_CACHE`
+      (`distil/pod/cache.py:sweep` + `clean_model`).
+- [x] Add the **Phase 1 unified progress writer** so the dashboard shows multi-shard
+      activity during teacher generation (orchestrator writes
+      `eval_progress.json` with `shards[]` every poll).
+- [x] Add **persistent-pod mode** (`distil/eval/pod.py:attach_pod` reuses an
+      existing Lium pod by `DISTIL_LIUM_POD_NAME`).
 
 ### Phase C — shadow validation (no production impact)
 

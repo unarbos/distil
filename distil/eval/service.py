@@ -22,7 +22,13 @@ from distil.chain.commitments import fetch_revealed, parse_commitments
 from distil.chain.metagraph import fetch_metagraph, get_subtensor
 from distil.chain.weights import SetWeightsError, set_weights
 from distil.eval.king import build_emission_weights, resolve_king
-from distil.eval.pod import acquire_pod, install_runtime, run_eval_on_pod, upload_runtime
+from distil.eval.pod import (
+    acquire_pod,
+    attach_pod,
+    install_runtime,
+    run_eval_on_pod,
+    upload_runtime,
+)
 from distil.eval.results import process_round
 from distil.eval.round import build_round_spec, evict_stale_composites, select_challengers
 from distil.settings import settings
@@ -49,6 +55,21 @@ def _wallet():
     import bittensor as bt
 
     return bt.wallet(name=settings.wallet_name, hotkey=settings.hotkey_name)
+
+
+def _pod_context(round_id: int):
+    """Persistent-pod when configured, ephemeral otherwise.
+
+    Persistent mode reuses an existing Lium pod (lium_pod_name) across
+    every round so teacher/student weights stay cached — this is what
+    drops a round from ~6 h of cold downloads to ~47 min of evals.
+    Falls back to ephemeral if no pod name is configured.
+    """
+    if settings.eval_persistent_pod and settings.lium_pod_name:
+        logger.info(f"attaching to persistent pod {settings.lium_pod_name!r}")
+        return attach_pod(settings.lium_pod_name)
+    logger.info("provisioning ephemeral pod (no DISTIL_LIUM_POD_NAME set)")
+    return acquire_pod(label=f"r{round_id}")
 
 
 def _round(state: ValidatorState, *, dry_run: bool) -> None:
@@ -86,7 +107,8 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     out_dir = Path(settings.state_dir) / "_rounds" / f"round_{spec['round_id']}"
     log_event(f"starting round block={block} king={king_name} challengers={len(challengers)}")
 
-    with acquire_pod(label=f"r{spec['round_id']}") as pod:
+    t_round_start = time.time()
+    with _pod_context(spec["round_id"]) as pod:
         upload_runtime(pod)
         install_runtime(pod)
         results = run_eval_on_pod(
@@ -94,7 +116,10 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
             round_spec=spec,
             out_dir=out_dir,
             timeout_s=settings.eval_round_max_minutes * 60,
+            n_gpus=settings.eval_n_gpus,
         )
+    dur_min = (time.time() - t_round_start) / 60
+    logger.info(f"round {spec['round_id']} eval finished in {dur_min:.1f} min")
 
     record = process_round(
         state=state,
