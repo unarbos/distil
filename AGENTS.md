@@ -42,14 +42,22 @@ You have full read access to this codebase. Use it to:
 - Quote non-sensitive code snippets when helpful
 
 ## 📁 Directory Guide
-- `api/` — FastAPI server (endpoints, state management)
-- `eval/` — Model checking, precheck logic
-- `scripts/` — Validator, pod eval, remote eval scripts  
-- `state/` — Runtime state files (scores, h2h, disqualified list)
-- `neurons/` — Bittensor neuron code
-- `docs/` — Documentation
-- `tests/` — Test files
+- `api/` — FastAPI server **currently running in prod** (endpoints, state management). Entry: `api/server.py`.
+- `scripts/` — **Currently-running** validator + pod eval (`scripts/remote_validator.py` → `scripts.validator.service.run_validator`; `scripts/pod_eval_vllm.py` runs on the GPU pod).
+- `eval/` — Shared eval utilities used by both `scripts/` and tests (KL, state, model_checker, dataset).
+- `distil/` — **Rewrite-v2 (WIP, not in prod yet).** See `distil/README.md` and `REWRITE_PLAN.md`. Do not describe it as "the current validator" to users.
+- `state/` — Runtime state files (scores, h2h, disqualified list, evaluated_hotkeys, composite_scores).
+- `neurons/` — Bittensor neuron code.
+- `docs/` — Documentation.
+- `tests/` — Test files (832 tests, all targeting `scripts.validator.*` + `eval.*`).
+- `deploy/` — Systemd unit files + Caddy config + deploy runbooks.
+- `frontend/` — Next.js dashboard (renders at distil.arbos.life).
 - `.env` — 🚫 NEVER READ OR SHARE
+
+### Note on the cleanup of 2026-05-15
+- `legacy/` was deleted (~76k LoC of decommissioned code, zero callers).
+- Old state snapshots (`state.bak-*/`) were moved to `/var/backups/`.
+- If a transcript references `legacy/<path>`, treat it as a historical mention — the path no longer exists.
 
 ## Tools Available
 - `read` — Read files in this workspace (USE THIS instead of web_fetch for code questions)
@@ -84,10 +92,41 @@ When you make meaningful progress, clarify an in-progress task, or the user says
 
 Historical mentions of OpenClaw or Codex may be legacy references only. Do not describe them as the current runtime unless they are actually active now.
 
-## Shared Context Snapshot
+## Architecture (2026-05-15)
 
-- scripts/validator/eval_orchestrator.py:550:        f"cd /home && python3 -u pod_eval.py " | scripts/validator/eval_orchestrator.py:639:                    pod.exec("pkill -9 -f pod_eval.py; echo killed", timeout=30) | eval/pod.py:63:        pm.upload("scripts/pod_eval_vllm.py", "/home/pod_eval.py") | eval/pod.py:64:        result = pm.exec("python3 /home/pod_eval.py ...") | scripts/pod_eval_vllm.py:27:    python3 pod_eval_vllm.py \\ | scripts/validator/eval_orchestrator.py:550:        f"cd /home && python3 -u pod_eval.py " | scripts/validator/eval_orchestrator.py:639:                    pod.exec("pkill -9 -f pod_eval.py; echo killed", timeout=30) | scripts/remote_validator.py:116:    eval_script = "scripts/pod_eval_vllm.py" | scripts/remote_validator.py:117:    eval_script_remote = "/home/pod_eval.py" | scripts/verify_round.py:363:    info(f"  2. Run eval: python scripts/pod_eval_vllm...
-- frontend/src/lib/api.ts:47:  commitments: Record< | frontend/src/lib/api.ts:49:    { block: number; model?: string; revision?: string; raw?: string } | frontend/src/lib/api.ts:90:  revision: string; | frontend/src/lib/api.ts:95:  commitBlock: number; | frontend/src/lib/api.ts:161:  return safeFetch(`${API_BASE}/api/commitments`); | frontend/src/lib/api.ts:274:  commitments: CommitmentsResponse | null, | frontend/src/lib/api.ts:278:  if (!metagraph || !commitments) return []; | frontend/src/lib/api.ts:280:  // Map hotkey → commitment | frontend/src/lib/api.ts:281:  const hotkeyCom = commitments.commitments; | frontend/src/lib/api.ts:320:    // Check DQ by hotkey:block (per-commit), hotkey (legacy), or UID (legacy) | frontend/src/lib/api.ts:321:    const commitBlock = com.block; | frontend/src/lib/api.ts:322:    const dqReason = (commitBlock != null ? scores?.disqualified?.[`${neuron.ho...
-- """Health check and root redirect endpoints.""" | import os | import time as _time | from fastapi import APIRouter | from fastapi.responses import RedirectResponse | from config import NETUID, STATE_DIR | from helpers.sanitize import _safe_json_load | router = APIRouter() | @router.get("/", include_in_schema=False) | def root(): | """Redirect to interactive API docs.""" | return RedirectResponse(url="/docs") | @router.get("/api/health", tags=["Overview"], summary="Service health and quick status", | description="""One-stop health check that returns the current state of the validator and subnet. | Response includes: | - `status`: `ok` if the API is running | - `king_uid` / `king_kl`: Current king and their KL score (lower = better) | - `n_scored` / `n_disqualified`: Number of active vs disqualified miners | - `last_eval_block` / `last_eval_age_min`: When the last eval happened | - `eva...
+```
+distil-validator.service
+  └─ scripts/run_validator.sh
+       └─ scripts/remote_validator.py (66-line Click wrapper)
+            └─ scripts.validator.service.run_validator
+                 ├─ scripts.validator.precheck     — model integrity preflight
+                 ├─ scripts.validator.challengers  — FIFO + king re-eval selection
+                 ├─ scripts.validator.pod_session  — SSH/upload/orchestrate the GPU pod
+                 │    └─ remote: scripts/parallel_orchestrator.py
+                 │         └─ remote: scripts/pod_eval_vllm.py × N GPU shards
+                 ├─ scripts.validator.results      — composite + DQ + dethrone gate
+                 ├─ scripts.validator.state_manager — H2H state + top-4 leaderboard
+                 └─ scripts.validator.announcements — Discord new-king notifier
+
+distil-api.service
+  └─ uvicorn api.server:app
+       ├─ api/routes/health.py        — GET /api/health
+       ├─ api/routes/market.py        — metagraph + price
+       ├─ api/routes/miners.py        — per-miner views
+       ├─ api/routes/evaluation.py    — leaderboard + H2H + dashboard
+       ├─ api/routes/chat.py          — proxies to chat-tunnel on :{CHAT_POD_PORT}
+       │    └─ api/agent_runner.py    — agent-harness over OpenAI Agents SDK
+       ├─ api/routes/telemetry.py     — overview + DQs + events + errors
+       └─ api/routes/debugging.py     — pod-logs + validator-logs + gpu-logs
+
+chat-keeper.timer + chat-tunnel.service
+  └─ scripts/chat_keeper.sh          — heals the chat pod / tunnel
+
+sn97-bot-snapshot.timer + .service
+  └─ scripts/sn97_bot_snapshot.py    — gathers live state into LIVE_STATUS.md for the Discord bot
+```
+
+State files all live under `state/` and are read/written atomically via
+`eval/state.py::ValidatorState.save()` (`atomic_json_write` → tmp + `os.replace`).
 - """Evaluation endpoints: H2H, leaderboard, eval progress, history, benchmarks, announcements.""" | import json | import os | import time | from fastapi import APIRouter | from fastapi.responses import JSONResponse | from config import STATE_DIR | from helpers.cache import _get_stale | from helpers.sanitize import _sanitize_floats, _safe_json_load | router = APIRouter() | @router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard", | description="Returns the top-4 leaderboard - current king and contenders. Dethronement uses paired t-test (p < 0.05).") | def get_leaderboard(): | top4 = _safe_json_load(os.path.join(STATE_DIR, "top4_leaderboard.json"), {}) or {} | scores = _safe_json_load(os.path.join(STATE_DIR, "scores.json"), {}) | h2h_latest = _safe_json_load(os.path.join(STATE_DIR, "h2h_latest.json"), {}) | uid_map = _safe_json_load(os.path.join(STATE_DIR, "uid_ho...
 
