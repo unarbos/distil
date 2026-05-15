@@ -12,6 +12,23 @@ POD_AUX_MODULES: tuple[tuple[str, str], ...] = (
     ("scripts/eval_policy.py", "eval_policy.py"),
     ("scripts/eval_benchmarks.py", "eval_benchmarks.py"),
     ("scripts/eval_items.py", "eval_items.py"),
+    # 2026-05-15: ``student_vllm`` powers the vLLM-backed student
+    # generation path used by the bench battery (--use-vllm-students /
+    # DISTIL_STUDENT_USE_VLLM=1). Without this entry the pod's
+    # `import student_vllm` raises and pod_eval.py logs "No module
+    # named 'student_vllm'" → silently falls back to HF transformers,
+    # turning a ~1 h round into a 4-5 h round. The legacy pod_runtime.py
+    # has had this entry since 2026-05-14; reintroducing it here so the
+    # active validator tree uploads it on every fresh pod run. Includes
+    # the max_position_embeddings clamp added 2026-05-15.
+    ("scripts/student_vllm.py", "student_vllm.py"),
+    # 2026-05-15: parallel orchestrator + watchdog. Optional companion
+    # to pod_eval.py used by validators that want multi-GPU fan-out
+    # (8xB200 etc.). pod_session.py invokes it instead of pod_eval.py
+    # when DISTIL_USE_PARALLEL_ORCH=1 — see the conditional at the
+    # eval-launch site. Even when unused, uploading it is cheap (~25 KB)
+    # and lets operators flip the flag without redeploying the pod.
+    ("scripts/parallel_orchestrator.py", "parallel_orchestrator.py"),
     # v31 procedural axis package (2026-05-09). The v31 generators
     # are imported on the pod via ``from scripts.v31.<axis> import
     # generate_items`` so they need to land at

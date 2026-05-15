@@ -281,6 +281,28 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     # per-prompt KL loop. Without propagation the pod env never sees it and
     # the pod falls back to single-prompt forwards.
     "DISTIL_STUDENT_BATCH_SIZE",
+    # ── Student vLLM (2026-05-14 8xB200 pivot) ──
+    # Without these the pod silently falls back to the HF transformers
+    # student path (~3 h/round). With ``DISTIL_STUDENT_USE_VLLM=1`` and
+    # the tokenizer path the pod uses ``scripts/student_vllm.py``
+    # (~30 min/round single GPU, much more under fan-out). Requires
+    # the corresponding aux module entry in ``pod_runtime.py``.
+    "DISTIL_STUDENT_USE_VLLM",
+    "DISTIL_STUDENT_VLLM_TOKENIZER",
+    "DISTIL_STUDENT_VLLM_MAX_LEN",
+    "DISTIL_STUDENT_VLLM_GPU_UTIL",
+    "DISTIL_STUDENT_VLLM_TP",
+    "DISTIL_STUDENT_VLLM_TRC",
+    "DISTIL_STUDENT_VLLM_EAGER",
+    # vLLM 0.20.2 needs deep_gemm disabled for Kimi-K2.6 MoE on B200
+    # (kernel selection bug). Re-enable when 0.21+ ships the fixed
+    # selector.
+    "VLLM_USE_DEEP_GEMM",
+    "VLLM_USE_DEEP_GEMM_E8M0",
+    # Vocab override for students compiled against Kimi K2.6 vocab=163840
+    # rather than the older 160K. Pod precheck refuses without this.
+    "ACTIVATION_FP_VOCAB_SIZE",
+    "TEACHER_CONFIG_VOCAB_SIZE",
 )
 
 
