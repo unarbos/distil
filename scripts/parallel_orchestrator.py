@@ -502,7 +502,27 @@ def main():
     )
 
     n_gpus = max(1, args.gpus)
-    king_path = os.path.join(workdir, "king_result.json")
+    # Phase 1/king writes to its own gpu0 subdir so that pod_eval.py's
+    # ``Path(args.output).with_name("eval_done.marker")`` lands in
+    # ``<workdir>/gpu0/eval_done.marker`` instead of the top-level
+    # ``<workdir>/eval_done.marker`` that the validator polls. Before this
+    # fix, Phase 1 finishing tripped DISTIL_STATUS:done while the
+    # challenger shards (and the merge step) were still running — the
+    # validator then tried to download eval_results.json (not written
+    # yet), failed, and cleared the round. Only THIS orchestrator should
+    # write the top-level marker, and only after merge completes.
+    gpu0_dir = os.path.join(workdir, "gpu0")
+    os.makedirs(gpu0_dir, exist_ok=True)
+    king_path = os.path.join(gpu0_dir, "king_result.json")
+    # Defensive: clear any stale top-level marker. The validator polls this
+    # via DISTIL_STATUS:done; any premature marker (e.g. a previous failed
+    # run) would race us into the validator's results-download path.
+    try:
+        top_marker = os.path.join(workdir, "eval_done.marker")
+        if os.path.exists(top_marker):
+            os.unlink(top_marker)
+    except Exception:
+        pass
 
     if args.skip_phase1 and not os.path.exists(args.teacher_cache):
         print(f"[orch] FATAL: --skip-phase1 but no teacher_cache at {args.teacher_cache}", flush=True)
