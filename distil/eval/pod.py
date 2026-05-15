@@ -248,6 +248,145 @@ def install_runtime(pod) -> None:
 # ── eval execution ────────────────────────────────────────────────────
 
 
+def _stream_pod_log(
+    pod,
+    remote_run: str,
+    round_id: int,
+    *,
+    round_spec: dict | None = None,
+) -> None:
+    """Mirror pod-side eval log + progress into ``state/`` so the
+    healthcheck sees the round as alive.
+
+    Production's ``sn97_healthcheck.py`` watches TWO files:
+
+    * ``state/gpu_eval.log`` — if ``eval_progress.active`` is True
+      and the log mtime is older than ``GPU_LOG_STALE_SEC``, it
+      force-restarts the validator with reason ``gpu_log_stale``.
+    * ``state/eval_progress.json`` — read for ``.active``,
+      ``.phase``, ``.students_*``, ``.teacher_prompts_done`` etc.
+      If the file is stale while ``.active=true``, it triggers
+      ``validator:stale_eval_progress`` → restart.
+
+    The legacy validator streamed paramiko stdout into gpu_eval.log
+    continuously and rewrote eval_progress.json after every shard
+    progress event. The distil polling loop wrote neither — which is
+    why the cutover validator was SIGKILLed by the healthcheck every
+    minute even though the pod-side orchestrator was healthy.
+
+    Best-effort: fetch the last 200 lines of orchestrator.log + each
+    active phase log and copy the pod-side ``eval_progress.json``
+    onto the host. Wraps the pod payload so it matches the legacy
+    eval_progress schema the healthcheck expects (``active``,
+    ``phase``, ``students_total``, etc.). Never raises — a stale SSH
+    channel is non-fatal; the next iteration retries.
+    """
+    try:
+        state_dir = Path(settings.state_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        local_log = state_dir / "gpu_eval.log"
+        local_progress = state_dir / "eval_progress.json"
+
+        # ``orchestrator.log`` is the canonical pod-side eval log. We
+        # also tail phase[1-3]_*.log so per-phase progress (api teacher
+        # 50/256, student vllm warmup, etc.) shows up in the host log.
+        cmd = (
+            f"tail -n 200 {remote_run}/orchestrator.log 2>/dev/null; "
+            f"echo '--- phase logs ---'; "
+            f"for f in {remote_run}/phase*_*.log; do "
+            f"[ -f \"$f\" ] && echo \"=== $(basename $f) ===\" && "
+            f"tail -n 40 \"$f\"; "
+            f"done 2>/dev/null; "
+            f"echo '--- progress ---'; "
+            f"cat {remote_run}/eval_progress.json 2>/dev/null"
+        )
+        res = pod.exec(cmd, timeout=15)
+        if not res.get("success"):
+            return
+        content = res.get("stdout") or ""
+        # Split off the progress JSON tail to write eval_progress.json
+        # separately. The marker is unique enough that we don't need a
+        # robust parser — last occurrence wins.
+        pod_progress: dict[str, Any] = {}
+        if "--- progress ---" in content:
+            log_part, _, prog_part = content.rpartition("--- progress ---")
+            try:
+                pod_progress = json.loads(prog_part.strip())
+            except Exception:
+                pod_progress = {}
+            content = log_part
+        local_log.write_text(
+            f"# round={round_id} updated_at={time.time():.0f}\n{content}"
+        )
+
+        # Build host-side eval_progress.json in the legacy schema the
+        # healthcheck reads. ``active=true`` while polling; phase +
+        # teacher_prompts_done come from the pod payload; models and
+        # eval_order come from the round_spec we built on the host.
+        host_progress: dict[str, Any] = {
+            "active": True,
+            "updated_at": time.time(),
+            "round_id": round_id,
+            "phase": pod_progress.get("phase") or "polling",
+            "students_total": pod_progress.get("n_prompts") or pod_progress.get("students_total"),
+            "students_done": (
+                len(pod_progress.get("completed", []))
+                if isinstance(pod_progress.get("completed"), list)
+                else None
+            ),
+            "teacher_prompts_done": pod_progress.get("teacher_prompts_done"),
+            "pod": pod_progress,
+        }
+        if round_spec:
+            host_progress["models"] = {
+                str(s["uid"]): s.get("repo", "")
+                for s in (round_spec.get("students") or [])
+            }
+            host_progress["eval_order"] = [
+                {
+                    "uid": s["uid"],
+                    "model": s.get("repo", ""),
+                    "role": "king" if s.get("is_king") else "challenger",
+                }
+                for s in (round_spec.get("students") or [])
+            ]
+            host_progress["king_uid"] = next(
+                (s["uid"] for s in (round_spec.get("students") or []) if s.get("is_king")),
+                None,
+            )
+            host_progress["challenger_uids"] = [
+                s["uid"]
+                for s in (round_spec.get("students") or [])
+                if not s.get("is_king")
+            ]
+        tmp = str(local_progress) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(host_progress, f)
+        os.replace(tmp, local_progress)
+    except Exception as exc:
+        logger.debug(f"_stream_pod_log non-fatal: {exc}")
+
+
+def _mark_progress_inactive(round_id: int) -> None:
+    """Flip ``state/eval_progress.json`` to ``active=false`` so the
+    healthcheck stops watching the gpu log freshness for this round."""
+    try:
+        path = Path(settings.state_dir) / "eval_progress.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "active": False,
+            "updated_at": time.time(),
+            "round_id": round_id,
+            "phase": "finished",
+        }
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.debug(f"_mark_progress_inactive non-fatal: {exc}")
+
+
 def _pod_run_state(pod, remote_run: str) -> str:
     """Returns 'absent' | 'in_progress' | 'complete' by probing the pod.
 
@@ -327,9 +466,11 @@ def run_eval_on_pod(
         deadline = time.time() + deadline_s
         while time.time() < deadline:
             time.sleep(20)
+            _stream_pod_log(pod, remote_run, round_id, round_spec=round_spec)
             if _pod_run_state(pod, remote_run) == "complete":
                 break
         else:
+            _mark_progress_inactive(round_id)
             raise RuntimeError(
                 f"resume: round {round_id} did not complete within {deadline_s / 60:.0f} min"
             )
@@ -363,12 +504,19 @@ def run_eval_on_pod(
                 f"orchestrator launch failed (rc={res.get('exit_code')}): "
                 f"{res.get('stdout', '')}{res.get('stderr', '')}"
             )
+        # Touch the host-side heartbeat files immediately so the
+        # sn97_healthcheck timer (which fires every minute) doesn't
+        # observe a 15-minute-stale gpu_eval.log during the 20s
+        # before the first poll iteration.
+        _stream_pod_log(pod, remote_run, round_id, round_spec=round_spec)
         deadline = time.time() + deadline_s
         while time.time() < deadline:
             time.sleep(20)
+            _stream_pod_log(pod, remote_run, round_id, round_spec=round_spec)
             if _pod_run_state(pod, remote_run) == "complete":
                 break
         else:
+            _mark_progress_inactive(round_id)
             raise RuntimeError(
                 f"round {round_id} did not complete within {deadline_s / 60:.0f} min"
             )
@@ -380,6 +528,7 @@ def run_eval_on_pod(
             pod.download(f"{remote_run}/{opt}", str(out_dir / opt))
         except Exception as exc:
             logger.warning(f"non-fatal download {opt}: {exc}")
+    _mark_progress_inactive(round_id)
 
     results_path = out_dir / "results.json"
     if not results_path.exists():
