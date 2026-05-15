@@ -35,7 +35,19 @@ _DEFAULT_MAX_PARAMS_B = MAX_STUDENT_PARAMS / 1e9
 @click.option("--wallet-name", default="affine")
 @click.option("--hotkey-name", default="validator")
 @click.option("--wallet-path", default="~/.bittensor/wallets/")
-@click.option("--lium-api-key", required=True, envvar="LIUM_API_KEY")
+@click.option(
+    "--lium-api-key",
+    required=False,
+    envvar="LIUM_API_KEY",
+    default=None,
+    help=(
+        "DEPRECATED on the CLI — passing this as an argv leaks the secret "
+        "to anyone with shell access (visible via `ps auxf`). Set the "
+        "LIUM_API_KEY environment variable instead (or put it in your "
+        "distil.env). The option remains so older invocations still parse, "
+        "but `scripts/run_validator.sh` no longer passes it."
+    ),
+)
 @click.option("--lium-pod-name", default="distil-validator")
 @click.option("--state-dir", default="state")
 @click.option("--max-params-b", type=float, default=_DEFAULT_MAX_PARAMS_B)
@@ -46,6 +58,15 @@ _DEFAULT_MAX_PARAMS_B = MAX_STUDENT_PARAMS / 1e9
 def main(network, netuid, wallet_name, hotkey_name, wallet_path,
          lium_api_key, lium_pod_name, state_dir, max_params_b, tempo, once, use_vllm):
     """Run the distillation validator with king-of-the-hill evaluation."""
+    # Resolve from env if not on argv (the prod path after 2026-05-15);
+    # fail fast with a clear message rather than letting the Lium client
+    # raise a confusing "401 Unauthorized" four layers deep.
+    import os as _os
+    lium_api_key = lium_api_key or _os.environ.get("LIUM_API_KEY", "")
+    if not lium_api_key:
+        raise click.UsageError(
+            "LIUM_API_KEY not set (env or --lium-api-key). Source distil.env."
+        )
     return run_validator(
         network,
         netuid,

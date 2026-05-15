@@ -29,12 +29,22 @@ fi
 
 export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || echo '')}"
 
+# 2026-05-15: do NOT pass --lium-api-key on argv — it would be visible
+# via ``ps auxf`` to anyone with shell access. ``remote_validator.py``'s
+# click option declares ``envvar="LIUM_API_KEY"`` and is no longer
+# ``required=True`` on the CLI, so passing it via the inherited env is
+# sufficient (and what every other secret in distil.env already does).
+if [ -z "${LIUM_API_KEY:-}" ]; then
+    echo "[run_validator] FATAL: LIUM_API_KEY not in env; check $ENV_FILE" >&2
+    exit 2
+fi
+export LIUM_API_KEY
+
 exec "$PYTHON_BIN" scripts/remote_validator.py \
   --wallet-name "${DISTIL_WALLET_NAME:-affine}" \
   --hotkey-name "${DISTIL_HOTKEY_NAME:-validator}" \
   --wallet-path "${DISTIL_WALLET_PATH:-$HOME/.bittensor/wallets}" \
   --state-dir "${DISTIL_STATE_DIR:-$REPO_ROOT/state}" \
-  --lium-api-key "$LIUM_API_KEY" \
   --lium-pod-name "${DISTIL_LIUM_POD_NAME:-distil-eval}" \
   --tempo "${DISTIL_VALIDATOR_TEMPO:-600}" \
   --use-vllm
