@@ -341,6 +341,42 @@ export async function fetchH2hLatest(): Promise<H2hLatestResponse | null> {
   return safeFetch(`${API_BASE}/api/h2h-latest`);
 }
 
+export interface EvalOrderItem {
+  uid: number;
+  model: string;
+  role: "king" | "challenger";
+}
+
+export interface CompletedStudent {
+  student_idx?: number;
+  student_name: string;
+  status: string;
+  status_detail?: string;
+  kl?: number;
+  prompts_scored?: number;
+  prompts_total?: number;
+  scoring_time_s?: number;
+}
+
+// 2026-05-15: parallel orchestrator (DISTIL_USE_PARALLEL_ORCH=1) emits a
+// per-GPU shard view inside the pod's eval_progress.json. The dashboard
+// renders the live panel's "Scoring" row as one tile per shard so users
+// can see N students evaluating concurrently on N GPUs.
+export interface ShardProgress {
+  gpu: number;
+  pid?: number;
+  alive?: boolean;
+  current_student?: string | null;
+  current_stage?: string | null;
+  current_prompts_done?: number;
+  current_prompts_total?: number;
+  stage_line?: string;
+  stale_s?: number;
+  repeat_tail?: number;
+  exit_code?: number | null;
+  shard_result_bytes?: number;
+}
+
 export interface EvalProgress {
   active: boolean;
   phase?: string;
@@ -362,37 +398,14 @@ export interface EvalProgress {
   bench_axis_idx?: number | null;
   bench_axis_total?: number | null;
   teacher_prompts_done?: number;
+  started_at?: number;
+  estimated_completion?: number;
+  estimated_duration_s?: number;
+  king_uid?: number;
   models?: Record<string, string>;
-  eval_order?: Array<{ uid: number; model: string; role: "king" | "challenger" }>;
-  completed?: Array<{
-    student_idx?: number;
-    student_name: string;
-    status: string;
-    status_detail?: string;
-    kl?: number;
-    prompts_scored?: number;
-    prompts_total?: number;
-    scoring_time_s?: number;
-  }>;
-  // 2026-05-15: when the validator runs ``parallel_orchestrator.py``
-  // (DISTIL_USE_PARALLEL_ORCH=1) the pod-side eval_progress.json
-  // includes a per-GPU shard view. The dashboard renders the live
-  // panel's "Scoring" row as one tile per shard so users can see
-  // that N students are evaluating concurrently on N GPUs.
-  shards?: Array<{
-    gpu: number;
-    pid?: number;
-    alive?: boolean;
-    current_student?: string | null;
-    current_stage?: string | null;
-    current_prompts_done?: number;
-    current_prompts_total?: number;
-    stage_line?: string;
-    stale_s?: number;
-    repeat_tail?: number;
-    exit_code?: number | null;
-    shard_result_bytes?: number;
-  }>;
+  eval_order?: EvalOrderItem[];
+  completed?: CompletedStudent[];
+  shards?: ShardProgress[];
   n_gpus?: number;
   orchestrator?: string;
 }

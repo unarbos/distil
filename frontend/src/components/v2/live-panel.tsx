@@ -2,83 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import type { CompletedStudent, EvalProgress, ShardProgress } from "@/lib/api";
 import { ChatKingPill } from "./chat-king-pill";
-
-interface EvalOrderItem {
-  uid: number;
-  model: string;
-  role: "king" | "challenger";
-}
-
-interface CompletedStudent {
-  student_idx?: number;
-  student_name: string;
-  status: string;
-  status_detail?: string;
-  kl?: number;
-  prompts_scored?: number;
-  prompts_total?: number;
-  scoring_time_s?: number;
-}
-
-interface EvalProgress {
-  active: boolean;
-  phase?: string;
-  current_student?: string;
-  students_done?: number;
-  students_total?: number;
-  prompts_done?: number;
-  prompts_total?: number;
-  phase_detail?: string | null;
-  phase_eta_s?: number | null;
-  progress_fraction?: number | null;
-  current_student_started_at?: number | null;
-  current_prompt?: number;
-  current_kl?: number;
-  // 2026-05-04: name of the per-student stage in flight (e.g.
-  // "chat_probe", "long_form_judge_probe", "kl_scoring"). Used by the
-  // queue row to show what's actually running while X/N prompts is
-  // still 0 (i.e. before KL scoring begins). Surfaced via
-  // ``current.stage`` from the pod's eval_progress.json.
-  current_stage?: string | null;
-  // 2026-05-04: bench-battery sub-axis index (1-based) and total
-  // (~17 axes). Stage is "bench_battery:<axis_name>" while the
-  // axis is in flight. Lets the queue row render
-  // "running bench: aime (6/17)" so the ~25-min phase doesn't
-  // look stuck on a static "bench_battery" stamp.
-  bench_axis_idx?: number | null;
-  bench_axis_total?: number | null;
-  teacher_prompts_done?: number;
-  started_at?: number;
-  estimated_completion?: number;
-  estimated_duration_s?: number;
-  eval_order?: EvalOrderItem[];
-  king_uid?: number;
-  completed?: CompletedStudent[];
-  models?: Record<string, string>;
-  // 2026-05-15: parallel orchestrator (DISTIL_USE_PARALLEL_ORCH=1)
-  // multi-GPU shard view. Each entry is one worker GPU; the live
-  // panel renders these stacked so the user can confirm N students
-  // are scoring in parallel rather than the legacy sequential mode.
-  shards?: ShardProgress[];
-  n_gpus?: number;
-  orchestrator?: string;
-}
-
-interface ShardProgress {
-  gpu: number;
-  pid?: number;
-  alive?: boolean;
-  current_student?: string | null;
-  current_stage?: string | null;
-  current_prompts_done?: number;
-  current_prompts_total?: number;
-  stage_line?: string;
-  stale_s?: number;
-  repeat_tail?: number;
-  exit_code?: number | null;
-  shard_result_bytes?: number;
-}
 
 interface LogLine {
   ts: number;
