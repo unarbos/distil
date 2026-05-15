@@ -565,6 +565,36 @@ def main():
                       f"{type(_fwd_exc).__name__}: {str(_fwd_exc)[:120]}",
                       flush=True)
 
+        n_students_target_total = len([king_n] + chals_n)
+
+        def _write_phase1_unified_with_shards():
+            """Once challengers are spawned, write the multi-shard unified
+            progress so the dashboard sees N students scoring concurrently
+            *during* king's bench battery instead of only after king exits.
+            Falls back silently if the writer hits an error."""
+            try:
+                shard_progress = {
+                    0: {
+                        "gpu": 0, "pid": pid, "alive": True,
+                        "shard_out": king_path,
+                    },
+                }
+                for gpu_idx, proc, out_path, _log in _CHALLENGERS_SPAWNED.get("procs", []) or []:
+                    shard_progress[gpu_idx] = {
+                        "gpu": gpu_idx,
+                        "pid": getattr(proc, "pid", None),
+                        "alive": (proc.poll() is None) if proc is not None else False,
+                        "shard_out": out_path,
+                    }
+                _write_unified_progress(
+                    workdir, args.unified_progress, shard_progress,
+                    n_students_target=n_students_target_total,
+                )
+            except Exception as _uw_exc:
+                print(f"[orch] phase1 unified write failed: "
+                      f"{type(_uw_exc).__name__}: {str(_uw_exc)[:120]}",
+                      flush=True)
+
         # Wait until teacher_cache hits disk (Phase 1 done), then move on
         # to fan-out IMMEDIATELY — don't wait for king's bench battery.
         # King keeps running on GPU 0; challengers fan across the remaining GPUs.
@@ -574,13 +604,15 @@ def main():
                 if ret != (0, 0):
                     exit_code = os.WEXITSTATUS(ret[1])
                     print(f"[orch] phase1+king exit_code={exit_code}", flush=True)
-                    _forward_phase1_progress()
+                    if _CHALLENGERS_SPAWNED.get("done"):
+                        _write_phase1_unified_with_shards()
+                    else:
+                        _forward_phase1_progress()
                     break
             except ChildProcessError:
                 print("[orch] phase1+king child gone", flush=True)
                 break
             time.sleep(30)
-            _forward_phase1_progress()
             tc_size = os.path.getsize(args.teacher_cache) if os.path.exists(args.teacher_cache) else 0
             kr_size = os.path.getsize(king_path) if os.path.exists(king_path) else 0
             if tc_size > 1_000_000 and not _CHALLENGERS_SPAWNED.get("done"):
@@ -591,6 +623,14 @@ def main():
                     workdir, args.prompts, args.teacher_cache, chals_n, n_gpus,
                 )
                 _CHALLENGERS_SPAWNED["done"] = True
+            # Pre-spawn: forward gpu0 only (king is the sole source of
+            # truth). Post-spawn: write the full multi-shard unified view
+            # so miners see all 8 GPUs concurrent during king's bench
+            # battery instead of a 15+ min king-only window.
+            if _CHALLENGERS_SPAWNED.get("done"):
+                _write_phase1_unified_with_shards()
+            else:
+                _forward_phase1_progress()
             print(f"[orch] phase1+king alive… teacher_cache={tc_size/1024/1024:.0f}MB "
                   f"king_result={kr_size}B", flush=True)
         if not os.path.exists(args.teacher_cache):
