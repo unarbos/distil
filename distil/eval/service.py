@@ -142,33 +142,54 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     # hasn't advanced past the round-completion deadline, re-use the prior
     # round_spec rather than building a fresh one. Lets a crashed-restarted
     # validator continue an eval that's still running on the persistent pod.
+    #
+    # Resume is GATED on the prior spec containing the same set of
+    # students we'd ship today. If the set differs (e.g. the king
+    # changed, the challenger pool rotated, or the previous attempt
+    # was built before a bugfix that altered selection rules) we
+    # ABANDON the stale spec and rebuild from scratch. Without this
+    # gate, a 1-student in-progress round from a pre-fix attempt
+    # would keep getting "resumed" forever even after distil started
+    # selecting king + 10 challengers properly.
+    def _fresh_spec() -> dict[str, Any]:
+        return build_round_spec(
+            block=block,
+            block_hash=block_hash,
+            teacher_repo=settings.teacher_repo,
+            reference_repo=settings.reference_repo,
+            king=king_commitment,
+            challengers=challengers,
+        )
+
     in_progress = state.current_round or {}
+    spec = None
     if in_progress.get("round_id") and not in_progress.get("completed"):
         age_min = (time.time() - in_progress.get("started_at", 0)) / 60
-        if age_min < settings.eval_round_max_minutes * 2:
-            logger.info(
-                f"resume: reusing in-progress round {in_progress['round_id']} "
-                f"(age {age_min:.1f} min)"
-            )
-            spec = in_progress["spec"]
-        else:
+        prev_spec = in_progress.get("spec") or {}
+        prev_uids = {int(s.get("uid", -1)) for s in (prev_spec.get("students") or [])}
+        fresh = _fresh_spec()
+        fresh_uids = {int(s.get("uid", -1)) for s in (fresh.get("students") or [])}
+        if age_min >= settings.eval_round_max_minutes * 2:
             logger.warning(
                 f"in-progress round {in_progress['round_id']} is {age_min:.1f} min old; "
                 f"abandoning and starting fresh"
             )
-            spec = build_round_spec(
-                block=block, block_hash=block_hash,
-                teacher_repo=settings.teacher_repo,
-                reference_repo=settings.reference_repo,
-                king=king_commitment, challengers=challengers,
+            spec = fresh
+        elif prev_uids != fresh_uids:
+            logger.warning(
+                f"in-progress round {in_progress['round_id']} students "
+                f"{sorted(prev_uids)} != fresh {sorted(fresh_uids)}; "
+                f"abandoning (likely built pre-bugfix) and starting fresh"
             )
+            spec = fresh
+        else:
+            logger.info(
+                f"resume: reusing in-progress round {in_progress['round_id']} "
+                f"(age {age_min:.1f} min, students match)"
+            )
+            spec = prev_spec
     else:
-        spec = build_round_spec(
-            block=block, block_hash=block_hash,
-            teacher_repo=settings.teacher_repo,
-            reference_repo=settings.reference_repo,
-            king=king_commitment, challengers=challengers,
-        )
+        spec = _fresh_spec()
 
     out_dir = Path(settings.state_dir) / "_rounds" / f"round_{spec['round_id']}"
     log_event(f"starting round block={block} king={king_name} challengers={len(challengers)}")
@@ -273,8 +294,16 @@ def run(
         try:
             _round(state, dry_run=dry_run)
         except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
             logger.exception(f"round failed: {exc}")
+            # The journal sometimes loses logger.exception() multi-line
+            # tracebacks (likely due to a missing handler config), so
+            # ALSO mirror the formatted traceback into validator_log.json
+            # via log_event — the first 1200 chars are enough to locate
+            # the offending frame without scrolling.
             log_event(f"round crashed: {exc}", level="error")
+            log_event(f"round traceback:\n{tb[-1200:]}", level="error")
             time.sleep(60)
             if once:
                 return 1
