@@ -1,0 +1,9 @@
+[Unit]
+Description=Bounce chat-tunnel.service when chat_pod.json changes
+After=chat-tunnel.service
+
+[Service]
+Type=oneshot
+# `try-restart` so we never spin up a fresh tunnel that the operator
+# manually disabled — `restart` would.
+ExecStart=/bin/systemctl try-restart chat-tunnel.service

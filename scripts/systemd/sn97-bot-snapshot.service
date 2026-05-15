@@ -1,0 +1,23 @@
+[Unit]
+Description=SN97 bot workspace snapshot
+After=distil-api.service
+Wants=distil-api.service
+
+[Service]
+Type=oneshot
+# 2026-05-03: tell the snapshot script which Lium pod to read live SSH
+# state from. The validator's own systemd unit (kimi-cutover.conf drop-in)
+# sets the same DISTIL_LIUM_POD_NAME for the validator process.
+# 2026-05-04: switched from distil-kimi-cutover (decommissioned) to
+# distil-eval; teacher mode is now API (no local 1T-param vLLM load).
+# 2026-05-15: switched from "distil-eval" (which substring-matched the
+# decommissioned ``distil-eval-b200`` pod via the script's fallback
+# list and silently SSH'd to a B300 single-GPU pod with stale data) to
+# "8xb200", which uniquely matches the live ``distil 8xb200 eval`` pod.
+Environment=DISTIL_LIUM_POD_NAME=8xb200
+Environment=DISTIL_TEACHER_MODE=api
+Environment=DISTIL_TEACHER_API_PROVIDERS=Inceptron
+Environment=DISTIL_TEACHER_API_MODEL=moonshotai/kimi-k2.6
+ExecStart=/opt/distil/venv/bin/python /opt/distil/repo/scripts/sn97_bot_snapshot.py
+User=root
+Nice=10
