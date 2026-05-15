@@ -1,77 +1,31 @@
-"""v31_math_competition — modular arithmetic / number-theory style items."""
+"""v31_math_competition — algebra/number-theory/combinatorics/geometry/probability.
+
+Items: ``distil.pod.axes.v31.math_competition.generate_items``.
+Grader: ``distil.pod.axes.v31.math_competition.grade_response`` (fraction
+aware — canonicalises p/q to lowest terms before comparison).
+"""
 
 from __future__ import annotations
 
-import re
+from distil.pod.axes._runner import run_axis
+from distil.pod.axes.v31 import math_competition as _v31
 
-from distil.pod.axes._base import (
-    aggregate,
-    block_seeded_rng,
-    estimate_completion_tokens,
-    generate_greedy,
-)
+MAX_TOKENS = 1024
+AXIS_NAME = "v31_math_competition"
 
 
-def _modular_gcd_lcm(rng) -> tuple[str, int]:
-    a = rng.randint(20, 999)
-    b = rng.randint(20, 999)
+def _grade(text: str, item: dict) -> bool:
+    return bool(_v31.grade_response(text, item.get("gold", "")))
 
-    def gcd(x, y):
-        while y:
-            x, y = y, x % y
-        return x
 
-    g = gcd(a, b)
-    return (
-        f"Find gcd({a}, {b}). Reply with only the integer.",
-        g,
+def run(engine, *, block_seed: int, n_items: int) -> dict:
+    items = _v31.generate_items(block_seed, n_items)
+    return run_axis(
+        engine,
+        axis_name=AXIS_NAME,
+        items=items,
+        prompt_fn=lambda it: it["question"],
+        grader=_grade,
+        max_tokens=MAX_TOKENS,
+        extra_item_keys=("family", "template"),
     )
-
-
-def _power_mod(rng) -> tuple[str, int]:
-    base = rng.randint(2, 30)
-    exp = rng.randint(2, 12)
-    mod = rng.randint(7, 97)
-    return (
-        f"Compute {base}^{exp} mod {mod}. Reply with only the integer.",
-        pow(base, exp, mod),
-    )
-
-
-def _arithmetic_sum(rng) -> tuple[str, int]:
-    a = rng.randint(1, 50)
-    d = rng.randint(1, 9)
-    n = rng.randint(8, 20)
-    s = n * (2 * a + (n - 1) * d) // 2
-    return (
-        f"What is the sum of the first {n} terms of the arithmetic sequence "
-        f"starting at {a} with common difference {d}? Reply with only the integer.",
-        s,
-    )
-
-
-_GENS = (_modular_gcd_lcm, _power_mod, _arithmetic_sum)
-
-
-def _extract(text: str) -> int | None:
-    nums = re.findall(r"-?\d+", text or "")
-    return int(nums[-1]) if nums else None
-
-
-def run(student_engine, *, block_seed: int, n_items: int):
-    rng = block_seeded_rng(block_seed, "v31_math_competition")
-    items = [rng.choice(_GENS)(rng) for _ in range(n_items)]
-    prompts = [f"{q}\n\nAnswer: " for q, _ in items]
-    outs = generate_greedy(student_engine, prompts, max_tokens=192)
-    rows = []
-    for (q, ans), (text, toks) in zip(items, outs, strict=False):
-        rows.append(
-            {
-                "q": q,
-                "ans": ans,
-                "guess": _extract(text),
-                "ok": _extract(text) == ans,
-                "tokens": len(toks),
-            }
-        )
-    return aggregate(rows, completion_tokens=estimate_completion_tokens(outs)).as_dict()

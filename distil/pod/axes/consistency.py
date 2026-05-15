@@ -1,58 +1,77 @@
-"""v31_consistency_paraphrase — paraphrase consistency on factual yes/no items."""
+"""v31_consistency_paraphrase — paraphrase-pair consistency axis.
+
+Each item carries two paraphrased versions of the same math question
+(``question`` / ``question_b``) plus a single ``gold``. We generate
+one response per phrasing and score:
+
+* 1.0 — both correct
+* 0.5 — exactly one correct (surface-form fragility)
+* 0.0 — neither correct
+
+This deliberately differs from pure pass-frac for the other v31 axes —
+a model that's right on one phrasing and wrong on the other is showing
+partial memorisation, which is what this axis is built to catch.
+"""
 
 from __future__ import annotations
 
-import re
+import logging
 
-from distil.pod.axes._base import (
-    aggregate,
-    block_seeded_rng,
-    estimate_completion_tokens,
-    generate_greedy,
-)
+from distil.pod.axes._base import BenchResult, generate_greedy
+from distil.pod.axes.v31 import consistency_paraphrase as _v31
 
-ITEMS = (
-    ("Is water wet?", "yes"),
-    ("Is fire cold?", "no"),
-    ("Are humans mammals?", "yes"),
-    ("Is the sun a planet?", "no"),
-    ("Do birds have feathers?", "yes"),
-    ("Is iron a noble gas?", "no"),
-)
+logger = logging.getLogger("distil.pod.axes.consistency")
 
-PARAPHRASES = (
-    "Answer yes or no: {q}",
-    "Reply 'yes' or 'no': {q}",
-    "{q} (yes/no)",
-    "True/false reformulated as yes/no: {q}",
-)
+MAX_TOKENS = 512
+AXIS_NAME = "v31_consistency_paraphrase"
 
 
-def _gen(rng) -> tuple[list[str], str]:
-    q, ans = rng.choice(ITEMS)
-    prompts = [tpl.format(q=q) for tpl in PARAPHRASES]
-    return prompts, ans
+def run(engine, *, block_seed: int, n_items: int) -> dict:
+    items = _v31.generate_items(block_seed, n_items)
+    if not items:
+        return {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
 
+    prompts_a = [it["question"] for it in items]
+    prompts_b = [it["question_b"] for it in items]
+    try:
+        gens_a = generate_greedy(engine, prompts_a, max_tokens=MAX_TOKENS)
+        gens_b = generate_greedy(engine, prompts_b, max_tokens=MAX_TOKENS)
+    except Exception as exc:
+        logger.exception(f"consistency vllm generate failed: {exc}")
+        return {"n": 0, "correct": 0, "pass_frac": 0.0, "error": str(exc)[:200]}
 
-def run(student_engine, *, block_seed: int, n_items: int):
-    rng = block_seeded_rng(block_seed, "v31_consistency_paraphrase")
-    item_prompts: list[list[str]] = []
-    item_answers: list[str] = []
-    for _ in range(n_items):
-        ps, a = _gen(rng)
-        item_prompts.append(ps)
-        item_answers.append(a)
-    flat = [p for ps in item_prompts for p in ps]
-    outs = generate_greedy(student_engine, flat, max_tokens=8)
-    rows = []
-    cursor = 0
-    for ps, ans in zip(item_prompts, item_answers, strict=False):
-        guesses = []
-        for _ in ps:
-            text, _toks = outs[cursor]
-            cursor += 1
-            m = re.search(r"\b(yes|no)\b", (text or "").lower())
-            guesses.append(m.group(1) if m else "")
-        consistent = all(g == ans for g in guesses)
-        rows.append({"ans": ans, "guesses": guesses, "ok": consistent, "tokens": 0})
-    return aggregate(rows, completion_tokens=estimate_completion_tokens(outs)).as_dict()
+    scored: list[dict] = []
+    total_score = 0.0
+    both_correct = 0
+    completion_tokens = 0
+    for it, (a_text, a_tok), (b_text, b_tok) in zip(items, gens_a, gens_b, strict=False):
+        completion_tokens += len(a_tok or ()) + len(b_tok or ())
+        s = float(_v31.consistency_score(a_text or "", b_text or "", str(it.get("gold", ""))))
+        total_score += s
+        if s >= 0.999:
+            both_correct += 1
+        scored.append(
+            {
+                "src": it.get("src", ""),
+                "gold": str(it.get("gold", ""))[:40],
+                "score": round(s, 3),
+                "ok": s >= 0.999,
+                "tokens": len(a_tok or ()) + len(b_tok or ()),
+                "tail_a": (a_text or "")[-80:],
+                "tail_b": (b_text or "")[-80:],
+                "template": it.get("template"),
+                "difficulty": it.get("difficulty"),
+            }
+        )
+
+    n = len(scored)
+    res = BenchResult(
+        n=n,
+        correct=both_correct,
+        completion_tokens=completion_tokens,
+        items=scored,
+        extra={"raw_consistency_mean": round(total_score / n, 4) if n else 0.0},
+    )
+    payload = res.as_dict()
+    payload["pass_frac"] = round(total_score / n, 4) if n else 0.0
+    return payload

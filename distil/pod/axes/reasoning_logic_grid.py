@@ -1,60 +1,30 @@
-"""v31_reasoning_logic_grid — small constraint-satisfaction puzzles."""
+"""v31_reasoning_logic_grid — Zebra-style constraint-satisfaction puzzles.
+
+Items: ``distil.pod.axes.v31.reasoning_logic_grid.generate_items``.
+Grader: ``distil.pod.axes.v31.reasoning_logic_grid.grade_response``.
+"""
 
 from __future__ import annotations
 
-import itertools
-import re
+from distil.pod.axes._runner import run_axis
+from distil.pod.axes.v31 import reasoning_logic_grid as _v31
 
-from distil.pod.axes._base import (
-    aggregate,
-    block_seeded_rng,
-    estimate_completion_tokens,
-    generate_greedy,
-)
-
-PEOPLE = ("Alice", "Bob", "Carol", "Dan")
-PETS = ("cat", "dog", "rabbit", "bird")
+MAX_TOKENS = 1024
+AXIS_NAME = "v31_reasoning_logic_grid"
 
 
-def _gen(rng) -> tuple[str, str]:
-    """Return (prompt, expected unique pet for first person)."""
-    rng.shuffle(list(PEOPLE))
-    pets = list(PETS)
-    rng.shuffle(pets)
-    truth = dict(zip(PEOPLE, pets, strict=False))
-    target = PEOPLE[0]
-    constraints = [
-        f"{PEOPLE[1]} does not own a {truth[PEOPLE[2]]}.",
-        f"{PEOPLE[3]} owns a {truth[PEOPLE[3]]}.",
-        f"{PEOPLE[2]} owns either a {truth[PEOPLE[2]]} or a {truth[PEOPLE[0]]}.",
-    ]
-    prompt = (
-        "Four friends own one pet each (cat, dog, rabbit, bird). Use the "
-        "constraints below to determine each pet, then reply with the pet "
-        f"owned by {target} as a single word.\n"
-        f"People: {', '.join(PEOPLE)}\n" + "\n".join(f"- {c}" for c in constraints)
+def _grade(text: str, item: dict) -> bool:
+    return bool(_v31.grade_response(text, item.get("gold", "")))
+
+
+def run(engine, *, block_seed: int, n_items: int) -> dict:
+    items = _v31.generate_items(block_seed, n_items)
+    return run_axis(
+        engine,
+        axis_name=AXIS_NAME,
+        items=items,
+        prompt_fn=lambda it: it["question"],
+        grader=_grade,
+        max_tokens=MAX_TOKENS,
+        extra_item_keys=("num_people", "num_attrs", "num_clues"),
     )
-    return prompt, truth[target]
-
-
-def _solve_or_extract(text: str) -> str:
-    if not text:
-        return ""
-    last = re.findall(r"\b(cat|dog|rabbit|bird)\b", text.lower())
-    return last[-1] if last else ""
-
-
-def run(student_engine, *, block_seed: int, n_items: int):
-    rng = block_seeded_rng(block_seed, "v31_reasoning_logic_grid")
-    items = [_gen(rng) for _ in range(n_items)]
-    prompts = [q for q, _ in items]
-    outs = generate_greedy(student_engine, prompts, max_tokens=320)
-    rows = []
-    for (q, ans), (text, toks) in zip(items, outs, strict=False):
-        guess = _solve_or_extract(text)
-        rows.append(
-            {"q": q[:80], "ans": ans, "guess": guess, "ok": guess == ans, "tokens": len(toks)}
-        )
-    # Use itertools to silence linter (constraint solver placeholder).
-    _ = list(itertools.permutations(PETS))
-    return aggregate(rows, completion_tokens=estimate_completion_tokens(outs)).as_dict()

@@ -1,57 +1,87 @@
-"""v31_code_humaneval_plus — sandboxed Python function completion."""
+"""v31_code_humaneval_plus — EvalPlus-style augmented HumanEval items.
+
+Each item: ``{prompt, test, entry_point, task_id, src, template,
+n_test_cases}``. Generator: ``distil.pod.axes.v31.code_humaneval_plus``.
+Grader: sandboxed subprocess that runs ``prompt + completion + test``
+and checks ``check(candidate)`` returns None.
+"""
 
 from __future__ import annotations
 
+import logging
 import re
 
-from distil.pod.axes._base import (
-    aggregate,
-    block_seeded_rng,
-    estimate_completion_tokens,
-    generate_greedy,
-)
+from distil.pod.axes._base import BenchResult, generate_greedy
+from distil.pod.axes.v31 import code_humaneval_plus as _v31
 from distil.pod.sandbox import run_humaneval
 
-PROBLEMS = (
-    {
-        "prompt": 'def add(a, b):\n    """Return a + b."""\n',
-        "tests": "def check(c):\n    assert c(1, 2) == 3\n    assert c(-3, 7) == 4\n",
-    },
-    {
-        "prompt": 'def reverse(s):\n    """Reverse a string."""\n',
-        "tests": "def check(c):\n    assert c('abc') == 'cba'\n    assert c('') == ''\n",
-    },
-    {
-        "prompt": 'def is_prime(n):\n    """Return True iff n is prime."""\n',
-        "tests": "def check(c):\n    assert c(2)\n    assert c(13)\n    assert not c(15)\n    assert not c(1)\n",
-    },
-    {
-        "prompt": 'def factorial(n):\n    """Iterative factorial."""\n',
-        "tests": "def check(c):\n    assert c(5) == 120\n    assert c(0) == 1\n",
-    },
-    {
-        "prompt": 'def unique_sorted(xs):\n    """Return sorted unique values."""\n',
-        "tests": "def check(c):\n    assert c([3, 1, 2, 1]) == [1, 2, 3]\n",
-    },
-)
+logger = logging.getLogger("distil.pod.axes.code_humaneval")
+
+MAX_TOKENS = 1024
+AXIS_NAME = "v31_code_humaneval_plus"
+
+_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
 
-def _extract_code(text: str) -> str:
-    m = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
-    return m.group(1) if m else (text or "")
+def _extract_body(text: str, entry_point: str) -> str:
+    """Pull the function body out of ``text`` for ``def {entry_point}``."""
+    if not text:
+        return ""
+    m = _FENCE_RE.search(text)
+    body = m.group(1) if m else text
+    if f"def {entry_point}" in body:
+        idx = body.index(f"def {entry_point}")
+        body = body[idx:]
+    return body
 
 
-def run(student_engine, *, block_seed: int, n_items: int):
-    rng = block_seeded_rng(block_seed, "v31_code_humaneval_plus")
-    items = [rng.choice(PROBLEMS) for _ in range(n_items)]
-    prompts = [
-        f"Complete the function. Reply with only the function body.\n\n```python\n{p['prompt']}```"
-        for p in items
-    ]
-    outs = generate_greedy(student_engine, prompts, max_tokens=384)
-    rows = []
-    for problem, (text, toks) in zip(items, outs, strict=False):
-        body = _extract_code(text)
-        ok = run_humaneval(problem["prompt"], body, problem["tests"], timeout_s=6.0)
-        rows.append({"prompt": problem["prompt"][:80], "ok": ok, "tokens": len(toks)})
-    return aggregate(rows, completion_tokens=estimate_completion_tokens(outs)).as_dict()
+def _build_prompt(item: dict) -> str:
+    return (
+        "Complete the following Python function. Output ONLY the function "
+        "body (no extra explanation, no markdown fences, no surrounding code).\n\n"
+        f"{item['prompt']}"
+    )
+
+
+def run(engine, *, block_seed: int, n_items: int) -> dict:
+    items = _v31.generate_items(block_seed, n_items)
+    if not items:
+        return {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
+
+    prompts = [_build_prompt(it) for it in items]
+    try:
+        gens = generate_greedy(engine, prompts, max_tokens=MAX_TOKENS)
+    except Exception as exc:
+        logger.exception(f"code vllm generate failed: {exc}")
+        return {"n": 0, "correct": 0, "pass_frac": 0.0, "error": str(exc)[:200]}
+
+    scored: list[dict] = []
+    correct = 0
+    completion_tokens = 0
+    for it, (text, tok_ids) in zip(items, gens, strict=False):
+        n_tok = len(tok_ids or ())
+        completion_tokens += n_tok
+        body = _extract_body(text or "", it["entry_point"])
+        try:
+            ok = run_humaneval(it["prompt"], body, it["test"], timeout_s=8.0)
+        except Exception as exc:
+            logger.warning(f"code sandbox crashed: {exc}")
+            ok = False
+        scored.append(
+            {
+                "src": it.get("src", ""),
+                "task_id": it.get("task_id"),
+                "entry_point": it.get("entry_point"),
+                "ok": bool(ok),
+                "tokens": n_tok,
+                "n_test_cases": it.get("n_test_cases"),
+                "template": it.get("template"),
+                "tail": body[-160:],
+            }
+        )
+        correct += int(ok)
+
+    res = BenchResult(
+        n=len(scored), correct=correct, completion_tokens=completion_tokens, items=scored
+    )
+    return res.as_dict()

@@ -1,42 +1,37 @@
-"""v31_knowledge_multi_hop_kg — multi-hop synthetic knowledge graph queries."""
+"""v31_knowledge_multi_hop_kg — synthetic multi-hop KG queries.
+
+Items: ``distil.pod.axes.v31.knowledge_multi_hop_kg.generate_items``.
+Grader: ``distil.pod.axes.v31.knowledge_multi_hop_kg.grade_response``
+(takes an ``all_correct`` list so equivalent answers count).
+"""
 
 from __future__ import annotations
 
-from distil.pod.axes._base import (
-    aggregate,
-    block_seeded_rng,
-    estimate_completion_tokens,
-    generate_greedy,
-)
+from distil.pod.axes._runner import run_axis
+from distil.pod.axes.v31 import knowledge_multi_hop_kg as _v31
 
-CITIES = ("Aria", "Belmont", "Cresta", "Dovenia", "Estoria", "Fellpoint", "Glaes", "Hollow")
-COUNTRIES = ("Voria", "Wessard", "Xenith", "Yondra", "Zelmar")
+MAX_TOKENS = 256
+AXIS_NAME = "v31_knowledge_multi_hop_kg"
 
 
-def _gen(rng) -> tuple[str, str]:
-    rng.shuffle(list(CITIES))
-    capital = CITIES[0]
-    country = rng.choice(COUNTRIES)
-    other = CITIES[1]
-    knowledge = (
-        f"In the country of {country}, the capital is {capital}. "
-        f"{capital} is famous for its {rng.choice(('canals', 'libraries', 'gardens', 'observatories'))}. "
-        f"{other} is the largest port. The currency of {country} is the {rng.choice(('luma', 'farad', 'cresc', 'argo'))}. "
+def _grade(text: str, item: dict) -> bool:
+    return bool(
+        _v31.grade_response(
+            text,
+            item.get("gold", ""),
+            all_correct=item.get("all_correct_answers") or [],
+        )
     )
-    prompt = (
-        knowledge
-        + f"\n\nQuestion: What is the capital of {country}? Reply with only the city name."
+
+
+def run(engine, *, block_seed: int, n_items: int) -> dict:
+    items = _v31.generate_items(block_seed, n_items)
+    return run_axis(
+        engine,
+        axis_name=AXIS_NAME,
+        items=items,
+        prompt_fn=lambda it: it["question"],
+        grader=_grade,
+        max_tokens=MAX_TOKENS,
+        extra_item_keys=("task",),
     )
-    return prompt, capital
-
-
-def run(student_engine, *, block_seed: int, n_items: int):
-    rng = block_seeded_rng(block_seed, "v31_knowledge_multi_hop_kg")
-    items = [_gen(rng) for _ in range(n_items)]
-    prompts = [q for q, _ in items]
-    outs = generate_greedy(student_engine, prompts, max_tokens=64)
-    rows = []
-    for (_q, ans), (text, toks) in zip(items, outs, strict=False):
-        guess = (text or "").strip().split()[0].rstrip(".,!?") if text else ""
-        rows.append({"ans": ans, "guess": guess, "ok": guess == ans, "tokens": len(toks)})
-    return aggregate(rows, completion_tokens=estimate_completion_tokens(outs)).as_dict()
