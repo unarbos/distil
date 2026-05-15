@@ -59,8 +59,17 @@ cutover_one() {
 }
 
 rollback_one() {
-  local unit="$1"
-  # restore the most recent backup
+  local target="$1"
+  # Accept either "api" / "validator" (the short form passed by callers
+  # of cutover.sh ... rollback api) or the full unit name. Either way
+  # we restore the most-recent ``distil-${short}.service.bak`` from
+  # /var/backups/.
+  local unit
+  case "$target" in
+    api|validator) unit="distil-${target}" ;;
+    distil-api|distil-validator) unit="$target" ;;
+    *) echo "FATAL: rollback: unknown target '$target' (expected api|validator)"; exit 3 ;;
+  esac
   local bak
   bak=$(ls -1t /var/backups/distil-cutover-*/"${unit}.service.bak" 2>/dev/null | head -1 || true)
   if [ -z "$bak" ]; then
