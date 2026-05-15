@@ -216,27 +216,59 @@ def _axis_bench_pass_frac(student: dict, axis_name: str) -> float | None:
     return _clamp(payload.get("pass_frac"))
 
 
+REASONING_DENSITY_TARGETS: dict[str, float] = {
+    # v31 procedural axes (steady-state, the only ones distil's pipeline produces).
+    "v31_math_gsm_symbolic": 400.0,
+    "v31_math_competition": 500.0,
+    "v31_math_robustness": 400.0,
+    "v31_code_humaneval_plus": 300.0,
+    "v31_reasoning_logic_grid": 200.0,
+    "v31_reasoning_dyval_arith": 300.0,
+    "v31_knowledge_multi_hop_kg": 80.0,
+    "v31_ifeval_verifiable": 250.0,
+    "v31_truthfulness_calibration": 60.0,
+    "v31_consistency_paraphrase": 60.0,
+    # Legacy bench targets — only present when rows produced by the prod
+    # pipeline are scored by distil (transition / parity-test path). Distil's
+    # own pipeline never emits these axes, so they drop out cleanly in
+    # steady state. Kept here so distil reproduces prod's `reasoning_density`
+    # bit-for-bit when reading prod-produced rows.
+    "math_bench": 400.0,
+    "code_bench": 300.0,
+    "reasoning_bench": 150.0,
+    "knowledge_bench": 30.0,
+    "ifeval_bench": 250.0,
+    "aime_bench": 800.0,
+    "mbpp_bench": 250.0,
+    "tool_use_bench": 300.0,
+    "long_context_bench": 30.0,
+    "robustness_bench": 400.0,
+    "debug_bench": 350.0,
+    "correction_bench": 350.0,
+    "multi_doc_synthesis_bench": 60.0,
+    "calibration_bench": 60.0,
+    "refactor_bench": 300.0,
+    "pragmatic_bench": 60.0,
+}
+
+
 def _axis_reasoning_density(student: dict) -> float | None:
-    """mean per-bench pass_frac × length_bonus (target tokens per axis)."""
-    targets = {
-        "v31_math_gsm_symbolic": 400.0,
-        "v31_math_competition": 500.0,
-        "v31_math_robustness": 400.0,
-        "v31_code_humaneval_plus": 300.0,
-        "v31_reasoning_logic_grid": 200.0,
-        "v31_reasoning_dyval_arith": 300.0,
-        "v31_knowledge_multi_hop_kg": 80.0,
-        "v31_ifeval_verifiable": 250.0,
-        "v31_truthfulness_calibration": 60.0,
-        "v31_consistency_paraphrase": 60.0,
-    }
+    """Mean per-bench pass_frac × length_bonus, matching prod's target dict.
+
+    `length_bonus = 1.0` at ≤ target tokens, `1/(1 + (ratio − 1))` above.
+    Same formula as `scripts.validator.composite._axis_reasoning_density`.
+    Missing or zero-token benches drop out (fail-open).
+    """
+    targets = REASONING_DENSITY_TARGETS
     scores: list[float] = []
     for name, target in targets.items():
         payload = student.get(name) or {}
         if not isinstance(payload, dict) or payload.get("error"):
             continue
         n = int(payload.get("n") or 0)
-        if n < BENCH_MIN_VALID.get(name, 4):
+        # Default floor of 2 matches prod (`BENCH_MIN_VALID.get(axis, 2)`).
+        # Per-axis overrides are still used when present in BENCH_MIN_VALID.
+        if n < BENCH_MIN_VALID.get(name, 2):
             continue
         correct = int(payload.get("correct") or 0)
         if correct == 0:

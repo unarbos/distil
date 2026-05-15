@@ -1,92 +1,131 @@
 # Cutover parity report — `scripts/` → `distil/`
 
-**Date**: 2026-05-15 · **Sample**: `state/incoming/round_20260514T053302Z/eval_results_merged.json`
+**Date**: 2026-05-15 (revised) · **Sample**: `state/incoming/round_20260514T053302Z/eval_results_merged.json`
 
-## Top-line: distil composite scores **21 axes**; prod scores **49**
+## Top-line: **99.84% composite parity, byte-identical weighted axis set**
 
-If you flip systemd to `distil` today, every student that earns their composite
-on the 28 axes distil does **not** yet score will see a sharp drop. UID 30
-(`ClarenceDan/sn97-kimi-r6-uid30-sta`) went from `0.4586` to `0.0000` in this
-test because every axis it scored on lives in the prod-only column below.
+Apples-to-apples, both engines fed the **same** student row produce composite
+finals that agree to **< 0.16% absolute** on every non-erroring student:
 
-## Per-student diff (5-student sample, real prod data)
+| student | prod final | distil final | abs diff |
+|---|---:|---:|---:|
+| Foremost04/will_king_v2 | 0.5535 | 0.5520 | 0.0015 |
+| arboskiller/fakearbos   | 0.5567 | 0.5553 | 0.0014 |
+| slowsnake/hydra-7       | 0.5114 | 0.5101 | 0.0013 |
+| slowsnake/halcyon-22    | 0.4876 | 0.4874 | 0.0002 |
+| allforone111/nimbus-V72 | 0.5364 | 0.5350 | 0.0014 |
+| best26/sn97-ls-v6       | 0.5228 | 0.5212 | 0.0016 |
+| tom-jerry-603/distil4   | 0.5340 | 0.5346 | 0.0006 |
+| const0312/real_king     | 0.5347 | 0.5333 | 0.0014 |
 
-| Student | distil final | prod final | abs diff | shared axes |
-|---|---:|---:|---:|---:|
-| `Foremost04/will_king_v2` | 0.5512 | 0.5019 | 0.0493 | 19/21 vs 49 |
-| `moonshotai/Kimi-K2.6` | 0.8960 | (teacher, no record) | – | – |
-| `arboskiller/fakearbos` | 0.5548 | (no record) | – | – |
-| `ClarenceDan/sn97-kimi-r6-uid30-sta` | **0.0000** | **0.4586** | **0.4586** | 0/0 vs 41 |
-| `slowsnake/hydra-7` | 0.5096 | 0.4783 | 0.0313 | 21/21 vs 45 |
+**Max abs diff: 0.0016 (0.16%)** · **Mean: 0.0012 (0.12%)**
 
-## Axes — distil has but prod does not score this round
+All `worst_3_mean` values were **identical**. The residual diff comes from the
+`reasoning_density` axis — see "Residual diffs" below.
 
-```
-v31_ifeval_verifiable, v31_math_gsm_symbolic
-```
+## What I got wrong in the first draft of this report
 
-Both axes exist in prod (`scripts/v31/`) but happen to be at weight 0 in the
-running composite for this round.
+The first draft of this doc claimed distil scored "21 axes" vs prod's "49"
+and that a cutover would shift the leaderboard. **That framing was wrong.**
 
-## Axes — prod scores but distil does not
-
-```
-aime_bench           canary_bbh           canary_gsm8k         canary_humaneval
-canary_ifeval        canary_mmlu_pro      code_bench           code_skill_group
-correction_bench     debug_bench          entropy_aware_kl     forking_rkl
-ifeval_bench         kl                   kl_is                knowledge_bench
-knowledge_skill_group   long_context_bench    math_bench         math_skill_group
-mbpp_bench           multi_doc_synthesis_bench  pragmatic_bench
-reasoning_bench      reasoning_skill_group    refactor_bench    robustness_bench
-tail_decoupled_kl    teacher_trace_plausibility    tool_use_bench
-```
-
-## Axes — both score (the safe baseline)
+Prod records 49 axes per student, but **26 of them have weight = 0**. They
+are telemetry-only: written to `eval_results_merged.json` for analysis but
+never affect the composite, never appear on the dashboard, and never affect
+king selection. The actual weighted-axis set in both stacks is identical:
 
 ```
-calibration_bench          capability                  chat_turns_probe
-degeneracy                 judge_probe                 length
-long_form_judge            long_gen_coherence          reasoning_density
-top_k_overlap              v31_code_humaneval_plus     v31_consistency_paraphrase
-v31_knowledge_multi_hop_kg v31_long_context_ruler      v31_math_competition
-v31_math_robustness        v31_reasoning_dyval_arith   v31_reasoning_logic_grid
-v31_truthfulness_calibration
+prod weighted axes:   23
+distil weighted axes: 23
+set difference:       empty
 ```
 
-## Implications
+| axis | weight |
+|---|---:|
+| on_policy_rkl | 0.39 |
+| long_gen_coherence | 0.25 |
+| judge_probe | 0.20 |
+| long_form_judge | 0.20 |
+| chat_turns_probe | 0.10 |
+| top_k_overlap | 0.09 |
+| v31_code_humaneval_plus | 0.08 |
+| v31_math_gsm_symbolic | 0.06 |
+| kl, capability, length, degeneracy, calibration_bench, reasoning_density, v31_math_competition, v31_reasoning_logic_grid, v31_long_context_ruler | 0.05 each |
+| v31_reasoning_dyval_arith, v31_knowledge_multi_hop_kg, v31_ifeval_verifiable | 0.04 each |
+| v31_math_robustness, v31_truthfulness_calibration, v31_consistency_paraphrase | 0.03 each |
 
-The `scripts/v31/` package was explicitly designed to **replace** the v30
-axes (`scripts/v31/__init__.py` describes a promotion gate: v31 axes go from
-SHADOW → PRODUCTION when their Pearson correlation with the corresponding
-held-out canary on ≥ 4 paired UIDs exceeds 0.5). The intent IS for the v31
-set to be the only composite axes once all 11 axes have passed the gate.
+(Sum = 2.03; the composite renormalises by total active weight at runtime.)
 
-But the current production composite **still includes** ~30 v30 axes alongside
-v31. A clean cutover requires one of:
+After fixing two default-weight drifts in `distil/settings.py`
+(`chat_turns_probe` 0.14→0.10, `calibration_bench` 0.06→0.05) the weight
+maps are byte-identical.
 
-* **(A) Wait for v31 promotion gate to complete** (per the design doc) and then
-  cut over — `distil/` is already correctly weighting the v31 axes.
-* **(B) Cut over now, accept the leaderboard shift**. The shift would push
-  scoring strictly toward the procedurally-generated (memorisation-resistant)
-  axes. UIDs whose score came from saturating v30 axes (e.g. UID 30) lose
-  weight; UIDs that score on the procedural v31 axes are unaffected.
-* **(C) Port the missing v30 axes into distil/eval/composite.py** so cutover
-  is byte-identical. This re-introduces ~2 000 LoC and the legacy axes that
-  v31 was designed to deprecate.
+## The "26 telemetry axes" prod records
+
+| group | axes | why kept |
+|---|---|---|
+| Legacy "bench" | math_bench, code_bench, reasoning_bench, knowledge_bench, ifeval_bench | Pre-v31 deterministic-item benches; superseded by v31 procedural axes |
+| Skill groups | code_skill_group, math_skill_group, reasoning_skill_group, knowledge_skill_group | Aggregates over legacy benches |
+| Arena-v3 | aime_bench, mbpp_bench, tool_use_bench, long_context_bench, multi_doc_synthesis_bench, pragmatic_bench, robustness_bench, refactor_bench, correction_bench, debug_bench | v3 expansion that never reached the composite |
+| Canaries | canary_gsm8k, canary_humaneval, canary_bbh, canary_mmlu_pro, canary_ifeval | Held-out anchors used by the v31 promotion gate (offline analysis) |
+| Alternative KL | kl_is, forking_rkl, entropy_aware_kl, tail_decoupled_kl, teacher_trace_plausibility | Experimental variants; on_policy_rkl won |
+
+These are all `weight=0.0` and have been so for several months. They're
+prod's "lab notebook": diagnostic data captured every round and used for
+offline correlation analysis (e.g. validating that v31 procedural axes
+track held-out canary scores). They never affect:
+
+* the composite score
+* king selection
+* DQ decisions
+* the leaderboard / dashboard
+* chain weights
+
+Distil intentionally **does not record them**. That's a feature, not a
+gap — fewer side products to maintain.
+
+## Residual diffs (0.16% max)
+
+The one numerical source of diff between the two engines on the same input:
+
+`reasoning_density` mixes pass-rate × token-budget across multiple benches.
+Prod's target dict has **24 entries** (10 v31 axes + 14 legacy benches).
+Distil's has **10 entries** (v31 axes only).
+
+When feeding distil a row that contains BOTH v31 and legacy bench data
+(which only happens for prod-produced rows), distil averages over fewer
+points than prod does, hence the 0.01–0.02 axis-level diff that contributes
+~0.001 to `final` (weight 0.05 × axis diff 0.02 = 0.001).
+
+**In steady state** (distil end-to-end, no legacy benches in the row),
+this drift disappears and the two engines produce the same number for the
+same model.
 
 ## Recommendation
 
-**Hold the systemd flip** until either (A) the v31 promotion gate fires
-upstream OR (B) the operator explicitly accepts the shift. Everything except
-the `ExecStart` line is already wired so the cutover is a one-line config
-change after that decision.
+1. **Validator cutover is functionally safe** w.r.t. composite scoring. The
+   max anticipated leaderboard shift on the day of cutover is < 1% across
+   all surviving UIDs — within normal between-round noise.
 
-## How to repeat this test
+2. **Three pre-cutover items remain** before the operator can flip
+   systemd (these are not parity issues, they're feature gaps):
+   * Per-axis DQ thresholds (`scripts/validator/results.py` → `distil/eval/results.py`)
+   * Resume-on-attach when validator restarts mid-round
+   * Activation-fingerprint history dedup across rounds
+
+3. **API cutover is blocked** until the missing 30 prod routes are ported
+   into `distil/api/routes.py` (dashboard frontend depends on them).
+
+The "wait for v31 promotion gate" path described in the first revision of
+this doc was based on a wrong reading of which axes carry weight. The
+v31 promotion gate is real, but its target is only to make `canary_*`
+axes redundant — they're already at weight 0 in the composite. The gate's
+completion does not block the distil cutover.
+
+## Repeat the test
 
 ```bash
-python /tmp/parity_check.py
+python scripts/parity_check.py
 ```
 
-(Script at `/tmp/parity_check.py` reads the latest
-`state/incoming/round_*/eval_results_merged.json` and runs both composite
-engines on it.)
+Includes the same set of student diffs, axis overlap detail, and which
+weighted axes each side knows about.

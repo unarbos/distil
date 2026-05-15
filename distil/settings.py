@@ -96,9 +96,9 @@ class Settings(BaseSettings):
     weight_judge_probe: float = 0.20
     weight_long_form_judge: float = 0.20
     weight_long_gen_coherence: float = 0.25
-    weight_chat_turns_probe: float = 0.14
+    weight_chat_turns_probe: float = 0.10  # match prod CHAT_TURNS_AXIS_WEIGHT
     weight_reasoning_density: float = 0.05
-    weight_calibration_bench: float = 0.06
+    weight_calibration_bench: float = 0.05  # match prod BENCH_CALIBRATION_WEIGHT
 
     weight_v31_math_gsm_symbolic: float = 0.06
     weight_v31_math_competition: float = 0.05

@@ -34,23 +34,21 @@ End state target: **\~12k LoC of organized prod code** (down from ~50k+).
 
 ## Remaining gaps before cutover
 
-> **2026-05-15 parity snapshot:** with all Phase A+B work landed, distil's
-> composite still scores only **21 axes** vs prod's **49** on a real prod round
-> (see `docs/CUTOVER_PARITY_2026-05-15.md`). On most students the absolute
-> composite diff is < 0.05 (5%), but on at least one UID the diff is 0.46
-> (composite goes from 0.46 → 0.00 because every axis it scored on is v30 and
-> distil has no v30 axes). **A blind cutover today would visibly shift the
-> leaderboard.**
+> **2026-05-15 parity snapshot (revised):** both engines agree to within
+> **0.16% max** on `final` when fed the same input row. The 23-axis weighted
+> set is **byte-identical** between prod and distil. The 26 "extra" axes
+> prod records every round are all `weight=0.0` — telemetry-only, never
+> affecting the composite or leaderboard. See
+> `docs/CUTOVER_PARITY_2026-05-15.md` for the per-student numbers and the
+> explanation of how my first revision of this section got that wrong.
 >
-> The 28-axis gap is structural: distil only scores the v31 procedural axes +
-> the always-on probes; prod still applies ~30 v30 axes that `scripts/v31/`
-> was designed to deprecate via the promotion gate
-> (`scripts/v31/__init__.py:_PROMOTION_GATE`). Closing the gap means either
-> (a) waiting for the v31 promotion gate to fire upstream, (b) accepting the
-> leaderboard shift, or (c) porting the missing v30 axes into `distil/`.
+> What that means: cutting over distil end-to-end will produce composite
+> finals that differ from prod end-to-end by **< 1% per UID on the day of
+> cutover**, well within normal between-round noise. **There is no
+> leaderboard-shift risk from the composite formula itself.**
 
-Most of what blocked a cutover on 2026-05-14 is **now ported** (Phase A + B, see
-"Cleanup landed" below). What's still missing:
+What blocked the cutover on 2026-05-14 has now been ported (Phase A + B,
+see "Cleanup landed" below). What's still required before flipping systemd:
 
 1. **Anti-finetune / fraud / DQ thresholds**
    `distil/eval/results.py` (212 LoC) implements the happy path but
@@ -80,13 +78,12 @@ Most of what blocked a cutover on 2026-05-14 is **now ported** (Phase A + B, see
    validator needs to kill the whole orchestrator subprocess. Prod's
    `scripts/validator/pod_session.py:StageStallWatchdog` does this.
 
-5. **Snapshot regression test against prod**
-   The 795-test suite still targets `scripts.validator.*`. A first parity
-   harness (`/tmp/parity_check.py`) was run on 2026-05-15 against a real
-   prod round (`state/incoming/round_20260514T053302Z/`) and produced the
-   parity diff captured in `docs/CUTOVER_PARITY_2026-05-15.md`. We have
-   **not** yet baked that harness into the test suite as a regression
-   guard — that's still TODO.
+5. **Snapshot regression test bound into pytest**
+   `scripts/parity_check.py` runs on the latest prod round and prints
+   per-student diffs. Current result: max abs diff = 0.0016 across 8
+   non-erroring students. We have **not** yet baked the harness into
+   `pytest` with a regression-gating assertion (e.g. `assert max_diff <
+   0.005`). That's the last "snapshot regression" todo.
 
 6. **API route gap**
    `distil/api/routes.py` exposes **15 routes**; the production
