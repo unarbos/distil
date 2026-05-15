@@ -75,6 +75,19 @@ def _spawn_phase(
     env = os.environ.copy()
     if gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    # Subprocess inherits env but not the parent's CWD-derived sys.path.
+    # The orchestrator is normally launched from `/home/` (where `distil/`
+    # lives as a top-level package) but each phase subprocess gets
+    # ``cwd=workdir`` (e.g. /home/distil_eval/round_X), which has no
+    # `distil/` on its sys.path. Propagate the parent of the `distil`
+    # package via PYTHONPATH so the children can ``-m distil.pod`` cleanly.
+    import distil as _distil_pkg
+
+    distil_parent = str(Path(_distil_pkg.__file__).resolve().parents[1])
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        distil_parent + (os.pathsep + existing_pp if existing_pp else "")
+    )
     cmd = [_python(), "-u", "-m", "distil.pod", str(spec_path), "--phase", phase]
     if out is not None:
         cmd += ["--out", str(out)]
