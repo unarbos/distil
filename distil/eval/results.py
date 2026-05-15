@@ -38,8 +38,15 @@ logger = logging.getLogger("distil.eval.results")
 
 
 def _resolve_anchor(rows: dict[str, dict], king_name: str | None, key: str) -> float | None:
-    """Pick the anchor for relative axes (king if seated, else round-min)."""
-    if king_name and (kr := rows.get(king_name)) is not None:
+    """Pick the anchor for relative axes (king if seated, else round-min).
+
+    Guarded against non-dict rows because results.json contains meta
+    entries like ``__finished_at__: <float>`` mixed in with the
+    student records — iterating ``rows.values()`` without an
+    ``isinstance`` check raised ``'float' object has no attribute 'get'``
+    on every cutover round at publish time.
+    """
+    if king_name and isinstance(kr := rows.get(king_name), dict):
         v = kr.get(key)
         try:
             f = float(v)
@@ -49,7 +56,7 @@ def _resolve_anchor(rows: dict[str, dict], king_name: str | None, key: str) -> f
             pass
     best: float | None = None
     for row in rows.values():
-        if row.get("is_teacher"):
+        if not isinstance(row, dict) or row.get("is_teacher"):
             continue
         try:
             v = float(row.get(key))
@@ -66,7 +73,11 @@ def _opr_anchor(rows: dict[str, dict], king_name: str | None) -> float | None:
     """on_policy_rkl uses the round-wide best (lowest) RKL when a non-king reported."""
     best = None
     for _name, row in rows.items():
-        opr = (row or {}).get("on_policy_rkl") or {}
+        if not isinstance(row, dict):
+            continue
+        opr = row.get("on_policy_rkl") or {}
+        if not isinstance(opr, dict):
+            continue
         rkl = opr.get("mean_rkl")
         if rkl is None:
             continue
@@ -271,7 +282,12 @@ def process_round(
     timings
         Optional per-bench timing list to record in h2h.
     """
-    students: dict[str, dict] = dict(pod_results)
+    # Drop meta-keys (``__finished_at__`` etc.) that the pod orchestrator
+    # mixes into results.json alongside per-student records — they
+    # would otherwise blow up every iteration in this function.
+    students: dict[str, dict] = {
+        k: v for k, v in pod_results.items() if isinstance(v, dict)
+    }
     teacher_row = students.get(teacher_name) if teacher_name else None
     reference_row = students.get(reference_name) if reference_name else None
     uid_index = uid_index or {}

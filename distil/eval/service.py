@@ -228,10 +228,25 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         }
         for c in commitments.values()
     }
+    # Two different "king" identifiers here, easily confused:
+    #
+    #   * ``king_key`` (model_name@revision) — matches the keys in
+    #     ``pod_results`` and ``commitments[].key``. Used by
+    #     ``process_round`` to find the king's row inside the pod's
+    #     results.json so its KL/RKL anchors the relative axes.
+    #   * ``king_name``  (UID-as-string)     — matches the keys in
+    #     ``state.composite_scores`` (UID-keyed, legacy schema). Used
+    #     by the dethrone gate ``resolve_king``.
+    #
+    # Before this split, ``king_name`` was both — and ``rows.get(uid_str)``
+    # in process_round returned None, so the king was never found in
+    # results.json and the round-min was used as anchor instead of the
+    # king's KL: a silent but big regression.
+    king_key = king_commitment.key if king_commitment is not None else None
     record = process_round(
         state=state,
         pod_results=results,
-        king_name=king_name,
+        king_name=king_key,
         reference_name=spec["teacher_repo"],
         teacher_name=spec["reference_repo"],
         block=block,
@@ -245,11 +260,19 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     record["king_after"] = new_king
     record["king_reason"] = why
     if new_king and new_king != king_name:
-        new_king_uid = next((c.uid for c in commitments.values() if c.key == new_king), None)
-        if new_king_uid is not None:
+        # ``new_king`` is a UID-string out of resolve_king (composite_scores
+        # is UID-keyed); convert to an int and look up the commitment.
+        try:
+            new_king_uid = int(new_king)
+        except (TypeError, ValueError):
+            new_king_uid = next(
+                (c.uid for c in commitments.values() if c.key == new_king),
+                None,
+            )
+        if new_king_uid is not None and new_king_uid in commitments:
             state.push_king(new_king_uid)
             king_uid = new_king_uid
-            king_name = new_king
+            king_name = str(new_king_uid)
 
     weights = build_emission_weights(
         n_uids=len(mg.hotkeys),

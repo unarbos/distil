@@ -61,8 +61,14 @@ def score_against_teacher_trace(
     from vllm import SamplingParams
 
     full_strings = [p + c for p, c in zip(prompts, teacher_continuations, strict=False)]
+    # vLLM >= 0.20 rejects ``max_tokens=0`` with a VLLMValidationError
+    # ("max_tokens must be at least 1, got 0"). We only care about
+    # prompt_logprobs here — the generated continuation is discarded —
+    # so we ask for the smallest legal value (1) and let vLLM emit one
+    # throwaway token. This is what the legacy
+    # ``scripts/pod_eval_vllm.py`` does for the same reason.
     params = SamplingParams(
-        max_tokens=0,
+        max_tokens=1,
         temperature=0.0,
         prompt_logprobs=prompt_logprobs,
     )
