@@ -25,7 +25,17 @@ def _default_env_files() -> tuple[str, ...]:
         Path.home() / ".secrets" / "distil.env",
         REPO_ROOT / ".env",
     ]
-    return tuple(str(p) for p in candidates if p.is_file())
+    out: list[str] = []
+    for p in candidates:
+        # Tolerate unreadable paths (wrong HOME, denied stat) so module
+        # import never raises — the running service simply misses that
+        # env file, which is logged downstream.
+        try:
+            if p.is_file():
+                out.append(str(p))
+        except (PermissionError, OSError):
+            continue
+    return tuple(out)
 
 
 class Settings(BaseSettings):
