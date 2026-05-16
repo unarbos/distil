@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch state/chat_pod.json and restart chat-tunnel.service on change
+After=network-online.target
+
+[Path]
+PathChanged=/opt/distil/repo/state/chat_pod.json
+Unit=chat-tunnel-restart.service
+
+[Install]
+WantedBy=multi-user.target

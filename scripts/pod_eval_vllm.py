@@ -698,17 +698,43 @@ def resolve_local_snapshot_path(name, revision=None, tokenizer_only=True):
 
 
 def clean_model_cache(name, teacher_name=None):
-    """Remove HF cache for a specific model, preserving teacher cache."""
+    """Remove HF cache for a specific model, preserving teacher cache.
+
+    Resolves the cache root via ``huggingface_hub.constants.HF_HUB_CACHE``
+    so HF_HOME / HF_HUB_CACHE / XDG_CACHE_HOME overrides are honoured.
+    Also sweeps the legacy ``Path.home()/.cache/...`` location for the
+    pod-side case where the hub library and pod_eval disagree about
+    where the cache lives (see the round-start cache_sweep fix). The
+    previous hard-coded ``Path.home()/.cache`` silently no-op'd on this
+    pod's ``HF_HOME=/home/.cache/huggingface``, so post-student cleanup
+    never reclaimed anything and disks crept toward 100 % full.
+    """
     try:
         cache_name = f"models--{name.replace('/', '--')}"
         if teacher_name:
             teacher_cache = f"models--{teacher_name.replace('/', '--')}"
             if cache_name == teacher_cache:
                 return
-        cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-            print(f"  [cleanup] Removed {cache_name}", flush=True)
+        candidates: list[Path] = []
+        try:
+            from huggingface_hub import constants as _hf_constants  # type: ignore
+            candidates.append(Path(_hf_constants.HF_HUB_CACHE))
+        except Exception:
+            pass
+        candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+        seen: set[str] = set()
+        for root in candidates:
+            try:
+                key = str(root.resolve())
+            except Exception:
+                key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            cache_dir = root / cache_name
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                print(f"  [cleanup] Removed {cache_name} from {root}", flush=True)
     except Exception:
         pass
 
@@ -5681,15 +5707,26 @@ def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     ``BENCH_ENABLE_THINKING`` env-controlled flag (see comment above).
     Pass-through callers don't need to change.
     """
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     rendered = _render_chat_prompt(
         tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
     )
-    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     # Apply the derail-budget multiplier. Floor at 64 tokens so even
     # short-answer probes (knowledge: 64 baseline → 16 with factor 0.25)
     # don't shrink below the answer length itself.
     effective_max = max(64, int(max_new_tokens * _BENCH_TOKEN_BUDGET_FACTOR))
+    try:
+        import student_vllm as _svllm  # type: ignore
+        if _svllm.is_active():
+            results = _svllm.generate_batch(
+                [rendered], [effective_max], greedy=True,
+            )
+            text, n_tok = results[0]
+            return text, int(n_tok)
+    except ImportError:
+        pass
+
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
+    ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     gen = model.generate(
         ids, max_new_tokens=effective_max,
         do_sample=False, temperature=1.0, top_p=1.0,
@@ -5877,7 +5914,49 @@ def _run_simple_bench(model, tokenizer, device, sample_key: str,
     """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
     samples = _BENCH_SAMPLES.get(sample_key) or []
-    if not samples or model is None or tokenizer is None:
+    if not samples or tokenizer is None:
+        return out
+
+    # vLLM batched-gen path: pre-render all prompts and dispatch to the
+    # in-process student vLLM in a single ``llm.generate`` call. The
+    # continuous-batching scheduler interleaves prompts at the token
+    # level which is the dominant wall-time win for bench probes.
+    try:
+        import student_vllm as _svllm  # type: ignore
+        _vllm_active = _svllm.is_active()
+    except ImportError:
+        _svllm = None  # type: ignore
+        _vllm_active = False
+
+    effective_max = max(64, int(max_tokens * _BENCH_TOKEN_BUDGET_FACTOR))
+
+    if _vllm_active:
+        try:
+            rendered = [
+                _render_chat_prompt(
+                    tokenizer, prompt_fn(it),
+                    enable_thinking=BENCH_ENABLE_THINKING,
+                )
+                for it in samples
+            ]
+            results = _svllm.generate_batch(
+                rendered, [effective_max] * len(rendered), greedy=True,
+            )
+            for it, (text, tok) in zip(samples, results):
+                try:
+                    item, ok = grade_fn(it, text, int(tok))
+                    out["items"].append(item)
+                    out["n"] += 1
+                    out["correct"] += int(ok)
+                except Exception as e:
+                    out["items"].append({"src": it.get("src", ""), "error": str(e)[:120]})
+            out["pass_frac"] = out["correct"] / max(1, out["n"])
+            _bench_finalize_token_stats(out)
+        except Exception as e:
+            out["error"] = str(e)[:200]
+        return out
+
+    if model is None:
         return out
     try:
         with _model_eval_no_grad(model):
@@ -5941,7 +6020,7 @@ def _run_humaneval_sandbox_bench(
     """
     out = {"n": 0, "correct": 0, "pass_frac": 0.0, "items": []}
     samples = _BENCH_SAMPLES.get(sample_key) or []
-    if not samples or model is None or tokenizer is None:
+    if not samples or tokenizer is None:
         return out
     try:
         import humaneval_sandbox as hs  # type: ignore
@@ -5951,18 +6030,41 @@ def _run_humaneval_sandbox_bench(
     if build_sandbox_tuple is None:
         def build_sandbox_tuple(gen, it):
             return (it["prompt"], gen, it["test"], it["entry_point"])
+
+    try:
+        import student_vllm as _svllm  # type: ignore
+        _vllm_active = _svllm.is_active()
+    except ImportError:
+        _svllm = None  # type: ignore
+        _vllm_active = False
+
+    effective_max = max(64, int(max_tokens * _BENCH_TOKEN_BUDGET_FACTOR))
+
     try:
         generations: list[tuple[str, int, dict]] = []
-        with _model_eval_no_grad(model):
-            for it in samples:
-                try:
-                    gen, tok = _bench_generate(
-                        model, tokenizer, build_prompt(it),
-                        max_tokens, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+        if _vllm_active:
+            rendered = [
+                _render_chat_prompt(tokenizer, build_prompt(it), enable_thinking=False)
+                for it in samples
+            ]
+            results = _svllm.generate_batch(
+                rendered, [effective_max] * len(rendered), greedy=True,
+            )
+            for it, (text, tok) in zip(samples, results):
+                generations.append((text, int(tok), it))
+        elif model is None:
+            return out
+        else:
+            with _model_eval_no_grad(model):
+                for it in samples:
+                    try:
+                        gen, tok = _bench_generate(
+                            model, tokenizer, build_prompt(it),
+                            max_tokens, device, enable_thinking=False,
+                        )
+                        generations.append((gen, int(tok), it))
+                    except Exception as e:
+                        generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
         sandbox_input = [
             build_sandbox_tuple(_strip_thinking_probe(gen or ""), it)
             for gen, _tok, it in generations if "gen_error" not in it
@@ -7276,10 +7378,24 @@ def _bench_generate_sampled(model, tokenizer, prompt: str, max_new_tokens: int,
     ``BENCH_ENABLE_THINKING`` flag (same as ``_bench_generate``) so
     self-consistency samples reward thinking-mode kings end-to-end.
     """
-    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     rendered = _render_chat_prompt(
         tokenizer, prompt, enable_thinking=BENCH_ENABLE_THINKING,
     )
+    try:
+        import student_vllm as _svllm  # type: ignore
+        if _svllm.is_active():
+            seeds = [int(seed) & 0x7FFFFFFF] if seed is not None else None
+            results = _svllm.generate_batch(
+                [rendered], [int(max_new_tokens)],
+                greedy=False, temperature=float(temperature),
+                top_p=float(top_p), seeds=seeds,
+            )
+            text, n_tok = results[0]
+            return text, int(n_tok)
+    except ImportError:
+        pass
+
+    eos_ids, pad_id = _eos_pad_ids(tokenizer)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
     prev_state = None
     if seed is not None:
@@ -16882,7 +16998,30 @@ def main():
     # Accepted for backward compat with older in-memory validators. Ignored.
     parser.add_argument("--max-prompt-len", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--max-params-b", type=float, default=None, help=argparse.SUPPRESS)
+    # vLLM-backed student bench generation. Off by default so prod stays on
+    # the proven HF path; turn on per-pod with ``--use-vllm-students`` or
+    # ``DISTIL_STUDENT_USE_VLLM=1`` to get continuous-batched generation
+    # for probes + benches (the autoregressive cost dominates an eval round).
+    parser.add_argument(
+        "--use-vllm-students", action="store_true",
+        default=os.environ.get("DISTIL_STUDENT_USE_VLLM", "0") == "1",
+        help="Use vLLM in-process for student bench/probe generation "
+             "(keeps HF for KL forward). Default: HF only.",
+    )
     args = parser.parse_args()
+
+    # Restart-safety: --save-teacher-logits is ON by default. Phase 1 with
+    # an API teacher costs ~17 min of OpenRouter calls (and the equivalent
+    # in vLLM teacher generation when local); persisting the sparse top-K
+    # cache makes any Phase 2 crash cheap to recover from. If --teacher-logits
+    # is provided we mirror that path; otherwise we save next to --output.
+    if not args.save_teacher_logits:
+        if args.teacher_logits:
+            args.save_teacher_logits = args.teacher_logits
+        else:
+            args.save_teacher_logits = os.path.join(
+                os.path.dirname(args.output) or ".", "teacher_cache.pt"
+            )
 
     # Make the resolved teacher name visible to helpers (load_model,
     # vLLM stub builders) without re-parsing CLI args.
@@ -16947,6 +17086,111 @@ def main():
     else:
         student_revisions = {s: "main" for s in students}
     timings = {}
+
+    # 2026-05-15: pre-round HF cache sweep. The existing
+    # ``clean_model_cache`` runs AFTER each student finishes, which keeps
+    # disk steady DURING a round but doesn't help when we start a round
+    # with the disk already 100 % from a previous round's leftovers
+    # (different student set + king rotation). On parallel runs the
+    # situation is worse: 8 worker processes each downloading a 30 GB
+    # student concurrently can blow past the 380 GB headroom on a
+    # 1.5 TB pod overlay. Sweep any cached ``models--*`` directory that
+    # is NOT in this process's student list, is NOT the teacher, and is
+    # NOT listed in DISTIL_CACHE_KEEP_MODELS (used by the parallel
+    # orchestrator to preserve sibling-shard models). Typical reclaim
+    # is 200-500 GB.
+    try:
+        # 2026-05-15: was hard-coded to ``Path.home()/.cache/huggingface/hub``
+        # which silently no-op'd on this pod (HOME=/root but the real cache
+        # is HF_HOME=/home/.cache/huggingface, so the sweep saw ~1 entry and
+        # freed 0 GB while 300+ GB of stale snapshots piled up under /home).
+        # Trust ``huggingface_hub``'s own resolver so the path follows the
+        # same env-var precedence (HF_HUB_CACHE > HF_HOME > XDG_CACHE_HOME >
+        # ~/.cache) that ``snapshot_download`` uses to fetch models. Also
+        # sweep BOTH the resolved cache AND the legacy ~/.cache location if
+        # they differ — the legacy path sometimes accumulates orphans when
+        # a process inherits HOME=/root but HF_HOME got set later.
+        try:
+            from huggingface_hub import constants as _hf_constants  # type: ignore
+            resolved = Path(_hf_constants.HF_HUB_CACHE)
+        except Exception:
+            resolved = Path.home() / ".cache" / "huggingface" / "hub"
+        legacy = Path.home() / ".cache" / "huggingface" / "hub"
+        candidate_roots = []
+        seen = set()
+        for c in (resolved, legacy):
+            try:
+                rp = c.resolve()
+            except Exception:
+                rp = c
+            key = str(rp)
+            if key not in seen and c.exists():
+                seen.add(key)
+                candidate_roots.append(c)
+        if candidate_roots:
+            keep = {f"models--{args.teacher.replace('/', '--')}"}
+            for s in students:
+                keep.add(f"models--{s.replace('/', '--')}")
+            extra_keep = os.environ.get("DISTIL_CACHE_KEEP_MODELS", "").strip()
+            if extra_keep:
+                for s in extra_keep.split(","):
+                    s = s.strip()
+                    if s:
+                        keep.add(f"models--{s.replace('/', '--')}")
+            freed_gb = 0.0
+            kept_n = 0
+            del_n = 0
+            for cache_root in candidate_roots:
+                for entry in sorted(cache_root.iterdir()):
+                    if not entry.name.startswith("models--") or not entry.is_dir():
+                        continue
+                    if entry.name in keep:
+                        kept_n += 1
+                        continue
+                    try:
+                        # Cheap size estimate — du is a single syscall walk;
+                        # don't import os.walk for every entry.
+                        sz = sum(
+                            p.stat().st_size for p in entry.rglob("*")
+                            if p.is_file() and not p.is_symlink()
+                        )
+                        freed_gb += sz / 1024**3
+                        shutil.rmtree(entry, ignore_errors=True)
+                        del_n += 1
+                    except Exception as _purge_exc:
+                        print(
+                            f"  [cache_sweep] could not remove {entry.name}: "
+                            f"{type(_purge_exc).__name__}: {str(_purge_exc)[:120]}",
+                            flush=True,
+                        )
+            roots_repr = ",".join(str(c) for c in candidate_roots)
+            print(
+                f"  [cache_sweep] roots={roots_repr} "
+                f"kept {kept_n} (this run's students + teacher), "
+                f"deleted {del_n} stale snapshots, ~{freed_gb:.0f} GB freed",
+                flush=True,
+            )
+            # Disk after sweep — log so the operator can see we're starting
+            # the round from a known-healthy baseline.
+            try:
+                _du = shutil.disk_usage("/home")
+                print(
+                    f"  [cache_sweep] post-sweep /home: "
+                    f"{_du.free / 1024**3:.0f} GB free of "
+                    f"{_du.total / 1024**3:.0f} GB "
+                    f"({100 * _du.used / _du.total:.0f}% used)",
+                    flush=True,
+                )
+            except Exception:
+                pass
+    except Exception as _sweep_exc:
+        # Never fatal — if the sweep can't run, fall through to per-student
+        # cleanup. We log so the operator can investigate later.
+        print(
+            f"  [cache_sweep] skipped: "
+            f"{type(_sweep_exc).__name__}: {str(_sweep_exc)[:200]}",
+            flush=True,
+        )
 
     with open(args.prompts) as f:
         prompts = json.load(f)
@@ -18074,6 +18318,18 @@ def main():
                 clean_model_cache(student_name, args.teacher)
                 continue
 
+            # 2026-05-15: vLLM bring-up DEFERRED to after the fine-tunability
+            # probe — see the moved block immediately after the probe section.
+            # Reason: vLLM grabs ~55% of GPU VRAM up-front (KV cache budget) and
+            # the finetune probe's autograd backward pass needs that VRAM free.
+            # On 8xB200 with 33B bf16 students, vLLM-first OOMs the backward
+            # path with "Tried to allocate 352 MiB, only 13 MiB free", marking
+            # the student anti_finetune (DQ) when it's actually a healthy model.
+            # The next student then load_fails because the orphan vLLM engine
+            # keeps its VRAM reservation. Bringing vLLM up *after* the probe
+            # leaves the full 178 GB free for the backward pass; the probe
+            # frees its grads in <1 s, and then vLLM has plenty of headroom.
+
             # 2026-05-03 (Kimi K2.6 cutover): VRAM fraud cap recalibrated for
             # 33B-param Kimi students. Previous 20GB cap was sized for 7B
             # Qwen students (~14GB bf16). 33B bf16 weights = 66GB exactly;
@@ -18155,6 +18411,68 @@ def main():
                     continue
             except Exception as e:
                 print(f"[eval] Finetune probe error (non-fatal, allowing): {e}", flush=True)
+
+        # ── Per-student vLLM bring-up (autoregressive batched gen) ──
+        # 2026-05-15: MOVED from pre-probe to post-probe. The probe needs the
+        # full VRAM budget for an HF backward pass; vLLM grabs ~55% up-front
+        # for its KV cache budget and would OOM the probe (see the comment
+        # block where the old position used to be). Now the probe runs with
+        # full memory, we explicitly drop its grad buffers, and *then* vLLM
+        # spins up — which sees a clean GPU and never collides with autograd.
+        # Subsequent probes (chat / think / capability / judge / chat-turns)
+        # and the bench battery all dispatch through `student_vllm.is_active`,
+        # so they get vLLM speed from this point on. KL pass still uses the
+        # HF model that stays loaded.
+        if student is not None and getattr(args, "use_vllm_students", False):
+            try:
+                # Drop any grad / activation scratch the probe left behind so
+                # vLLM's GPU-fraction reservation has the whole 178 GB to plan
+                # against. Without this, B200 cuda allocator fragmentation
+                # can still bite on the second student of a shard.
+                try:
+                    for _p in student.parameters():
+                        if getattr(_p, "grad", None) is not None:
+                            _p.grad = None
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+
+                import student_vllm as _svllm  # type: ignore
+                _vllm_t0 = time.time()
+                # Route vLLM's tokenizer load to the teacher's local
+                # snapshot — most distilled students reference a custom
+                # Kimi tokenizer class without shipping its python source,
+                # which crashes vLLM's tokenizer init. Teacher is already
+                # cached locally so the substitution is free.
+                _tok_path = (
+                    teacher_path if "teacher_path" in dir() and teacher_path
+                    else args.teacher
+                )
+                _svllm.start(
+                    student_name, revision=student_rev,
+                    tokenizer_name_or_path=_tok_path,
+                )
+                print(
+                    f"[eval] vLLM student started in "
+                    f"{time.time() - _vllm_t0:.1f}s, total VRAM: {gpu_mem_str()}",
+                    flush=True,
+                )
+            except Exception as _e:
+                # Per the user mandate (2026-05-15): HF fallback is too slow
+                # to be a viable production path. Log loudly so we notice the
+                # regression, but don't fall back — the bench battery just runs
+                # on HF here too, which is the legacy default path. The
+                # max_model_len clamp in student_vllm.py should already prevent
+                # the most common failure (context-window mismatch).
+                print(
+                    f"[eval] vLLM student start FAILED — bench loop will use HF "
+                    f"(SLOW; investigate) ({str(_e)[:200]})",
+                    flush=True,
+                )
 
         # ── Chat-collapse probe (CoT-collapse defense) ──
         # Allan's Discord observation + arxiv 2502.07266: off-policy CoT distillation
@@ -19424,6 +19742,16 @@ def main():
         })
         live_progress["current"] = None
         _write_progress(force=True)
+
+        # Stop the per-student vLLM (if any) so the next student loads
+        # from a clean GPU. Free BEFORE the HF model so vLLM has clean
+        # ownership of its block manager during teardown.
+        if getattr(args, "use_vllm_students", False):
+            try:
+                import student_vllm as _svllm  # type: ignore
+                _svllm.stop()
+            except Exception:
+                pass
 
         # Cleanup — DON'T unload king
         if not is_king:

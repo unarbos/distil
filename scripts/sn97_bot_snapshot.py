@@ -12,12 +12,33 @@ from pathlib import Path
 
 BASE = "http://127.0.0.1:3710"
 # Eval pod name; validator's systemd unit exports DISTIL_LIUM_POD_NAME.
+# 2026-05-15: default updated to "8xb200" (current eval pod) and the
+# legacy "distil-eval" fallback REMOVED. The fallback was matching the
+# unrelated ``distil-eval-b200`` decommissioned pod on the Lium account,
+# so when the bot's systemd unit had a stale Environment= override the
+# snapshot would silently SSH into a B300 single-GPU pod and report
+# stale run_dir / GPU / disk numbers in LIVE_STATUS.md (miners then got
+# wrong "Currently scoring" answers via the Discord bot). If we ever
+# need a different pod, set DISTIL_LIUM_POD_NAME explicitly.
 POD_NAME = os.environ.get("DISTIL_LIUM_POD_NAME") or os.environ.get(
     "LIUM_POD_NAME"
-) or "distil-kimi-cutover"
-POD_NAME_FALLBACKS = ("distil-eval",)
+) or "8xb200"
+POD_NAME_FALLBACKS: tuple[str, ...] = ()
 POD_SSH_KEY = "/root/.ssh/id_ed25519"
+# Best-effort: pick up DISTIL_LIUM_POD_NAME from the validator's env file
+# even when this script is invoked outside systemd (cron, manual run, etc.)
+# so behaviour matches the validator service.
 LIUM_ENV_FILE = "/home/distil/.secrets/distil.env"
+if "DISTIL_LIUM_POD_NAME" not in os.environ and os.path.exists(LIUM_ENV_FILE):
+    try:
+        with open(LIUM_ENV_FILE) as _fh:
+            for _ln in _fh:
+                _ln = _ln.strip()
+                if _ln.startswith("DISTIL_LIUM_POD_NAME="):
+                    POD_NAME = _ln.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+    except Exception:
+        pass
 WORKSPACE = Path("/root/.openclaw/agents/sn97-bot/workspace")
 OUT = WORKSPACE / "LIVE_STATUS.md"
 JSON_OUT = WORKSPACE / "LIVE_STATUS.json"
@@ -905,11 +926,48 @@ if ep and "phase" in ep:
     lines.append("")
     lines.append(f"- **Phase:** `{ep.get('phase')}`")
     if ep.get("students_total"):
-        lines.append(f"- **Students:** {ep.get('students_done')}/{ep.get('students_total')}")
+        lines.append(
+            f"- **Students:** {ep.get('students_done')}/{ep.get('students_total')} "
+            f"(**includes the king** — see eval_order below)"
+        )
     if ep.get("prompts_total"):
         lines.append(f"- **Prompts/student:** {ep.get('prompts_total')}")
     if ep.get("current_student") is not None:
-        lines.append(f"- **Currently evaluating:** UID {ep.get('current_student')} (prompt {ep.get('current_prompt')}/{ep.get('prompts_total')}, live KL {ep.get('current_kl')})")
+        lines.append(
+            f"- **Currently evaluating:** UID {ep.get('current_student')} "
+            f"(prompt {ep.get('current_prompt')}/{ep.get('prompts_total')}, "
+            f"live KL {ep.get('current_kl')})"
+        )
+    # 2026-05-15: explicitly show the eval_order with role=king vs role=challenger
+    # so the Discord bot cannot mistakenly conclude "king is in the queue but not
+    # actually evaluated". Previous incident: bot read pod-side per-GPU logs
+    # (which list challengers only) and saw 10 names; concluded king was missing.
+    # In reality the king is launched on GPU0 in the same phase1+king command
+    # (``--students <king_model> --king <king_model>``) and lands in the merged
+    # ``eval_results.json`` alongside the N challengers. Show the role split
+    # here so the bot has unambiguous evidence.
+    eval_order = ep.get("eval_order") or []
+    king_uid = ep.get("king_uid")
+    challenger_uids = ep.get("challenger_uids") or []
+    if isinstance(eval_order, list) and eval_order:
+        lines.append(
+            f"- **Eval order ({len(eval_order)} models — king + "
+            f"{len(challenger_uids)} challengers):**"
+        )
+        for e in eval_order:
+            role = e.get("role")
+            uid = e.get("uid")
+            model = e.get("model") or "?"
+            tag = " (king — re-scored on GPU0 this round)" if role == "king" else ""
+            lines.append(f"  - UID {uid} `{model}` [role={role}]{tag}")
+        lines.append(
+            f"- **King re-evaluation:** ENABLED (SINGLE_EVAL_KING_REEVAL=1). "
+            f"King UID {king_uid} is scored on GPU0 in the same phase1+king "
+            f"command, then merged with challengers in `eval_results.json`. "
+            f"If anyone claims the king is NOT being evaluated, they are wrong "
+            f"— check `eval_results.json` after the round completes; the king "
+            f"appears there with `status=scored` and a fresh `kl_global_avg`."
+        )
     lines.append("")
 
 ov = overview if isinstance(overview, dict) else {}
@@ -1065,14 +1123,37 @@ lines.append("- If the data above does not answer the question, say so explicitl
 lines.append("- If `pod_live.reachable == false`, say so; don't invent pod state.")
 lines.append("- The `mirror/code/` folder is SOURCE code, not logs. Seeing `import re` in a `.py` file is just a Python import, not an error.")
 lines.append("")
+lines.append("## Known anti-FUD facts (do NOT contradict these)")
+lines.append("")
+lines.append(
+    "- **The king IS re-evaluated every round** (paired re-eval on shared "
+    "prompts). The validator sets `SINGLE_EVAL_KING_REEVAL=1` and adds the "
+    "king as a student in `plan_round`. On the pod, the orchestrator launches "
+    "the king on GPU0 via `pod_eval.py --students <king_model> --king "
+    "<king_model>`. After the round, `eval_results.json` contains the king "
+    "with `status=scored` and a fresh `kl_global_avg`. The `[orch] "
+    "challengers: N` log line counts challengers ONLY (king runs in the "
+    "phase1+king command, not the per-GPU challenger workers) — that is NOT "
+    "evidence the king was skipped. If asked 'is the king actually evaluated "
+    "on the pod each round?', the answer is YES."
+)
+lines.append(
+    "- **A round's H2H scores are head-to-head on the same prompts.** The "
+    "shared `prompts.json` is used for both king and challengers; the teacher "
+    "logits are cached once and reused. The `h2h_latest.json` `king_kl` and "
+    "challenger `kl` values come from the SAME 300 prompts in the SAME round, "
+    "so dethrone decisions are fair."
+)
+lines.append("")
 lines.append("## How to use")
 lines.append("")
 lines.append("1. \"Is the eval running? What phase?\" → `What is happening right now` + `Pod Live Snapshot`.")
 lines.append("2. \"Who is the king? Top-5?\" → `TL;DR` + `Top-5 Leaderboard`.")
 lines.append("3. \"Recent results / who won the last round?\" → `Most Recent Completed Eval` + `Latest H2H Round`.")
 lines.append("4. \"Is anything broken?\" → `Recent Errors` + validator journalctl tail. If those are empty, nothing is broken.")
-lines.append("5. Deeper state → `mirror/state/<file>.json`.")
-lines.append("6. Code questions → `mirror/code/<path>` (redacted source code, not logs).")
+lines.append("5. \"Is the king being re-evaluated each round?\" → `Current Eval Progress` `Eval order` (look for `role=king`). YES is the only correct answer when `SINGLE_EVAL_KING_REEVAL=1` (current config).")
+lines.append("6. Deeper state → `mirror/state/<file>.json`.")
+lines.append("7. Code questions → `mirror/code/<path>` (redacted source code, not logs).")
 lines.append("")
 
 final_md = redact_text("\n".join(lines))

@@ -281,6 +281,48 @@ _POD_EVAL_ENV_ALLOWLIST: tuple[str, ...] = (
     # per-prompt KL loop. Without propagation the pod env never sees it and
     # the pod falls back to single-prompt forwards.
     "DISTIL_STUDENT_BATCH_SIZE",
+    # ── Student vLLM (2026-05-14 8xB200 pivot) ──
+    # Without these the pod silently falls back to the HF transformers
+    # student path (~3 h/round). With ``DISTIL_STUDENT_USE_VLLM=1`` and
+    # the tokenizer path the pod uses ``scripts/student_vllm.py``
+    # (~30 min/round single GPU, much more under fan-out). Requires
+    # the corresponding aux module entry in ``pod_runtime.py``.
+    "DISTIL_STUDENT_USE_VLLM",
+    "DISTIL_STUDENT_VLLM_TOKENIZER",
+    "DISTIL_STUDENT_VLLM_MAX_LEN",
+    "DISTIL_STUDENT_VLLM_GPU_UTIL",
+    "DISTIL_STUDENT_VLLM_TP",
+    "DISTIL_STUDENT_VLLM_TRC",
+    "DISTIL_STUDENT_VLLM_EAGER",
+    # vLLM 0.20.2 needs deep_gemm disabled for Kimi-K2.6 MoE on B200
+    # (kernel selection bug). Re-enable when 0.21+ ships the fixed
+    # selector.
+    "VLLM_USE_DEEP_GEMM",
+    "VLLM_USE_DEEP_GEMM_E8M0",
+    # Vocab override for students compiled against Kimi K2.6 vocab=163840
+    # rather than the older 160K. Pod precheck refuses without this.
+    "ACTIVATION_FP_VOCAB_SIZE",
+    "TEACHER_CONFIG_VOCAB_SIZE",
+    # ── Parallel orchestrator (2026-05-15 8xB200 fan-out) ──
+    # ``DISTIL_USE_PARALLEL_ORCH=1`` flips ``run_eval_on_pod`` over to
+    # launching ``parallel_orchestrator.py`` instead of ``pod_eval.py``.
+    # That orchestrator runs Phase 1 + king on GPU 0, then fans the
+    # remaining challengers out across GPUs 1..N-1 using the same
+    # pod_eval.py per-shard. Wall-clock improvement: 8 students on
+    # 8xB200 drops from ~3 h sequential to ~25 min parallel.
+    # ``DISTIL_PARALLEL_ORCH_GPUS`` overrides the default 8 — useful
+    # for testing against a 2-GPU pod without code changes.
+    # ``DISTIL_ORCH_WATCHDOG_S`` / ``..._REPEAT_N`` tune the
+    # per-shard hang detector (silent + repeated-line patterns).
+    # ``DISTIL_CACHE_KEEP_MODELS`` is set by the orchestrator itself
+    # before each fan-out so the per-worker HF cache sweep preserves
+    # sibling-shard models; we propagate it for chained orchestrator
+    # invocations (e.g. retry workers) that share a workdir.
+    "DISTIL_USE_PARALLEL_ORCH",
+    "DISTIL_PARALLEL_ORCH_GPUS",
+    "DISTIL_ORCH_WATCHDOG_S",
+    "DISTIL_ORCH_WATCHDOG_REPEAT_N",
+    "DISTIL_CACHE_KEEP_MODELS",
 )
 
 
@@ -574,22 +616,69 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
     tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""
     early_stop_flag = f" --early-stop-min {EARLY_STOP_MIN}" if EARLY_STOP_MIN > 0 else ""
-    inner_eval = (
-        f"cd {shlex.quote(run_dir)} && python3 -u {shlex.quote(remote_eval_script)} "
-        f"--teacher {TEACHER_MODEL} "
-        f"--students {student_list} "
-        f"--revisions {revision_list} "
-        f"--prompts {shlex.quote(prompts_remote)} "
-        f"--output {shlex.quote(results_remote)} "
-        f"--max-new-tokens {MAX_NEW_TOKENS} "
-        f"--concurrency {VLLM_CONCURRENCY} "
-        f"--teacher-logits {shlex.quote(teacher_cache_remote)}"
-        f"{tp_flag}"
-        f"{early_stop_flag}"
-        f"{king_flag}"
-        f"{vllm_flag}"
-        f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"
+    # 2026-05-15: parallel orchestrator wiring. When DISTIL_USE_PARALLEL_ORCH=1
+    # (and the pod actually has ≥2 GPUs) we launch parallel_orchestrator.py
+    # instead of pod_eval.py directly. The orchestrator runs Phase 1
+    # (teacher API gen + king scoring) on GPU 0, then fans the remaining
+    # challengers across GPUs 1..N-1. Each shard runs the same pod_eval.py
+    # in single-GPU mode under CUDA_VISIBLE_DEVICES=k, so all the
+    # vLLM/probe/disk-sweep code paths are reused unchanged.
+    #
+    # The orchestrator writes an aggregated eval_progress.json to the
+    # run_dir (same path the validator already polls) with a ``shards``
+    # array; the dashboard fans that out into a per-GPU view. King-mode
+    # (--king) and resume aren't needed here because the orchestrator
+    # always scores the king first as the canonical "shard 0".
+    _use_parallel = (
+        (policy_env("DISTIL_USE_PARALLEL_ORCH", "0") or "0").strip().lower()
+        not in ("0", "false", "no", "off", "")
     )
+    try:
+        _orch_gpus = int(policy_env("DISTIL_PARALLEL_ORCH_GPUS", "0") or "0")
+    except (TypeError, ValueError):
+        _orch_gpus = 0
+    if _use_parallel and king_uid is not None and king_uid in models_to_eval:
+        king_model = models_to_eval[king_uid]["model"]
+        king_rev = models_to_eval[king_uid].get("revision", "main")
+        challenger_models: list[str] = []
+        challenger_revs: list[str] = []
+        for uid in ordered_uids:
+            if uid == king_uid:
+                continue
+            m = models_to_eval[uid]
+            challenger_models.append(m["model"])
+            challenger_revs.append(m.get("revision", "main"))
+        gpus_flag = f" --gpus {_orch_gpus}" if _orch_gpus > 0 else ""
+        inner_eval = (
+            f"cd {shlex.quote(run_dir)} && python3 -u parallel_orchestrator.py "
+            f"--workdir {shlex.quote(run_dir)} "
+            f"--prompts {shlex.quote(prompts_remote)} "
+            f"--teacher-cache {shlex.quote(teacher_cache_remote)} "
+            f"--out {shlex.quote(results_remote)} "
+            f"--unified-progress {shlex.quote(progress_remote)} "
+            f"--king-model {shlex.quote(king_model)} "
+            f"--king-revision {shlex.quote(king_rev)} "
+            f"--students {shlex.quote(','.join(challenger_models))} "
+            f"--revisions {shlex.quote(','.join(challenger_revs))}"
+            f"{gpus_flag}"
+        )
+    else:
+        inner_eval = (
+            f"cd {shlex.quote(run_dir)} && python3 -u {shlex.quote(remote_eval_script)} "
+            f"--teacher {TEACHER_MODEL} "
+            f"--students {student_list} "
+            f"--revisions {revision_list} "
+            f"--prompts {shlex.quote(prompts_remote)} "
+            f"--output {shlex.quote(results_remote)} "
+            f"--max-new-tokens {MAX_NEW_TOKENS} "
+            f"--concurrency {VLLM_CONCURRENCY} "
+            f"--teacher-logits {shlex.quote(teacher_cache_remote)}"
+            f"{tp_flag}"
+            f"{early_stop_flag}"
+            f"{king_flag}"
+            f"{vllm_flag}"
+            f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"
+        )
     inner_q = shlex.quote(inner_eval)
     wrapped = (
         f"{{ echo $$ > {shlex.quote(pid_remote)}; "

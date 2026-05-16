@@ -1,0 +1,28 @@
+[Unit]
+Description=Distil SN97 API (rewrite-v2 cutover)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=distil
+# WorkingDirectory must be the repo root so that `distil` resolves as a
+# top-level package. The legacy unit pointed at /opt/distil/repo/api so that
+# `server:app` resolved — for the rewrite cutover we target `distil.api.server:app`.
+WorkingDirectory=/opt/distil/repo
+Environment=HOME=/home/distil
+# Same env file as legacy unit — TMC_API_KEY, HF_TOKEN, etc.
+EnvironmentFile=-/home/distil/.secrets/distil.env
+# Same uvicorn flags as the legacy unit, ONLY the import target changes.
+ExecStart=/opt/distil/venv/bin/python -m uvicorn distil.api.server:app --host 0.0.0.0 --port 3710 --log-level warning --limit-concurrency 2000 --timeout-keep-alive 3 --backlog 2048 --workers 1
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=distil-api
+LogRateLimitIntervalSec=10
+LogRateLimitBurst=50
+
+[Install]
+WantedBy=multi-user.target

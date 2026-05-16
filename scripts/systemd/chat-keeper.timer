@@ -1,0 +1,15 @@
+[Unit]
+Description=Tick chat-keeper.service every 3 minutes
+Documentation=https://github.com/distil-sn97/distil
+
+[Timer]
+# 60s after boot to let chat-tunnel come up first, then every 3 minutes.
+# 3 min is a sweet spot: vLLM warm-up after heal is ~60-90s, so we never
+# heal twice on top of an in-flight start.
+OnBootSec=60s
+OnUnitActiveSec=3min
+AccuracySec=15s
+Unit=chat-keeper.service
+
+[Install]
+WantedBy=timers.target

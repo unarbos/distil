@@ -2,61 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { CLIENT_API_BASE } from "@/lib/subnet";
+import type { CompletedStudent, EvalProgress, ShardProgress } from "@/lib/api";
 import { ChatKingPill } from "./chat-king-pill";
-
-interface EvalOrderItem {
-  uid: number;
-  model: string;
-  role: "king" | "challenger";
-}
-
-interface CompletedStudent {
-  student_idx?: number;
-  student_name: string;
-  status: string;
-  status_detail?: string;
-  kl?: number;
-  prompts_scored?: number;
-  prompts_total?: number;
-  scoring_time_s?: number;
-}
-
-interface EvalProgress {
-  active: boolean;
-  phase?: string;
-  current_student?: string;
-  students_done?: number;
-  students_total?: number;
-  prompts_done?: number;
-  prompts_total?: number;
-  phase_detail?: string | null;
-  phase_eta_s?: number | null;
-  progress_fraction?: number | null;
-  current_student_started_at?: number | null;
-  current_prompt?: number;
-  current_kl?: number;
-  // 2026-05-04: name of the per-student stage in flight (e.g.
-  // "chat_probe", "long_form_judge_probe", "kl_scoring"). Used by the
-  // queue row to show what's actually running while X/N prompts is
-  // still 0 (i.e. before KL scoring begins). Surfaced via
-  // ``current.stage`` from the pod's eval_progress.json.
-  current_stage?: string | null;
-  // 2026-05-04: bench-battery sub-axis index (1-based) and total
-  // (~17 axes). Stage is "bench_battery:<axis_name>" while the
-  // axis is in flight. Lets the queue row render
-  // "running bench: aime (6/17)" so the ~25-min phase doesn't
-  // look stuck on a static "bench_battery" stamp.
-  bench_axis_idx?: number | null;
-  bench_axis_total?: number | null;
-  teacher_prompts_done?: number;
-  started_at?: number;
-  estimated_completion?: number;
-  estimated_duration_s?: number;
-  eval_order?: EvalOrderItem[];
-  king_uid?: number;
-  completed?: CompletedStudent[];
-  models?: Record<string, string>;
-}
 
 interface LogLine {
   ts: number;
@@ -227,9 +174,19 @@ export function LivePanel() {
 
   const phases = derivePhases(progress);
   const phase = progress?.phase ?? (progress?.active ? "running" : "idle");
-  const explainer =
-    PHASE_EXPLAINERS[phase] ??
-    (progress?.active ? "Validator running…" : PHASE_EXPLAINERS.idle);
+  // 2026-05-15: when DISTIL_USE_PARALLEL_ORCH=1 the pod fans the
+  // round across N GPUs. The single-shard "score sequentially" copy
+  // is then wrong: students score in parallel. Swap in a parallel-
+  // aware explainer + show which shards are live.
+  const activeShards =
+    progress?.shards?.filter((s) => s.alive && s.current_student) ?? [];
+  const isParallel =
+    (progress?.orchestrator === "parallel") ||
+    (progress?.shards?.length ?? 0) > 1;
+  const explainer = isParallel && progress?.active
+    ? `Parallel scoring across ${progress?.n_gpus ?? progress?.shards?.length ?? 0} GPUs — ${activeShards.length} student${activeShards.length === 1 ? "" : "s"} evaluating concurrently.`
+    : (PHASE_EXPLAINERS[phase] ??
+       (progress?.active ? "Validator running…" : PHASE_EXPLAINERS.idle));
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1.1fr_1fr] min-h-[calc(100vh-3.5rem-3rem)]">
@@ -265,6 +222,10 @@ export function LivePanel() {
             <ChatKingPill variant="block" />
           </div>
         </div>
+
+        {isParallel && (progress?.shards?.length ?? 0) > 0 && (
+          <ShardsPanel shards={progress!.shards!} />
+        )}
 
         <div className="flex flex-col gap-3">
           {phases.map((p) => (
@@ -635,6 +596,77 @@ function buildMetaText(p: EvalProgress): string {
   if (BENCH_PHASES.has(phase)) return "bench battery running";
   if (POST_PHASES.has(phase)) return PHASE_LABELS[phase] ?? phase;
   return p.phase ?? "running";
+}
+
+/**
+ * Per-GPU shard view for parallel-orchestrator runs.
+ *
+ * Each row is one worker GPU. We show the GPU index, the model the
+ * worker is currently scoring, the stage it's in, and either a
+ * progress fraction (during KL scoring) or the last log line (during
+ * probes/bench — when ``prompts_done`` is 0).
+ *
+ * The watchdog stall flag (``repeat_tail`` ≥ 100) is rendered in
+ * orange — operators see at a glance when a shard's tokenizer
+ * hung on the v4-style encode loop before the SIGKILL fires.
+ */
+function ShardsPanel({ shards }: { shards: ShardProgress[] }) {
+  const sorted = [...shards].sort((a, b) => (a.gpu ?? 0) - (b.gpu ?? 0));
+  return (
+    <div className="-mt-1">
+      <HeadRow
+        title="Parallel shards"
+        meta={`${sorted.filter((s) => s.alive).length} of ${sorted.length} active`}
+      />
+      <div className="mt-3 flex flex-col gap-1.5">
+        {sorted.map((s) => (
+          <ShardRow key={s.gpu} shard={s} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ShardRow({ shard }: { shard: ShardProgress }) {
+  const pd = shard.current_prompts_done ?? 0;
+  const pt = shard.current_prompts_total ?? 0;
+  const pct = pt > 0 ? Math.min(100, Math.round((pd / pt) * 100)) : 0;
+  const stalled = (shard.repeat_tail ?? 0) >= 100;
+  const dotClass = !shard.alive
+    ? "bg-[var(--border-strong)]"
+    : stalled
+      ? "bg-warning"
+      : "bg-ok";
+  const detail = (() => {
+    if (!shard.alive) {
+      return shard.exit_code === 0 ? "done" : `exited rc=${shard.exit_code ?? "?"}`;
+    }
+    if (pt > 0 && pd > 0) {
+      return `${pd}/${pt} prompts · ${pct}%`;
+    }
+    if (shard.current_stage) {
+      return shard.current_stage.replace(/_/g, " ");
+    }
+    return shard.stage_line?.slice(0, 60) || "running";
+  })();
+  return (
+    <div className="grid grid-cols-[16px_48px_1fr_auto] items-center gap-2.5 py-1.5 text-[12.5px] border-b border-border last:border-b-0">
+      <span
+        className={[
+          "w-1.5 h-1.5 rounded-full justify-self-center",
+          dotClass,
+          shard.alive && !stalled ? "ring-2 ring-ok/15" : "",
+        ].join(" ")}
+      />
+      <span className="num text-meta">gpu{shard.gpu}</span>
+      <span className="truncate text-foreground min-w-0" title={shard.current_student ?? ""}>
+        {shard.current_student ?? "(idle)"}
+      </span>
+      <span className="text-[11px] text-meta num text-right whitespace-nowrap">
+        {detail}
+      </span>
+    </div>
+  );
 }
 
 function HeadRow({ title, meta }: { title: string; meta: string }) {

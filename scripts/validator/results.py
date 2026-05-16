@@ -1409,7 +1409,17 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         speed_flag = student_result.get("speed_flag")
         if speed_flag:
             logger.warning(f"UID {uid} ({model_name}): ⚠️ {speed_flag}")
-        kl = student_result.get("kl_global_avg", float("inf"))
+        kl = student_result.get("kl_global_avg")
+        # ``kl_global_avg`` is explicitly None for load_failed students
+        # (orchestrator stub for shards that crashed before scoring).
+        # ``dict.get(key, default)`` does NOT substitute the default
+        # when the key is present with a None value — so the previous
+        # ``kl <= 1e-6`` comparison raised TypeError on the resume path
+        # the moment the parallel orchestrator emitted any partial
+        # round. Coerce missing/None to inf so it falls through to the
+        # invalid-KL branch below and gets recorded as a failure.
+        if kl is None:
+            kl = float("inf")
         if kl <= 1e-6:
             _dq_student_by_uid(
                 state=state, uid=uid, model_name=model_name,

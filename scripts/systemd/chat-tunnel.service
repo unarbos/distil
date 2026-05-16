@@ -1,0 +1,22 @@
+[Unit]
+Description=SSH tunnel to chat-king pod for chat.arbos.life
+Documentation=https://github.com/distil-sn97/distil
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Read chat pod coordinates from state/chat_pod.json on every restart.
+# chat-tunnel.path watches that file and triggers `systemctl restart` on
+# write so rotations propagate without daemon-reload or manual editing.
+Environment=DISTIL_STATE_DIR=/opt/distil/repo/state
+ExecStart=/opt/distil/repo/scripts/chat_tunnel_loop.sh
+Restart=always
+RestartSec=10
+# 3 fast restarts then back off. autossh handles the steady state via
+# ServerAliveInterval; the systemd burst is for state-file churn.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target

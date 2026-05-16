@@ -89,7 +89,7 @@ Disqualification reasons are shown on the dashboard and available via the API.
 
 - **SHA256 hash duplicate detection**: Model weight hashes tracked forever; copies blacklisted for that commitment
 - **Logit fingerprinting**: Even if hashes differ, models with identical activation distributions on the first 2 prompts are flagged as functional copies (cosine similarity > 0.99999 on per-position vectors)
-- **Cosine similarity tool**: `scripts/cosine_similarity_check.py` provides offline near-copy detection between any two models
+- **Activation fingerprint near-copy detection**: the validator records a per-position activation fingerprint for every scored student in `state/activation_fingerprints.json`; pairs with cosine similarity ≥ `settings.activation_fp_threshold` (default 0.99999) are DQ'd as functional copies
 - **Anti-spiral**: `reasoning_density` axis + `thinking_collapse_probe` catch the "model thinks forever, never answers" failure mode (see [paper/off_policy_cot_collapse.md](paper/off_policy_cot_collapse.md))
 - **Commitment block priority**: Earlier on-chain commitment wins hash ownership
 - **Revision-pinned integrity**: Models checked for new HF commits (git SHA comparison) — any change after commitment = DQ. Much cheaper than re-hashing weights every epoch.

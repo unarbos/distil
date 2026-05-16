@@ -568,9 +568,16 @@ def greedy_batch_api(
 # ---------------------------------------------------------------------------
 
 def api_health_check(config: Optional[APIConfig] = None, prompt: str = "Say OK and nothing else.",
-                     max_attempts: int = 6) -> Dict[str, Any]:
+                     max_attempts: int = 60) -> Dict[str, Any]:
     """Connectivity + logprobs sanity test. Retries 429/5xx with backoff.
-    Run once before committing an eval round to the API path."""
+    Run once before committing an eval round to the API path.
+
+    NOTE 2026-05-14: bumped from 6 → 60 attempts. OpenRouter/Inceptron
+    429s the moonshotai/kimi-k2.6 endpoint several times per validator
+    restart, and a fresh round can spend 5-10 min waiting before the
+    rate-limit bucket recovers. With max_attempts=60 and exponential
+    backoff capped at 30s, total worst-case wait is ~25 min, which is
+    cheaper than tearing down and re-renting the pod."""
     import requests
 
     cfg = config or APIConfig.from_env()

@@ -1,0 +1,17 @@
+[Unit]
+Description=Watchdog that keeps chat.arbos.life vLLM alive on the king pod
+Documentation=https://github.com/distil-sn97/distil
+After=chat-tunnel.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=DISTIL_REPO_ROOT=/opt/distil/repo
+Environment=DISTIL_STATE_DIR=/opt/distil/repo/state
+ExecStart=/opt/distil/repo/scripts/chat_keeper.sh
+# Keeper is best-effort — never block the timer if a single tick fails.
+SuccessExitStatus=0 1
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

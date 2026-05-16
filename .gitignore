@@ -35,7 +35,7 @@ benchmark_results/
 # Next.js incremental build artifacts
 frontend/tsconfig.tsbuildinfo
 frontend/.next/
-state/
+/state/
 frontend/.next/
 .openclaw/
 .trash/
@@ -45,7 +45,14 @@ node_modules/
 memory/
 HEARTBEAT.md
 SESSION_MEMORY.md
-REWRITE_PLAN.md
+
+# Local state-directory snapshots (moved to /var/backups/ on cleanup).
+state.bak-*/
+
+# Ad-hoc local archives kept outside git history.
+legacy/
+*.tar.zst
+*.tar.gz
 
 # Tweet drafts (local only)
 .tweet-drafts.md

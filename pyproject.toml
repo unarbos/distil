@@ -1,7 +1,7 @@
 [project]
 name = "distillation"
-version = "0.8.0"
-description = "Bittensor subnet for moonshotai/Kimi-K2.6 model distillation (post-2026-05-02 cutover; was Qwen3.5/Qwen3.6-35B-A3B) — competitive knowledge compression"
+version = "0.9.0"
+description = "Bittensor SN97 — Kimi-K2.6 distillation validator (clean rewrite-v2 stack under distil/)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -13,9 +13,10 @@ dependencies = [
     "fastapi",
     "huggingface-hub",
     "httpx",
-    "lium",
+    "lium.io",
     "numpy",
     "pydantic",
+    "pydantic-settings",
     "requests",
     "rich",
     "safetensors",
@@ -26,13 +27,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest",
-]
-gpu = [
-    "flash-attn",
-]
+dev = ["pytest", "pytest-subtests"]
+gpu = ["flash-attn", "vllm"]
+
+[project.scripts]
+distil = "distil.cli.entry:main"
 
 [tool.setuptools.packages.find]
-include = ["eval*", "api*"]
-exclude = ["state*", "scripts*", "distillation*", "neurons*"]
+# distil/ is the production stack (post 2026-05-15 cutover).
+# eval/ and api/ are kept temporarily for shim compatibility and will
+# be removed in a follow-up commit once the systemd units no longer
+# reference them.
+include = ["distil*", "eval*", "api*"]
+exclude = ["state*", "scripts*", "distillation*", "neurons*", "frontend*", "tests*"]

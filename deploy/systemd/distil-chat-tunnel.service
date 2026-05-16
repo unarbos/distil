@@ -1,0 +1,25 @@
+[Unit]
+Description=SSH tunnel from API host to chat pod vLLM (:8100)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=distil
+Group=distil
+EnvironmentFile=/home/distil/.secrets/distil.env
+ExecStart=/usr/bin/ssh -N \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o StrictHostKeyChecking=no \
+    -L 127.0.0.1:8100:127.0.0.1:8100 \
+    -i /home/distil/.ssh/id_ed25519 \
+    ${CHAT_POD_USER}@${CHAT_POD_HOST}
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
