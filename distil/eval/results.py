@@ -376,20 +376,32 @@ def process_round(
         # ``composites`` dict above stays model-name-keyed because the
         # h2h record + DQ logic below indexes by name.
         #
-        # CRITICAL: only persist when ``worst`` is computable. The
-        # legacy merge_composite_scores (scripts.validator.single_eval)
-        # does ``if comp.get('worst') is None: continue`` — without
-        # the same guard a Phase-2 student crash (vLLM OOM, HF 401,
-        # KL shape mismatch, etc.) overwrites the king's PRIOR
-        # composite_scores row with all-null, and the next round's
-        # ``resolve_king`` then promotes whatever stale score is on
-        # disk. Lost an actual round + an on-chain set_weights to
-        # this on 2026-05-16 00:30 UTC, see the round_1778890262 post-
-        # mortem in the cutover notes.
-        if comp.get("worst") is None and not comp.get("disqualified"):
+        # CRITICAL: only persist when Phase 2 actually produced a KL
+        # signal. The legacy merge_composite_scores does the equivalent
+        # of ``if comp.get('worst') is None: continue`` -- but that's
+        # only a *partial* guard: if Phase 2 vLLM-loaded the student
+        # OK but the JSON-stringified teacher_logprobs keys made every
+        # position's intersection empty (kl=None, top_k_overlap=0), the
+        # bench axes alone produce a small-but-positive ``worst`` and
+        # the guard falls through. The student's composite then
+        # overwrites the king's prior composite with a low score and
+        # ``resolve_king`` promotes whatever stale score is on disk.
+        # We hit both modes in the 2026-05-16 round_1778892714 post-
+        # mortem: 8/10 challengers failed at vLLM load (composite all
+        # null, fine) but king 47 + UID 137 vLLM-loaded, ran 16 bench
+        # axes, and STILL came back with kl=None — and the bench-only
+        # composite was lower than UID 83's stale prior, triggering a
+        # bogus dethrone. So we now require BOTH ``worst`` to be
+        # computable AND the KL axis to be real (or the model to be
+        # explicitly DQ'd) before writing the row.
+        kl_axis = (comp.get("axes") or {}).get("kl")
+        kl_failed = kl_axis is None and not comp.get("disqualified")
+        worst_missing = comp.get("worst") is None and not comp.get("disqualified")
+        if worst_missing or kl_failed:
             logger.warning(
-                f"uid={uid} ({name}): composite worst=None (eval failed); "
-                f"skipping composite_scores write to preserve prior record"
+                f"uid={uid} ({name}): composite skipped "
+                f"(worst={comp.get('worst')!r}, kl_axis={kl_axis!r}, "
+                f"dq={comp.get('disqualified')}) — preserving prior record"
             )
         else:
             state.composite_scores[str(uid) if uid is not None else name] = comp

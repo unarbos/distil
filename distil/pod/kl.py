@@ -11,6 +11,37 @@ import math
 from typing import Iterator
 
 
+def _coerce_int_keys(d: dict) -> dict[int, float]:
+    """JSON round-tripping stringifies dict keys.
+
+    The teacher_logprobs payload is persisted in
+    ``teacher_cache/round_<id>.json`` and re-loaded for Phase 2 student
+    scoring. JSON has no concept of integer dict keys, so a payload
+    written as ``{42: -1.2}`` round-trips as ``{"42": -1.2}``. Student
+    logprobs come straight out of vLLM with native ``int`` keys, so
+    without this coercion the two key spaces never intersect and KL +
+    top-K overlap silently collapse to ``None`` / ``0`` — that's exactly
+    the regression we hit on round ``1778892714`` where every student's
+    ``kl_global_avg`` came back ``None`` despite a clean Phase 2 run.
+
+    We accept either ``int`` or ``str(int)`` keys and drop anything that
+    won't parse cleanly (defensive against, e.g., special teacher-API
+    decode artifacts).
+    """
+    if not d:
+        return {}
+    out: dict[int, float] = {}
+    for k, v in d.items():
+        if isinstance(k, int):
+            out[k] = v
+            continue
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _renorm(d: dict[int, float], support: set[int]) -> dict[int, float]:
     if not d or not support:
         return {}
@@ -23,10 +54,12 @@ def _renorm(d: dict[int, float], support: set[int]) -> dict[int, float]:
     return {tid: lp - log_z for tid, lp in log_probs.items()}
 
 
-def position_kl(teacher: dict[int, float], student: dict[int, float]) -> float | None:
+def position_kl(teacher: dict, student: dict) -> float | None:
     """Return KL(teacher || student) on the shared support, or None if disjoint."""
     if not teacher or not student:
         return None
+    teacher = _coerce_int_keys(teacher)
+    student = _coerce_int_keys(student)
     support = set(teacher) & set(student)
     if not support:
         return None
@@ -41,7 +74,7 @@ def position_kl(teacher: dict[int, float], student: dict[int, float]) -> float |
     return out
 
 
-def position_rkl(teacher: dict[int, float], student: dict[int, float]) -> float | None:
+def position_rkl(teacher: dict, student: dict) -> float | None:
     """Return KL(student || teacher) — same as ``position_kl`` with args swapped."""
     return position_kl(student, teacher)
 
@@ -118,6 +151,8 @@ def top_k_overlap(
     for t, s in _iter_positions(teacher, student):
         if not t or not s:
             continue
+        t = _coerce_int_keys(t)
+        s = _coerce_int_keys(s)
         t_top = {tid for tid, _ in sorted(t.items(), key=lambda kv: -kv[1])[:k]}
         s_top = {tid for tid, _ in sorted(s.items(), key=lambda kv: -kv[1])[:k]}
         if not t_top:
