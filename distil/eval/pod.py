@@ -488,6 +488,37 @@ def run_eval_on_pod(
     else:
         pod.exec(f"mkdir -p {remote_run}", timeout=30)
         pod.upload(str(spec_local), f"{remote_run}/round_spec.json")
+        # Sweep orphaned vLLM EngineCore + distil.pod processes from
+        # prior rounds. When a Phase-2 shard dies ungracefully (OOM, GPU
+        # init crash, watchdog SIGKILL) its child ``VLLM::EngineCore``
+        # gets re-parented to init and survives with the model weights
+        # still resident in GPU memory. The next round's shard then
+        # cannot allocate its own engine because the device is full
+        # (e.g. round 1778905724 / 2026-05-16 lost the king because
+        # GPU 0 was holding 162 GB from a 3-hour-old leak). Killing any
+        # EngineCore whose parent is no longer a live ``distil.pod`` is
+        # safe — the only legitimate parent is our orchestrator's own
+        # shard subprocess, which won't exist yet when we sweep.
+        cleanup_cmd = (
+            "for pid in $(pgrep -f 'VLLM::EngineCore' 2>/dev/null); do "
+            "  ppid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' '); "
+            "  parent=$(ps -o cmd= -p $ppid 2>/dev/null || echo init); "
+            "  case \"$parent\" in "
+            "    *distil.pod*) ;; "
+            "    *) echo \"sweep: kill stale vLLM pid=$pid (parent='$parent')\"; "
+            "       kill -9 $pid 2>/dev/null ;; "
+            "  esac; "
+            "done; "
+            "pkill -9 -f 'distil.pod.orchestrator' 2>/dev/null; "
+            "pkill -9 -f 'distil.pod ' 2>/dev/null; "
+            "sleep 1; "
+            "echo 'cleanup_done'"
+        )
+        sweep = pod.exec(cleanup_cmd, timeout=30)
+        if sweep.get("stdout") and "sweep:" in sweep["stdout"]:
+            logger.warning(
+                f"pre-launch cleanup swept stale procs:\n{sweep['stdout'].strip()}"
+            )
         # Forward configuration/secrets from the validator env to the pod.
         # The orchestrator inherits ``cd /home`` env only, so anything our
         # phase subprocesses need (API key for the cloud-teacher path,

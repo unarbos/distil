@@ -30,17 +30,41 @@ class StudentScores:
 
 
 def start_student(model_repo: str, vllm_cfg: dict[str, Any]):
+    """Spin up a vLLM ``LLM`` for ``model_repo`` using the round's
+    ``vllm_cfg`` knobs. If the configured ``max_model_len`` exceeds the
+    student model's declared ``max_position_embeddings``, vLLM 0.21+
+    raises a Pydantic ValidationError that kills the whole shard
+    before we even get to score the student. Honest miners sometimes
+    ship checkpoints with shorter native context (8 k, 16 k) than the
+    teacher's 32 k window — we should NOT disqualify them for that,
+    we should fall back to the model's own max so the round produces
+    a valid composite. Setting ``VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`` for
+    the duration of this constructor lets vLLM clamp instead of raise;
+    if the resulting context can't actually hold our prompts the
+    prefix-len guard in :func:`score_against_teacher_trace` will drop
+    those positions cleanly.
+    """
+    import os
+
     from vllm import LLM, SamplingParams
 
-    llm = LLM(
-        model=model_repo,
-        max_model_len=vllm_cfg.get("max_model_len", 32768),
-        enable_chunked_prefill=vllm_cfg.get("enable_chunked_prefill", True),
-        gpu_memory_utilization=vllm_cfg.get("gpu_memory_utilization", 0.85),
-        dtype=vllm_cfg.get("dtype", "bfloat16"),
-        max_logprobs=vllm_cfg.get("max_logprobs", 128),
-        trust_remote_code=True,
-    )
+    prev_allow = os.environ.get("VLLM_ALLOW_LONG_MAX_MODEL_LEN")
+    os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+    try:
+        llm = LLM(
+            model=model_repo,
+            max_model_len=vllm_cfg.get("max_model_len", 32768),
+            enable_chunked_prefill=vllm_cfg.get("enable_chunked_prefill", True),
+            gpu_memory_utilization=vllm_cfg.get("gpu_memory_utilization", 0.85),
+            dtype=vllm_cfg.get("dtype", "bfloat16"),
+            max_logprobs=vllm_cfg.get("max_logprobs", 128),
+            trust_remote_code=True,
+        )
+    finally:
+        if prev_allow is None:
+            os.environ.pop("VLLM_ALLOW_LONG_MAX_MODEL_LEN", None)
+        else:
+            os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = prev_allow
     try:
         llm.generate(["hi"], SamplingParams(max_tokens=1, temperature=0.0))
         logger.info("student warm-up generate ok")
