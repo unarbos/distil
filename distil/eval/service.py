@@ -29,6 +29,7 @@ from distil.eval.pod import (
     run_eval_on_pod,
     upload_runtime,
 )
+from distil.eval.dq_recovery import sweep_integrity_dq_recoveries
 from distil.eval.results import process_round
 from distil.eval.round import (
     build_round_spec,
@@ -95,6 +96,24 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     n_recommit = len(evict_stale_evaluated_uids(state, commitments))
     if n_recommit:
         logger.info(f"evicted {n_recommit} re-committed UIDs (slot reset)")
+
+    # Legacy ``integrity:HF 404`` DQs are otherwise permanent. When a
+    # miner restores their HF repo (aizaysi did this for
+    # ``RLStepone/distil-success-h19`` on 2026-05-16) we want the DQ
+    # to clear automatically rather than requiring a human to edit
+    # ``disqualified.json``. The sweeper HEAD-checks each
+    # ``integrity:.*404`` row and drops the DQ when HF returns 200.
+    try:
+        cleared = sweep_integrity_dq_recoveries(state)
+    except Exception as exc:  # pragma: no cover — fail open
+        logger.warning(f"dq_recovery sweeper raised: {type(exc).__name__}: {exc}")
+        cleared = []
+    if cleared:
+        for entry in cleared:
+            logger.info(
+                f"dq_recovery: cleared {entry['hotkey'][:20]}... "
+                f"({entry['model']!r}) — HF restored"
+            )
 
     # Resolve seated king. Mirrors the legacy
     # ``scripts/validator/service._resolve_king`` precedence rules so
