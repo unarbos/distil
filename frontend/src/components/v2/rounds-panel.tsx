@@ -6,7 +6,14 @@ import { CLIENT_API_BASE } from "@/lib/subnet";
 interface H2hResult {
   uid?: number;
   model: string;
-  kl: number;
+  // ``kl`` is null at the API layer for any student whose Phase 2
+  // failed (HF 404, vLLM init crash, max_model_len mismatch, etc.).
+  // The dashboard MUST treat this as nullable — assuming ``number``
+  // is what crashed the Rounds tab on 2026-05-16: every challenger
+  // in recent rounds had failed at vLLM load, so every row tripped
+  // ``result.kl.toFixed(4)`` and the whole RoundsPanel React tree
+  // crashed with "Cannot read properties of null (reading toFixed)".
+  kl: number | null;
   is_king?: boolean;
   vs_king?: string;
   disqualified?: boolean;
@@ -550,7 +557,9 @@ function Side({ side, loser, result, showAnnotation, annotation, margin }: SideP
       <div className="text-[10px] text-meta num tracking-wider">
         {worst != null
           ? `worst ${worst.toFixed(3)}`
-          : `KL ${result.kl.toFixed(4)}`}
+          : typeof result.kl === "number" && Number.isFinite(result.kl)
+            ? `KL ${result.kl.toFixed(4)}`
+            : "— no score"}
       </div>
       {limiting && worst != null && (
         <div
