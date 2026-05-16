@@ -102,7 +102,7 @@ def miner_detail(uid: int) -> dict[str, Any]:
     rounds = [
         r
         for r in store.h2h_history()
-        if any(s.get("uid") == int(uid) for s in r.get("students") or [])
+        if any(s.get("uid") == int(uid) for s in (r.get("results") or r.get("students") or []))
     ]
     return {
         "uid": int(uid),

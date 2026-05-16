@@ -110,7 +110,10 @@ def summarise_history(n: int = 5) -> dict[str, Any]:
             {
                 "block": r.get("block"),
                 "winner": winner,
-                "students": [s.get("name") for s in r.get("students") or []],
+                "students": [
+                    s.get("name") or s.get("model")
+                    for s in (r.get("results") or r.get("students") or [])
+                ],
                 "broken_axes": r.get("broken_axes"),
             }
         )

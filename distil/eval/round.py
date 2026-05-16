@@ -60,27 +60,43 @@ def select_challengers(
     king_uid: int | None,
     n: int = MAX_CHALLENGERS_PER_ROUND,
 ) -> list[Commitment]:
-    """FIFO challenger picker; never selects the king itself."""
-    candidates = [
-        c
-        for uid, c in commitments.items()
-        if (king_uid is None or int(uid) != int(king_uid))
-        and not state.is_disqualified(c.hotkey, uid=c.uid)
-    ]
-    never_evaluated: list[Commitment] = []
-    seen: list[tuple[float, Commitment]] = []
-    for c in candidates:
-        key = _model_key(c)
-        comp = state.composite_scores.get(key) or {}
-        ts = float(comp.get("evaluated_at") or 0.0)
-        if ts <= 0:
-            never_evaluated.append(c)
-        else:
-            seen.append((ts, c))
-    never_evaluated.sort(key=lambda c: c.block)
-    seen.sort(key=lambda t: t[0])
-    out = never_evaluated + [c for _, c in seen]
-    return out[:n]
+    """Pick challengers for the round (legacy ``single_eval`` semantics).
+
+    A UID is **eligible** when:
+
+      * it isn't the seated king (the king runs as paired re-eval, not
+        as a challenger),
+      * it isn't disqualified,
+      * it isn't already in ``state.composite_scores`` (UID-keyed),
+      * it isn't already in ``state.evaluated_uids`` (str-set of UIDs
+        whose single-eval slot is spent).
+
+    Eligible UIDs are sorted FIFO by ``commit_block`` (oldest first) and
+    capped at ``n``. We deliberately DO NOT pad the round with already-
+    evaluated UIDs — that's the legacy "one eval per commitment"
+    contract. If only 2 fresh commits exist this round, only 2
+    challengers run. Empty result = round is a king-only re-eval.
+
+    Earlier distil revisions padded with re-evals when fewer than ``n``
+    new commits existed; that produced phantom "10 challengers per
+    round" output and silently re-scored UIDs that had already taken
+    their one shot — see the dashboard regression flagged on 2026-05-15.
+    """
+    evaluated = {str(u) for u in (state.evaluated_uids or [])}
+    candidates: list[Commitment] = []
+    for uid, c in commitments.items():
+        if king_uid is not None and int(uid) == int(king_uid):
+            continue
+        if state.is_disqualified(c.hotkey, uid=c.uid):
+            continue
+        uid_str = str(uid)
+        if uid_str in state.composite_scores:
+            continue
+        if uid_str in evaluated:
+            continue
+        candidates.append(c)
+    candidates.sort(key=lambda c: (int(getattr(c, "block", 0) or 0), int(c.uid)))
+    return candidates[:n]
 
 
 def build_round_spec(

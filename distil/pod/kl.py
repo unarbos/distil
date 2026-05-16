@@ -8,6 +8,7 @@ RKL(student || teacher). Mean over positions; mean over prompts.
 from __future__ import annotations
 
 import math
+from typing import Iterator
 
 
 def _renorm(d: dict[int, float], support: set[int]) -> dict[int, float]:
@@ -45,12 +46,48 @@ def position_rkl(teacher: dict[int, float], student: dict[int, float]) -> float 
     return position_kl(student, teacher)
 
 
+def _iter_positions(
+    teacher_seq: list,
+    student_seq: list,
+) -> "Iterator[tuple[dict[int, float], dict[int, float]]]":
+    """Yield aligned ``(teacher_pos_dict, student_pos_dict)`` pairs.
+
+    Caller can pass either:
+      * flat shape ``list[dict[int, float]]`` (one prompt, per-position), or
+      * nested shape ``list[list[dict[int, float]]]`` (per-prompt then
+        per-position).
+
+    The pod's Phase 2 call site builds the nested shape (one teacher
+    trace per prompt, each with N positions), and the legacy validator
+    aggregated mean-over-positions *then* mean-over-prompts. We do
+    "flatten then mean" which yields the SAME value when all prompts
+    have equal position counts (true for our fixed max_new_tokens)
+    and is robust if a prompt got truncated. Without the shape sniff,
+    ``set(teacher)`` blew up on the nested shape with
+    ``TypeError: unhashable type: 'dict'`` and every student row
+    returned ``kl_global_avg=None`` (the 2026-05-15 round regression).
+    """
+    if not teacher_seq or not student_seq:
+        return
+    t0 = teacher_seq[0] if teacher_seq else None
+    s0 = student_seq[0] if student_seq else None
+    nested = isinstance(t0, list) and isinstance(s0, list)
+    if nested:
+        for t_prompt, s_prompt in zip(teacher_seq, student_seq, strict=False):
+            for t_pos, s_pos in zip(t_prompt or [], s_prompt or [], strict=False):
+                yield t_pos, s_pos
+    else:
+        for t_pos, s_pos in zip(teacher_seq, student_seq, strict=False):
+            yield t_pos, s_pos
+
+
 def average_kl(
-    teacher_per_pos: list[dict[int, float]],
-    student_per_pos: list[dict[int, float]],
+    teacher: list,
+    student: list,
 ) -> float | None:
+    """Mean of position-level KL(teacher || student) over the joint trace."""
     vals: list[float] = []
-    for t, s in zip(teacher_per_pos, student_per_pos, strict=False):
+    for t, s in _iter_positions(teacher, student):
         v = position_kl(t, s)
         if v is not None and v == v:
             vals.append(v)
@@ -58,11 +95,12 @@ def average_kl(
 
 
 def average_rkl(
-    teacher_per_pos: list[dict[int, float]],
-    student_per_pos: list[dict[int, float]],
+    teacher: list,
+    student: list,
 ) -> float | None:
+    """Mean of position-level KL(student || teacher) over the joint trace."""
     vals: list[float] = []
-    for t, s in zip(teacher_per_pos, student_per_pos, strict=False):
+    for t, s in _iter_positions(teacher, student):
         v = position_rkl(t, s)
         if v is not None and v == v:
             vals.append(v)
@@ -70,13 +108,14 @@ def average_rkl(
 
 
 def top_k_overlap(
-    teacher_per_pos: list[dict[int, float]],
-    student_per_pos: list[dict[int, float]],
+    teacher: list,
+    student: list,
     *,
     k: int = 20,
 ) -> float | None:
+    """Mean |top-K(teacher) ∩ top-K(student)| / K over the joint trace."""
     overlaps: list[float] = []
-    for t, s in zip(teacher_per_pos, student_per_pos, strict=False):
+    for t, s in _iter_positions(teacher, student):
         if not t or not s:
             continue
         t_top = {tid for tid, _ in sorted(t.items(), key=lambda kv: -kv[1])[:k]}

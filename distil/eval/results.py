@@ -375,7 +375,24 @@ def process_round(
         # ``state.composite_scores[uid_str] = record``). The in-memory
         # ``composites`` dict above stays model-name-keyed because the
         # h2h record + DQ logic below indexes by name.
-        state.composite_scores[str(uid) if uid is not None else name] = comp
+        #
+        # CRITICAL: only persist when ``worst`` is computable. The
+        # legacy merge_composite_scores (scripts.validator.single_eval)
+        # does ``if comp.get('worst') is None: continue`` — without
+        # the same guard a Phase-2 student crash (vLLM OOM, HF 401,
+        # KL shape mismatch, etc.) overwrites the king's PRIOR
+        # composite_scores row with all-null, and the next round's
+        # ``resolve_king`` then promotes whatever stale score is on
+        # disk. Lost an actual round + an on-chain set_weights to
+        # this on 2026-05-16 00:30 UTC, see the round_1778890262 post-
+        # mortem in the cutover notes.
+        if comp.get("worst") is None and not comp.get("disqualified"):
+            logger.warning(
+                f"uid={uid} ({name}): composite worst=None (eval failed); "
+                f"skipping composite_scores write to preserve prior record"
+            )
+        else:
+            state.composite_scores[str(uid) if uid is not None else name] = comp
 
         # Update the cross-round fingerprint store so future rounds see this uid.
         if isinstance(fp, dict) and fp.get("layer_fingerprints"):
@@ -408,30 +425,111 @@ def process_round(
         # the dashboard's "king_model" widget.
         king_model_resolved = king_name.split("@", 1)[0]
 
+    # Per-student result rows in the LEGACY ``results[]`` shape — what
+    # the dashboard + prod ``/api/h2h-history`` / ``/api/miner/{uid}``
+    # / ``/api/king-history`` already index by. Field names match
+    # ``scripts/validator/results.py`` so the cutover is byte-shape
+    # compatible.
+    results: list[dict[str, Any]] = []
+    n_prompts = 0
+    for name, row in students.items():
+        if row.get("is_teacher"):
+            continue
+        idx = uid_index.get(name) or {}
+        uid = idx.get("uid") if idx else row.get("uid")
+        hotkey = idx.get("hotkey") if idx else row.get("hotkey")
+        comp = composites.get(name)
+        is_king = (name == king_name)
+        is_ref = (name == reference_name)
+        # H2H KL = the global-avg KL on this round's prompts. Lower
+        # better. The dashboard's bout-card renders this as the
+        # "raw_kl" column in the per-round axis grid.
+        kl = row.get("kl_global_avg")
+        try:
+            kl_val = float(kl) if kl is not None else float("inf")
+        except (TypeError, ValueError):
+            kl_val = float("inf")
+        n_prompts = max(n_prompts, int(row.get("n_prompts") or 0))
+        prompts_scored = int(row.get("n_prompts") or 0)
+        result_row: dict[str, Any] = {
+            "uid": uid,
+            "model": (idx.get("model") if idx else None) or name.split("@", 1)[0],
+            "kl": kl_val if kl_val != float("inf") else None,
+            "is_king": is_king,
+            "is_reference": is_ref,
+            "prompts_scored": prompts_scored,
+            "prompts_total": prompts_scored,
+            "paired_prompts": prompts_scored,
+            "dethrone_eligible": (not is_king) and (comp or {}).get("disqualified") is not True,
+            "early_stopped": False,
+            "composite": comp,
+            "axes_summary": (comp or {}).get("axes"),
+            "hotkey": hotkey,
+            "name": name,
+        }
+        if (comp or {}).get("disqualified"):
+            result_row["disqualified"] = True
+            result_row["dq_reason"] = (comp or {}).get("dq_reason")
+        results.append(result_row)
+        # Legacy single-eval policy: mark this UID as having spent its
+        # one slot. ``state.evaluated_uids`` is a list-backed set on
+        # disk; the challenger picker (``distil.eval.round.select_
+        # challengers``) skips any UID present here, matching prod's
+        # ``scripts.validator.single_eval._evict_stale_evaluated_uids``.
+        if uid is not None and not is_ref:
+            uid_str = str(uid)
+            if uid_str not in state.evaluated_uids:
+                state.evaluated_uids.append(uid_str)
+            if hotkey and hotkey not in state.evaluated_hotkeys:
+                state.evaluated_hotkeys[hotkey] = {
+                    "uid": int(uid),
+                    "model": result_row["model"],
+                    "evaluated_at_ts": time.time(),
+                    "evaluated_at_block": block,
+                    "composite_final": (comp or {}).get("final"),
+                    "composite_worst": (comp or {}).get("worst"),
+                }
+
+    # King KL anchor — the "king_kl" / "king_h2h_kl" / "king_global_kl"
+    # the dashboard surfaces. Falls back to the resolved anchor when
+    # the seated king didn't report a row this round.
+    if king_name and isinstance(students.get(king_name), dict):
+        king_row = students[king_name]
+        try:
+            king_kl_val = float(king_row.get("kl_global_avg") or 0.0)
+            if king_kl_val <= 0:
+                king_kl_val = king_kl or 0.0
+        except (TypeError, ValueError):
+            king_kl_val = king_kl or 0.0
+    else:
+        king_kl_val = king_kl or 0.0
+
     record = {
         "block": block,
         "block_hash": block_hash,
+        # Two timestamp aliases for back-compat: ``ts`` was distil's
+        # original name, ``timestamp`` is the legacy h2h_history /
+        # /api/h2h-history field name the dashboard reads.
         "ts": time.time(),
+        "timestamp": time.time(),
+        "type": "single_eval",
         "king_uid": king_uid_resolved,
         "king_name": king_name,
         "king_model": king_model_resolved,
+        "king_kl": king_kl_val or None,
+        "king_h2h_kl": king_kl_val or None,
+        "king_global_kl": king_kl_val or None,
         "reference_name": reference_name,
         "teacher_name": teacher_name,
         "broken_axes": sorted(broken),
         "dq_events": dq_events,
-        "students": [
-            {
-                "name": name,
-                "uid": (uid_index.get(name) or {}).get("uid") or students[name].get("uid"),
-                "hotkey": (uid_index.get(name) or {}).get("hotkey") or students[name].get("hotkey"),
-                "is_king": (name == king_name),
-                "is_reference": (name == reference_name),
-                "composite": composites.get(name),
-                "axes_summary": composites.get(name, {}).get("axes"),
-            }
-            for name in students
-            if not students[name].get("is_teacher")
-        ],
+        "n_prompts": n_prompts,
+        "n_students": len(results),
+        # ``results`` is the legacy field name. ``students`` is kept as
+        # an alias so callers that already migrated to the new schema
+        # keep working through the dashboard cutover.
+        "results": results,
+        "students": results,
         "per_bench_timing": timings or [],
     }
     state.append_round(record)

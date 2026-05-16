@@ -259,6 +259,16 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     new_king, why = resolve_king(state.composite_scores, current_king_model=king_name)
     record["king_after"] = new_king
     record["king_reason"] = why
+
+    # Persist legacy dethrone-context fields back onto the round record
+    # AFTER resolve_king. The dashboard's RoundsPanel / king-history
+    # endpoint reads ``prev_king_uid`` + ``new_king_uid`` + ``king_changed``
+    # to render the "dethrone" annotation and the past-reigns chart;
+    # without these every round renders as a king-retain regardless of
+    # actual outcome. ``dethrone_method`` is the human label for WHY
+    # the gate flipped (e.g. ``no_king``, ``final_gain ...``, ``margin_not_met``).
+    prev_king_uid = king_uid  # the seat going INTO this round
+    new_king_uid: int | None = prev_king_uid
     if new_king and new_king != king_name:
         # ``new_king`` is a UID-string out of resolve_king (composite_scores
         # is UID-keyed); convert to an int and look up the commitment.
@@ -273,6 +283,22 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
             state.push_king(new_king_uid)
             king_uid = new_king_uid
             king_name = str(new_king_uid)
+    record["prev_king_uid"] = prev_king_uid
+    record["new_king_uid"] = new_king_uid
+    record["king_changed"] = (
+        new_king_uid is not None
+        and prev_king_uid is not None
+        and int(new_king_uid) != int(prev_king_uid)
+    )
+    record["dethrone_method"] = why
+    # The record was already appended by process_round; rewrite the
+    # last h2h_history row + h2h_latest with the dethrone-context
+    # fields so the dashboard reads the same payload the validator
+    # used to set weights.
+    if state.h2h_history:
+        state.h2h_history[-1] = record
+    state.h2h_latest = record
+    state.save()
 
     weights = build_emission_weights(
         n_uids=len(mg.hotkeys),
