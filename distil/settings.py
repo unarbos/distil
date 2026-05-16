@@ -135,6 +135,17 @@ class Settings(BaseSettings):
     long_form_derail_dq_threshold: float = 0.30  # coherence below = derailed
     long_form_derail_dq_ratio: float = 0.50  # fraction derailed → DQ
     composite_dethrone_floor: float = 0.20  # worst-axis floor; below = no dethrone
+    # Consecutive Phase-2 load failures (HF 404, vLLM init crash,
+    # OSError "not a valid model identifier", etc.) tolerated before
+    # the UID's single-eval slot is consumed for the current
+    # commitment. Without a cap, ghost models like ``slowsnake/kimi-43043``
+    # (deleted from HF) crowd out every fresh challenger because
+    # ``select_challengers`` is FIFO by commit_block and these UIDs
+    # always retry first. 3 strikes ≈ 30 min of teacher tokens before
+    # we accept the model is gone, which matches the legacy
+    # single_eval failure-counter behaviour ported from prod
+    # ``scripts/validator/single_eval.record_failure``.
+    max_load_failures: int = 3
 
     # ── HF / dataset ────────────────────────────────────────────────
     eval_dataset: str = "karpathy/climbmix-400b-shuffle"

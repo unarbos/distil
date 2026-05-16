@@ -17,6 +17,15 @@ interface H2hResult {
   is_king?: boolean;
   vs_king?: string;
   disqualified?: boolean;
+  // Phase-2 load failure surface: when the pod-side ``_phase_student``
+  // catches an HF 404 / vLLM init crash / OSError, the validator
+  // attaches the truncated error message + a "load_failed (N/M):
+  // ..." status_detail string so the bout-card can render the real
+  // reason instead of a blank "— no score" row. Both are nullable
+  // (only set when the row had no axes to score against).
+  status?: string;
+  status_detail?: string;
+  error?: string;
   composite?: {
     worst?: number | null;
     weighted?: number | null;
@@ -559,8 +568,20 @@ function Side({ side, loser, result, showAnnotation, annotation, margin }: SideP
           ? `worst ${worst.toFixed(3)}`
           : typeof result.kl === "number" && Number.isFinite(result.kl)
             ? `KL ${result.kl.toFixed(4)}`
-            : "— no score"}
+            : result.status === "load_failed"
+              ? "model failed to load"
+              : "— no score"}
       </div>
+      {result.status_detail && worst == null && (
+        <div
+          className="text-[9px] text-warning tracking-[0.05em] truncate max-w-full"
+          title={result.error ?? result.status_detail}
+        >
+          {result.status_detail.length > 60
+            ? result.status_detail.slice(0, 57) + "…"
+            : result.status_detail}
+        </div>
+      )}
       {limiting && worst != null && (
         <div
           className="text-[9px] text-meta tracking-[0.05em] truncate max-w-full"

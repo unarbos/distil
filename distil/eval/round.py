@@ -147,6 +147,13 @@ def evict_stale_evaluated_uids(
         except ValueError:
             pass
         state.composite_scores.pop(uid_str, None)
+        # Also reset the load-failure counter: when the miner pushes a
+        # fresh commitment they get a clean 3-strikes budget against
+        # the new repo. Without this reset a UID that hit 3 strikes on
+        # a typo'd repo (e.g. ``slowsnake/kimi-43043`` deleted from HF)
+        # would inherit the 3-strike state to their corrected repo and
+        # burn their slot on the very first transient HF blip.
+        state.reset_failures(int(uid))
         evicted.append(uid_str)
     if evicted:
         logger.info(

@@ -494,6 +494,44 @@ def process_round(
             "hotkey": hotkey,
             "name": name,
         }
+        # Phase-2 load failure tracking. The pod-side ``_phase_student``
+        # catches HF 404 / vLLM init crash / OSError and writes
+        # ``{"name", "uid", "hotkey", "error": "..."}`` to its shard
+        # output (no axis payloads). Pre-fix these rows fed
+        # ``compute_composite`` which returned ``worst=None`` for every
+        # axis — the row was then NOT marked disqualified, NOT added to
+        # ``evaluated_uids`` (audit fix preserves the slot for transient
+        # blips), and NOT counted as a failure. The same UIDs kept
+        # being re-selected by ``select_challengers`` every round,
+        # burning ~25 min of teacher API budget + 8×B200 GPU time per
+        # round (10 ghost UIDs in 2026-05-16 round 1778935073). We
+        # now record a failure counter per UID; after
+        # ``settings.max_load_failures`` consecutive strikes we mark
+        # the slot consumed so the UID stops crowding out fresh
+        # commits. ``evict_stale_evaluated_uids`` resets the counter
+        # on honest re-commitment (different model / revision / block).
+        load_failed = bool(row.get("error")) and not (comp or {}).get("worst")
+        load_succeeded = (comp or {}).get("worst") is not None
+        load_failures_after = None
+        if uid is not None and not is_ref and not is_king:
+            if load_succeeded:
+                state.reset_failures(int(uid))
+            elif load_failed:
+                load_failures_after = state.record_failure(int(uid), name)
+                err_short = str(row.get("error") or "")[:200]
+                result_row["error"] = err_short
+                result_row["status"] = "load_failed"
+                result_row["status_detail"] = (
+                    f"load_failed ({load_failures_after}/"
+                    f"{settings.max_load_failures}): {err_short}"
+                )
+                dq_events.append({
+                    "uid": uid,
+                    "name": name,
+                    "kind": "load_failed",
+                    "strike": load_failures_after,
+                    "error": err_short,
+                })
         if (comp or {}).get("disqualified"):
             result_row["disqualified"] = True
             result_row["dq_reason"] = (comp or {}).get("dq_reason")
@@ -514,8 +552,20 @@ def process_round(
         # used by ``process_round`` to decide whether to persist the
         # composite row), so transient infra failures retry on the
         # next round and the slot is only consumed on a real score.
+        # Three-strikes load-failure consumption (see failure-tracking
+        # block above): after ``max_load_failures`` consecutive Phase-2
+        # crashes on the same commitment we burn the slot to stop the
+        # UID from monopolising challenger picks forever.
         composite_landed = (comp or {}).get("worst") is not None
-        slot_consumed = composite_landed or (comp or {}).get("disqualified")
+        load_exhausted = (
+            load_failures_after is not None
+            and load_failures_after >= settings.max_load_failures
+        )
+        slot_consumed = (
+            composite_landed
+            or (comp or {}).get("disqualified")
+            or load_exhausted
+        )
         if uid is not None and not is_ref and slot_consumed:
             uid_str = str(uid)
             if uid_str not in state.evaluated_uids:
@@ -528,6 +578,7 @@ def process_round(
                     "evaluated_at_block": block,
                     "composite_final": (comp or {}).get("final"),
                     "composite_worst": (comp or {}).get("worst"),
+                    "load_failures": load_failures_after,
                 }
 
     # King KL anchor — the "king_kl" / "king_h2h_kl" / "king_global_kl"

@@ -24,13 +24,22 @@ from distil.eval.round import (
 class _FakeState:
     """Minimal duck-typed ValidatorState for round.py tests."""
 
-    def __init__(self, *, evaluated_uids=None, composite_scores=None):
+    def __init__(self, *, evaluated_uids=None, composite_scores=None, failures=None):
         self.evaluated_uids = list(evaluated_uids or [])
         self.composite_scores = dict(composite_scores or {})
+        self.failures = dict(failures or {})
         self.scores = {}
 
     def is_disqualified(self, *_a, **_k):
         return False
+
+    def reset_failures(self, uid: int) -> None:
+        """Mirror ``ValidatorState.reset_failures``. Required since
+        ``evict_stale_evaluated_uids`` now resets the load-failure
+        counter so a re-commitment to a corrected repo gets a clean
+        3-strikes budget (see test_distil_load_failure_tracking).
+        """
+        self.failures.pop(str(uid), None)
 
 
 def _commit(uid: int, model: str, revision: str = "main", block: int = 100) -> Commitment:
