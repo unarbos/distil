@@ -648,24 +648,90 @@ def _refresh_top4(state: ValidatorState, composites: dict[str, dict]) -> None:
             return False
         return True
 
+    # Pull the canonical king from ``h2h_latest`` rather than guessing
+    # from ``composites`` ordering — the reigning king might be missing
+    # from the current round's composites (sparse-axes round, eviction,
+    # etc.) and the dashboard would mislabel rank 1 as the king.
+    h2h_latest = getattr(state, "h2h_latest", None) or {}
+    king_uid_canonical = h2h_latest.get("king_uid")
+
+    # Best-effort UID lookup: ``composites`` is name-keyed
+    # (model@revision) but the legacy dashboard wants ``{uid, model}``
+    # per row. ``state.composite_scores`` is UID-keyed and stores the
+    # ``model`` field on each row, so build a reverse map.
+    cs = getattr(state, "composite_scores", None) or {}
+    name_to_uid: dict[str, int] = {}
+    for uid_str, comp in (cs.items() if isinstance(cs, dict) else []):
+        m = (comp or {}).get("model")
+        rev = (comp or {}).get("revision")
+        if m and rev:
+            name_to_uid[f"{m}@{rev}"] = int(uid_str)
+        elif m:
+            name_to_uid[m] = int(uid_str)
+
     ranked = sorted(
         ((name, c) for name, c in composites.items() if _keep(c)),
         key=lambda kv: kv[1]["final"],
         reverse=True,
     )[:4]
+
+    def _row(rank: int, name: str, c: dict) -> dict:
+        uid = name_to_uid.get(name)
+        if uid is None:
+            base_name = name.split("@", 1)[0] if "@" in name else name
+            uid = name_to_uid.get(base_name)
+        return {
+            "rank": rank,
+            "uid": uid,
+            "name": name,
+            "model": name.split("@", 1)[0] if "@" in name else name,
+            "final": c.get("final"),
+            "worst_3_mean": c.get("worst_3_mean"),
+            "weighted": c.get("weighted"),
+            "present_count": c.get("present_count"),
+        }
+
+    rows = [_row(i + 1, n, c) for i, (n, c) in enumerate(ranked)]
+
+    # Legacy schema bridge: the dashboard's ``/api/leaderboard`` and
+    # ``/api/miner/{uid}`` endpoints destructure ``top4.king`` and
+    # ``top4.contenders`` (UID-bearing dicts) to populate ``is_king``
+    # / ``in_top5``. Without these fields ``is_king`` was ``False`` for
+    # the actual king and ``in_top5`` was ``False`` for every top-4
+    # contender — confirmed in #distil 2026-05-16 ("UID 47 shows
+    # is_king:false on the API"). We pick ``king`` from ``h2h_latest``
+    # (the canonical seat-of-the-throne record) and ``contenders``
+    # from the ranked composites minus the king.
+    king_row: dict | None = None
+    if king_uid_canonical is not None:
+        for r in rows:
+            if r.get("uid") == king_uid_canonical:
+                king_row = r
+                break
+        if king_row is None and isinstance(cs, dict):
+            kc = cs.get(str(king_uid_canonical)) or {}
+            if kc:
+                king_row = {
+                    "rank": None,
+                    "uid": int(king_uid_canonical),
+                    "name": (
+                        f"{kc.get('model')}@{kc.get('revision')}"
+                        if kc.get("model") and kc.get("revision")
+                        else kc.get("model")
+                    ),
+                    "model": kc.get("model"),
+                    "final": kc.get("final"),
+                    "worst_3_mean": kc.get("worst_3_mean"),
+                    "weighted": kc.get("weighted"),
+                    "present_count": kc.get("present_count"),
+                }
+    contenders = [r for r in rows if r is not king_row]
+
     state.top4_leaderboard = {
         "updated_at": time.time(),
-        "rows": [
-            {
-                "rank": i + 1,
-                "name": name,
-                "final": c.get("final"),
-                "worst_3_mean": c.get("worst_3_mean"),
-                "weighted": c.get("weighted"),
-                "present_count": c.get("present_count"),
-            }
-            for i, (name, c) in enumerate(ranked)
-        ],
+        "rows": rows,
+        "king": king_row or {},
+        "contenders": contenders,
     }
 
 

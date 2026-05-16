@@ -29,6 +29,7 @@ from distil.eval.pod import (
     run_eval_on_pod,
     upload_runtime,
 )
+from distil.eval.composite_backfill import backfill_missing_composites
 from distil.eval.dq_recovery import sweep_integrity_dq_recoveries
 from distil.eval.results import process_round
 from distil.eval.round import (
@@ -114,6 +115,25 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
                 f"dq_recovery: cleared {entry['hotkey'][:20]}... "
                 f"({entry['model']!r}) — HF restored"
             )
+
+    # Backfill any ``evaluated_uids`` entry missing a composite by
+    # walking ``h2h_history`` newest-first. The cutover from prod's
+    # ``scripts/validator`` rebuilt ``composite_scores.json`` from
+    # scratch but preserved ``evaluated_uids.json`` — left ~120 UIDs
+    # flagged "evaluated" with no composite, surfacing as
+    # ``eval_status: evaluated_no_composite`` + zero emission. The
+    # legacy h2h composite is enough for emission-share purposes and
+    # heals the mismatch within one round of redeploy.
+    try:
+        backfilled = backfill_missing_composites(state)
+    except Exception as exc:  # pragma: no cover — fail open
+        logger.warning(f"composite_backfill raised: {type(exc).__name__}: {exc}")
+        backfilled = []
+    if backfilled:
+        logger.info(
+            f"composite_backfill: restored {len(backfilled)} composite_scores "
+            f"entries from h2h_history"
+        )
 
     # Resolve seated king. Mirrors the legacy
     # ``scripts/validator/service._resolve_king`` precedence rules so

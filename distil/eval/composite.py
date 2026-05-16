@@ -165,7 +165,20 @@ def _axis_length(student: dict) -> float | None:
 
 
 def _axis_degeneracy(student: dict) -> float | None:
-    """think_probe terminate + non-degenerate + self-bleu margin → [0, 1]."""
+    """think_probe terminate + non-degenerate + self-bleu margin → [0, 1].
+
+    Retired 2026-04-19: the underlying ``think_probe`` was disabled in
+    reports/2026-04-19-think-probe-disabled.md after a calibration
+    failure DQ'd every miner including the reference Qwen baseline for
+    3 consecutive rounds. The new ``distil/pod`` pipeline does not
+    produce ``think_probe`` rows at all, so the data path here is dead
+    in steady state. We keep the extractor for parity-test runs that
+    might be fed legacy prod rows containing a ``think_probe`` payload
+    — those flow through unchanged. When no data is present we return
+    ``None`` and ``_compute_axes_dict`` SKIPS the axis entirely (rather
+    than emitting a perpetually-``null`` field that confuses miners
+    reading the dashboard).
+    """
     tp = student.get("think_probe") or {}
     if not tp:
         return None
@@ -300,7 +313,6 @@ def compute_axes(
         "top_k_overlap": _axis_top_k_overlap(student),
         "capability": _axis_capability(student),
         "length": _axis_length(student),
-        "degeneracy": _axis_degeneracy(student),
         "judge_probe": _axis_judge_probe(student),
         "long_form_judge": _axis_long_form_judge(student),
         "long_gen_coherence": _axis_long_gen_coherence(student),
@@ -308,6 +320,15 @@ def compute_axes(
         "reasoning_density": _axis_reasoning_density(student),
         "calibration_bench": _axis_bench_pass_frac(student, "calibration_bench"),
     }
+    # ``degeneracy`` is included ONLY when the student carries an actual
+    # ``think_probe`` payload (parity-test runs over legacy prod rows).
+    # The distil pipeline doesn't produce ``think_probe`` since the probe
+    # was retired 2026-04-19, so we drop the field from steady-state
+    # composites entirely rather than emitting a perpetually-null axis
+    # that confuses miners on the dashboard.
+    degeneracy = _axis_degeneracy(student)
+    if degeneracy is not None:
+        out["degeneracy"] = degeneracy
     for axis in V31_AXIS_NAMES:
         out[axis] = _axis_bench_pass_frac(student, axis)
     return out

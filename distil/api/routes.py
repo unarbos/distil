@@ -7,6 +7,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 
 from distil.api.external import hf_model_info, tao_price
+from distil.eval.composite import BENCH_MIN_VALID, V31_AXIS_NAMES
+from distil.eval.round import MAX_CHALLENGERS_PER_ROUND
+from distil.settings import settings
 from distil.state.store import store
 
 router = APIRouter(prefix="/api")
@@ -146,4 +149,64 @@ def telemetry_overview() -> dict[str, Any]:
         "phase_timings": (progress.get("phase_timings") or [])[-20:],
         "updated_at": progress.get("updated_at"),
         "last_eval": last_eval,
+    }
+
+
+@router.get("/composite-config")
+def composite_config() -> dict[str, Any]:
+    """Composite-score weights and dethrone thresholds (read-only).
+
+    Surfaces the canonical axis schema, per-axis minimum sample floors,
+    final-score blend coefficient, and dethrone gate parameters so
+    miners can reproduce ``state.composite_scores`` locally without
+    digging through ``distil/eval/composite.py`` source.
+
+    Miners flagged in #distil 2026-05-16 that the dashboard had no
+    machine-readable spec for the v32 schema, leading to confusion
+    about which axes were weighted vs telemetry, which floors apply,
+    and how the worst-3 mean interacts with the weighted mean to
+    produce ``final``. Adding this avoids guesswork and lets
+    third-party tooling pin against the same definitions the validator
+    uses.
+    """
+    return {
+        "schema_version": 32,
+        "axes": {
+            "core": [
+                "on_policy_rkl",
+                "kl",
+                "top_k_overlap",
+                "capability",
+                "length",
+            ],
+            "judge": [
+                "judge_probe",
+                "long_form_judge",
+                "long_gen_coherence",
+                "chat_turns_probe",
+            ],
+            "discipline": [
+                "reasoning_density",
+                "calibration_bench",
+            ],
+            "v31_procedural": list(V31_AXIS_NAMES),
+        },
+        "bench_min_valid": dict(BENCH_MIN_VALID),
+        "final_blend": {
+            "alpha_bottom": settings.composite_final_bottom_weight,
+            "worst_k": settings.worst_3_mean_k,
+            "formula": (
+                "final = alpha_bottom * worst_K_mean + "
+                "(1 - alpha_bottom) * weighted_mean"
+            ),
+        },
+        "dethrone": {
+            "margin": settings.composite_dethrone_margin,
+            "min_axes": settings.composite_dethrone_min_axes,
+            "floor": settings.composite_dethrone_floor,
+        },
+        "single_eval": {
+            "max_per_round": MAX_CHALLENGERS_PER_ROUND,
+            "max_load_failures": settings.max_load_failures,
+        },
     }

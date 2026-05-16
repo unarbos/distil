@@ -85,6 +85,13 @@ def build_queue_slots(progress: dict, round_state: dict, backlog: dict) -> list[
             "uid": uid,
             "model": model,
             "role": role,
+            # External API consumers (and the Discord audit bot reading
+            # raw ``/api/queue.slots[*].is_king``) expected a boolean
+            # field — without it ``is_king: undefined`` rendered as
+            # ``false`` for the actual king. Surfacing it explicitly
+            # matches both ``role`` (legacy frontend) and ``is_king``
+            # (legacy bots) without changing the wire shape otherwise.
+            "is_king": role == "king",
             "status": slot_status(
                 uid,
                 model,
@@ -106,6 +113,7 @@ def build_queue_slots(progress: dict, round_state: dict, backlog: dict) -> list[
             "uid": uid,
             "model": row.get("model"),
             "role": "challenger",
+            "is_king": False,
             "status": "deferred",
             "reason": "Deferred by SINGLE_EVAL_MAX_PER_ROUND FIFO cap; will be retried next round.",
             "commit_block": row.get("commit_block"),
