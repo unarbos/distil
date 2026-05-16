@@ -209,6 +209,76 @@ def test_recommit_evicts_failure_counter():
     )
 
 
+def test_select_challengers_skips_hf_404_candidates(monkeypatch):
+    """``select_challengers`` MUST HEAD-check each candidate's HF repo
+    and short-circuit any that 404. Without this preflight the round
+    burns ~25 min of teacher-API tokens (Phase 1) discovering the
+    same fact the HEAD check returns in 50 ms.
+    """
+    from distil.chain.commitments import Commitment
+    from distil.eval.round import select_challengers
+    import distil.eval.round as round_mod
+
+    state = _state()
+    commitments: dict[int, Commitment] = {
+        99: Commitment(
+            uid=99, hotkey="hk99", model="real/model-ok", revision="main", block=100, coldkey="ck99"
+        ),
+        157: Commitment(
+            uid=157, hotkey="hk157", model="ghost/deleted-repo", revision="main",
+            block=101, coldkey="ck157",
+        ),
+        96: Commitment(
+            uid=96, hotkey="hk96", model="other/works", revision="main", block=102, coldkey="ck96"
+        ),
+    }
+    reachable_calls: list[tuple[str, str]] = []
+
+    def fake_reach(repo: str, rev: str | None) -> tuple[bool, str]:
+        reachable_calls.append((repo, rev or "main"))
+        if "ghost" in repo:
+            return False, "hf_404"
+        return True, "ok"
+
+    monkeypatch.setattr(round_mod, "_hf_repo_reachable", fake_reach)
+
+    picked = select_challengers(commitments, state, king_uid=None, n=5)
+    uids = [c.uid for c in picked]
+    assert 157 not in uids, (
+        f"HF-404 ghost candidate MUST be filtered out; got picked={uids}"
+    )
+    assert {99, 96} <= set(uids), f"valid candidates must survive; got {uids}"
+    assert state.failures.get("157", 0) >= 1, (
+        f"HF-404 candidate must accumulate a strike so the dashboard / "
+        f"audit can see why it was skipped; got failures={state.failures}"
+    )
+
+
+def test_select_challengers_skip_hf_check_escape_hatch():
+    """The ``skip_hf_check`` escape hatch MUST bypass the preflight so
+    offline unit suites don't hit the network. This is also the path
+    legacy/unit tests rely on; if it's accidentally inverted every
+    test that calls ``select_challengers`` without monkeypatching
+    will start timing out on HF HEAD requests.
+    """
+    from distil.chain.commitments import Commitment
+    from distil.eval.round import select_challengers
+
+    state = _state()
+    commitments = {
+        7: Commitment(
+            uid=7, hotkey="hk7", model="any/repo-name", revision="main", block=100, coldkey="ck7"
+        ),
+    }
+    picked = select_challengers(commitments, state, king_uid=None, n=5, skip_hf_check=True)
+    assert [c.uid for c in picked] == [7], (
+        f"skip_hf_check=True must return candidates verbatim; got {picked}"
+    )
+    assert state.failures.get("7", 0) == 0, (
+        "skip_hf_check path must NOT touch the failures counter"
+    )
+
+
 def test_status_detail_is_surfaced_on_load_failure():
     """The result row must carry a ``status_detail`` string describing
     the load failure so the dashboard can render
