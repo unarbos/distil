@@ -19,6 +19,7 @@ from collections import Counter
 from typing import Any
 
 from distil.pod.axes._base import generate_greedy
+from distil.pod.grader import Grader, VLLMGrader
 
 # Mix of medium (300-500 w) and long (600-1000 w) coherence-stress prompts.
 _TEMPLATES: tuple[str, ...] = (
@@ -140,19 +141,30 @@ def collect_responses(
     ]
 
 
-def grade_responses(teacher_engine, collected: list[dict[str, Any]]) -> dict[str, Any]:
+def grade_responses(teacher_or_grader, collected: list[dict[str, Any]]) -> dict[str, Any]:
+    """Phase 3 long-form rubric grading.
+
+    Accepts either a :class:`Grader` (preferred — works with both local
+    vLLM and the cloud API) or a raw vLLM engine (back-compat for
+    in-process tests). See :mod:`distil.pod.grader` for context.
+    """
     if not collected:
         return {"n": 0, "n_valid": 0, "normalized": None, "coherence_factor": None}
+    grader: Grader = (
+        teacher_or_grader
+        if hasattr(teacher_or_grader, "greedy")
+        else VLLMGrader(teacher_or_grader)
+    )
     judge_prompts = [
         RUBRIC.format(prompt=c["prompt"], response=c["response"]) for c in collected
     ]
     try:
-        judges = generate_greedy(teacher_engine, judge_prompts, max_tokens=8)
+        texts = grader.greedy(judge_prompts, max_tokens=8)
     except Exception:
         return {"n": len(collected), "n_valid": 0, "normalized": None, "coherence_factor": None}
     scores = [
         (int(m.group(1)) if (m := _INTEGER_RE.search(t or "")) else None)
-        for t, _ in judges
+        for t in texts
     ]
     coherences = [coherence_factor(c["response"]) for c in collected]
     valid = [(s, c) for s, c in zip(scores, coherences, strict=False) if s is not None]
@@ -168,6 +180,6 @@ def grade_responses(teacher_engine, collected: list[dict[str, Any]]) -> dict[str
     }
 
 
-def run(student_engine, teacher_engine, *, block_seed: int, n_items: int) -> dict[str, Any]:
+def run(student_engine, teacher_or_grader, *, block_seed: int, n_items: int) -> dict[str, Any]:
     collected = collect_responses(student_engine, n_items=n_items, block_seed=block_seed)
-    return grade_responses(teacher_engine, collected)
+    return grade_responses(teacher_or_grader, collected)

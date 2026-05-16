@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from distil.pod.axes._base import generate_greedy
+from distil.pod.grader import Grader, VLLMGrader
 
 OPENERS: tuple[str, ...] = (
     "Hi! I'm trying to learn how Docker volumes work. Can you start with the basics?",
@@ -73,17 +74,27 @@ def collect_dialogues(
     return dialogues
 
 
-def grade_dialogues(teacher_engine, collected: list[dict[str, Any]]) -> dict[str, Any]:
+def grade_dialogues(teacher_or_grader, collected: list[dict[str, Any]]) -> dict[str, Any]:
+    """Phase 3 chat-turns rubric grading.
+
+    Accepts a :class:`Grader` (preferred) or a raw vLLM engine for
+    back-compat. See :mod:`distil.pod.grader` for rationale.
+    """
     if not collected:
         return {"n": 0, "n_valid": 0, "normalized": None}
+    grader: Grader = (
+        teacher_or_grader
+        if hasattr(teacher_or_grader, "greedy")
+        else VLLMGrader(teacher_or_grader)
+    )
     judge_prompts = [RUBRIC.format(dialogue=c["dialogue"] or "(empty)") for c in collected]
     try:
-        judges = generate_greedy(teacher_engine, judge_prompts, max_tokens=8)
+        texts = grader.greedy(judge_prompts, max_tokens=8)
     except Exception:
         return {"n": len(collected), "n_valid": 0, "normalized": None}
     scores = [
         (int(m.group(1)) if (m := _INTEGER_RE.search(t or "")) else None)
-        for t, _ in judges
+        for t in texts
     ]
     valid = [s for s in scores if s is not None]
     if not valid:
@@ -97,6 +108,6 @@ def grade_dialogues(teacher_engine, collected: list[dict[str, Any]]) -> dict[str
     }
 
 
-def run(student_engine, teacher_engine, *, block_seed: int, n_items: int) -> dict[str, Any]:
+def run(student_engine, teacher_or_grader, *, block_seed: int, n_items: int) -> dict[str, Any]:
     collected = collect_dialogues(student_engine, n_items=n_items, block_seed=block_seed)
-    return grade_dialogues(teacher_engine, collected)
+    return grade_dialogues(teacher_or_grader, collected)

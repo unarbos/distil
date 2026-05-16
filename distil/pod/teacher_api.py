@@ -346,4 +346,170 @@ def generate_continuations_api(
     return out
 
 
-__all__ = ["generate_continuations_api"]
+# ── greedy text-only API grading (Phase 3 judge path) ─────────────────
+
+
+def _greedy_text_once(prompt: str, max_new_tokens: int, cfg: dict) -> str:
+    """One chat-completions call returning text only.
+
+    Used by Phase 3 (judge) rubric grading where we only need a single
+    digit / short response from the teacher — no logprobs, no
+    tokenization alignment. This mirrors
+    ``scripts.api_teacher._greedy_text_one`` from the legacy stack.
+    """
+    body = {
+        "model": cfg["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.0,
+    }
+    if cfg["providers"]:
+        body["provider"] = {"only": list(cfg["providers"])}
+    if "openrouter" in cfg["base_url"]:
+        body["reasoning"] = {"enabled": False}
+
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+    if "openrouter" in cfg["base_url"]:
+        headers["HTTP-Referer"] = _env(
+            "DISTIL_OPENROUTER_REFERER", "https://chat.arbos.life"
+        )
+        headers["X-Title"] = _env(
+            "DISTIL_OPENROUTER_TITLE", "Bittensor SN97 distil validator"
+        )
+
+    r = requests.post(
+        f"{cfg['base_url']}/v1/chat/completions",
+        json=body,
+        headers=headers,
+        timeout=cfg["timeout_s"],
+    )
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data and not data.get("choices"):
+        raise RuntimeError(f"API error: {data['error']}")
+    choice = data["choices"][0]
+    msg = choice.get("message") or {}
+    return msg.get("content") or ""
+
+
+def _greedy_text_with_retry(
+    prompt: str,
+    max_new_tokens: int,
+    cfg: dict,
+    max_attempts: int = 6,
+) -> str:
+    """Same exp-backoff retry envelope as :func:`_call_with_retry`."""
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return _greedy_text_once(prompt, max_new_tokens, cfg)
+        except requests.HTTPError as exc:
+            last_exc = exc
+            sc = getattr(exc.response, "status_code", None)
+            transient = sc == 429 or (sc is not None and 500 <= sc < 600)
+            if not transient or attempt >= max_attempts - 1:
+                if attempt < max_attempts - 1:
+                    time.sleep(min(2**attempt, 30))
+                    continue
+                raise
+            retry_after = None
+            try:
+                ra_hdr = exc.response.headers.get("Retry-After")
+                if ra_hdr:
+                    retry_after = float(ra_hdr)
+            except Exception:
+                retry_after = None
+            wait = max(min(retry_after or (2**attempt), 30), 1)
+            logger.warning(
+                f"api judge HTTP {sc} (attempt {attempt + 1}/{max_attempts}); "
+                f"retrying in {wait:.1f}s"
+            )
+            time.sleep(wait)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                wait = min(2**attempt, 30)
+                logger.warning(
+                    f"api judge attempt {attempt + 1}/{max_attempts} failed: "
+                    f"{type(exc).__name__}: {exc} — retrying in {wait}s"
+                )
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"api judge exhausted retries: {last_exc}") from last_exc
+
+
+def greedy_batch_api(
+    prompts: list[str],
+    *,
+    max_new_tokens: int = 8,
+    concurrency: int | None = None,
+) -> list[str]:
+    """Greedy text-only batch generation via the OpenAI-compatible API.
+
+    Phase 3 judge / long-form / chat-turns rubric grading routes through
+    this when ``DISTIL_TEACHER_MODE=api`` because Kimi-K2.6 cannot fit
+    on the 8xB200 pod. The rubrics return a single digit (1-5) or a
+    short verdict, so we cap ``max_new_tokens`` at 8 by default and fan
+    out with ``min(concurrency, len(prompts))`` workers.
+
+    Concurrency defaults to ``DISTIL_TEACHER_API_JUDGE_CONCURRENCY``
+    (env), falling back to ``max(1, teacher_concurrency // 2)`` so that
+    the burst stays under the Inceptron rate-limit bucket — matching
+    the legacy 2026-05-04 fix that solved the same 429-storm issue
+    when probe batches followed Phase 1 sustained traffic. Failed
+    prompts return ``""`` (the probe's ``_extract_score`` then returns
+    ``None`` and the prompt drops out of the mean) rather than poisoning
+    the whole round — judge axes are advisory, not gating.
+    """
+    cfg = _config()
+    n = len(prompts)
+    if n == 0:
+        return []
+    if concurrency is None:
+        env_c = _env("DISTIL_TEACHER_API_JUDGE_CONCURRENCY")
+        if env_c:
+            try:
+                concurrency = int(env_c)
+            except ValueError:
+                concurrency = None
+        if concurrency is None:
+            concurrency = max(1, cfg["concurrency"] // 2)
+    concurrency = max(1, min(int(concurrency), n))
+
+    logger.info(
+        f"api judge model={cfg['model']!r} prompts={n} concurrency={concurrency}"
+    )
+    out: list[str] = [""] * n
+    if concurrency == 1:
+        for i, p in enumerate(prompts):
+            try:
+                out[i] = _greedy_text_with_retry(p, max_new_tokens, cfg)
+            except Exception as exc:
+                logger.warning(f"api judge prompt {i} failed: {exc}")
+                out[i] = ""
+        return out
+
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {
+            ex.submit(_greedy_text_with_retry, p, max_new_tokens, cfg): i
+            for i, p in enumerate(prompts)
+        }
+        completed = 0
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                out[i] = fut.result()
+            except Exception as exc:
+                logger.warning(f"api judge prompt {i} failed: {exc}")
+                out[i] = ""
+            completed += 1
+            if completed % 8 == 0 or completed == n:
+                logger.info(f"api judge progress {completed}/{n}")
+    return out
+
+
+__all__ = ["generate_continuations_api", "greedy_batch_api"]

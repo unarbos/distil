@@ -223,29 +223,62 @@ def _phase_judge(
     raw_by_student: dict[str, dict],
     progress_path: Path,
 ) -> dict[str, dict[str, Any]]:
-    """Re-load the teacher and grade collected responses for every student."""
+    """Grade collected responses for every student.
+
+    Two routes, picked by ``DISTIL_TEACHER_MODE``:
+
+    * ``api`` (production) — uses :class:`distil.pod.grader.APIGrader`
+      to send rubric prompts to OpenRouter/Inceptron. Never loads the
+      1T-param Kimi-K2.6 teacher onto the pod (it doesn't fit on
+      8xB200). This mirrors the legacy ``judge_teacher_score_api``
+      path in ``scripts/pod_eval_vllm.py`` (added 2026-05-03 for the
+      exact same reason).
+    * ``vllm`` — re-loads the teacher locally via vLLM and grades on
+      GPU 0. Only viable for teachers that fit in pod VRAM.
+
+    Pre-fix this function unconditionally called ``start_teacher`` and
+    crashed every Phase 3 in API mode with ``RuntimeError: Engine core
+    initialization failed`` — judge / long-form / chat-turns axes came
+    back ``None`` for every student, which sank the king's worst-3
+    composite and triggered a bogus dethrone on round 1778895344
+    (see 2026-05-16 post-mortem in the cutover notes).
+    """
     if not raw_by_student:
         return {}
-    write_progress(progress_path, phase="judge_loading")
-    teacher = start_teacher(spec["teacher_repo"], spec.get("vllm") or {})
+
+    from distil.pod.grader import APIGrader, Grader, VLLMGrader
+
+    teacher_mode = os.environ.get("DISTIL_TEACHER_MODE", "vllm").lower().strip()
+    grader: Grader
+    teacher = None
+    if teacher_mode == "api":
+        write_progress(progress_path, phase="judge_api")
+        logger.info("phase 3: routing rubric grading through OpenAI-compatible API")
+        grader = APIGrader()
+    else:
+        write_progress(progress_path, phase="judge_loading")
+        teacher = start_teacher(spec["teacher_repo"], spec.get("vllm") or {})
+        grader = VLLMGrader(teacher)
+
     out: dict[str, dict[str, Any]] = {}
     try:
         for name, raw in raw_by_student.items():
             write_progress(progress_path, phase="judge_grading", student=name)
             out[name] = {
                 "judge_probe": judge_probe.grade_responses(
-                    teacher, raw["judge_responses"]
+                    grader, raw["judge_responses"]
                 ),
                 "long_form_judge_probe": long_form_judge.grade_responses(
-                    teacher, raw["long_form_responses"]
+                    grader, raw["long_form_responses"]
                 ),
                 "chat_turns_probe": chat_turns_probe.grade_dialogues(
-                    teacher, raw["chat_dialogues"]
+                    grader, raw["chat_dialogues"]
                 ),
             }
     finally:
-        del teacher
-        free_gpu()
+        if teacher is not None:
+            del teacher
+            free_gpu()
     return out
 
 

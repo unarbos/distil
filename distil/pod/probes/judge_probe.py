@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from distil.pod.axes._base import generate_greedy
+from distil.pod.grader import Grader, VLLMGrader
 
 # 16 short single-turn prompts, mixed (factual / advice / creative /
 # technical). Procedural sampling per round if a block-seed RNG is
@@ -84,19 +85,32 @@ def collect_responses(student_engine, *, n_items: int) -> list[dict[str, Any]]:
     ]
 
 
-def grade_responses(teacher_engine, collected: list[dict[str, Any]]) -> dict[str, Any]:
-    """Phase 3: teacher grades each ``(prompt, response)`` 1-5."""
+def grade_responses(teacher_or_grader, collected: list[dict[str, Any]]) -> dict[str, Any]:
+    """Phase 3: teacher grades each ``(prompt, response)`` 1-5.
+
+    ``teacher_or_grader`` is either a :class:`distil.pod.grader.Grader`
+    (preferred — works with both local vLLM and the cloud teacher API)
+    or, for back-compat with existing test fixtures, a raw vLLM engine
+    which we wrap in :class:`VLLMGrader` on the fly. Routing the rubric
+    through the API path is non-optional in production because Kimi-K2.6
+    doesn't fit on the 8xB200 pod (see ``distil.pod.grader`` docstring).
+    """
     if not collected:
         return {"n": 0, "n_valid": 0, "normalized": None}
+    grader: Grader = (
+        teacher_or_grader
+        if hasattr(teacher_or_grader, "greedy")
+        else VLLMGrader(teacher_or_grader)
+    )
     judge_prompts = [
         RUBRIC.format(prompt=c["prompt"], response=_sanitize(c["response"]))
         for c in collected
     ]
     try:
-        judges = generate_greedy(teacher_engine, judge_prompts, max_tokens=8)
+        texts = grader.greedy(judge_prompts, max_tokens=8)
     except Exception:
         return {"n": len(collected), "n_valid": 0, "normalized": None}
-    scores = [_extract_score(t) for t, _ in judges]
+    scores = [_extract_score(t) for t in texts]
     valid = [s for s in scores if s is not None]
     if not valid:
         return {"n": len(collected), "n_valid": 0, "normalized": None}
@@ -110,6 +124,6 @@ def grade_responses(teacher_engine, collected: list[dict[str, Any]]) -> dict[str
 
 
 # Backwards-compatible single-pass entry (used by old tests / shadow runs).
-def run(student_engine, teacher_engine, *, block_seed: int, n_items: int) -> dict[str, Any]:
+def run(student_engine, teacher_or_grader, *, block_seed: int, n_items: int) -> dict[str, Any]:
     collected = collect_responses(student_engine, n_items=n_items)
-    return grade_responses(teacher_engine, collected)
+    return grade_responses(teacher_or_grader, collected)
