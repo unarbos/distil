@@ -314,9 +314,17 @@ def run(
     logger.info("phase 2 done; merging shards")
     merged = _merge_shards([s["out"] for s in shard_state.values()])
     raw_merged = _merge_raw([s["raw"] for s in shard_state.values()])
-    out.write_text(json.dumps(merged, indent=2))
+    # Atomic writes: a crash mid-write here would leave a truncated
+    # results.json / results.raw.json that the validator's downstream
+    # ``process_round`` would parse as empty + skip every student,
+    # losing the whole round's Phase 2 work without an error.
+    tmp_out = out.with_suffix(out.suffix + ".tmp")
+    tmp_out.write_text(json.dumps(merged, indent=2))
+    os.replace(tmp_out, out)
     raw_merged_path = out.with_suffix(".raw.json")
-    raw_merged_path.write_text(json.dumps(raw_merged, indent=2))
+    tmp_raw = raw_merged_path.with_suffix(raw_merged_path.suffix + ".tmp")
+    tmp_raw.write_text(json.dumps(raw_merged, indent=2))
+    os.replace(tmp_raw, raw_merged_path)
 
     # ── Phase 3: judge grading on GPU 0 ─────────────────────────────
     logger.info("phase 3: judge grading (GPU 0)")
