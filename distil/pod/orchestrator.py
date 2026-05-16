@@ -345,6 +345,16 @@ def run(
         return rc
 
     _write_unified_progress(progress, shard_state, n_students, finished=True)
+    # Sentinel file: signals to the host validator that ``results.json``
+    # contains the FINAL merged Phase-2 + Phase-3 (judge) output. Without
+    # this the host races against Phase 3 — Phase 2 writes results.json
+    # first (no judge axes), then Phase 3 rewrites it ~30-60 s later
+    # with judge_probe/long_form_judge_probe/chat_turns_probe merged in.
+    # The host's 20s polling loop would see results.json existing
+    # between those two writes and download a judge-axis-less file,
+    # losing every Phase-3 score for the round.
+    done_path = workdir / "results.done"
+    done_path.write_text(str(int(time.time())))
     logger.info("orchestrator finished")
     return 0
 

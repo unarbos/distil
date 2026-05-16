@@ -390,6 +390,17 @@ def _mark_progress_inactive(round_id: int) -> None:
 def _pod_run_state(pod, remote_run: str) -> str:
     """Returns 'absent' | 'in_progress' | 'complete' by probing the pod.
 
+    Completion is gated on the ``results.done`` sentinel that the
+    orchestrator writes ONLY after Phase 3 (judge grading) finishes
+    merging its scores into ``results.json``. Probing for
+    ``results.json`` directly is racy: Phase 2 writes the file first
+    (no judge axes), then Phase 3 rewrites it 30-60 s later with
+    judge_probe/long_form_judge_probe/chat_turns_probe merged in. The
+    host's 20s polling loop would otherwise see ``results.json``
+    existing between the two writes, mark the round complete, and
+    download a judge-axis-less file — silently losing every Phase 3
+    score for the round.
+
     A round counts as ``in_progress`` ONLY when ``round_spec.json`` is
     present AND a ``distil.pod.orchestrator`` process is still alive
     on the pod. Without the process check we'd wait forever on a stale
@@ -398,7 +409,7 @@ def _pod_run_state(pod, remote_run: str) -> str:
     spin until the eval_round_max_minutes deadline before failing.
     """
     res = pod.exec(
-        f"if [ -f {remote_run}/results.json ]; then echo complete; exit 0; fi; "
+        f"if [ -f {remote_run}/results.done ]; then echo complete; exit 0; fi; "
         f"if [ -f {remote_run}/round_spec.json ]; then "
         f"  if pgrep -f 'distil.pod.orchestrator' >/dev/null 2>&1; then "
         f"    echo in_progress; "
