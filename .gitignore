@@ -26,6 +26,7 @@ dataset/
 # Runtime cache
 state/api_cache/
 state/prompt_cache/
+state-archive/
 knowledge/
 results/
 
