@@ -366,6 +366,21 @@ def process_round(
             reference_axes=reference_axes if name != reference_name else None,
         )
         comp["evaluated_at"] = time.time()
+        # Commit signature: ``model`` / ``revision`` / ``block`` are how
+        # ``distil.eval.round.evict_stale_evaluated_uids`` detects an
+        # honest re-commitment on the same UID (legacy
+        # ``scripts/validator/single_eval.commitment_changed``). Without
+        # these fields the stored composite is treated as bootstrapped
+        # and the UID stays consumed forever, which silently starves
+        # miners who push v2 of their model.
+        model_repo = name.split("@", 1)[0] if "@" in name else name
+        comp["model"] = row.get("model") or model_repo
+        revision_str = ""
+        if "@" in name:
+            revision_str = name.split("@", 1)[1]
+        comp["revision"] = row.get("revision") or revision_str or "main"
+        if commit_block is not None:
+            comp["block"] = int(commit_block)
         if state.is_disqualified(hotkey, uid=int(uid) if uid is not None else None):
             comp["disqualified"] = True
             comp["dq_reason"] = state.dq_reason(hotkey, uid=int(uid) if uid is not None else None)
@@ -484,11 +499,24 @@ def process_round(
             result_row["dq_reason"] = (comp or {}).get("dq_reason")
         results.append(result_row)
         # Legacy single-eval policy: mark this UID as having spent its
-        # one slot. ``state.evaluated_uids`` is a list-backed set on
-        # disk; the challenger picker (``distil.eval.round.select_
-        # challengers``) skips any UID present here, matching prod's
+        # one slot ONLY when the eval actually produced a usable result.
+        # ``state.evaluated_uids`` is a list-backed set on disk; the
+        # challenger picker (``distil.eval.round.select_challengers``)
+        # skips any UID present here, matching prod's
         # ``scripts.validator.single_eval._evict_stale_evaluated_uids``.
-        if uid is not None and not is_ref:
+        #
+        # Pre-fix: every non-reference row was appended unconditionally
+        # even when the pod returned ``error`` (HF 404, OOM, transient
+        # network, vLLM init crash) — the miner's one shot was burned
+        # without ever scoring. The 2026-05-16 audit flagged this as a
+        # honest-mistake-becomes-permanent-DQ class of bug. Now we
+        # require ``composite_worst`` to be present (the same predicate
+        # used by ``process_round`` to decide whether to persist the
+        # composite row), so transient infra failures retry on the
+        # next round and the slot is only consumed on a real score.
+        composite_landed = (comp or {}).get("worst") is not None
+        slot_consumed = composite_landed or (comp or {}).get("disqualified")
+        if uid is not None and not is_ref and slot_consumed:
             uid_str = str(uid)
             if uid_str not in state.evaluated_uids:
                 state.evaluated_uids.append(uid_str)

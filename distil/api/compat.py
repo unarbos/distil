@@ -12,10 +12,16 @@ This module loads the prod routers in-process (after putting ``api/`` on
 distil FastAPI app then mounts them alongside the native distil routers.
 
 After cutover, individual prod routes can be migrated to distil-native
-implementations one at a time without breaking the frontend. The native
-distil routers (in ``distil/api/routes.py``) take precedence: where a
-route is defined in both, the distil version wins (FastAPI uses first
-match).
+implementations one at a time without breaking the frontend.
+
+Route precedence: ``distil/api/server.py`` mounts the prod routers
+**first** so the established prod implementations win on any
+overlapping path during the cutover. This is intentional — the prod
+``api/`` module is the live, dashboard-tested source of truth until
+each route is verified-equivalent in distil. Native distil routers in
+``distil/api/routes.py`` are mounted last and only "win" for paths
+that prod doesn't define (``/api/miner/{uid}``, ``/api/telemetry/*``,
+``/api/incidents``, ``/api/model-info/{owner}/{name}``, etc.).
 """
 
 from __future__ import annotations

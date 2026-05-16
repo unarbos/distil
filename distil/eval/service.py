@@ -30,7 +30,12 @@ from distil.eval.pod import (
     upload_runtime,
 )
 from distil.eval.results import process_round
-from distil.eval.round import build_round_spec, evict_stale_composites, select_challengers
+from distil.eval.round import (
+    build_round_spec,
+    evict_stale_composites,
+    evict_stale_evaluated_uids,
+    select_challengers,
+)
 from distil.settings import settings
 from distil.state.files import ValidatorState, log_event
 
@@ -82,6 +87,14 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     n_evict = evict_stale_composites(state)
     if n_evict:
         logger.info(f"evicted {n_evict} stale composite rows (schema bump)")
+    # Honest re-commit support: if a miner pushed v2 of their model on
+    # the same UID, drop the prior evaluated_uids/composite row so the
+    # challenger picker picks them up again. Without this, miners are
+    # silently starved after their first eval — matches legacy
+    # ``scripts/validator/single_eval.evict_stale_evaluated_uids``.
+    n_recommit = len(evict_stale_evaluated_uids(state, commitments))
+    if n_recommit:
+        logger.info(f"evicted {n_recommit} re-committed UIDs (slot reset)")
 
     # Resolve seated king. Mirrors the legacy
     # ``scripts/validator/service._resolve_king`` precedence rules so
@@ -132,6 +145,33 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
                     None,
                 )
     king_commitment = commitments.get(king_uid) if king_uid is not None else None
+    # Self-healing: if h2h_latest pointed at a UID that no longer has
+    # a valid on-chain commitment (deregistered, model deleted, hotkey
+    # rotated), fall back to the composite-scores top scorer. Without
+    # this, ``build_round_spec`` runs a king-less round and downstream
+    # paired-KL anchors are missing — silently corrupts every
+    # subsequent dethrone gate.
+    if king_uid is not None and king_commitment is None:
+        logger.warning(
+            f"seated king uid={king_uid} no longer in commitments; "
+            "falling back to composite-scores top scorer"
+        )
+        fallback_name, _ = resolve_king(state.composite_scores, current_king_model=None)
+        king_name = None
+        king_uid = None
+        if fallback_name is not None:
+            try:
+                king_uid = int(fallback_name)
+            except (TypeError, ValueError):
+                king_uid = next(
+                    (c.uid for c in commitments.values() if c.key == fallback_name),
+                    None,
+                )
+            king_commitment = commitments.get(king_uid) if king_uid is not None else None
+            if king_commitment is not None:
+                king_name = str(king_uid)
+            else:
+                king_uid = None
 
     challengers = select_challengers(commitments, state, king_uid=king_uid)
     if not challengers and king_commitment is None:

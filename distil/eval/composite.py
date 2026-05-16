@@ -463,9 +463,19 @@ def is_dethrone(
 ) -> tuple[bool, str]:
     """Return ``(is_dethrone, reason)`` for one challenger vs the seated king.
 
-    Default margin: ``settings.composite_dethrone_margin`` (5%). Fails OPEN
-    (no dethrone) when fewer than ``composite_dethrone_min_axes`` axes are
-    present in either composite.
+    Default margin: ``settings.composite_dethrone_margin`` (5%). **Fails
+    CLOSED** (no dethrone) when fewer than ``composite_dethrone_min_axes``
+    are present in *either* composite. Both sides need a full axis count
+    before the margin gate is meaningful — otherwise a king whose last
+    composite was a partial recovery (e.g. a 6-axis bench-only record
+    that survived an axis-shape migration) would be dethroned by any
+    challenger with a complete composite, regardless of model quality.
+
+    Pre-fix: sparse-king path returned ``True`` ("dethrone") which read
+    as "the seat is up for grabs". That behavior surfaced during the
+    2026-05-16 cutover when a recovered legacy composite (42 axes,
+    different axis set than v32) compared against fresh 23-axis runs
+    and triggered spurious dethrones.
     """
     m = float(margin if margin is not None else settings.composite_dethrone_margin)
     cf = challenger_composite.get("final") if isinstance(challenger_composite, dict) else None
@@ -478,7 +488,7 @@ def is_dethrone(
     if (challenger_composite.get("present_count") or 0) < settings.composite_dethrone_min_axes:
         return False, "challenger_too_sparse"
     if (king_composite.get("present_count") or 0) < settings.composite_dethrone_min_axes:
-        return True, "king_too_sparse"
+        return False, "king_too_sparse"
     if cf >= kf * (1.0 + m):
         return True, f"final_gain {cf:.4f} >= king {kf:.4f} * (1+{m:.3f})"
     return False, f"margin_not_met (challenger={cf:.4f} king={kf:.4f})"

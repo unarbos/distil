@@ -60,7 +60,12 @@ def _flush_partial() -> None:
     if _OUT_PATH is None:
         return
     try:
-        _OUT_PATH.write_text(json.dumps(_PARTIAL, indent=2))
+        # Atomic: tmp + os.replace. Crash mid-write leaves the prior
+        # results.json intact instead of a truncated JSON that breaks
+        # the orchestrator's per-shard merge step.
+        tmp = _OUT_PATH.with_suffix(_OUT_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(_PARTIAL, indent=2))
+        os.replace(tmp, _OUT_PATH)
     except Exception as exc:
         logger.warning(f"failed to flush partial results: {exc}")
 

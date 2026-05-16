@@ -52,8 +52,18 @@ from distil.pod.watchdog import LineStallDetector
 logger = logging.getLogger("distil.pod.orchestrator")
 
 POLL_INTERVAL_S = 3.0
-SHARD_STALL_AFTER_S = 240.0  # 4 minutes silence ⇒ kill the shard.
-SHARD_REPEAT_WINDOW = 16
+# Per-shard stall watchdog. A shard that prints **nothing** for
+# ``SHARD_STALL_AFTER_S`` is presumed wedged and ``proc.terminate()``
+# fires. Tunable via env to keep big-model cold-load (vLLM init on
+# slow HF download) from being mistaken for a hang:
+#
+#   DISTIL_ORCH_WATCHDOG_S      — stall threshold (seconds, default 240)
+#   DISTIL_ORCH_WATCHDOG_REPEAT — repeat-line collapse window (default 16)
+#
+# Bumped to 300s default to absorb routine 33B-param model downloads
+# from HF on fresh pods (~3-4 min observed on B200 with cold cache).
+SHARD_STALL_AFTER_S = float(os.environ.get("DISTIL_ORCH_WATCHDOG_S") or "300")
+SHARD_REPEAT_WINDOW = int(os.environ.get("DISTIL_ORCH_WATCHDOG_REPEAT") or "16")
 
 
 def _python() -> str:

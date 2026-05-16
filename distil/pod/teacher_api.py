@@ -116,8 +116,17 @@ def _load_tokenizer(repo: str):
         return _TOKENIZER
 
 
-def _str_to_vocab_id(token_str: str) -> int:
-    """API token string → Kimi vocab ID, with encode() fallback."""
+def _str_to_vocab_id(token_str: str) -> int | None:
+    """API token string → Kimi vocab ID, with ``encode()`` fallback.
+
+    Returns ``None`` when neither the direct vocab lookup nor the
+    encode-fallback maps the API-returned string to a valid token id.
+    Pre-fix, this returned ``0`` (the BOS / pad id), which silently
+    piled logprob mass at id 0 in the teacher distribution. That
+    mass intersects with student id 0 too often to be noise — it
+    inflated KL on some prompts and broke top-K overlap on others.
+    Callers must now skip ``None`` entries rather than persist them.
+    """
     assert _TOKEN_TO_ID is not None
     tid = _TOKEN_TO_ID.get(token_str)
     if tid is not None:
@@ -125,9 +134,9 @@ def _str_to_vocab_id(token_str: str) -> int:
     assert _TOKENIZER is not None
     try:
         encoded = _TOKENIZER.encode(token_str, add_special_tokens=False)
-        return int(encoded[0]) if encoded else 0
+        return int(encoded[0]) if encoded else None
     except Exception:
-        return 0
+        return None
 
 
 def _align_prompt_boundary(full_text: str, prompt_text: str, full_ids) -> int:
@@ -238,12 +247,16 @@ def _call_once(prompt: str, max_new_tokens: int, top_k: int, cfg: dict) -> Teach
         chosen_lp = entry.get("logprob")
         d: dict[int, float] = {}
         if chosen_lp is not None and chosen != "":
-            d[_str_to_vocab_id(chosen)] = float(chosen_lp)
+            cid = _str_to_vocab_id(chosen)
+            if cid is not None:
+                d[cid] = float(chosen_lp)
         for alt in entry.get("top_logprobs") or []:
             t = alt.get("token", "")
             lp = alt.get("logprob")
             if lp is not None and t != "":
-                d.setdefault(_str_to_vocab_id(t), float(lp))
+                aid = _str_to_vocab_id(t)
+                if aid is not None:
+                    d.setdefault(aid, float(lp))
         per_pos_logprobs.append(d)
 
     # Length harmonization: KL keys on min(len) positions, but mid-stream
@@ -260,7 +273,16 @@ def _call_once(prompt: str, max_new_tokens: int, top_k: int, cfg: dict) -> Teach
 def _call_with_retry(
     prompt: str, max_new_tokens: int, top_k: int, cfg: dict, max_attempts: int = 6
 ) -> TeacherOutput:
-    """Retry transient 429/5xx with exp backoff, honoring Retry-After."""
+    """Retry transient 429/5xx with exp backoff, honoring Retry-After.
+
+    Non-transient HTTP errors (e.g. ``401`` unauthorized, ``403``
+    forbidden, ``404`` not-found, ``422`` unprocessable) raise
+    *immediately* — exp-backoffing those just wastes wall time and
+    drowns the logs in spurious retry warnings. The model name in the
+    body is the only knob that changes between rounds; if the
+    OpenRouter / Inceptron auth is wrong or the model id was retired,
+    the next 5 retries will fail too.
+    """
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
@@ -269,10 +291,9 @@ def _call_with_retry(
             last_exc = exc
             sc = getattr(exc.response, "status_code", None)
             transient = sc == 429 or (sc is not None and 500 <= sc < 600)
-            if not transient or attempt >= max_attempts - 1:
-                if attempt < max_attempts - 1:
-                    time.sleep(min(2**attempt, 30))
-                    continue
+            if not transient:
+                raise
+            if attempt >= max_attempts - 1:
                 raise
             retry_after = None
             try:
@@ -401,7 +422,11 @@ def _greedy_text_with_retry(
     cfg: dict,
     max_attempts: int = 6,
 ) -> str:
-    """Same exp-backoff retry envelope as :func:`_call_with_retry`."""
+    """Same exp-backoff retry envelope as :func:`_call_with_retry`.
+
+    Non-transient HTTP errors raise immediately (see that function's
+    docstring for rationale).
+    """
     last_exc: Exception | None = None
     for attempt in range(max_attempts):
         try:
@@ -410,10 +435,9 @@ def _greedy_text_with_retry(
             last_exc = exc
             sc = getattr(exc.response, "status_code", None)
             transient = sc == 429 or (sc is not None and 500 <= sc < 600)
-            if not transient or attempt >= max_attempts - 1:
-                if attempt < max_attempts - 1:
-                    time.sleep(min(2**attempt, 30))
-                    continue
+            if not transient:
+                raise
+            if attempt >= max_attempts - 1:
                 raise
             retry_after = None
             try:

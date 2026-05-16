@@ -53,6 +53,108 @@ def evict_stale_composites(state: ValidatorState) -> int:
     return len(drop)
 
 
+def _commit_signature(c: Commitment) -> tuple[str, str, int]:
+    """``(model, revision, block)`` for the current on-chain commitment."""
+    return (
+        str(getattr(c, "model", "") or ""),
+        str(getattr(c, "revision", "") or "main"),
+        int(getattr(c, "block", 0) or 0),
+    )
+
+
+def _stored_commit_signature(record: dict) -> tuple[str, str, int]:
+    """Same shape, pulled from a stored composite record."""
+    return (
+        str(record.get("model") or ""),
+        str(record.get("revision") or "main"),
+        int(record.get("block") or 0),
+    )
+
+
+def _commitment_changed(stored: dict | None, current: Commitment) -> bool:
+    """Match legacy ``scripts/validator/single_eval.commitment_changed``.
+
+    Bootstrap records (no ``block`` AND no ``revision`` stored) compare
+    on model name only — that's how distil bootstrapped composites
+    recovered from ``h2h_history`` (no per-row commit signature) stay
+    valid until they're naturally overwritten.
+    """
+    if not stored:
+        return True
+    cur_model, cur_rev, cur_block = _commit_signature(current)
+    stored_model = str(stored.get("model") or "")
+    if stored_model and stored_model != cur_model:
+        return True
+    if stored.get("_bootstrapped"):
+        return False
+    # Pre-eviction-port records (no signature fields at all) also
+    # behave as bootstrapped — model-only compare, no revision/block.
+    if not stored.get("model") and not stored.get("revision") and not stored.get("block"):
+        return False
+    stored_rev = str(stored.get("revision") or "main")
+    if stored_rev != cur_rev:
+        return True
+    if stored.get("block") is None:
+        return False
+    return int(stored.get("block") or 0) != cur_block
+
+
+def evict_stale_evaluated_uids(
+    state: ValidatorState, commitments: dict[int, Commitment]
+) -> list[str]:
+    """Drop ``evaluated_uids`` + ``composite_scores`` rows whose on-chain
+    commitment has moved since the last eval. Returns the list of evicted
+    UID strings.
+
+    This is the legacy ``scripts/validator/single_eval.evict_stale_
+    evaluated_uids`` invariant ported into distil — without it, a miner
+    who pushes v2 of their model on the same UID is starved forever
+    because :func:`select_challengers` short-circuits on
+    ``uid in state.evaluated_uids``.
+
+    The implementation matches legacy behavior for the three observed
+    cases:
+
+    * **honest re-commit** — stored composite has ``model``/``revision``/
+      ``block`` fields, all three set; new commitment differs on any
+      one of them ⇒ evict.
+    * **DQ-only row** — UID is in ``evaluated_uids`` but ``composite_
+      scores`` lookup is ``None`` (precheck DQ wrote the DQ row but no
+      composite). The DQ row's commit_block is the source of truth for
+      retry; we leave the UID consumed here and let the DQ-clear path
+      handle re-eval.
+    * **bootstrapped legacy row** — pre-2026-05-16 composites recovered
+      from ``h2h_history`` (no commit signature). Stay sticky; model-
+      name-only compare so a same-UID model-name change still evicts.
+    """
+    evicted: list[str] = []
+    composite_scores = state.composite_scores or {}
+    for uid, c in commitments.items():
+        uid_str = str(uid)
+        in_eu = uid_str in (state.evaluated_uids or [])
+        in_cs = uid_str in composite_scores
+        if not (in_eu or in_cs):
+            continue
+        stored = composite_scores.get(uid_str)
+        if stored is None:
+            # In ``evaluated_uids`` but no composite row — DQ-only
+            # path; leave consumed (matches legacy single_eval:128-132).
+            continue
+        if not _commitment_changed(stored, c):
+            continue
+        try:
+            state.evaluated_uids.remove(uid_str)
+        except ValueError:
+            pass
+        state.composite_scores.pop(uid_str, None)
+        evicted.append(uid_str)
+    if evicted:
+        logger.info(
+            f"evicted {len(evicted)} stale evaluated UIDs (re-committed): {evicted}"
+        )
+    return evicted
+
+
 def select_challengers(
     commitments: dict[int, Commitment],
     state: ValidatorState,
