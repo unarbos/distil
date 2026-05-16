@@ -108,9 +108,14 @@ def miner_detail(uid: int) -> dict[str, Any]:
         "uid": int(uid),
         "hotkey": hotkey,
         "disqualified": store.disqualified().get(hotkey, ""),
-        "composite": next(
-            (c for k, c in composites.items() if (c or {}).get("uid") == int(uid)), None
-        ),
+        # ``state.composite_scores`` is UID-keyed (``str(uid)`` → row).
+        # The stored row does NOT include a ``uid`` field, so a
+        # ``(c for k, c in composites.items() if c.get('uid') == int(uid))``
+        # generator (the pre-fix code) always returned ``None`` and
+        # the miner profile page rendered an empty composite block
+        # for every UID. Direct UID-key lookup matches the writer in
+        # ``results.process_round``.
+        "composite": composites.get(str(uid)),
         "rounds": rounds[-20:],
     }
 

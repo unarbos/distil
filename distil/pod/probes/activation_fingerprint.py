@@ -39,10 +39,30 @@ def _project(token_ids: list[int], dim: int) -> list[float]:
     return [x / norm for x in out]
 
 
-def run(student_engine, *, dim: int | None = None) -> list[float]:
+def run(student_engine, *, dim: int | None = None) -> dict:
+    """Return ``{"layer_fingerprints": {...}, "n_layers": ..., "hidden_size": ...}``.
+
+    The output schema MUST match what the host's
+    ``distil.eval.results._check_activation_copy`` expects: a dict with
+    a ``layer_fingerprints`` mapping (each value is a fixed-length unit
+    vector that cosine-comparable across rounds). Earlier versions of
+    this function returned a flat ``list[float]`` — the host's
+    ``isinstance(fp, dict)`` guards then short-circuited every DQ check
+    and never wrote anything to ``state.activation_fingerprints``,
+    silently disabling copy detection for the entire migration. We now
+    return a single-bucket dict (``{"all": vector}``) so the existing
+    similarity machinery treats the whole greedy-decode trace as one
+    "layer". When layer-wise probing is added we'll expand this to a
+    per-layer mapping without a schema break.
+    """
     d = int(dim or settings.activation_fp_dim)
     outs = generate_greedy(student_engine, list(SEED_PROMPTS), max_tokens=24)
     all_tokens: list[int] = []
     for _text, toks in outs:
         all_tokens.extend(toks)
-    return _project(all_tokens, d)
+    vector = _project(all_tokens, d)
+    return {
+        "layer_fingerprints": {"all": vector},
+        "n_layers": 1,
+        "hidden_size": d,
+    }

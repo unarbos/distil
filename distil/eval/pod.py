@@ -94,7 +94,11 @@ _REMOTE_ENV_WHITELIST: tuple[str, ...] = (
     "TEACHER_CONFIG_VOCAB_SIZE",
     # Watchdog tuning (2026-05-15 fan-out)
     "DISTIL_ORCH_WATCHDOG_S",
-    "DISTIL_ORCH_WATCHDOG_REPEAT_N",
+    # NOTE: orchestrator.py reads ``DISTIL_ORCH_WATCHDOG_REPEAT`` (no
+    # trailing ``_N``). They MUST stay aligned or operator tuning is
+    # silently ineffective — the orchestrator just keeps the hardcoded
+    # default of 16 even when the host sets a different value.
+    "DISTIL_ORCH_WATCHDOG_REPEAT",
     "DISTIL_CACHE_KEEP_MODELS",
     # HF auth for tokenizer/model pulls
     "HF_TOKEN",

@@ -173,10 +173,21 @@ class ValidatorState:
         atomic_json_write(d / ACTIVATION_FP_FILE, self.activation_fingerprints)
         atomic_json_write(d / EVAL_BACKLOG_FILE, self.eval_backlog)
         atomic_json_write(d / CURRENT_ROUND_FILE, self.current_round)
-        # h2h_latest is the live snapshot; h2h_history is append-only and
-        # already persisted by :meth:`append_round`.
+        # h2h_latest is the live snapshot. h2h_history is normally
+        # append-only via :meth:`append_round`, but ``service._round``
+        # mutates ``h2h_history[-1]`` *after* ``append_round`` to add
+        # dethrone-context fields (``king_after``, ``king_changed``,
+        # ``prev_king_uid``, ``new_king_uid``, ``dethrone_method``).
+        # Without re-writing the history file on save the dashboard's
+        # ``/api/h2h-history`` endpoint permanently returns the last
+        # round without those fields, and every round renders as a
+        # king-retain regardless of actual outcome. Atomic-writing the
+        # whole list on every save is fine — h2h_history is capped at
+        # 1000 entries, well under any IO budget.
         if self.h2h_latest:
             atomic_json_write(d / H2H_LATEST_FILE, self.h2h_latest)
+        if self.h2h_history:
+            atomic_json_write(d / H2H_HISTORY_FILE, self.h2h_history)
         if self.h2h_tested_against_king:
             atomic_json_write(d / H2H_TESTED_KING_FILE, self.h2h_tested_against_king)
 

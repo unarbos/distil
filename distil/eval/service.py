@@ -287,8 +287,17 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         state=state,
         pod_results=results,
         king_name=king_key,
-        reference_name=spec["teacher_repo"],
-        teacher_name=spec["reference_repo"],
+        # ``reference_name`` is the local-loadable baseline (Qwen3.5-4B,
+        # used for the baseline-penalty axis). ``teacher_name`` is the
+        # cloud-API teacher (Kimi-K2.6) the round was graded against.
+        # Pre-fix these two were swapped — currently harmless because
+        # neither repo appears as a student key in ``pod_results`` (so
+        # both rows resolved to None), but the broken-axis detection
+        # and baseline-penalty reference would have silently used the
+        # wrong row the moment either repo was added to the students
+        # list, which is what happens during a teacher-rotation round.
+        reference_name=spec["reference_repo"],
+        teacher_name=spec["teacher_repo"],
         block=block,
         block_hash=block_hash,
         uid_index=uid_index,

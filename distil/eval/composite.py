@@ -476,6 +476,13 @@ def is_dethrone(
     2026-05-16 cutover when a recovered legacy composite (42 axes,
     different axis set than v32) compared against fresh 23-axis runs
     and triggered spurious dethrones.
+
+    Worst-axis floor: a challenger with a great ``final`` score but a
+    single terrible axis (e.g. ``humaneval_plus=0.0``) is rejected here
+    via the ``composite_dethrone_floor`` gate — ported from the legacy
+    ``_composite_dethrone_veto``. Without this, a math-only specialist
+    could grab the seat from a balanced king and then catastrophically
+    fail on coding traffic the moment it serves the chat-king endpoint.
     """
     m = float(margin if margin is not None else settings.composite_dethrone_margin)
     cf = challenger_composite.get("final") if isinstance(challenger_composite, dict) else None
@@ -489,6 +496,13 @@ def is_dethrone(
         return False, "challenger_too_sparse"
     if (king_composite.get("present_count") or 0) < settings.composite_dethrone_min_axes:
         return False, "king_too_sparse"
+    worst = challenger_composite.get("worst")
+    if worst is not None and float(worst) < settings.composite_dethrone_floor:
+        return (
+            False,
+            f"worst_below_floor ({float(worst):.3f} < "
+            f"{settings.composite_dethrone_floor:.2f})",
+        )
     if cf >= kf * (1.0 + m):
         return True, f"final_gain {cf:.4f} >= king {kf:.4f} * (1+{m:.3f})"
     return False, f"margin_not_met (challenger={cf:.4f} king={kf:.4f})"

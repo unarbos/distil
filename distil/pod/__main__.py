@@ -412,9 +412,18 @@ def main(argv: list[str] | None = None) -> int:
             wall.check(f"after_student_{student_spec['name']}")
 
         if args.phase == "students":
-            # Side-car the raw responses so the orchestrator can merge them.
+            # Side-car the raw responses so the orchestrator can merge
+            # them into Phase 3 (judge) grading. CRITICAL: write
+            # atomically — a crash mid-write leaves a truncated JSON
+            # blob and the orchestrator's ``_merge_raw`` then catches
+            # the parse error and silently drops every student in this
+            # shard's raw responses, setting judge_probe / long_form /
+            # chat_turns axes (combined weight ~0.75 of the composite)
+            # to None across the entire shard.
             raw_path = _OUT_PATH.with_suffix(".raw.json")
-            raw_path.write_text(json.dumps(raw_by_student, indent=2))
+            tmp = raw_path.with_suffix(raw_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(raw_by_student, indent=2))
+            os.replace(tmp, raw_path)
             write_progress(progress_path, phase="finished")
             return 0
 
