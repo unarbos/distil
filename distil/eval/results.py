@@ -582,11 +582,23 @@ def process_round(
 
 
 def _refresh_top4(state: ValidatorState, composites: dict[str, dict]) -> None:
+    # Match the persistence guard in ``process_round``: rows whose KL
+    # axis is None (bench-only / failed Phase 2) don't reach
+    # ``state.composite_scores``, so they must not bypass that filter
+    # into top4_leaderboard either — otherwise the dashboard's "top
+    # contenders" panel can briefly show a low-score row that exists
+    # in-memory but is *not* part of the dethrone state on disk.
+    def _keep(c: dict) -> bool:
+        if c.get("final") is None:
+            return False
+        if c.get("disqualified"):
+            return False
+        if (c.get("axes") or {}).get("kl") is None:
+            return False
+        return True
+
     ranked = sorted(
-        (
-            (name, c) for name, c in composites.items()
-            if c.get("final") is not None and not c.get("disqualified")
-        ),
+        ((name, c) for name, c in composites.items() if _keep(c)),
         key=lambda kv: kv[1]["final"],
         reverse=True,
     )[:4]

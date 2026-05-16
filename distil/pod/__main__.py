@@ -158,7 +158,7 @@ def _phase_student(
         prompts=teacher_payload["prompts"],
         teacher_continuations=teacher_payload["teacher_continuations"],
         teacher_token_ids=teacher_payload["teacher_token_ids"],
-        prompt_logprobs=spec.get("student_prompt_logprobs", True),
+        prompt_logprobs=int(spec.get("student_prompt_logprobs") or 20),
     )
     student_logprobs = [s.student_logprobs for s in scored]
     teacher_logprobs = teacher_payload["teacher_logprobs"]
