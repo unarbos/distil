@@ -322,6 +322,19 @@ def _call_with_retry(
     raise RuntimeError(f"api teacher exhausted retries: {last_exc}") from last_exc
 
 
+# Outer retry loop: when OpenRouter's Inceptron route hits a sustained
+# 429 storm (which happens during peak hours on the kimi-k2.6 endpoint),
+# the per-prompt 6-attempt × ~30s backoff isn't enough — every prompt in
+# the batch can fail simultaneously after exhausting its inner budget.
+# Legacy ``scripts/api_teacher.generate_via_api`` solved this with a
+# second-tier outer retry pass: collect every failure from the main
+# fan-out, then sequentially re-issue them with multi-minute cool-downs
+# between passes. This buys ~12 min of additional stall budget per
+# prompt without thrashing the API. We mirror that behaviour here.
+_OUTER_RETRY_PASSES = 5
+_OUTER_RETRY_COOLDOWNS_S = (60, 90, 120, 180, 300)
+
+
 def generate_continuations_api(
     prompts: list[str],
     *,
@@ -336,6 +349,17 @@ def generate_continuations_api(
     (no silent holes — the round is poisoned if even one prompt is
     missing, which is detectable at the validator and triggers a
     deterministic retry rather than a corrupted leaderboard write).
+
+    Two-tier retry strategy:
+    * **Inner** (``_call_with_retry``) — per-prompt 6 attempts with
+      exp-backoff (1s → 30s), honoring ``Retry-After`` on transient
+      429/5xx. Non-transient HTTP (401/404/422) raises immediately.
+    * **Outer** (this function) — after the main fan-out, collect every
+      prompt that failed and re-issue it across up to 5 sequential
+      passes with 60s → 300s cool-downs between passes. Buys ~12 min of
+      additional stall budget per prompt vs. a single-tier retry, which
+      is what we needed to survive the 2026-05-16 OpenRouter outage
+      that killed round 1778905724 Phase 1.
     """
     cfg = _config()
     _load_tokenizer(cfg["tokenizer_repo"])
@@ -346,6 +370,7 @@ def generate_continuations_api(
 
     n = len(prompts)
     results: list[TeacherOutput | None] = [None] * n
+    failed: list[tuple[int, str]] = []
     with ThreadPoolExecutor(max_workers=max(1, cfg["concurrency"])) as ex:
         futures = {
             ex.submit(_call_with_retry, p, max_new_tokens, top_k, cfg): i
@@ -354,10 +379,65 @@ def generate_continuations_api(
         completed = 0
         for fut in as_completed(futures):
             idx = futures[fut]
-            results[idx] = fut.result()
-            completed += 1
-            if completed % 10 == 0 or completed == n:
-                logger.info(f"api teacher progress {completed}/{n}")
+            try:
+                results[idx] = fut.result()
+                completed += 1
+                if completed % 10 == 0 or completed == n:
+                    logger.info(f"api teacher progress {completed}/{n}")
+            except Exception as exc:
+                failed.append((idx, f"{type(exc).__name__}: {exc}"))
+                logger.warning(
+                    f"api teacher prompt {idx} failed after inner retries: "
+                    f"{type(exc).__name__}: {exc} (deferred to outer retry)"
+                )
+
+    # Outer retry pass for any prompts that failed during the fan-out.
+    if failed:
+        logger.warning(
+            f"api teacher main fan-out completed with {len(failed)} failed prompt(s); "
+            f"entering outer retry (up to {_OUTER_RETRY_PASSES} passes)"
+        )
+        for pass_idx in range(_OUTER_RETRY_PASSES):
+            if not failed:
+                break
+            logger.info(
+                f"api teacher outer retry pass {pass_idx + 1}/{_OUTER_RETRY_PASSES} "
+                f"on {len(failed)} failed prompt(s)"
+            )
+            still_failed: list[tuple[int, str]] = []
+            for idx, _err in failed:
+                try:
+                    results[idx] = _call_with_retry(
+                        prompts[idx], max_new_tokens, top_k, cfg
+                    )
+                    completed += 1
+                    logger.info(
+                        f"api teacher outer retry prompt {idx}: OK "
+                        f"({completed}/{n} total)"
+                    )
+                except Exception as exc:
+                    still_failed.append(
+                        (idx, f"{type(exc).__name__}: {exc}")
+                    )
+                    logger.warning(
+                        f"api teacher outer retry pass {pass_idx + 1} "
+                        f"prompt {idx} failed: {type(exc).__name__}: {exc}"
+                    )
+            failed = still_failed
+            if failed and pass_idx < _OUTER_RETRY_PASSES - 1:
+                cool_s = _OUTER_RETRY_COOLDOWNS_S[pass_idx]
+                logger.warning(
+                    f"api teacher {len(failed)} prompt(s) still failing — "
+                    f"cooling {cool_s}s before next pass (likely sustained 429 storm)"
+                )
+                time.sleep(cool_s)
+        if failed:
+            first_idx, first_err = failed[0]
+            raise RuntimeError(
+                f"api teacher: {len(failed)} prompt(s) failed after "
+                f"{_OUTER_RETRY_PASSES} outer retry passes "
+                f"(first failure: prompt {first_idx}: {first_err})"
+            )
 
     out: list[TeacherOutput] = []
     for i, r in enumerate(results):

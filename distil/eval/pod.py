@@ -521,11 +521,26 @@ def run_eval_on_pod(
         # before the first poll iteration.
         _stream_pod_log(pod, remote_run, round_id, round_spec=round_spec)
         deadline = time.time() + deadline_s
+        # Tolerate a brief startup window where the orchestrator process
+        # hasn't yet been picked up by pgrep (setsid + forking takes a
+        # few seconds). After that window, if ``_pod_run_state`` returns
+        # ``absent`` (which is what crashed/exited orchestrators map to),
+        # we fail fast instead of polling the full ``deadline_s`` — the
+        # round can't recover without a re-launch from the host side.
+        startup_grace_until = time.time() + 90
         while time.time() < deadline:
             time.sleep(20)
             _stream_pod_log(pod, remote_run, round_id, round_spec=round_spec)
-            if _pod_run_state(pod, remote_run) == "complete":
+            state = _pod_run_state(pod, remote_run)
+            if state == "complete":
                 break
+            if state == "absent" and time.time() > startup_grace_until:
+                _mark_progress_inactive(round_id)
+                raise RuntimeError(
+                    f"round {round_id} orchestrator died before producing "
+                    f"results.done (check {remote_run}/phase*_*.log on the "
+                    f"pod for the crash trace)"
+                )
         else:
             _mark_progress_inactive(round_id)
             raise RuntimeError(
