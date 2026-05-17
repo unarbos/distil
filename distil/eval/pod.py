@@ -327,18 +327,40 @@ def _stream_pod_log(
         # healthcheck reads. ``active=true`` while polling; phase +
         # teacher_prompts_done come from the pod payload; models and
         # eval_order come from the round_spec we built on the host.
+        # ``students_total`` should be the count of student models running
+        # this round (1 king + N challengers, typically 11), NOT the
+        # ``n_prompts`` (256) the teacher API call sends. The legacy
+        # fallback ``pod_progress.get("n_prompts") or students_total``
+        # had the wrong precedence — during the ``teacher_generating``
+        # phase the pod payload carries ``n_prompts: 256`` but no
+        # ``students_total``, so the dashboard rendered ``0/256
+        # students`` for the entire teacher window, and miners read it
+        # as "256 students to score". Fix: prefer pod-provided
+        # ``students_total`` (set by the orchestrator during the
+        # scoring phase) and otherwise fall back to the
+        # round_spec's student list length, which IS the correct count.
+        spec_students_total = len(round_spec.get("students") or []) if round_spec else None
         host_progress: dict[str, Any] = {
             "active": True,
             "updated_at": time.time(),
             "round_id": round_id,
             "phase": pod_progress.get("phase") or "polling",
-            "students_total": pod_progress.get("n_prompts") or pod_progress.get("students_total"),
+            "students_total": (
+                pod_progress.get("students_total")
+                or spec_students_total
+                or None
+            ),
             "students_done": (
-                len(pod_progress.get("completed", []))
-                if isinstance(pod_progress.get("completed"), list)
-                else None
+                pod_progress.get("students_done")
+                if pod_progress.get("students_done") is not None
+                else (
+                    len(pod_progress.get("completed", []))
+                    if isinstance(pod_progress.get("completed"), list)
+                    else None
+                )
             ),
             "teacher_prompts_done": pod_progress.get("teacher_prompts_done"),
+            "n_prompts": pod_progress.get("n_prompts"),
             "pod": pod_progress,
         }
         if round_spec:
