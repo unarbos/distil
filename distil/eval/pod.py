@@ -322,6 +322,33 @@ def _stream_pod_log(
         local_log.write_text(
             f"# round={round_id} updated_at={time.time():.0f}\n{content}"
         )
+        # Per-round persisted copy under ``state/pod_logs/`` so the
+        # ``/api/pod-logs`` endpoint (and the dashboard's pod-log
+        # browser) sees fresh logs. The legacy validator wrote a
+        # timestamped file per round; we keep the same naming so the
+        # existing endpoint's ``listdir`` + ``endswith('.log')`` filter
+        # picks them up without code changes. Trim to the most recent
+        # 50 per-round files to bound disk usage (one round/hour ≈
+        # 50 files = ~50 days of history, plenty for miner triage).
+        try:
+            pod_logs_dir = state_dir / "pod_logs"
+            pod_logs_dir.mkdir(parents=True, exist_ok=True)
+            per_round = pod_logs_dir / f"eval_round_{round_id}.log"
+            per_round.write_text(
+                f"# round={round_id} updated_at={time.time():.0f}\n{content}"
+            )
+            existing = sorted(
+                pod_logs_dir.glob("eval_round_*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in existing[50:]:
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        except Exception as exc:
+            logger.debug(f"per-round pod_log persistence non-fatal: {exc}")
 
         # Build host-side eval_progress.json in the legacy schema the
         # healthcheck reads. ``active=true`` while polling; phase +

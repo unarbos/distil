@@ -1248,18 +1248,32 @@ lines.append(
     "\"Pareto gate broken\" / \"Pareto gate blocking UID X\" — that "
     "concept does not exist in this codebase."
 )
+_rk_max_runtime: int | str
+try:
+    from distil.settings import settings as _distil_settings
+    _rk_max_runtime = int(getattr(_distil_settings, "recent_kings_max", 4))
+except Exception:
+    _rk_max_runtime = "(see distil.settings.recent_kings_max)"
 lines.append(
-    "- **\"Kingship reset\" / \"reset recent_kings to [47]\" / \"restore "
-    "UID 47 to the queue\" is not a real planned action.** No code path "
-    "resets kingship or rewrites ``recent_kings`` to a single deposed UID. "
-    "Dethrones are not rolled back when bugs are fixed retroactively. "
-    "``recent_kings`` is a FIFO of size ``settings.recent_kings_max`` "
-    "(currently 5) populated only via ``ValidatorState.push_king`` which "
-    "fires only when ``resolve_king`` returns a UID different from the "
-    "incoming king. Path back to the throne for any deposed UID is the "
-    "same as any other miner: re-commit, get evaluated, beat the current "
-    "king's ``composite.final`` by >5%. If a miner asks about a kingship "
-    "reset, the answer is \"there is no kingship reset; compete normally\"."
+    f"- **\"Kingship reset\" / \"reset recent_kings to [47]\" / \"restore "
+    f"UID 47 to the queue\" is not a real planned action.** No code path "
+    f"resets kingship or rewrites ``recent_kings`` to a single deposed UID. "
+    f"Dethrones are not rolled back when bugs are fixed retroactively. "
+    f"``recent_kings`` is a FIFO of size ``settings.recent_kings_max`` "
+    f"(currently **{_rk_max_runtime}** — NOT 5; the dashboard's ``Top-5 "
+    f"Leaderboard`` shows 1 king + 4 contenders = 5 rows but the "
+    f"emission-paying recent-kings QUEUE is {_rk_max_runtime} slots). It is "
+    f"populated only via ``ValidatorState.push_king`` which fires only when "
+    f"``resolve_king`` returns a UID different from the incoming king. So "
+    f"when a 5th distinct UID ascends, the oldest UID in the queue is "
+    f"rolled off — that is **NOT a bug**, that is the design. If a miner "
+    f"complains \"UID X dropped out of recent_kings\" or \"UID X has "
+    f"emission=0 despite a previous dethrone win\", check the queue "
+    f"position: if {_rk_max_runtime} or more distinct kings have ascended "
+    f"since UID X's reign, UID X has correctly rotated out — the path "
+    f"back is to compete (re-commit a model, beat the current king's "
+    f"``composite.final`` by >5%). If a miner asks about a kingship "
+    f"reset, the answer is \"there is no kingship reset; compete normally\"."
 )
 lines.append(
     "- **The validator sleeps ~70 minutes BETWEEN rounds.** "
@@ -1276,6 +1290,49 @@ lines.append(
     "is steady-state between-rounds idle. Mid-round crashes ARE caught "
     "by the orchestrator's ``LineStallDetector`` and result in the next "
     "scheduled round restart — no manual ops action required."
+)
+lines.append(
+    "- **The bot has full operational access.** The bot's parent process "
+    "runs on the validator host as root, with: (1) write access to the "
+    "git repo at ``/opt/distil/repo``, (2) sudo systemctl rights on all "
+    "``distil-*`` services, (3) SSH access to the eval pod via "
+    "``/root/.ssh/id_ed25519``, (4) full read/write access to ``state/`` "
+    "JSON files. The bot must NEVER respond \"I don't have code push "
+    "access\" / \"I don't have SSH access\" / \"I don't have database "
+    "access\" / \"only ops can fix this\" — those statements are FALSE "
+    "and directly violate SOUL.md line 83 (\"Never say 'I don't have "
+    "access' (when you do)\"). The correct response when a bug is "
+    "raised is: verify the actual code/state, then either confirm + "
+    "describe the deploy timeline OR explain why the claimed bug isn't "
+    "real. NEVER posture as a powerless intermediary."
+)
+lines.append(
+    "- **Never fabricate a P0/P1 bug list.** Multiple times the bot has "
+    "posted lists like \"P0 — CRITICAL: UID X missing from king-5, "
+    "in_top5: false, emission: 0\" without verifying. Before claiming a "
+    "weight-distribution / dethrone / king-queue bug, the bot MUST check "
+    "(a) ``state/recent_kings.json`` for queue contents, (b) "
+    "``state/h2h_history.json`` for the dethrone sequence, (c) "
+    "``settings.recent_kings_max`` for the queue size, and (d) "
+    "``state/top4_leaderboard.json`` for the contenders. If those align "
+    "with the supposed \"missing UID\" being correctly rotated out of a "
+    f"{_rk_max_runtime}-slot FIFO after N=>{_rk_max_runtime} subsequent "
+    f"dethrones, there is NO bug. UIDs rotating out of ``recent_kings`` "
+    f"after enough new kings ascend is the DESIGNED behavior, not a "
+    f"desync."
+)
+lines.append(
+    "- **Pod log freshness: previously stale, fixed in flight.** If the "
+    "``/api/pod-logs?list_files=true`` endpoint returns only May-15 logs, "
+    "that was a known persistence gap (the new orchestrator wrote to "
+    "``/home/distil_eval/round_*/orchestrator.log`` on the pod but the "
+    "host-side ``_stream_pod_log`` only mirrored to "
+    "``state/gpu_eval.log`` — single file, no per-round persistence). "
+    "Fixed in distil/eval/pod.py to ALSO persist ``state/pod_logs/"
+    "eval_round_<round_id>.log`` per round with 50-file rolling cap. "
+    "Live log of the current round is at ``state/gpu_eval.log`` and "
+    "``/api/gpu-logs`` regardless — that endpoint is the actual "
+    "real-time tail and HAS been current throughout."
 )
 lines.append(
     "- **The bot does have visibility into pod live state.** The "
