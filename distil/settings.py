@@ -182,7 +182,18 @@ class Settings(BaseSettings):
 
     # ── Multi-king / weight setting ────────────────────────────────
     multi_king_payout_enabled: bool = True
-    recent_kings_max: int = 4
+    # Number of distinct recent kings that share emission. Legacy
+    # ``scripts/validator/eval/state.py:RECENT_KINGS_MAX`` was 5 (1
+    # live king + 4 previous distinct UIDs, each receiving 1/5 of
+    # the round's emission). The 2026-05-15 ``distil/`` rewrite
+    # silently dropped this to 4, which cut one slot per round and
+    # was flagged by miner @itorgov on 2026-05-17 12:07 UTC as a
+    # regression that quietly removed emission from one ranked
+    # miner. Restored to 5 here; ``build_recent_kings_weights`` and
+    # ``ValidatorState.push_king`` both read from this setting so
+    # the queue cap, weight split, and emission expectations all
+    # align with the legacy 5-king split.
+    recent_kings_max: int = 5
     set_weights_on_dq: bool = True
 
     # ── Lium / pod ─────────────────────────────────────────────────
