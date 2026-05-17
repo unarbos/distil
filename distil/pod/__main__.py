@@ -408,6 +408,20 @@ def main(argv: list[str] | None = None) -> int:
         my_students = _filter_students_for_shard(spec["students"], shard_idx, n_shards)
         logger.info(f"shard {shard_idx}/{n_shards}: {len(my_students)} students")
         raw_by_student: dict[str, dict] = {}
+        # Seed shard progress with the per-shard student-count plumbing
+        # the orchestrator sums for the unified ``students_done`` field.
+        # Without this seed, the shard's progress file never carries
+        # ``students_done`` and ``_write_unified_progress`` reports
+        # ``students_done: 0`` for the entire round even after every
+        # student finishes, which the dashboard rendered as a stuck
+        # eval and the bot mis-parsed as "no progress".
+        students_done_in_shard = 0
+        write_progress(
+            progress_path,
+            phase="student_starting",
+            shard_students_total=len(my_students),
+            students_done=0,
+        )
         for student_spec in my_students:
             if not cuda_alive():
                 logger.error("CUDA poisoned — quarantining round")
@@ -427,6 +441,13 @@ def main(argv: list[str] | None = None) -> int:
             if raw is not None and "error" not in row:
                 raw_by_student[student_spec["name"]] = raw
             _flush_partial()
+            students_done_in_shard += 1
+            write_progress(
+                progress_path,
+                phase="student_axes",
+                students_done=students_done_in_shard,
+                shard_students_total=len(my_students),
+            )
             try:
                 hf_cache.clean_model(
                     student_spec["repo"], keep_repos=(spec["teacher_repo"],)
