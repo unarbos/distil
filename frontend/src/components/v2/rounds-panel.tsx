@@ -315,12 +315,66 @@ const ROUND_AXIS_COLS: { key: string; label: string; group?: "raw" | "axis" }[] 
   { key: "code_bench", label: "code" },
   { key: "reasoning_bench", label: "reas" },
   { key: "ifeval_bench", label: "ifev" },
-  { key: "aime_bench", label: "aime" },
+  { key: "knowledge_bench", label: "know" },
   { key: "judge_probe", label: "judg" },
   { key: "chat_turns_probe", label: "chat" },
   { key: "length", label: "len" },
-  { key: "degeneracy", label: "deg" },
+  { key: "top_k_overlap", label: "topK" },
 ];
+
+// v32 schema (live since 2026-05-02 teacher swap) uses ``v31_*``-prefixed
+// per-bench axis keys; the earlier ``*_bench`` aggregate keys are legacy.
+// Dashboard columns kept their semantic short labels (math/code/reas/ifev
+// /know/aime/deg), but the value lookup needs to know how to resolve the
+// new schema. ``resolveAxisValue`` returns the column's value from the
+// per-row ``composite.axes`` payload by:
+//
+//   1. If a v32 key with the same name exists, return it (forward-compat
+//      if the schema is bumped to add a true aggregate axis).
+//   2. Else, map ``<bench>_bench`` to the canonical v31 axis(es):
+//        * ``math_bench``   → mean of ``v31_math_*`` (3 axes)
+//        * ``code_bench``   → ``v31_code_humaneval_plus``
+//        * ``reasoning_bench`` → mean of ``v31_reasoning_*`` (2 axes)
+//        * ``ifeval_bench`` → ``v31_ifeval_verifiable``
+//        * ``knowledge_bench`` → ``v31_knowledge_multi_hop_kg``
+//   3. ``aime_bench`` is no longer in the schema (replaced by
+//      ``v31_math_competition``) and ``degeneracy`` was dropped in the
+//      think_probe-only refactor — both return null.
+//
+// Without this resolver, every ``*_bench`` column rendered ``—`` for
+// every miner this round, which made the round detail look like a
+// broken evaluation. The data was always there under the v31 keys.
+function resolveAxisValue(
+  axes: Record<string, number | null | undefined>,
+  key: string,
+): number | null {
+  if (key in axes) {
+    const v = axes[key];
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  const meanOf = (prefix: string): number | null => {
+    const vals = Object.entries(axes)
+      .filter(([k, v]) => k.startsWith(prefix) && typeof v === "number" && Number.isFinite(v))
+      .map(([, v]) => v as number);
+    if (vals.length === 0) return null;
+    return vals.reduce((a, b) => a + b, 0) / vals.length;
+  };
+  if (key === "math_bench") return meanOf("v31_math_");
+  if (key === "code_bench") {
+    const v = axes["v31_code_humaneval_plus"];
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  if (key === "reasoning_bench") return meanOf("v31_reasoning_");
+  if (key === "ifeval_bench") {
+    const v = axes["v31_ifeval_verifiable"];
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  if (key === "knowledge_bench") {
+    const v = axes["v31_knowledge_multi_hop_kg"];
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  }
+  return null;
+}
 
 /**
  * Pre-grid summary chips: list saturated axes (≥80% of UIDs ≥0.95)
@@ -501,8 +555,8 @@ function RoundAxisGrid({ round }: { round: H2hRound }) {
                       </td>
                     );
                   }
-                  const v = ax[c.key];
-                  if (typeof v !== "number" || !Number.isFinite(v)) {
+                  const v = resolveAxisValue(ax, c.key);
+                  if (v == null) {
                     return (
                       <td key={c.key} className="text-right px-2 py-1.5 text-meta">
                         —

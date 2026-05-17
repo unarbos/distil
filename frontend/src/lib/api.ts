@@ -227,13 +227,48 @@ export async function fetchAllModelInfo(models: string[]): Promise<Record<string
   return results;
 }
 
+// Composite axis surface — keep ``[key: string]`` open because the
+// schema version drives which axes are present and the dashboard reads
+// values by key dynamically (``axes[col.key]`` with a resolver that
+// also handles ``<bench>_bench`` aliases mapping to v31_* sub-axes).
+// The named fields below are documented for editor-hover only; the
+// authoritative source of truth is whichever schema bumped
+// ``composite.version`` last (currently v32: ``v31_*``-prefixed
+// per-bench keys + core/judge/discipline buckets, with ``degeneracy``
+// dropped because think_probe is not part of every round).
 export interface H2hCompositeAxes {
+  [key: string]: number | undefined;
+  // Core (always present)
   kl?: number;
+  on_policy_rkl?: number;
+  top_k_overlap?: number;
   capability?: number;
   length?: number;
-  degeneracy?: number;
-  on_policy_rkl?: number;
+  // Judge bucket
   judge_probe?: number;
+  long_form_judge?: number;
+  long_gen_coherence?: number;
+  chat_turns_probe?: number;
+  // Discipline bucket (note: ``degeneracy`` only present when
+  // think_probe data was collected this round, otherwise absent —
+  // do NOT treat missing as a bug)
+  reasoning_density?: number;
+  calibration_bench?: number;
+  degeneracy?: number;
+  // v31 per-bench axes (current schema, v32)
+  v31_math_gsm_symbolic?: number;
+  v31_math_competition?: number;
+  v31_math_robustness?: number;
+  v31_code_humaneval_plus?: number;
+  v31_reasoning_logic_grid?: number;
+  v31_reasoning_dyval_arith?: number;
+  v31_long_context_ruler?: number;
+  v31_knowledge_multi_hop_kg?: number;
+  v31_ifeval_verifiable?: number;
+  v31_truthfulness_calibration?: number;
+  v31_consistency_paraphrase?: number;
+  // Legacy aggregate keys (older rounds; dashboard resolver maps
+  // these onto the v31_* sub-axes when reading current rounds)
   math_bench?: number;
   code_bench?: number;
   reasoning_bench?: number;
@@ -249,8 +284,6 @@ export interface H2hCompositeAxes {
   procedural_bench?: number;
   robustness_bench?: number;
   noise_resistance_bench?: number;
-  reasoning_density?: number;
-  chat_turns_probe?: number;
 }
 
 export interface H2hComposite {
@@ -461,10 +494,26 @@ export function buildMinerList(
     const uid = neuron.uid;
     const emaStr = scores?.ema_scores?.[String(uid)];
     const ema = emaStr != null ? emaStr : null;
-    // Use ema_scores as authoritative — includes disqualifications (duplicates, integrity failures)
-    // Fall back to last_eval model KL only if no ema_score exists
+    // KL display fallback chain:
+    //   1) ``ema_scores[uid]`` — authoritative across rounds (drops to
+    //      null if the miner has been disqualified or never scored).
+    //   2) ``last_eval.students[model].kl_global_avg`` — populated by the
+    //      legacy ``scripts/validator/single_eval`` writer; only present
+    //      for UIDs evaluated under the pre-rewrite path.
+    //   3) ``h2h_latest.results[*].kl`` — paired-KL from the current
+    //      round, populated by ``distil/eval/results.publish_round`` for
+    //      every model in the live eval set (king + challengers). This
+    //      is the row that previously showed ``—`` for the king and the
+    //      top challengers — the rewrite stopped writing to
+    //      ``last_eval.students``, so steps 1 and 2 returned null for
+    //      every freshly-evaluated miner. Step 3 closes the gap so the
+    //      KL column is populated for any UID that has appeared in the
+    //      most recent round.
     const rawKl = modelKl[com.model] ?? null;
-    const kl = ema != null && ema > maxKl ? null : (ema ?? rawKl);
+    const h2hKlEarly = uidToH2h.get(uid)?.kl;
+    const h2hKlNumber =
+      typeof h2hKlEarly === "number" && Number.isFinite(h2hKlEarly) ? h2hKlEarly : null;
+    const kl = ema != null && ema > maxKl ? null : (ema ?? rawKl ?? h2hKlNumber);
 
     // Compute confidence interval from per-prompt data
     const studentData = scores?.last_eval?.students?.[com.model];
