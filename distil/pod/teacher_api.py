@@ -39,6 +39,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -340,6 +341,7 @@ def generate_continuations_api(
     *,
     max_new_tokens: int,
     top_k: int,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> list[TeacherOutput]:
     """Drop-in for ``teacher.generate_continuations`` running via API.
 
@@ -384,6 +386,16 @@ def generate_continuations_api(
                 completed += 1
                 if completed % 10 == 0 or completed == n:
                     logger.info(f"api teacher progress {completed}/{n}")
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(completed, n)
+                        except Exception as cb_exc:
+                            # Telemetry callback failure must not poison
+                            # the round; just log + continue.
+                            logger.warning(
+                                f"api teacher progress_cb raised: "
+                                f"{type(cb_exc).__name__}: {cb_exc}"
+                            )
             except Exception as exc:
                 failed.append((idx, f"{type(exc).__name__}: {exc}"))
                 logger.warning(

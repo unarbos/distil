@@ -111,9 +111,33 @@ def _phase_teacher(spec: dict, progress_path: Path) -> dict:
             phase="teacher_generating",
             round_id=spec["round_id"],
             n_prompts=len(prompts),
+            teacher_prompts_done=0,
             mode="api",
         )
-        outs = generate_continuations_api(prompts, max_new_tokens=max_new, top_k=top_k)
+
+        # Plumb teacher progress through to eval_progress.json so the
+        # validator (and dashboard) can render a teacher-phase fraction
+        # instead of the bare "teacher_generating" string for the full
+        # 10+ minute teacher window. Before this hook, eval_progress.json
+        # had ``teacher_prompts_done: null`` until the pod transitioned
+        # to the student phase, even though the teacher_api logs were
+        # already emitting ``api teacher progress N/256``.
+        def _teacher_progress(done: int, total: int) -> None:
+            write_progress(
+                progress_path,
+                phase="teacher_generating",
+                round_id=spec["round_id"],
+                n_prompts=total,
+                teacher_prompts_done=done,
+                mode="api",
+            )
+
+        outs = generate_continuations_api(
+            prompts,
+            max_new_tokens=max_new,
+            top_k=top_k,
+            progress_cb=_teacher_progress,
+        )
     else:
         write_progress(progress_path, phase="teacher_starting", round_id=spec["round_id"])
         teacher = start_teacher(spec["teacher_repo"], spec.get("vllm") or {})
