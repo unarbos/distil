@@ -15,15 +15,15 @@ from distil.state.store import store
 router = APIRouter(prefix="/api")
 
 
-@router.get("/health")
-def health() -> dict[str, Any]:
-    progress = store.eval_progress()
-    return {
-        "ok": True,
-        "phase": progress.get("phase"),
-        "round_id": progress.get("round_id"),
-        "updated_at": progress.get("updated_at"),
-    }
+# ``/api/health`` is owned by the legacy ``api/routes/health.py`` —
+# that one returns the rich subnet snapshot (king, eval-active, n_scored,
+# etc.) that the dashboard and external bots actually consume. The bare-
+# bones distil-side health used to live here for the rewrite scaffolding
+# but it was shadowed by the legacy router (mounted first in
+# ``server.py``) and only produced a duplicate-operation-id warning. The
+# legacy implementation is the canonical one; if/when the rewrite needs
+# its own diagnostic endpoint it can mount under a new path
+# (e.g. ``/api/v2/health``) so the schemas stay disambiguated.
 
 
 @router.get("/leaderboard")
@@ -137,19 +137,13 @@ def telemetry_timings(window: int = 100) -> dict[str, Any]:
     return {"window": int(window), "rows": timings}
 
 
-@router.get("/telemetry/overview")
-def telemetry_overview() -> dict[str, Any]:
-    """High-level overview for the Live tab."""
-    progress = store.eval_progress()
-    last_eval = store.last_eval()
-    return {
-        "phase": progress.get("phase"),
-        "round_id": progress.get("round_id"),
-        "n_prompts": progress.get("n_prompts"),
-        "phase_timings": (progress.get("phase_timings") or [])[-20:],
-        "updated_at": progress.get("updated_at"),
-        "last_eval": last_eval,
-    }
+# ``/api/telemetry/overview`` is owned by the legacy
+# ``api/routes/telemetry.py`` — that one is the rich dashboard payload
+# (recent DQs, private-pool, king probe, composite axes, events feed).
+# The rewrite-scaffolding shim removed for the same reason as
+# ``/api/health`` above (duplicate-operation-id warning, legacy wins,
+# distil-side never reachable). Mount a new path under ``/api/v2/`` if a
+# parallel implementation is needed.
 
 
 @router.get("/composite-config")

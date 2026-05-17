@@ -61,15 +61,14 @@ def _normalise_messages(raw: list[dict]) -> list[dict]:
     return out
 
 
-@router.get("/api/chat/status")
-def chat_status() -> dict[str, Any]:
-    h2h = store.h2h_latest() or {}
-    return {
-        "king_model": h2h.get("king_after") or h2h.get("king_name"),
-        "block": h2h.get("block"),
-        "model_name": settings.chat_model_name,
-        "pod_url": settings.chat_pod_url.rsplit(":", 1)[0],
-    }
+# ``/api/chat/status`` is owned by the legacy ``api/routes/chat.py`` —
+# that one returns the full server-availability probe (pod reachability,
+# eval-active flag, long_form_judge / coherence / judge_probe axes,
+# composite_final, 10s cache). The bare-bones distil-side status used to
+# live here for rewrite scaffolding but was shadowed by the legacy
+# router and only produced a duplicate-operation-id warning. Removed
+# rather than carry dead code; mount under ``/api/v2/`` if a parallel
+# diagnostic is needed.
 
 
 @router.post("/api/chat")
