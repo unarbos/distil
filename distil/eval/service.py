@@ -373,12 +373,34 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
             king_name = str(new_king_uid)
     record["prev_king_uid"] = prev_king_uid
     record["new_king_uid"] = new_king_uid
-    record["king_changed"] = (
+    king_changed = (
         new_king_uid is not None
         and prev_king_uid is not None
         and int(new_king_uid) != int(prev_king_uid)
     )
+    record["king_changed"] = king_changed
     record["dethrone_method"] = why
+    # CRITICAL: when dethrone fires, rewrite ``record["king_uid"]`` (and
+    # the matching name+model fields) to the NEW seated king so the
+    # next round's resolver (``service._round`` line ~167 reads
+    # ``state.h2h_latest.king_uid``) picks the dethrone winner instead
+    # of replaying the deposed king. Without this rewrite, three
+    # successive rounds (blocks 8198615, 8199086, 8199665) recorded
+    # ``king_changed=True`` with ``king_after`` set to 52, 92, and 35
+    # respectively — but each next round read ``king_uid=47`` and
+    # re-seated UID 47 anyway. ``king_after`` and ``new_king_uid``
+    # become PURELY informational (post-gate audit fields) while
+    # ``king_uid`` is the canonical seated-king field that drives the
+    # next round.
+    if king_changed and new_king_uid is not None:
+        record["king_uid"] = int(new_king_uid)
+        record["king_name"] = str(new_king_uid)
+        # Look up the new king's model+revision so the dashboard +
+        # downstream consumers don't render the stale deposed-king
+        # model on h2h_latest.king_model.
+        new_king_commit = commitments.get(int(new_king_uid))
+        if new_king_commit is not None:
+            record["king_model"] = new_king_commit.model
     # The record was already appended by process_round; rewrite the
     # last h2h_history row + h2h_latest with the dethrone-context
     # fields so the dashboard reads the same payload the validator
