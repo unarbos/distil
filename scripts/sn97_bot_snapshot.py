@@ -1144,6 +1144,39 @@ lines.append(
     "challenger `kl` values come from the SAME 300 prompts in the SAME round, "
     "so dethrone decisions are fair."
 )
+lines.append(
+    "- **The dethrone gate has NO 'Pareto gate', NO per-axis veto, and NO "
+    "axis-wise win-count check.** ``grep -ri 'pareto' /opt/distil/repo/distil/`` "
+    "returns ZERO matches. The actual gate (``distil/eval/results.py::can_dethrone``) "
+    "is, in order: (1) challenger must have ``composite.final`` set; (2) "
+    "if no king is seated, dethrone (cold start); (3) both sides must have "
+    "``present_count >= composite_dethrone_min_axes`` (currently 5); (4) "
+    "challenger's ``composite.worst`` (single-axis worst) must be ``>= "
+    "composite_dethrone_floor`` (currently 0.20); (5) challenger's "
+    "``composite.final >= king.final * (1 + composite_dethrone_margin)`` "
+    "(currently 1.05, i.e. 5%). That is the entire gate. If a UID has a "
+    "composite below ``king.final * 1.05`` it loses on the margin check, "
+    "NOT on a phantom Pareto gate. ``resolve_king`` then picks the BEST "
+    "challenger that passes the gate (winner-takes-all), so if two "
+    "challengers both beat the king, only the higher-composite one is "
+    "seated and the other is NOT \"blocked\" — they just lost the "
+    "single-king slot to a stronger model that round. NEVER claim "
+    "\"Pareto gate broken\" / \"Pareto gate blocking UID X\" — that "
+    "concept does not exist in this codebase."
+)
+lines.append(
+    "- **\"Kingship reset\" / \"reset recent_kings to [47]\" / \"restore "
+    "UID 47 to the queue\" is not a real planned action.** No code path "
+    "resets kingship or rewrites ``recent_kings`` to a single deposed UID. "
+    "Dethrones are not rolled back when bugs are fixed retroactively. "
+    "``recent_kings`` is a FIFO of size ``settings.recent_kings_max`` "
+    "(currently 5) populated only via ``ValidatorState.push_king`` which "
+    "fires only when ``resolve_king`` returns a UID different from the "
+    "incoming king. Path back to the throne for any deposed UID is the "
+    "same as any other miner: re-commit, get evaluated, beat the current "
+    "king's ``composite.final`` by >5%. If a miner asks about a kingship "
+    "reset, the answer is \"there is no kingship reset; compete normally\"."
+)
 lines.append("")
 lines.append("## How to use")
 lines.append("")
