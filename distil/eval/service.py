@@ -401,6 +401,46 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         new_king_commit = commitments.get(int(new_king_uid))
         if new_king_commit is not None:
             record["king_model"] = new_king_commit.model
+        # ``top4_leaderboard.king`` was already written by
+        # ``_refresh_top4`` inside ``process_round`` BEFORE the dethrone
+        # gate ran above — so its ``king`` field still names the deposed
+        # UID, and ``/api/miner/<deposed>`` returns ``is_king: true``
+        # while ``/api/miner/<new_king>`` returns ``is_king: false``.
+        # Confirmed in #distil 2026-05-17 ("UID 35 leaderboard king,
+        # UID 14 still is_king:true on API"). The contender rows ranked
+        # by composite ``final`` are still valid (dethrone doesn't move
+        # any composite scores) so only the ``king`` field and the
+        # ``contenders`` partitioning need a post-dethrone rewrite.
+        leaderboard = getattr(state, "top4_leaderboard", None) or {}
+        rows = list(leaderboard.get("rows") or [])
+        cs_map = getattr(state, "composite_scores", None) or {}
+        new_king_row: dict | None = None
+        for r in rows:
+            if r.get("uid") == int(new_king_uid):
+                new_king_row = r
+                break
+        if new_king_row is None:
+            kc = cs_map.get(str(int(new_king_uid))) or {}
+            if kc:
+                model = kc.get("model")
+                revision = kc.get("revision")
+                new_king_row = {
+                    "rank": None,
+                    "uid": int(new_king_uid),
+                    "name": f"{model}@{revision}" if model and revision else model,
+                    "model": model,
+                    "final": kc.get("final"),
+                    "worst_3_mean": kc.get("worst_3_mean"),
+                    "weighted": kc.get("weighted"),
+                    "present_count": kc.get("present_count"),
+                }
+        if new_king_row is not None:
+            state.top4_leaderboard = {
+                **leaderboard,
+                "updated_at": time.time(),
+                "king": new_king_row,
+                "contenders": [r for r in rows if r is not new_king_row],
+            }
     # The record was already appended by process_round; rewrite the
     # last h2h_history row + h2h_latest with the dethrone-context
     # fields so the dashboard reads the same payload the validator
