@@ -338,21 +338,50 @@ def pod_live_info(ssh):
         "-p", str(ssh["port"]),
         f"{ssh['user']}@{ssh['host']}",
         (
-            "ls -1dt /home/distil_eval_*/ 2>/dev/null | head -1 > /tmp/rd; "
-            "RD=$(cat /tmp/rd); "
+            # The pod's eval run-dir layout changed: legacy was
+            # /home/distil_eval_<round_id>_<pid>/ (single dir per round);
+            # current layout is /home/distil_eval/round_<round_id>/ (one
+            # container with per-round subdirs). The old glob
+            # /home/distil_eval_*/ ONLY matched the legacy form (the
+            # trailing underscore + char requirement skipped the new
+            # /home/distil_eval/ container), so on the new layout the
+            # snapshot fell back to the most recent LEGACY dir (often
+            # weeks-stale) and reported "Eval process DEAD" from a
+            # round that finished days ago. This new selector
+            # explicitly checks both layouts and picks the most-recent
+            # mtime, then picks the right log/pid file for that layout.
+            "RD=$(ls -1dt /home/distil_eval/round_*/ /home/distil_eval_*/ 2>/dev/null | head -1); "
             "echo RUN_DIR:$RD; "
             "if [ -n \"$RD\" ]; then "
             "  echo ---PROGRESS---; "
-            "  cat ${RD}eval_progress.json 2>/dev/null | head -c 3000; echo; "
+            # New orchestrator's eval_progress.json carries 8 per-GPU
+            # shard rows pushing past the legacy 3KB cap; bump to 8KB.
+            "  cat ${RD}eval_progress.json 2>/dev/null | head -c 8000; echo; "
             "  echo ---PID_ALIVE---; "
             "  if [ -f ${RD}pod_eval.pid ]; then "
             "    PID=$(cat ${RD}pod_eval.pid); "
             "    if kill -0 $PID 2>/dev/null; then echo alive:$PID; else echo dead:$PID; fi; "
+            "  elif echo $RD | grep -q 'distil_eval/round_'; then "
+            # New-layout dirs don't carry a pod_eval.pid (the Python
+            # orchestrator owns the process tree); detect liveness via
+            # the orchestrator PID running on the pod instead.
+            "    if pgrep -f \"distil.pod.orchestrator.*${RD#/home/distil_eval/}\" >/dev/null 2>&1; then "
+            "      echo alive:orchestrator; "
+            "    elif [ -f ${RD}orchestrator.log ] && grep -q 'round completed' ${RD}orchestrator.log 2>/dev/null; then "
+            "      echo finished_clean; "
+            "    else echo no_pid; fi; "
             "  else echo no_pid; fi; "
             "  echo ---TAIL_LOG---; "
-            "  tail -40 ${RD}eval_output.log 2>/dev/null; "
+            "  if [ -f ${RD}eval_output.log ]; then tail -40 ${RD}eval_output.log; "
+            "  elif [ -f ${RD}orchestrator.log ]; then "
+            "    tail -20 ${RD}orchestrator.log 2>/dev/null; "
+            "    echo '--- phase1_teacher.log tail ---'; "
+            "    tail -10 ${RD}phase1_teacher.log 2>/dev/null; "
+            "  fi; "
             "  echo ---DONE_MARKER---; "
-            "  [ -f ${RD}eval_done.marker ] && echo present || echo absent; "
+            "  if [ -f ${RD}eval_done.marker ]; then echo present; "
+            "  elif [ -f ${RD}results.json ]; then echo present_results_json; "
+            "  else echo absent; fi; "
             "fi; "
             "echo ---NVIDIA---; "
             "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null; "
@@ -361,29 +390,48 @@ def pod_live_info(ssh):
             "echo ---DISK---; "
             "df -h /home 2>/dev/null | tail -1; "
             "echo ---VLLM_PROCS---; "
-            "pgrep -af 'pod_eval.py|vllm' 2>/dev/null | head -5 || echo none"
+            "pgrep -af 'pod_eval.py|vllm|distil.pod' 2>/dev/null | head -5 || echo none"
         ),
     ]
     rc, out = _run(cmd, timeout=25)
-    return {"reachable": rc == 0, "rc": rc, "raw": out[:6000]}
+    # The 8KB head -c on eval_progress.json alone, plus nvidia-smi (8
+    # lines × ~70B), plus log tails, easily blows the old 6KB cap; bump
+    # so the trailing ---NVIDIA--- / ---VLLM_PROCS--- sections aren't
+    # silently truncated mid-line.
+    return {"reachable": rc == 0, "rc": rc, "raw": out[:16000]}
 
 
 def parse_pod_live(raw):
     """Turn the SSH output into structured fields."""
-    out = {"phase": None, "students_total": None, "students_done": None,
-           "prompts_total": None, "current": None, "teacher_prompts_done": None,
-           "pid_state": None, "done_marker": None, "gpu": None, "disk": None,
-           "procs_count": 0, "run_dir": None, "log_tail": None}
+    out = {"phase": None, "active": None, "students_total": None,
+           "students_done": None, "prompts_total": None, "current": None,
+           "teacher_prompts_done": None, "pid_state": None, "done_marker": None,
+           "gpu": None, "disk": None, "procs_count": 0, "run_dir": None,
+           "log_tail": None}
     if not isinstance(raw, str):
         return out
     m = re.search(r"RUN_DIR:([^\n]+)", raw)
     if m:
         out["run_dir"] = m.group(1).strip()
-    pb = re.search(r"---PROGRESS---\n(\{.*?\})\n", raw, re.DOTALL)
+    # Extract the JSON between ``---PROGRESS---`` and the next section
+    # marker. Previously this used ``(\{.*?\})\n`` which assumed a
+    # single-line trailing brace, but the new orchestrator's eval_progress
+    # has 8 per-GPU shard entries pushing the JSON well past the SSH
+    # buffer's old 3KB cap; truncation chopped the final ``}`` so the
+    # non-greedy regex matched the FIRST inner shard ``}`` and produced
+    # invalid JSON that the except branch silently swallowed.
+    pb = re.search(r"---PROGRESS---\n(.+?)\n---", raw, re.DOTALL)
     if pb:
         try:
-            pj = json.loads(pb.group(1))
+            pj = json.loads(pb.group(1).strip())
             out["phase"] = pj.get("phase")
+            # Pod's eval_progress.json sets ``active=False`` the moment the
+            # round wraps. Surface this so the narrative builder can
+            # distinguish "between rounds" from "stuck mid-round" instead
+            # of leaning on the now-removed pod_eval.pid as a liveness
+            # proxy.
+            if "active" in pj:
+                out["active"] = bool(pj.get("active"))
             out["students_total"] = pj.get("students_total")
             out["prompts_total"] = pj.get("prompts_total")
             out["teacher_prompts_done"] = pj.get("teacher_prompts_done")
@@ -406,10 +454,13 @@ def parse_pod_live(raw):
                 }
         except Exception:
             pass
-    m = re.search(r"---PID_ALIVE---\n(alive|dead|no_pid)(?::(\d+))?", raw)
+    m = re.search(
+        r"---PID_ALIVE---\n(alive(?::orchestrator|:\d+)?|dead(?::\d+)?|finished_clean|no_pid)",
+        raw,
+    )
     if m:
-        out["pid_state"] = m.group(1) + (f":{m.group(2)}" if m.group(2) else "")
-    m = re.search(r"---DONE_MARKER---\n(present|absent)", raw)
+        out["pid_state"] = m.group(1)
+    m = re.search(r"---DONE_MARKER---\n(present(?:_results_json)?|absent)", raw)
     if m:
         out["done_marker"] = m.group(1)
     nv = re.search(r"---NVIDIA---\n(.*?)(?=\n---|\Z)", raw, re.DOTALL)
@@ -858,7 +909,15 @@ phase = pl.get("phase")
 cur = pl.get("current") or {}
 if pl.get("reachable"):
     gpu_s = pl.get("gpu") or "?"
-    if pid_state == "alive" and not done:
+    # Cross-check the pod's view of `active`/`phase` with the validator
+    # snapshot. In the new orchestrator layout the pod writes
+    # ``active: false`` + ``phase: finished`` into eval_progress.json
+    # the moment the round wraps up, so the validator may show
+    # ``eval_active: false`` for the entire 70-minute inter-round sleep.
+    # Treat that as "between rounds", NOT "stuck".
+    pod_active = bool(pl.get("active")) if pl.get("active") is not None else None
+    finished_phase = phase in (None, "finished", "done") or done
+    if pid_state == "alive" and not done and not finished_phase:
         narrative.append(
             f"**Eval is RUNNING on pod.** Phase=`{phase}`. "
             + (f"Current student UID/model: `{cur.get('name')}` "
@@ -868,10 +927,35 @@ if pl.get("reachable"):
             + f"GPU: {gpu_s}. Disk: {pl.get('disk')}. "
             + f"{pl.get('students_done') or 0}/{pl.get('students_total') or '?'} students scored."
         )
+    elif pid_state == "finished_clean" or (finished_phase and not api_eval):
+        narrative.append(
+            "**Round COMPLETE — validator is between rounds.** Pod's "
+            "eval_progress.json reports `phase=finished`, "
+            "no orchestrator/vllm processes running on the pod, GPUs idle. "
+            "Validator now sleeps `ROUND_INTERVAL_S = 4200s` (~70min) before "
+            "the next round queues (see `distil/eval/service.py`). This is "
+            "the expected steady-state between rounds — it is NOT a hang."
+        )
     elif done:
         narrative.append("**Eval DONE on pod.** done marker present; validator will apply results next cycle.")
     elif pid_state == "dead":
-        narrative.append("**Eval process DEAD on pod** (pid recorded but not alive). Validator will clean up and restart next epoch.")
+        # Only consider this a real problem if the round is BOTH not
+        # marked finished AND the API still thinks eval is active.
+        if api_eval and not finished_phase:
+            narrative.append(
+                "**Eval process DEAD on pod mid-round** (pid recorded "
+                "but not alive, phase not yet `finished`, validator still "
+                "reports `eval_active=true`). Validator should clean up "
+                "and restart next epoch — flag this in #ops if it "
+                "persists past one full sleep cycle (~70 min)."
+            )
+        else:
+            narrative.append(
+                "Pod's pod_eval.pid points to a stale dead process from a "
+                "previous round (the new orchestrator layout doesn't write "
+                "this file). Round is complete; validator is between rounds. "
+                "This is cosmetic, not a real failure."
+            )
     elif pid_state == "no_pid":
         narrative.append("No active pod_eval PID on pod. Validator is likely between rounds or prechecking.")
     else:
