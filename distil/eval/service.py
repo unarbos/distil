@@ -169,6 +169,31 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     # crashing every distil round at this exact line until 22:46 UTC).
     king_name: str | None = None
     king_uid: int | None = None
+    # Filter ``composite_scores`` to only UIDs with a current on-chain
+    # commitment before any ``resolve_king`` call. Without this filter,
+    # a UID that deregistered (or whose commitment became unparseable)
+    # but still has a stored ``composite_final`` will beat every live
+    # miner in ``select_king``'s highest-final scan, the
+    # ``commitments.get(uid)`` lookup will then return ``None``, and
+    # the self-heal fallback calls ``resolve_king`` *again on the same
+    # unfiltered dict*, getting the same dead UID back → ``king_uid``
+    # collapses to ``None`` and the round runs king-less. The seat
+    # then stays empty for every subsequent round because each round
+    # writes ``h2h_latest.king_uid=null``, which gates out the
+    # ``h2h_latest`` fast path next time around.
+    #
+    # 2026-05-18: this was the live failure mode after UID 119
+    # (composite_final=0.4209, scored 2026-05-17 12:42 UTC) lost its
+    # chain commitment overnight — every round since 14:00 UTC ran
+    # king-less, emission weights collapsed to zeros, and the bot
+    # surfaced "king_uid: None" across the channel.
+    valid_composites = {
+        k: v
+        for k, v in (state.composite_scores or {}).items()
+        if isinstance(k, str)
+        and k.isdigit()
+        and int(k) in commitments
+    }
     h2h_king_uid = (state.h2h_latest or {}).get("king_uid")
     if h2h_king_uid is not None and int(h2h_king_uid) in commitments:
         king_uid = int(h2h_king_uid)
@@ -176,7 +201,7 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         _king_reason = "h2h_latest"
     else:
         king_name, _king_reason = resolve_king(
-            state.composite_scores, current_king_model=None
+            valid_composites, current_king_model=None
         )
         if king_name is not None:
             try:
@@ -200,7 +225,7 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
             f"seated king uid={king_uid} no longer in commitments; "
             "falling back to composite-scores top scorer"
         )
-        fallback_name, _ = resolve_king(state.composite_scores, current_king_model=None)
+        fallback_name, _ = resolve_king(valid_composites, current_king_model=None)
         king_name = None
         king_uid = None
         if fallback_name is not None:
