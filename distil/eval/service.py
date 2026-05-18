@@ -374,7 +374,28 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     )
     state.current_round = {**state.current_round, "completed": True, "completed_at": time.time()}
     state.save()
-    new_king, why = resolve_king(state.composite_scores, current_king_model=king_name)
+    # End-of-round dethrone gate. MUST use the same commitments-filtered
+    # composites that round-start used (see ``valid_composites`` above),
+    # otherwise a dead UID with a stale-but-high stored
+    # ``composite_final`` will beat the freshly-seated king here, the
+    # record-rewrite at line ~425 will write ``king_uid=<dead_uid>`` into
+    # ``h2h_latest``, and the next round's fast path will replay the
+    # dead UID's lookup. 2026-05-18: this was the second half of the UID 119
+    # incident — even after ``valid_composites`` blocked UID 119 from
+    # being seated at round start, the unfiltered ``resolve_king`` here
+    # promoted UID 119 to ``new_king_uid`` at round end (0.4209 stale >
+    # 0.4175 fresh on UID 92) and the record-rewrite at line 425
+    # silently re-introduced the dead UID to ``h2h_latest``. Recomputed
+    # because ``process_round`` may have just inserted a fresh composite
+    # for the seated king.
+    valid_composites_end = {
+        k: v
+        for k, v in (state.composite_scores or {}).items()
+        if isinstance(k, str)
+        and k.isdigit()
+        and int(k) in commitments
+    }
+    new_king, why = resolve_king(valid_composites_end, current_king_model=king_name)
     record["king_after"] = new_king
     record["king_reason"] = why
 
