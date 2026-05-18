@@ -14,7 +14,14 @@ Environment=HOME=/home/distil
 # Same env file as legacy unit — TMC_API_KEY, HF_TOKEN, etc.
 EnvironmentFile=-/home/distil/.secrets/distil.env
 # Same uvicorn flags as the legacy unit, ONLY the import target changes.
-ExecStart=/opt/distil/venv/bin/python -m uvicorn distil.api.server:app --host 0.0.0.0 --port 3710 --log-level warning --limit-concurrency 2000 --timeout-keep-alive 3 --backlog 2048 --workers 1
+# --workers 4 — bumped 2026-05-18 from 1 → 4 after the API was
+# returning 503 "Exceeded concurrency limit" under the live load mix
+# (~6.4k public connections to caddy fan out to ~4k upstream to the
+# API on a single worker, swamping the 2000-concurrency cap). Four
+# workers gives 8000 total concurrency with ~1.5 GB RSS budget, which
+# fits comfortably on this host. The validator state files are read
+# lock-free (mmap'd JSON; safe across workers).
+ExecStart=/opt/distil/venv/bin/python -m uvicorn distil.api.server:app --host 0.0.0.0 --port 3710 --log-level warning --limit-concurrency 2000 --timeout-keep-alive 3 --backlog 2048 --workers 4
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
