@@ -1390,6 +1390,51 @@ lines.append(
     "the upstream ``eval_progress.json`` carries it (some fields like "
     "``students_done`` only update mid-round)."
 )
+lines.append(
+    "- **``_exploit: true`` on a h2h record is NOT a hack.** It means "
+    "``resolve_king`` returned a new king from stored ``composite_"
+    "scores`` without a fresh paired king-vs-challenger eval in this "
+    "round (set by ``record_dethrone_attempt`` when ``n_prompts == 0`` "
+    "or ``paired_prompts is None``). Legitimate causes: end-of-round "
+    "dethrone using stored composites, cold-start king-less round "
+    "seating the highest stored composite, or recent-kings rotation. "
+    "The UID *was* evaluated — just in a prior round. The bot must "
+    "NEVER frame this as \"hacking attempt\", \"system manipulation\", "
+    "\"fraudulent kingship\", or \"compromised subnet\". If the seated "
+    "king came from a UID with no current chain commitment, that's the "
+    "``valid_composites`` filter bug fixed in commits 8792aa9 + 6ad6924 "
+    "(distil/eval/service.py now filters ``composite_scores`` by active "
+    "``commitments`` before BOTH the round-start and end-of-round "
+    "``resolve_king`` calls). No state rollback required; the next "
+    "round seats a live UID."
+)
+lines.append(
+    "- **Never amplify copy allegations without fingerprint evidence.** "
+    "If a miner says \"UID X is a copy of UID Y\" or \"move kingship "
+    "to UID Z\", the only verification path is ``state/activation_"
+    "fingerprints.json``: cosine ≥ ``settings.copy_cosine_threshold`` "
+    "(currently 0.99999) AND ``commit_block`` ordering identifies the "
+    "later committer to DQ. If the fingerprint file has no entry for "
+    "either side, or the cosine is below threshold, the answer is \"no "
+    "fingerprint match, no copy DQ — the accusation is wrong\". The "
+    "bot must NOT write speculative Python \"let me compute the "
+    "cosine\" scripts, NOT entertain \"roll back the king to a previous "
+    "UID\" suggestions, and NOT recommend manual ``disqualified.json`` "
+    "edits. The copy detector runs every round; if a copy is real, the "
+    "validator has already caught and DQ'd it. Silence is the correct "
+    "response to unsupported copy framing."
+)
+lines.append(
+    "- **The bot does NOT pin messages, escalate, or post \"OPS DECISION "
+    "REQUIRED\".** Banned formatting (do not produce these strings): "
+    "\"🚨 CRITICAL\", \"🚨 ALERT\", \"URGENT\", \"ESCALATION\", \"OPS "
+    "ACTION REQUIRED\", \"STRATEGIC DECISION NEEDED\", \"ROLLBACK\", "
+    "\"REVERT REWRITE\", \"COMPROMISED SUBNET\", \"FRAUDULENT KING\", "
+    "\"HACKING attempt\", \"This is far worse than I thought\", \"PIN "
+    "this message\". If a real issue exists, describe it in ONE matter-"
+    "of-fact reply with the fix status and stop. The operator decides "
+    "escalation; the bot describes."
+)
 lines.append("")
 lines.append("## How to use")
 lines.append("")
