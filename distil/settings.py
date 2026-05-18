@@ -196,6 +196,24 @@ class Settings(BaseSettings):
     recent_kings_max: int = 5
     set_weights_on_dq: bool = True
 
+    # ── Round pacing ──────────────────────────────────────────────
+    # Seconds the validator sleeps between rounds. Historically this
+    # was hard-coded to 4200s (~70 min, one Bittensor super-block) to
+    # pace ``set_weights`` calls with the chain's WeightsRateLimit. On
+    # 2026-05-18 it was made configurable and dropped to 0 so rounds
+    # run back-to-back — the eval backlog clears faster and the bot
+    # stops having to explain "validator is in scheduled sleep" every
+    # time a miner asks "is it stuck?". If the chain rejects
+    # ``set_weights`` with ``SettingWeightsTooFast`` you can raise this
+    # back up via the ``DISTIL_ROUND_INTERVAL_S`` env var; the retry
+    # path in ``distil/chain/weights.py`` will handle transient
+    # rate-limit errors as long as the value stays >= 60s.
+    round_interval_s: int = Field(
+        default=0,
+        validation_alias="DISTIL_ROUND_INTERVAL_S",
+        description="Inter-round sleep in seconds; 0 = back-to-back rounds.",
+    )
+
     # ── Lium / pod ─────────────────────────────────────────────────
     lium_api_key: str = Field(default="", validation_alias="LIUM_API_KEY")
     lium_default_pod_size: str = "B200x1"

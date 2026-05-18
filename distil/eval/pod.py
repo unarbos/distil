@@ -174,7 +174,51 @@ def attach_pod(name: str | None = None):
         )
     lium = _make_lium()
     pm = _pod_manager(lium, pod_name)
-    pm.connect()  # raises RuntimeError if pod is missing
+
+    # Retry on transient Lium portal API errors (LiumServerError /
+    # 5xx). The Lium control-plane API at lium.io occasionally returns
+    # 503 when its db is under load — this does NOT mean the pod
+    # itself is unreachable. Without this retry the validator
+    # surfaces a "CRITICAL pod unavailable" alert in the bot and
+    # users panic; with it we just log a warning and try again.
+    # ``RuntimeError`` ("pod not found") still fails fast — that's
+    # genuine pod-list state, not a transient API blip.
+    last_err: Exception | None = None
+    for attempt in range(1, 6):
+        try:
+            pm.connect()
+            break
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            err_type = type(exc).__name__
+            err_str = str(exc)
+            transient = (
+                "LiumServerError" in err_type
+                or "Server error: 5" in err_str
+                or "ConnectionError" in err_type
+                or "Timeout" in err_type
+            )
+            if not transient or attempt == 5:
+                logger.error(
+                    f"attach_pod {pod_name!r} failed permanently after "
+                    f"{attempt} attempt(s): {err_type}: {err_str}"
+                )
+                raise
+            backoff = min(60, 5 * (2 ** (attempt - 1)))
+            last_err = exc
+            logger.warning(
+                f"attach_pod {pod_name!r} attempt {attempt}/5 hit "
+                f"transient Lium portal error ({err_type}: {err_str}); "
+                f"retrying in {backoff}s — this is a CONTROL-PLANE "
+                f"glitch, not a pod outage"
+            )
+            time.sleep(backoff)
+    else:  # pragma: no cover — defensive, the loop always breaks or raises
+        raise RuntimeError(
+            f"attach_pod {pod_name!r}: exhausted retries (last: {last_err!r})"
+        )
+
     logger.info(f"attached to persistent pod {pod_name!r}")
     yield pm
     # Persistent: do NOT terminate.

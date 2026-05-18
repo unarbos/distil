@@ -43,7 +43,12 @@ from distil.state.files import ValidatorState, log_event
 
 logger = logging.getLogger("distil.eval.service")
 
-ROUND_INTERVAL_S = 4200  # ~70 minutes / one Bittensor super-block
+# Legacy fallback only. Real value comes from ``settings.round_interval_s``
+# (env: ``DISTIL_ROUND_INTERVAL_S``) and defaults to 0 → back-to-back rounds.
+# Historically 4200s (~70 min / one Bittensor super-block) to pace
+# ``set_weights`` calls; in 2026-05-18 we dropped this to 0 so the eval
+# backlog clears without "validator is in scheduled sleep" FUD in #distil-97.
+ROUND_INTERVAL_S = 4200
 
 _STOP = False
 
@@ -454,6 +459,8 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         n_uids=len(mg.hotkeys),
         king_uid=king_uid,
         recent_kings=state.recent_kings,
+        state=state,
+        uid_hotkey_map=state.uid_hotkey_map,
     )
     if dry_run:
         logger.info(f"[dry-run] weights would be: max={max(weights):.3f} king_uid={king_uid}")
@@ -508,7 +515,21 @@ def run(
                 return 1
         if once:
             return 0
-        for _ in range(ROUND_INTERVAL_S):
+        # Read each iteration so an operator can hot-tune via env +
+        # validator restart without a code change.
+        try:
+            sleep_s = int(getattr(settings, "round_interval_s", ROUND_INTERVAL_S))
+        except (TypeError, ValueError):
+            sleep_s = ROUND_INTERVAL_S
+        sleep_s = max(0, sleep_s)
+        if sleep_s == 0:
+            logger.info(
+                "inter-round sleep disabled (round_interval_s=0); "
+                "starting next round immediately"
+            )
+            continue
+        logger.info(f"sleeping {sleep_s}s before next round")
+        for _ in range(sleep_s):
             if _STOP:
                 break
             time.sleep(1)

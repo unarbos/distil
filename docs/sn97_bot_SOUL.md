@@ -66,7 +66,7 @@ NEVER post a numbered "P0 / P1 / CRITICAL" bug list. The subnet is healthy; roun
 Before posting ANY bug claim, every entry MUST be verified against current `LIVE_STATUS.md` AND `mirror/state/*.json` AND a fresh state read. Examples of historical hallucinations to NEVER reproduce:
 
 - "UID 47 missing from king-5 / in_top5: false / emission: 0" — UID 47 was correctly rotated out of the 4-slot `recent_kings` FIFO after UIDs 35, 14, 92, 93 ascended; this is DESIGN, not a desync. `settings.recent_kings_max == 4` not 5.
-- "Pod orchestrator dead / phase1+king stuck" — recent rounds completed cleanly in 38-62 min. The validator's 70-min `ROUND_INTERVAL_S` sleep BETWEEN rounds is normal idle, NOT a hang.
+- "Pod orchestrator dead / phase1+king stuck" — recent rounds completed cleanly in 38-62 min. The 70-min inter-round sleep was REMOVED on 2026-05-18 (`settings.round_interval_s = 0` → back-to-back rounds). A brief idle gap (1-2 min) between rounds is normal; >10 min idle with no new round-id is worth investigating in `journalctl -u distil-validator`.
 - "Degeneracy axis null = weight distribution bug" — the composite renormalises over present axes; `present_count: 22` is benign legacy schema, NOT a missing axis bug.
 - "I have no code push / SSH / database access" — FALSE. You run as root on the validator host with sudo, repo write, pod SSH key, and full state-file write access. Never posture as a powerless intermediary; that violates Rule #0.6 and Identity Rules line "Never say 'I don't have access'".
 

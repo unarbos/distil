@@ -129,6 +129,7 @@ def evict_stale_evaluated_uids(
     """
     evicted: list[str] = []
     composite_scores = state.composite_scores or {}
+    evaluated_hotkeys = getattr(state, "evaluated_hotkeys", {}) or {}
     for uid, c in commitments.items():
         uid_str = str(uid)
         in_eu = uid_str in (state.evaluated_uids or [])
@@ -137,8 +138,63 @@ def evict_stale_evaluated_uids(
             continue
         stored = composite_scores.get(uid_str)
         if stored is None:
-            # In ``evaluated_uids`` but no composite row — DQ-only
-            # path; leave consumed (matches legacy single_eval:128-132).
+            # In ``evaluated_uids`` but no composite row. STRICT
+            # one-eval-per-commit invariant: only evict when the
+            # CURRENT chain commit has NOT been evaluated against this
+            # hotkey before. Use ``evaluated_hotkeys[hk]`` as the
+            # source of truth — it persists across composite-schema
+            # bumps (which ``evict_stale_composites`` blew away).
+            #
+            # Two branches eligible for eviction:
+            #   1. No ``evaluated_hotkeys`` entry for this hotkey at
+            #      all — brand-new hotkey / hotkey rotation; the
+            #      ``evaluated_uids`` row is stale book-keeping from
+            #      whoever held this UID before.
+            #   2. Entry exists but ``(model, revision)`` differs from
+            #      the current chain commit — same hotkey pushed a
+            #      new model and the composite row was lost to a
+            #      schema bump or never written (e.g. orchestrator
+            #      crashed between the slot consume and composite
+            #      write).
+            #
+            # Earlier revisions of this function were too aggressive
+            # and evicted any ``in_eu && composite=None`` UID
+            # regardless of whether the same commit had already been
+            # evaluated. That re-queued 41 miners on commits they had
+            # already taken their fair eval against and burned ~10x
+            # OpenRouter teacher-API spend for no scoring change. See
+            # the 2026-05-18 #distil-97 post-mortem.
+            hk = getattr(c, "hotkey", None)
+            eh_entry = evaluated_hotkeys.get(hk) if hk else None
+            if eh_entry:
+                eh_model = (eh_entry.get("model") or "").strip().lower()
+                eh_rev = (eh_entry.get("revision") or "main").strip().lower()
+                cur_model = (getattr(c, "model", "") or "").strip().lower()
+                cur_rev = (getattr(c, "revision", "main") or "main").strip().lower()
+                # Same commit if model matches and revisions agree on
+                # at least their 7-char short SHA prefix (mirrors how
+                # bittensor commitments report revisions).
+                rev_match = (
+                    eh_rev[:7] == cur_rev[:7]
+                    or (eh_rev in ("", "main") and cur_rev in ("", "main"))
+                )
+                if eh_model == cur_model and rev_match:
+                    continue  # SAME commit; one-eval-per-commit holds.
+                logger.info(
+                    f"evicting UID {uid_str} (hotkey {hk!r}): same hotkey "
+                    f"pushed new commit {cur_model}@{cur_rev[:7]} "
+                    f"(prev was {eh_model}@{eh_rev[:7]})"
+                )
+            else:
+                logger.info(
+                    f"evicting UID {uid_str} (hotkey {hk!r}): no prior "
+                    f"evaluated_hotkeys entry — new miner / hotkey rotation"
+                )
+            try:
+                state.evaluated_uids.remove(uid_str)
+            except ValueError:
+                pass
+            evicted.append(uid_str)
             continue
         if not _commitment_changed(stored, c):
             continue
