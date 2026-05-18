@@ -68,13 +68,42 @@ def maybe_json(text: str) -> Any:
         return None
 
 
-def request_url(url: str, timeout: int = 10) -> dict[str, Any]:
-    """Fetch ``url`` once; return a normalized status dict.
+def request_url(url: str, timeout: int = 10, retries: int = 2) -> dict[str, Any]:
+    """Fetch ``url``; return a normalized status dict.
+
+    Retries up to ``retries`` additional times on transient failures
+    (503, network errors, timeout) before declaring the endpoint
+    unhealthy. This avoids the false-positive restart loop where a
+    single transient 503 under load (e.g. ``Exceeded concurrency
+    limit`` from uvicorn) flips ``http:api_*:ok=False`` and triggers
+    ``restart("distil-api", "api_unhealthy")`` — which then takes 90s
+    to die under graceful shutdown, drops all in-flight requests, and
+    causes the NEXT healthcheck tick (5 min later) to see another
+    transient blip from the cold-start traffic surge, repeating.
 
     Catches every transport-level exception (HTTPError, URLError, plain
     OSError/TimeoutError) so the healthcheck never crashes on a flaky
     endpoint -- failures become ``ok=False`` records.
     """
+    last: dict[str, Any] | None = None
+    delay_s = 1.0
+    for attempt in range(retries + 1):
+        last = _request_url_once(url, timeout=timeout)
+        # Healthy on this attempt → return immediately.
+        if last.get("ok"):
+            return last
+        # 4xx (except 429) is a real client/config problem — no point retrying.
+        status = last.get("status")
+        if isinstance(status, int) and 400 <= status < 500 and status != 429:
+            return last
+        # On 5xx / network failure / 429 / timeout → retry after backoff.
+        if attempt < retries:
+            time.sleep(delay_s)
+            delay_s *= 2
+    return last or {"ok": False, "status": None, "body_excerpt": "no_attempt", "body_bytes": 0, "json": None}
+
+
+def _request_url_once(url: str, timeout: int = 10) -> dict[str, Any]:
     req = Request(url, headers={"User-Agent": "sn97-healthcheck/1.0"})
     try:
         with urlopen(req, timeout=timeout) as resp:
@@ -323,6 +352,32 @@ def chain_weight_sanity(expected_king_uid: int | None) -> dict[str, Any]:
 
 
 def journal_failures(units: list[str], since: str = "1 hour ago") -> dict[str, int]:
+    """Count *meaningful* failure lines per unit.
+
+    Previously this counted every line containing ``"Failed"`` — which
+    matches a lot of systemd cgroup chatter that has nothing to do with
+    service health:
+
+      * ``Failed to kill control group /system.slice/<unit>: Invalid argument``
+        — systemd-cgroup-v2 cosmetic; happens on every restart attempt.
+      * ``Failed to fork off main process: Resource temporarily unavailable``
+        — transient PID-allocation hiccup.
+
+    These lines accumulate ~2 per restart and, since the healthcheck's
+    ``api_unhealthy`` branch will then restart the unit again, the
+    counter inflates monotonically and the autorepair loop never
+    converges. The 2026-05-18 distil-api thrash (restart every ~40 min
+    for several hours) was caused by this feedback path.
+
+    The actual SIGNAL we care about is one of:
+
+      * ``<unit>: Failed with result '<reason>'``   — the unit's own
+        exit reason as recorded by systemd.
+      * ``<unit>: Main process exited, code=killed, status=9/KILL``
+      * ``ERROR`` / ``CRITICAL`` log lines in the unit's stderr/stdout.
+
+    Filter to those so we don't restart on the noise we ourselves produce.
+    """
     out: dict[str, int] = {}
     for unit in units:
         result = run(
@@ -332,7 +387,30 @@ def journal_failures(units: list[str], since: str = "1 hour ago") -> dict[str, i
         if result.returncode != 0:
             out[unit] = -1
             continue
-        out[unit] = sum(1 for line in result.stdout.splitlines() if "Failed" in line or "failed with result" in line)
+        count = 0
+        for line in result.stdout.splitlines():
+            # systemd-internal cgroup chatter — always noise.
+            if "Failed to kill control group" in line:
+                continue
+            if "Failed to fork off main process" in line:
+                continue
+            # uvicorn warning spam ("Exceeded concurrency limit.") shows
+            # up under transient load and recovers on its own — never
+            # restart for it.
+            if "Exceeded concurrency limit" in line:
+                continue
+            # Actual unit-level failure surfaces:
+            if "failed with result" in line.lower():
+                count += 1
+                continue
+            if "Main process exited, code=killed" in line:
+                count += 1
+                continue
+            # Application-level loud errors (unit prefix → real stderr).
+            if "CRITICAL" in line or "Traceback (most recent call last)" in line:
+                count += 1
+                continue
+        out[unit] = count
     return out
 
 

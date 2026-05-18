@@ -328,15 +328,61 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     dur_min = (time.time() - t_round_start) / 60
     logger.info(f"round {spec['round_id']} eval finished in {dur_min:.1f} min")
 
-    uid_index = {
-        c.key: {
-            "uid": c.uid, "hotkey": uid_to_hotkey.get(c.uid),
-            "coldkey": getattr(c, "coldkey", None),
-            "commit_block": getattr(c, "commit_block", None),
-            "revision": getattr(c, "revision", "main"),
+    # Build the ``model@revision -> {uid, hotkey, ...}`` lookup that
+    # ``process_round`` uses to map each pod result row back to a
+    # specific (uid, hotkey) for state writes (composite_scores,
+    # evaluated_hotkeys, activation_fingerprints, DQs).
+    #
+    # CRITICAL: when two miners commit the **same** model@revision under
+    # **different** hotkeys, ``commitments.values()`` has two entries
+    # that produce the same ``c.key``. A naive dict comprehension keeps
+    # only the last-iterated one — and which one wins is whatever Python
+    # gave us from the metagraph iteration (typically uid-ascending,
+    # i.e. the *later* committer). Result of the bug: ``select_challengers``
+    # picks the fresh UID (no composite, no evaluated_hotkeys entry),
+    # the round_spec is built with that UID, the pod evaluates the
+    # model, but ``process_round`` looks the result up in this
+    # ``uid_index`` and writes the composite under the OTHER UID. The
+    # fresh UID never gets marked evaluated, gets re-selected every
+    # round, and burns 1 of the 3 challenger slots indefinitely.
+    # Observed 2026-05-18 on UID 25 / UID 28 both holding
+    # ``RLStepone/distil-b300-training-h25@5b20b59...``: UID 25 was in
+    # the spec for 8+ consecutive rounds but every result was credited
+    # to UID 28.
+    #
+    # Fix: prefer the (uid, hotkey) that's actually in ``spec["students"]``
+    # for this round. That's the UID we scheduled, so that's the UID
+    # whose state should be mutated. Fall back to ``commitments.values()``
+    # for any model row not in the spec (king/reference/teacher).
+    uid_index: dict[str, dict] = {}
+    for s in spec.get("students", []) or []:
+        name = s.get("name")
+        uid_val = s.get("uid")
+        if not name or uid_val is None:
+            continue
+        # spec entries carry uid/hotkey/revision/is_king but not
+        # commit_block / coldkey — fetch those from commitments[uid].
+        c = commitments.get(int(uid_val))
+        uid_index[name] = {
+            "uid": int(uid_val),
+            "hotkey": s.get("hotkey") or uid_to_hotkey.get(int(uid_val)),
+            "coldkey": getattr(c, "coldkey", None) if c else None,
+            "commit_block": getattr(c, "commit_block", None) if c else None,
+            "revision": s.get("revision") or (getattr(c, "revision", "main") if c else "main"),
         }
-        for c in commitments.values()
-    }
+    # Fallback: include any chain commitment NOT in the spec, but use
+    # ``setdefault`` so the spec winners stay authoritative.
+    for c in commitments.values():
+        uid_index.setdefault(
+            c.key,
+            {
+                "uid": c.uid,
+                "hotkey": uid_to_hotkey.get(c.uid),
+                "coldkey": getattr(c, "coldkey", None),
+                "commit_block": getattr(c, "commit_block", None),
+                "revision": getattr(c, "revision", "main"),
+            },
+        )
     # Two different "king" identifiers here, easily confused:
     #
     #   * ``king_key`` (model_name@revision) — matches the keys in
