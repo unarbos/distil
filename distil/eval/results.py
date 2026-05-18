@@ -513,7 +513,20 @@ def process_round(
         load_failed = bool(row.get("error")) and not (comp or {}).get("worst")
         load_succeeded = (comp or {}).get("worst") is not None
         load_failures_after = None
-        if uid is not None and not is_ref and not is_king:
+        # Kings ARE included in the failure tracker as of 2026-05-18.
+        # Previously kings were exempt (the assumption was "the king
+        # cleared the floor in past rounds, so a load blip should not
+        # cost their crown"). In practice this caused the
+        # ``dethrone:no_king`` cascade: a king with a permanently
+        # broken model (e.g. unloadable tokenizer config like
+        # ``talent-richer/top-training-6@44e856cd``) would fail re-eval
+        # every round, ``can_dethrone`` would return ``no_king`` on
+        # every challenger, and the crown thrashed across ~10
+        # back-to-back rounds before stabilising on whatever happened
+        # to load. Kings still don't get their ``evaluated_uids`` slot
+        # burned (they hold the crown until either re-eval succeeds
+        # or the load-strikes DQ them outright).
+        if uid is not None and not is_ref:
             if load_succeeded:
                 state.reset_failures(int(uid))
             elif load_failed:
@@ -531,7 +544,37 @@ def process_round(
                     "kind": "load_failed",
                     "strike": load_failures_after,
                     "error": err_short,
+                    "was_king": bool(is_king),
                 })
+                # After ``max_load_failures`` consecutive load failures
+                # on the SAME commitment, DQ the hotkey. For a king
+                # this is what breaks the ``dethrone:no_king`` cascade:
+                # the next ``select_king`` pass will skip them and a
+                # legitimate dethrone (margin-checked) picks the
+                # replacement. For a challenger the slot-consume
+                # logic below already handles burn-down; the DQ here
+                # is the explicit signal so the dashboard / bot can
+                # surface "model is permanently broken" rather than
+                # "model is just temporarily missing".
+                if (
+                    hotkey
+                    and load_failures_after is not None
+                    and load_failures_after >= settings.max_load_failures
+                    and not state.is_disqualified(hotkey, uid=int(uid))
+                ):
+                    dq_reason = (
+                        f"load_failed_{load_failures_after}x:"
+                        f"{name}:{err_short[:120]}"
+                    )
+                    state.disqualify(hotkey, dq_reason)
+                    result_row["disqualified"] = True
+                    result_row["dq_reason"] = dq_reason
+                    logger.warning(
+                        f"UID {uid} ({'KING ' if is_king else ''}hotkey "
+                        f"{hotkey[:14]}..) DQ'd after "
+                        f"{load_failures_after} consecutive load failures "
+                        f"on {name}: {err_short[:120]}"
+                    )
         if (comp or {}).get("disqualified"):
             result_row["disqualified"] = True
             result_row["dq_reason"] = (comp or {}).get("dq_reason")
