@@ -42,22 +42,49 @@ You have full read access to this codebase. Use it to:
 - Quote non-sensitive code snippets when helpful
 
 ## 📁 Directory Guide
-- `api/` — FastAPI server **currently running in prod** (endpoints, state management). Entry: `api/server.py`.
-- `scripts/` — **Currently-running** validator + pod eval (`scripts/remote_validator.py` → `scripts.validator.service.run_validator`; `scripts/pod_eval_vllm.py` runs on the GPU pod).
-- `eval/` — Shared eval utilities used by both `scripts/` and tests (KL, state, model_checker, dataset).
-- `distil/` — **Rewrite-v2 (WIP, not in prod yet).** See `distil/README.md` and `REWRITE_PLAN.md`. Do not describe it as "the current validator" to users.
-- `state/` — Runtime state files (scores, h2h, disqualified list, evaluated_hotkeys, composite_scores).
-- `neurons/` — Bittensor neuron code.
-- `docs/` — Documentation.
-- `tests/` — Test files (832 tests, all targeting `scripts.validator.*` + `eval.*`).
-- `deploy/` — Systemd unit files + Caddy config + deploy runbooks.
+- `distil/` — **The live production validator + API + pod eval.** All three
+  systemd-managed services (`distil-validator.service`, `distil-api.service`,
+  `distil-dashboard.service`) entry-point here. CLI: `distil validate …`
+  → `distil/eval/service.py`. API: `uvicorn distil.api.server:app`.
+  See `distil/README.md` for the full layout.
+- `api/` — Legacy FastAPI route package, still **mounted at runtime** via
+  `distil/api/compat.py` because the rewrite reuses ~3k LoC of proven prod
+  route business logic (`api/routes/*`, `api/state_store.py`,
+  `api/agent_runner.py` for chat). The `api/server.py` Uvicorn entry is
+  **no longer the systemd target** — read it for context only.
+- `scripts/` — Mix of ops scripts on the active hot path
+  (`sn97_healthcheck.py`, `sn97_bot_snapshot.py`, `chat_tunnel_loop.sh`,
+  `chat_keeper.sh`, `openclaw_config_guard.py`) and legacy validator code
+  (`scripts/validator/*`, `pod_eval_vllm.py`, `parallel_orchestrator.py`)
+  that's kept on disk for the test suite + manual ops helpers
+  (`chat_pod_admin`) but is **not** what the live validator runs.
+- `eval/` — Legacy shared library. Only `eval/pod.PodManager` is still on
+  the validator hot path (re-exported via `distil/eval/pod.py`); the rest
+  is kept for the legacy validator + tests + `api/state_store.py` paths.
+- `state/` — Runtime state files (scores, h2h, disqualified list,
+  evaluated_hotkeys, composite_scores, announcement). Both the validator
+  and the API target `$DISTIL_STATE_DIR/` (default: `state/`).
 - `frontend/` — Next.js dashboard (renders at distil.arbos.life).
-- `.env` — 🚫 NEVER READ OR SHARE
+- `tests/` — Test suite (~832 tests). **Heavily imports `scripts.validator.*`
+  and `eval.*`** — do not delete those directories even though prod doesn't
+  use them.
+- `neurons/`, `distillation/` — Bittensor neuron scaffolding, not wired into
+  the live systemd units.
+- `docs/` — Operator + miner docs.
+- `deploy/` — Systemd unit files + Caddy config + deploy runbooks (notably
+  `deploy/cutover.md`).
+- `.env` — 🚫 NEVER READ OR SHARE.
 
-### Note on the cleanup of 2026-05-15
-- `legacy/` was deleted (~76k LoC of decommissioned code, zero callers).
-- Old state snapshots (`state.bak-*/`) were moved to `/var/backups/`.
-- If a transcript references `legacy/<path>`, treat it as a historical mention — the path no longer exists.
+### Cleanup history
+- **2026-05-15:** `legacy/` deleted (~76k LoC of decommissioned code,
+  zero callers); old state snapshots moved to `/var/backups/`.
+- **2026-05-19:** `scripts/remote_validator.py.{KILLED,DISABLED_PERMANENTLY}`
+  + the broken `scripts/run_validator.sh` wrapper were removed. The live
+  validator is launched directly by systemd as `distil validate …`; the
+  bash wrapper had been broken since the killed file was removed (it still
+  `exec`-ed `scripts/remote_validator.py`).
+- If a transcript references `legacy/<path>`, treat it as a historical
+  mention — the path no longer exists.
 
 ## Tools Available
 - `read` — Read files in this workspace (USE THIS instead of web_fetch for code questions)

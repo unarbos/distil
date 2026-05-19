@@ -46,7 +46,6 @@ from typing import Any, Callable
 
 from agents import (
     Agent,
-    AgentHooks,
     AsyncOpenAI,
     ItemHelpers,
     MaxTurnsExceeded,
@@ -85,7 +84,7 @@ except ImportError:  # pragma: no cover -- older openai pkg
     ResponseReasoningTextDeltaEvent = None  # type: ignore
 
 from agent_tools import (
-    ALL_TOOLS, SN97AgentContext, python_exec, system_prompt_for,
+    SN97AgentContext, python_exec, system_prompt_for,
 )
 
 logger = logging.getLogger("distil.agent_runner")

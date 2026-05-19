@@ -1,15 +1,21 @@
-# Distil — Rewrite Plan (v2)
+# Distil — Rewrite Plan (v2) — **CUTOVER COMPLETE**
 
-Last updated: **2026-05-15** · target state: **`distil/` is production, `scripts/` retired**.
+Last updated: **2026-05-19** · current state: **`distil/` IS production**.
+
+> This document captures the historical rewrite plan. The cutover landed
+> 2026-05-15 and `distil/` has been serving live traffic since. Keeping
+> this file around for the rollback runbook in `deploy/cutover.md` and so
+> we can refer back to the parity-snapshot evidence. New work should
+> happen directly in `distil/`.
 
 ## Current state (truth)
 
-The repo has **two parallel implementations** of the SN97 validator:
+The repo has two implementations still on disk; only one is live:
 
 | Track | Lives in | Status | Used by prod? |
 |---|---|---|---|
-| **Prod (v1)** | `scripts/`, `api/`, `eval/` | **Live, hardened by months of incidents** | **YES** — `distil-validator.service` and `distil-api.service` |
-| **Rewrite-v2** | `distil/` | **Feature-tracking prod** — Phase A + B done 2026-05-15 | NO — still not imported by the systemd units |
+| **Live** | `distil/` | **Production** — all three systemd units entry-point here | **YES** — `distil-validator.service`, `distil-api.service`, `distil-dashboard.service` |
+| **Legacy** | `scripts/`, `api/`, `eval/` | **Kept on disk** for tests (~832 tests still import `scripts.validator.*`) and for two narrowly-scoped shims (`api/routes/*` mounted by `distil/api/compat.py`, `eval/pod.PodManager` used by `distil/eval/pod.py`) | **NO** as a standalone validator path |
 
 ### Sizes (as of 2026-05-15)
 
