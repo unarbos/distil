@@ -26,9 +26,20 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(__file__))
 API = os.path.join(ROOT, "api")
 ROUTES = os.path.join(API, "routes")
+# Keep API ahead of ROUTES on sys.path: ``api/chat/`` (the new package
+# hosting the chat-completions plumbing extracted out of agent_runner) and
+# ``api/routes/chat.py`` (the FastAPI route module) both want the bare
+# ``chat`` name. The package wins when API is first; otherwise
+# ``from chat.sanitizer import …`` (inside agent_runner) explodes with
+# ``'chat' is not a package``.
 for path in (ROUTES, API, ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
+for path in (ROUTES, API):
+    if path in sys.path:
+        sys.path.remove(path)
+sys.path.insert(0, ROUTES)
+sys.path.insert(0, API)
 
 import agent_runner  # noqa: E402
 import agent_tools  # noqa: E402
@@ -846,11 +857,20 @@ def test_summarise_run_emits_tool_trace_in_reasoning():
 def _patch_streaming(monkeypatch, events):
     """Replace ``_run_agent_streaming`` with an async generator that just
     yields the supplied ``_StreamEvent`` list. Lets us isolate the SSE
-    format wrappers from the SDK ``Runner.run_streamed`` machinery."""
+    format wrappers from the SDK ``Runner.run_streamed`` machinery.
+
+    Since the chat-package split (2026-05-19), the streaming bridges live
+    in ``chat.streaming`` and reference ``_run_agent_streaming`` from
+    that module's own namespace; ``agent_runner._run_agent_streaming`` is
+    just a re-export. We patch BOTH binding points so the fake wins
+    regardless of which symbol path the SSE bridge resolves through.
+    """
     async def fake(body, king_uid, king_model, max_tokens, inputs):
         for ev in events:
             yield ev
     monkeypatch.setattr(agent_runner, "_run_agent_streaming", fake)
+    import chat.streaming
+    monkeypatch.setattr(chat.streaming, "_run_agent_streaming", fake)
 
 
 def test_stream_agent_chat_openai_emits_role_then_content_then_done(monkeypatch):

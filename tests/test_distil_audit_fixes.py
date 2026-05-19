@@ -24,10 +24,23 @@ from distil.eval.round import (
 class _FakeState:
     """Minimal duck-typed ValidatorState for round.py tests."""
 
-    def __init__(self, *, evaluated_uids=None, composite_scores=None, failures=None):
+    def __init__(
+        self,
+        *,
+        evaluated_uids=None,
+        composite_scores=None,
+        failures=None,
+        evaluated_hotkeys=None,
+    ):
         self.evaluated_uids = list(evaluated_uids or [])
         self.composite_scores = dict(composite_scores or {})
         self.failures = dict(failures or {})
+        # ``evaluated_hotkeys[hk]`` persists across composite-schema bumps
+        # and is the source of truth for the one-eval-per-commit invariant
+        # (see ``evict_stale_evaluated_uids``). ``process_round`` writes
+        # this map next to ``evaluated_uids`` whenever a slot is consumed
+        # (composite landed OR precheck DQ OR load-failure exhaustion).
+        self.evaluated_hotkeys = dict(evaluated_hotkeys or {})
         self.scores = {}
 
     def is_disqualified(self, *_a, **_k):
@@ -111,10 +124,23 @@ def test_bootstrapped_legacy_composite_not_evicted() -> None:
 
 
 def test_dq_only_uid_not_re_evicted() -> None:
-    """A UID in evaluated_uids but not composite_scores (precheck DQ) is left alone."""
+    """A UID in evaluated_uids but not composite_scores (precheck DQ) is left alone.
+
+    In production ``process_round`` writes ``evaluated_uids`` AND
+    ``evaluated_hotkeys[hk]`` atomically whenever a slot is consumed
+    (composite landed OR precheck DQ OR load-failure exhaustion).
+    The fake state mirrors that invariant so the eviction logic sees
+    a hotkey record matching the current commit and short-circuits.
+    """
     state = _FakeState(
         evaluated_uids=["55"],
         composite_scores={},
+        evaluated_hotkeys={
+            "hk55": {
+                "uid": 55, "model": "alice/v3", "revision": "main",
+                "composite_final": None, "composite_worst": None,
+            }
+        },
     )
     commitments = {55: _commit(55, model="alice/v3")}
     assert evict_stale_evaluated_uids(state, commitments) == []

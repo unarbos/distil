@@ -13,12 +13,24 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 API = os.path.join(ROOT, "api")
+# Order matters: keep API ahead of ROUTES so the new ``api/chat/`` package
+# resolves before ``api/routes/chat.py`` (the route file). The bare-name
+# ``import chat`` was historically resolved to the routes file via the
+# ROUTES path entry; we now spell that qualified to avoid the clash.
 ROUTES = os.path.join(API, "routes")
 for path in (ROUTES, API, ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
+# Re-shuffle so API sits ahead of ROUTES in the resolution order, otherwise
+# ``import chat`` lands on ``routes/chat.py`` and shadows the ``api/chat/``
+# package that ``agent_runner`` depends on.
+for path in (ROUTES, API):
+    if path in sys.path:
+        sys.path.remove(path)
+sys.path.insert(0, ROUTES)  # last
+sys.path.insert(0, API)     # first
 
-import chat as chat_route  # noqa: E402
+from routes import chat as chat_route  # noqa: E402
 
 
 # ── Transport-error mapping ──────────────────────────────────────────────────
