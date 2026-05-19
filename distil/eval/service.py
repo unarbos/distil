@@ -420,26 +420,61 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     )
     state.current_round = {**state.current_round, "completed": True, "completed_at": time.time()}
     state.save()
-    # End-of-round dethrone gate. MUST use the same commitments-filtered
-    # composites that round-start used (see ``valid_composites`` above),
-    # otherwise a dead UID with a stale-but-high stored
-    # ``composite_final`` will beat the freshly-seated king here, the
-    # record-rewrite at line ~425 will write ``king_uid=<dead_uid>`` into
-    # ``h2h_latest``, and the next round's fast path will replay the
-    # dead UID's lookup. 2026-05-18: this was the second half of the UID 119
-    # incident — even after ``valid_composites`` blocked UID 119 from
-    # being seated at round start, the unfiltered ``resolve_king`` here
-    # promoted UID 119 to ``new_king_uid`` at round end (0.4209 stale >
-    # 0.4175 fresh on UID 92) and the record-rewrite at line 425
-    # silently re-introduced the dead UID to ``h2h_latest``. Recomputed
-    # because ``process_round`` may have just inserted a fresh composite
-    # for the seated king.
+    # End-of-round dethrone gate. Restrict the candidate pool to:
+    #   1. The seated king (so they can defend the crown), and
+    #   2. UIDs that were students in THIS round (so their composite
+    #      was either freshly written by ``process_round`` above, or
+    #      — for the king's slot when ``SINGLE_EVAL_KING_REEVAL=1`` —
+    #      freshly re-measured on the current round's prompts).
+    #
+    # Without this same-round restriction the dethrone gate scans
+    # every entry in ``state.composite_scores`` regardless of when it
+    # was measured, and a UID with a stale-but-high stored
+    # ``composite_final`` will beat the freshly-evaluated king on
+    # variance alone. Observed live (Discord 2026-05-19 03:13 UTC):
+    #
+    #   block=8214203  students=[44]  prev=44 → new=66
+    #     reason=dethrone:final_gain 0.4253 >= king 0.4015 * (1+0.050)
+    #   block=8214362  students=[66]  prev=66 → new=68
+    #     reason=dethrone:final_gain 0.4215 >= king 0.3991 * (1+0.050)
+    #
+    # Both rounds had only the seated king in ``students`` (no other
+    # challengers in the eval backlog), the king's fresh score dipped a
+    # few points on the round's unlucky prompts, and a stale stored
+    # composite from a UID that hadn't been re-evaluated this round
+    # squeaked past the 5 % margin. The new king then took the crown
+    # without a single head-to-head comparison on the current round's
+    # prompts — i.e. the gate gave the crown to a model whose composite
+    # was measured on a different prompt seed than the king's was.
+    #
+    # The earlier ``in commitments`` filter (against deregistered UIDs)
+    # is still applied — it's an additional safety net, not a
+    # replacement.
+    #
+    # 2026-05-18: this was also the second half of the UID 119
+    # incident — even after the commitments filter blocked UID 119
+    # from being seated at round start, the unfiltered ``resolve_king``
+    # here promoted UID 119 to ``new_king_uid`` at round end (0.4209
+    # stale > 0.4175 fresh on UID 92) and the record-rewrite below
+    # silently re-introduced the dead UID to ``h2h_latest``.
+    same_round_uids: set[int] = set()
+    if king_uid is not None:
+        same_round_uids.add(int(king_uid))
+    for student in (record.get("students") or []):
+        if isinstance(student, dict):
+            uid_val = student.get("uid")
+            if uid_val is not None:
+                try:
+                    same_round_uids.add(int(uid_val))
+                except (TypeError, ValueError):
+                    continue
     valid_composites_end = {
         k: v
         for k, v in (state.composite_scores or {}).items()
         if isinstance(k, str)
         and k.isdigit()
         and int(k) in commitments
+        and int(k) in same_round_uids
     }
     new_king, why = resolve_king(valid_composites_end, current_king_model=king_name)
     record["king_after"] = new_king
