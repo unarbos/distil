@@ -91,156 +91,9 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     commitments, uid_to_hotkey, _ = parse_commitments(mg, revealed, n_uids=len(mg.hotkeys))
 
     state.uid_hotkey_map = {str(uid): hk for uid, hk in uid_to_hotkey.items()}
-    n_evict = evict_stale_composites(state)
-    if n_evict:
-        logger.info(f"evicted {n_evict} stale composite rows (schema bump)")
-    # Honest re-commit support: if a miner pushed v2 of their model on
-    # the same UID, drop the prior evaluated_uids/composite row so the
-    # challenger picker picks them up again. Without this, miners are
-    # silently starved after their first eval — matches legacy
-    # ``scripts/validator/single_eval.evict_stale_evaluated_uids``.
-    n_recommit = len(evict_stale_evaluated_uids(state, commitments))
-    if n_recommit:
-        logger.info(f"evicted {n_recommit} re-committed UIDs (slot reset)")
+    _maintain_state_at_round_start(state, commitments)
 
-    # Legacy ``integrity:HF 404`` DQs are otherwise permanent. When a
-    # miner restores their HF repo (aizaysi did this for
-    # ``RLStepone/distil-success-h19`` on 2026-05-16) we want the DQ
-    # to clear automatically rather than requiring a human to edit
-    # ``disqualified.json``. The sweeper HEAD-checks each
-    # ``integrity:.*404`` row and drops the DQ when HF returns 200.
-    try:
-        cleared = sweep_integrity_dq_recoveries(state)
-    except Exception as exc:  # pragma: no cover — fail open
-        logger.warning(f"dq_recovery sweeper raised: {type(exc).__name__}: {exc}")
-        cleared = []
-    if cleared:
-        for entry in cleared:
-            logger.info(
-                f"dq_recovery: cleared {entry['hotkey'][:20]}... "
-                f"({entry['model']!r}) — HF restored"
-            )
-
-    # Backfill any ``evaluated_uids`` entry missing a composite by
-    # walking ``h2h_history`` newest-first. The cutover from prod's
-    # ``scripts/validator`` rebuilt ``composite_scores.json`` from
-    # scratch but preserved ``evaluated_uids.json`` — left ~120 UIDs
-    # flagged "evaluated" with no composite, surfacing as
-    # ``eval_status: evaluated_no_composite`` + zero emission. The
-    # legacy h2h composite is enough for emission-share purposes and
-    # heals the mismatch within one round of redeploy.
-    try:
-        backfilled = backfill_missing_composites(state)
-    except Exception as exc:  # pragma: no cover — fail open
-        logger.warning(f"composite_backfill raised: {type(exc).__name__}: {exc}")
-        backfilled = []
-    if backfilled:
-        logger.info(
-            f"composite_backfill: restored {len(backfilled)} composite_scores "
-            f"entries from h2h_history"
-        )
-
-    # Resolve seated king. Mirrors the legacy
-    # ``scripts/validator/service._resolve_king`` precedence rules so
-    # the cutover doesn't inadvertently dethrone the king every round:
-    #
-    #   1) PRIMARY  — ``state.h2h_latest.king_uid`` if that uid is
-    #      still a valid commitment on the chain. The seated king
-    #      keeps the crown until the paired-test dethrone gate
-    #      decides otherwise, which happens AFTER scoring this round
-    #      (see ``distil.eval.results.publish_round``), NOT at round-
-    #      spec build time.
-    #   2) FALLBACK — best ``final`` in composite_scores (UID-keyed).
-    #      Only used on a cold-start validator with no h2h_latest yet.
-    #
-    # The previous code called ``resolve_king`` with
-    # ``current_king_model=None`` which short-circuits the dethrone
-    # gate and unconditionally returns the highest composite scorer —
-    # i.e. every round would dethrone the current king. The legacy
-    # validator never did that, and the dashboard would have flipped
-    # on every cutover round.
-    # ``king_name`` is the dethrone-gate's "current king" string (the
-    # downstream resolve_king() call uses it as
-    # ``current_king_model=``). Distil's composite_scores is UID-keyed,
-    # so by convention king_name here is ``str(uid)`` — the UID-as-
-    # string — matching what ``select_king`` returns. Both branches
-    # MUST bind king_name (or the f-string log_event below and the
-    # downstream dethrone-gate call hit UnboundLocalError, which was
-    # crashing every distil round at this exact line until 22:46 UTC).
-    king_name: str | None = None
-    king_uid: int | None = None
-    # Filter ``composite_scores`` to only UIDs with a current on-chain
-    # commitment before any ``resolve_king`` call. Without this filter,
-    # a UID that deregistered (or whose commitment became unparseable)
-    # but still has a stored ``composite_final`` will beat every live
-    # miner in ``select_king``'s highest-final scan, the
-    # ``commitments.get(uid)`` lookup will then return ``None``, and
-    # the self-heal fallback calls ``resolve_king`` *again on the same
-    # unfiltered dict*, getting the same dead UID back → ``king_uid``
-    # collapses to ``None`` and the round runs king-less. The seat
-    # then stays empty for every subsequent round because each round
-    # writes ``h2h_latest.king_uid=null``, which gates out the
-    # ``h2h_latest`` fast path next time around.
-    #
-    # 2026-05-18: this was the live failure mode after UID 119
-    # (composite_final=0.4209, scored 2026-05-17 12:42 UTC) lost its
-    # chain commitment overnight — every round since 14:00 UTC ran
-    # king-less, emission weights collapsed to zeros, and the bot
-    # surfaced "king_uid: None" across the channel.
-    valid_composites = {
-        k: v
-        for k, v in (state.composite_scores or {}).items()
-        if isinstance(k, str)
-        and k.isdigit()
-        and int(k) in commitments
-    }
-    h2h_king_uid = (state.h2h_latest or {}).get("king_uid")
-    if h2h_king_uid is not None and int(h2h_king_uid) in commitments:
-        king_uid = int(h2h_king_uid)
-        king_name = str(king_uid)
-        _king_reason = "h2h_latest"
-    else:
-        king_name, _king_reason = resolve_king(
-            valid_composites, current_king_model=None
-        )
-        if king_name is not None:
-            try:
-                # composite_scores is UID-keyed (matches legacy writer
-                # ``single_eval.py:state.composite_scores[uid_str] = record``).
-                king_uid = int(king_name)
-            except (TypeError, ValueError):
-                king_uid = next(
-                    (c.uid for c in commitments.values() if c.key == king_name),
-                    None,
-                )
-    king_commitment = commitments.get(king_uid) if king_uid is not None else None
-    # Self-healing: if h2h_latest pointed at a UID that no longer has
-    # a valid on-chain commitment (deregistered, model deleted, hotkey
-    # rotated), fall back to the composite-scores top scorer. Without
-    # this, ``build_round_spec`` runs a king-less round and downstream
-    # paired-KL anchors are missing — silently corrupts every
-    # subsequent dethrone gate.
-    if king_uid is not None and king_commitment is None:
-        logger.warning(
-            f"seated king uid={king_uid} no longer in commitments; "
-            "falling back to composite-scores top scorer"
-        )
-        fallback_name, _ = resolve_king(valid_composites, current_king_model=None)
-        king_name = None
-        king_uid = None
-        if fallback_name is not None:
-            try:
-                king_uid = int(fallback_name)
-            except (TypeError, ValueError):
-                king_uid = next(
-                    (c.uid for c in commitments.values() if c.key == fallback_name),
-                    None,
-                )
-            king_commitment = commitments.get(king_uid) if king_uid is not None else None
-            if king_commitment is not None:
-                king_name = str(king_uid)
-            else:
-                king_uid = None
+    king_uid, king_name, king_commitment = _resolve_seated_king(state, commitments)
 
     challengers = select_challengers(commitments, state, king_uid=king_uid)
     if not challengers:
@@ -274,58 +127,13 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
         return
 
-    # Resume-on-attach: if we have an in-progress round and the chain block
-    # hasn't advanced past the round-completion deadline, re-use the prior
-    # round_spec rather than building a fresh one. Lets a crashed-restarted
-    # validator continue an eval that's still running on the persistent pod.
-    #
-    # Resume is GATED on the prior spec containing the same set of
-    # students we'd ship today. If the set differs (e.g. the king
-    # changed, the challenger pool rotated, or the previous attempt
-    # was built before a bugfix that altered selection rules) we
-    # ABANDON the stale spec and rebuild from scratch. Without this
-    # gate, a 1-student in-progress round from a pre-fix attempt
-    # would keep getting "resumed" forever even after distil started
-    # selecting king + 10 challengers properly.
-    def _fresh_spec() -> dict[str, Any]:
-        return build_round_spec(
-            block=block,
-            block_hash=block_hash,
-            teacher_repo=settings.teacher_repo,
-            reference_repo=settings.reference_repo,
-            king=king_commitment,
-            challengers=challengers,
-        )
-
-    in_progress = state.current_round or {}
-    spec = None
-    if in_progress.get("round_id") and not in_progress.get("completed"):
-        age_min = (time.time() - in_progress.get("started_at", 0)) / 60
-        prev_spec = in_progress.get("spec") or {}
-        prev_uids = {int(s.get("uid", -1)) for s in (prev_spec.get("students") or [])}
-        fresh = _fresh_spec()
-        fresh_uids = {int(s.get("uid", -1)) for s in (fresh.get("students") or [])}
-        if age_min >= settings.eval_round_max_minutes * 2:
-            logger.warning(
-                f"in-progress round {in_progress['round_id']} is {age_min:.1f} min old; "
-                f"abandoning and starting fresh"
-            )
-            spec = fresh
-        elif prev_uids != fresh_uids:
-            logger.warning(
-                f"in-progress round {in_progress['round_id']} students "
-                f"{sorted(prev_uids)} != fresh {sorted(fresh_uids)}; "
-                f"abandoning (likely built pre-bugfix) and starting fresh"
-            )
-            spec = fresh
-        else:
-            logger.info(
-                f"resume: reusing in-progress round {in_progress['round_id']} "
-                f"(age {age_min:.1f} min, students match)"
-            )
-            spec = prev_spec
-    else:
-        spec = _fresh_spec()
+    spec = _resolve_round_spec(
+        state,
+        block=block,
+        block_hash=block_hash,
+        king_commitment=king_commitment,
+        challengers=challengers,
+    )
 
     out_dir = Path(settings.state_dir) / "_rounds" / f"round_{spec['round_id']}"
     log_event(f"starting round block={block} king={king_name} challengers={len(challengers)}")
@@ -355,61 +163,7 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     dur_min = (time.time() - t_round_start) / 60
     logger.info(f"round {spec['round_id']} eval finished in {dur_min:.1f} min")
 
-    # Build the ``model@revision -> {uid, hotkey, ...}`` lookup that
-    # ``process_round`` uses to map each pod result row back to a
-    # specific (uid, hotkey) for state writes (composite_scores,
-    # evaluated_hotkeys, activation_fingerprints, DQs).
-    #
-    # CRITICAL: when two miners commit the **same** model@revision under
-    # **different** hotkeys, ``commitments.values()`` has two entries
-    # that produce the same ``c.key``. A naive dict comprehension keeps
-    # only the last-iterated one — and which one wins is whatever Python
-    # gave us from the metagraph iteration (typically uid-ascending,
-    # i.e. the *later* committer). Result of the bug: ``select_challengers``
-    # picks the fresh UID (no composite, no evaluated_hotkeys entry),
-    # the round_spec is built with that UID, the pod evaluates the
-    # model, but ``process_round`` looks the result up in this
-    # ``uid_index`` and writes the composite under the OTHER UID. The
-    # fresh UID never gets marked evaluated, gets re-selected every
-    # round, and burns 1 of the 3 challenger slots indefinitely.
-    # Observed 2026-05-18 on UID 25 / UID 28 both holding
-    # ``RLStepone/distil-b300-training-h25@5b20b59...``: UID 25 was in
-    # the spec for 8+ consecutive rounds but every result was credited
-    # to UID 28.
-    #
-    # Fix: prefer the (uid, hotkey) that's actually in ``spec["students"]``
-    # for this round. That's the UID we scheduled, so that's the UID
-    # whose state should be mutated. Fall back to ``commitments.values()``
-    # for any model row not in the spec (king/reference/teacher).
-    uid_index: dict[str, dict] = {}
-    for s in spec.get("students", []) or []:
-        name = s.get("name")
-        uid_val = s.get("uid")
-        if not name or uid_val is None:
-            continue
-        # spec entries carry uid/hotkey/revision/is_king but not
-        # commit_block / coldkey — fetch those from commitments[uid].
-        c = commitments.get(int(uid_val))
-        uid_index[name] = {
-            "uid": int(uid_val),
-            "hotkey": s.get("hotkey") or uid_to_hotkey.get(int(uid_val)),
-            "coldkey": getattr(c, "coldkey", None) if c else None,
-            "commit_block": getattr(c, "commit_block", None) if c else None,
-            "revision": s.get("revision") or (getattr(c, "revision", "main") if c else "main"),
-        }
-    # Fallback: include any chain commitment NOT in the spec, but use
-    # ``setdefault`` so the spec winners stay authoritative.
-    for c in commitments.values():
-        uid_index.setdefault(
-            c.key,
-            {
-                "uid": c.uid,
-                "hotkey": uid_to_hotkey.get(c.uid),
-                "coldkey": getattr(c, "coldkey", None),
-                "commit_block": getattr(c, "commit_block", None),
-                "revision": getattr(c, "revision", "main"),
-            },
-        )
+    uid_index = _build_uid_index(spec, commitments, uid_to_hotkey)
     # Two different "king" identifiers here, easily confused:
     #
     #   * ``king_key`` (model_name@revision) — matches the keys in
@@ -447,43 +201,447 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     )
     state.current_round = {**state.current_round, "completed": True, "completed_at": time.time()}
     state.save()
-    # End-of-round dethrone gate. Restrict the candidate pool to:
-    #   1. The seated king (so they can defend the crown), and
-    #   2. UIDs that were students in THIS round (so their composite
-    #      was either freshly written by ``process_round`` above, or
-    #      — for the king's slot when ``SINGLE_EVAL_KING_REEVAL=1`` —
-    #      freshly re-measured on the current round's prompts).
-    #
-    # Without this same-round restriction the dethrone gate scans
-    # every entry in ``state.composite_scores`` regardless of when it
-    # was measured, and a UID with a stale-but-high stored
-    # ``composite_final`` will beat the freshly-evaluated king on
-    # variance alone. Observed live (Discord 2026-05-19 03:13 UTC):
-    #
-    #   block=8214203  students=[44]  prev=44 → new=66
-    #     reason=dethrone:final_gain 0.4253 >= king 0.4015 * (1+0.050)
-    #   block=8214362  students=[66]  prev=66 → new=68
-    #     reason=dethrone:final_gain 0.4215 >= king 0.3991 * (1+0.050)
-    #
-    # Both rounds had only the seated king in ``students`` (no other
-    # challengers in the eval backlog), the king's fresh score dipped a
-    # few points on the round's unlucky prompts, and a stale stored
-    # composite from a UID that hadn't been re-evaluated this round
-    # squeaked past the 5 % margin. The new king then took the crown
-    # without a single head-to-head comparison on the current round's
-    # prompts — i.e. the gate gave the crown to a model whose composite
-    # was measured on a different prompt seed than the king's was.
-    #
-    # The earlier ``in commitments`` filter (against deregistered UIDs)
-    # is still applied — it's an additional safety net, not a
-    # replacement.
-    #
-    # 2026-05-18: this was also the second half of the UID 119
-    # incident — even after the commitments filter blocked UID 119
-    # from being seated at round start, the unfiltered ``resolve_king``
-    # here promoted UID 119 to ``new_king_uid`` at round end (0.4209
-    # stale > 0.4175 fresh on UID 92) and the record-rewrite below
-    # silently re-introduced the dead UID to ``h2h_latest``.
+
+    king_uid, king_name, prev_king_uid, new_king_uid, king_changed, why = (
+        _apply_dethrone_gate(
+            state=state,
+            record=record,
+            commitments=commitments,
+            king_uid=king_uid,
+            king_name=king_name,
+        )
+    )
+
+    # The record was already appended by process_round; rewrite the
+    # last h2h_history row + h2h_latest with the dethrone-context
+    # fields so the dashboard reads the same payload the validator
+    # used to set weights.
+    if state.h2h_history:
+        state.h2h_history[-1] = record
+    state.h2h_latest = record
+    state.save()
+
+    _emit_dethrone_announcement(
+        state=state,
+        record=record,
+        king_changed=king_changed,
+        prev_king_uid=prev_king_uid,
+        new_king_uid=new_king_uid,
+        commitments=commitments,
+        why=why,
+    )
+
+    _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
+
+
+def _emit_dethrone_announcement(
+    *,
+    state: ValidatorState,
+    record: dict,
+    king_changed: bool,
+    prev_king_uid: int | None,
+    new_king_uid: int | None,
+    commitments: dict,
+    why: str | None,
+) -> None:
+    """Post a king-change announcement to Discord and ``state/announcement.json``.
+
+    Best-effort: a Discord-side outage or missing bot token must never
+    crash the round or block ``set_weights`` from firing. Fires AFTER
+    ``state.save()`` so the dashboard banner (``GET /api/announcement``)
+    and the state-file-derived claim endpoint both see a consistent
+    view. See ``distil/eval/announce.py`` for the underlying transport.
+    """
+    if not (king_changed and new_king_uid is not None):
+        return
+    try:
+        from distil.eval.announce import announce_new_king
+        cs = state.composite_scores or {}
+        new_cs = cs.get(str(int(new_king_uid))) or {}
+        prev_cs = (
+            cs.get(str(int(prev_king_uid)))
+            if prev_king_uid is not None else {}
+        ) or {}
+        prev_model: str | None = None
+        if prev_king_uid is not None:
+            prev_commit = commitments.get(int(prev_king_uid))
+            if prev_commit is not None:
+                prev_model = getattr(prev_commit, "model", None)
+            if not prev_model:
+                prev_model = prev_cs.get("model")
+        new_model: str | None = record.get("king_model")
+        if not new_model:
+            new_commit = commitments.get(int(new_king_uid))
+            if new_commit is not None:
+                new_model = getattr(new_commit, "model", None)
+        announce_new_king(
+            new_uid=int(new_king_uid),
+            new_model=new_model,
+            prev_uid=int(prev_king_uid) if prev_king_uid is not None else None,
+            prev_model=prev_model,
+            new_composite_final=new_cs.get("final"),
+            prev_composite_final=prev_cs.get("final"),
+            dethrone_method=why,
+            block=record.get("block"),
+            state_dir=settings.state_dir,
+        )
+    except Exception as exc:
+        # Defensive: announce must never propagate. Log only.
+        logger.warning(f"announce_new_king failed (non-fatal): {exc}")
+
+
+def _maintain_state_at_round_start(state: ValidatorState, commitments: dict) -> None:
+    """Apply schema evictions, re-commit cleanup, DQ recovery, and composite backfill.
+
+    Three independent maintenance passes, all best-effort:
+
+    1. ``evict_stale_composites`` drops composite rows whose schema
+       version is older than the current code expects.
+
+    2. ``evict_stale_evaluated_uids`` supports honest re-commit: if a
+       miner pushed v2 of their model on the same UID, drop the prior
+       ``evaluated_uids`` / ``composite_scores`` row so the challenger
+       picker picks them up again. Without this, miners are silently
+       starved after their first eval. Matches legacy
+       ``scripts/validator/single_eval.evict_stale_evaluated_uids``.
+
+    3. ``sweep_integrity_dq_recoveries`` reverts legacy
+       ``integrity:HF 404`` DQs once the miner restores their HF repo
+       (e.g. aizaysi restored ``RLStepone/distil-success-h19`` on
+       2026-05-16); HEAD-checks each ``integrity:.*404`` row and
+       drops the DQ when HF returns 200. Raises are caught so a
+       network blip can't crash the round.
+
+    4. ``backfill_missing_composites`` walks ``h2h_history`` newest-
+       first to restore any ``evaluated_uids`` entry missing a
+       composite. The cutover from prod's ``scripts/validator``
+       rebuilt ``composite_scores.json`` from scratch but preserved
+       ``evaluated_uids.json``, leaving ~120 UIDs flagged "evaluated"
+       with no composite (surfaced as ``eval_status:
+       evaluated_no_composite`` + zero emission). The legacy h2h
+       composite is enough for emission-share purposes and heals the
+       mismatch within one round of redeploy.
+    """
+    n_evict = evict_stale_composites(state)
+    if n_evict:
+        logger.info(f"evicted {n_evict} stale composite rows (schema bump)")
+    n_recommit = len(evict_stale_evaluated_uids(state, commitments))
+    if n_recommit:
+        logger.info(f"evicted {n_recommit} re-committed UIDs (slot reset)")
+
+    try:
+        cleared = sweep_integrity_dq_recoveries(state)
+    except Exception as exc:  # pragma: no cover — fail open
+        logger.warning(f"dq_recovery sweeper raised: {type(exc).__name__}: {exc}")
+        cleared = []
+    if cleared:
+        for entry in cleared:
+            logger.info(
+                f"dq_recovery: cleared {entry['hotkey'][:20]}... "
+                f"({entry['model']!r}) — HF restored"
+            )
+
+    try:
+        backfilled = backfill_missing_composites(state)
+    except Exception as exc:  # pragma: no cover — fail open
+        logger.warning(f"composite_backfill raised: {type(exc).__name__}: {exc}")
+        backfilled = []
+    if backfilled:
+        logger.info(
+            f"composite_backfill: restored {len(backfilled)} composite_scores "
+            f"entries from h2h_history"
+        )
+
+
+def _resolve_seated_king(
+    state: ValidatorState,
+    commitments: dict,
+) -> tuple[int | None, str | None, Any]:
+    """Pick the king going INTO this round.
+
+    Returns ``(king_uid, king_name, king_commitment)`` where ``king_name``
+    is the UID-as-string used by the dethrone gate (composite_scores
+    is UID-keyed).
+
+    Mirrors the legacy ``scripts/validator/service._resolve_king``
+    precedence so cutover doesn't inadvertently dethrone the king
+    every round:
+
+      1) PRIMARY  — ``state.h2h_latest.king_uid`` if that UID is still
+         a valid on-chain commitment. The seated king keeps the crown
+         until the paired-test dethrone gate decides otherwise, which
+         happens AFTER scoring this round (in ``_apply_dethrone_gate``
+         below), NOT at round-spec build time.
+      2) FALLBACK — best ``final`` in composite_scores (UID-keyed).
+         Only used on a cold-start validator with no h2h_latest yet.
+
+    Pre-fix the call was ``resolve_king(..., current_king_model=None)``
+    which short-circuits the dethrone gate and unconditionally returns
+    the highest composite scorer — i.e. every round would dethrone the
+    current king. The legacy validator never did that.
+
+    composite_scores is filtered to only UIDs with a current on-chain
+    commitment before any ``resolve_king`` call. Without this filter,
+    a UID that deregistered (or whose commitment became unparseable)
+    but still has a stored ``composite_final`` would beat every live
+    miner in ``select_king``'s highest-final scan, the
+    ``commitments.get(uid)`` lookup would return ``None``, and the
+    self-heal fallback would call ``resolve_king`` *again on the same
+    unfiltered dict*, getting the same dead UID back → king_uid
+    collapses to ``None`` and the round runs king-less. The seat then
+    stays empty for every subsequent round because each round writes
+    ``h2h_latest.king_uid=null``, gating out the h2h_latest fast path
+    next time around. This was the live failure mode 2026-05-18 after
+    UID 119 lost its chain commitment overnight.
+    """
+    valid_composites = {
+        k: v
+        for k, v in (state.composite_scores or {}).items()
+        if isinstance(k, str)
+        and k.isdigit()
+        and int(k) in commitments
+    }
+
+    king_uid: int | None = None
+    king_name: str | None = None
+    h2h_king_uid = (state.h2h_latest or {}).get("king_uid")
+    if h2h_king_uid is not None and int(h2h_king_uid) in commitments:
+        king_uid = int(h2h_king_uid)
+        king_name = str(king_uid)
+    else:
+        king_name, _ = resolve_king(valid_composites, current_king_model=None)
+        if king_name is not None:
+            try:
+                # composite_scores is UID-keyed (matches legacy writer
+                # ``single_eval.py:state.composite_scores[uid_str] = record``).
+                king_uid = int(king_name)
+            except (TypeError, ValueError):
+                king_uid = next(
+                    (c.uid for c in commitments.values() if c.key == king_name),
+                    None,
+                )
+    king_commitment = commitments.get(king_uid) if king_uid is not None else None
+
+    # Self-healing: if h2h_latest pointed at a UID that no longer has
+    # a valid on-chain commitment (deregistered, model deleted, hotkey
+    # rotated), fall back to the composite-scores top scorer. Without
+    # this, ``build_round_spec`` runs a king-less round and downstream
+    # paired-KL anchors are missing — silently corrupts every
+    # subsequent dethrone gate.
+    if king_uid is not None and king_commitment is None:
+        logger.warning(
+            f"seated king uid={king_uid} no longer in commitments; "
+            "falling back to composite-scores top scorer"
+        )
+        fallback_name, _ = resolve_king(valid_composites, current_king_model=None)
+        king_uid = None
+        king_name = None
+        if fallback_name is not None:
+            try:
+                king_uid = int(fallback_name)
+            except (TypeError, ValueError):
+                king_uid = next(
+                    (c.uid for c in commitments.values() if c.key == fallback_name),
+                    None,
+                )
+            king_commitment = commitments.get(king_uid) if king_uid is not None else None
+            if king_commitment is not None:
+                king_name = str(king_uid)
+            else:
+                king_uid = None
+    return king_uid, king_name, king_commitment
+
+
+def _build_fresh_round_spec(
+    *,
+    block: int,
+    block_hash: str | None,
+    king_commitment,
+    challengers: list,
+) -> dict:
+    """Wrapper around ``build_round_spec`` that fills in subnet-wide config."""
+    return build_round_spec(
+        block=block,
+        block_hash=block_hash,
+        teacher_repo=settings.teacher_repo,
+        reference_repo=settings.reference_repo,
+        king=king_commitment,
+        challengers=challengers,
+    )
+
+
+def _resolve_round_spec(
+    state: ValidatorState,
+    *,
+    block: int,
+    block_hash: str | None,
+    king_commitment,
+    challengers: list,
+) -> dict:
+    """Resume an in-progress round if students still match; else build fresh.
+
+    Resume-on-attach: if we have an in-progress round and the chain
+    block hasn't advanced past the round-completion deadline, re-use
+    the prior round_spec rather than building a fresh one. Lets a
+    crashed-restarted validator continue an eval that's still running
+    on the persistent pod.
+
+    Resume is GATED on the prior spec containing the same set of
+    students we'd ship today. If the set differs (e.g. the king
+    changed, the challenger pool rotated, or the previous attempt
+    was built before a bugfix that altered selection rules) we
+    ABANDON the stale spec and rebuild from scratch. Without this
+    gate, a 1-student in-progress round from a pre-fix attempt would
+    keep getting "resumed" forever even after distil started
+    selecting king + 10 challengers properly.
+    """
+    in_progress = state.current_round or {}
+    if not (in_progress.get("round_id") and not in_progress.get("completed")):
+        return _build_fresh_round_spec(
+            block=block,
+            block_hash=block_hash,
+            king_commitment=king_commitment,
+            challengers=challengers,
+        )
+
+    age_min = (time.time() - in_progress.get("started_at", 0)) / 60
+    prev_spec = in_progress.get("spec") or {}
+    prev_uids = {int(s.get("uid", -1)) for s in (prev_spec.get("students") or [])}
+    fresh = _build_fresh_round_spec(
+        block=block,
+        block_hash=block_hash,
+        king_commitment=king_commitment,
+        challengers=challengers,
+    )
+    fresh_uids = {int(s.get("uid", -1)) for s in (fresh.get("students") or [])}
+    if age_min >= settings.eval_round_max_minutes * 2:
+        logger.warning(
+            f"in-progress round {in_progress['round_id']} is {age_min:.1f} min old; "
+            f"abandoning and starting fresh"
+        )
+        return fresh
+    if prev_uids != fresh_uids:
+        logger.warning(
+            f"in-progress round {in_progress['round_id']} students "
+            f"{sorted(prev_uids)} != fresh {sorted(fresh_uids)}; "
+            f"abandoning (likely built pre-bugfix) and starting fresh"
+        )
+        return fresh
+    logger.info(
+        f"resume: reusing in-progress round {in_progress['round_id']} "
+        f"(age {age_min:.1f} min, students match)"
+    )
+    return prev_spec
+
+
+def _build_uid_index(
+    spec: dict,
+    commitments: dict,
+    uid_to_hotkey: dict[int, str],
+) -> dict[str, dict]:
+    """Build the ``model@revision -> {uid, hotkey, ...}`` lookup.
+
+    Used by ``process_round`` to map each pod result row back to a
+    specific (uid, hotkey) for state writes (composite_scores,
+    evaluated_hotkeys, activation_fingerprints, DQs).
+
+    CRITICAL: when two miners commit the **same** model@revision under
+    **different** hotkeys, ``commitments.values()`` has two entries
+    that produce the same ``c.key``. A naive dict comprehension keeps
+    only the last-iterated one — and which one wins is whatever Python
+    gave us from the metagraph iteration (typically uid-ascending,
+    i.e. the *later* committer). Result of the bug:
+    ``select_challengers`` picks the fresh UID (no composite, no
+    evaluated_hotkeys entry), the round_spec is built with that UID,
+    the pod evaluates the model, but ``process_round`` looks the
+    result up in this ``uid_index`` and writes the composite under
+    the OTHER UID. The fresh UID never gets marked evaluated, gets
+    re-selected every round, and burns 1 of the 3 challenger slots
+    indefinitely. Observed 2026-05-18 on UID 25 / UID 28 both holding
+    ``RLStepone/distil-b300-training-h25@5b20b59...``: UID 25 was in
+    the spec for 8+ consecutive rounds but every result was credited
+    to UID 28.
+
+    Fix: prefer the (uid, hotkey) that's actually in
+    ``spec["students"]`` for this round. That's the UID we scheduled,
+    so that's the UID whose state should be mutated. Fall back to
+    ``commitments.values()`` for any model row not in the spec
+    (king/reference/teacher).
+    """
+    uid_index: dict[str, dict] = {}
+    for s in spec.get("students", []) or []:
+        name = s.get("name")
+        uid_val = s.get("uid")
+        if not name or uid_val is None:
+            continue
+        # spec entries carry uid/hotkey/revision/is_king but not
+        # commit_block / coldkey — fetch those from commitments[uid].
+        c = commitments.get(int(uid_val))
+        uid_index[name] = {
+            "uid": int(uid_val),
+            "hotkey": s.get("hotkey") or uid_to_hotkey.get(int(uid_val)),
+            "coldkey": getattr(c, "coldkey", None) if c else None,
+            "commit_block": getattr(c, "commit_block", None) if c else None,
+            "revision": s.get("revision") or (getattr(c, "revision", "main") if c else "main"),
+        }
+    # Fallback: include any chain commitment NOT in the spec, but use
+    # ``setdefault`` so the spec winners stay authoritative.
+    for c in commitments.values():
+        uid_index.setdefault(
+            c.key,
+            {
+                "uid": c.uid,
+                "hotkey": uid_to_hotkey.get(c.uid),
+                "coldkey": getattr(c, "coldkey", None),
+                "commit_block": getattr(c, "commit_block", None),
+                "revision": getattr(c, "revision", "main"),
+            },
+        )
+    return uid_index
+
+
+def _apply_dethrone_gate(
+    *,
+    state: ValidatorState,
+    record: dict,
+    commitments: dict,
+    king_uid: int | None,
+    king_name: str | None,
+) -> tuple[int | None, str | None, int | None, int | None, bool, str | None]:
+    """Run the end-of-round dethrone gate; mutate ``record`` + ``state``.
+
+    Returns ``(king_uid, king_name, prev_king_uid, new_king_uid,
+    king_changed, why)`` — the LIVE seat coming OUT of this round
+    plus the audit fields the announcement and the dashboard need.
+
+    Candidate pool is restricted to:
+      1. The seated king (so they can defend the crown), and
+      2. UIDs that were students in THIS round (so their composite
+         was either freshly written by ``process_round`` above, or
+         — for the king's slot when ``SINGLE_EVAL_KING_REEVAL=1`` —
+         freshly re-measured on the current round's prompts).
+
+    Without this same-round restriction the dethrone gate scans every
+    entry in ``state.composite_scores`` regardless of when it was
+    measured, and a UID with a stale-but-high stored ``composite_final``
+    will beat the freshly-evaluated king on variance alone. Observed
+    live (Discord 2026-05-19 03:13 UTC):
+
+      block=8214203  students=[44]  prev=44 -> new=66
+        reason=dethrone:final_gain 0.4253 >= king 0.4015 * (1+0.050)
+      block=8214362  students=[66]  prev=66 -> new=68
+        reason=dethrone:final_gain 0.4215 >= king 0.3991 * (1+0.050)
+
+    Both rounds had only the seated king in ``students`` (no other
+    challengers in the eval backlog), the king's fresh score dipped a
+    few points on the round's unlucky prompts, and a stale stored
+    composite from a UID that hadn't been re-evaluated this round
+    squeaked past the 5 % margin.
+
+    The earlier ``in commitments`` filter (against deregistered UIDs)
+    is still applied — it's an additional safety net, not a
+    replacement.
+    """
     same_round_uids: set[int] = set()
     if king_uid is not None:
         same_round_uids.add(int(king_uid))
@@ -517,8 +675,9 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     prev_king_uid = king_uid  # the seat going INTO this round
     new_king_uid: int | None = prev_king_uid
     if new_king and new_king != king_name:
-        # ``new_king`` is a UID-string out of resolve_king (composite_scores
-        # is UID-keyed); convert to an int and look up the commitment.
+        # ``new_king`` is a UID-string out of resolve_king
+        # (composite_scores is UID-keyed); convert to an int and look
+        # up the commitment.
         try:
             new_king_uid = int(new_king)
         except (TypeError, ValueError):
@@ -539,120 +698,84 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     )
     record["king_changed"] = king_changed
     record["dethrone_method"] = why
-    # CRITICAL: when dethrone fires, rewrite ``record["king_uid"]`` (and
-    # the matching name+model fields) to the NEW seated king so the
-    # next round's resolver (``service._round`` line ~167 reads
-    # ``state.h2h_latest.king_uid``) picks the dethrone winner instead
-    # of replaying the deposed king. Without this rewrite, three
-    # successive rounds (blocks 8198615, 8199086, 8199665) recorded
-    # ``king_changed=True`` with ``king_after`` set to 52, 92, and 35
-    # respectively — but each next round read ``king_uid=47`` and
-    # re-seated UID 47 anyway. ``king_after`` and ``new_king_uid``
-    # become PURELY informational (post-gate audit fields) while
-    # ``king_uid`` is the canonical seated-king field that drives the
-    # next round.
     if king_changed and new_king_uid is not None:
-        record["king_uid"] = int(new_king_uid)
-        record["king_name"] = str(new_king_uid)
-        # Look up the new king's model+revision so the dashboard +
-        # downstream consumers don't render the stale deposed-king
-        # model on h2h_latest.king_model.
-        new_king_commit = commitments.get(int(new_king_uid))
-        if new_king_commit is not None:
-            record["king_model"] = new_king_commit.model
-        # ``top4_leaderboard.king`` was already written by
-        # ``_refresh_top4`` inside ``process_round`` BEFORE the dethrone
-        # gate ran above — so its ``king`` field still names the deposed
-        # UID, and ``/api/miner/<deposed>`` returns ``is_king: true``
-        # while ``/api/miner/<new_king>`` returns ``is_king: false``.
-        # Confirmed in #distil 2026-05-17 ("UID 35 leaderboard king,
-        # UID 14 still is_king:true on API"). The contender rows ranked
-        # by composite ``final`` are still valid (dethrone doesn't move
-        # any composite scores) so only the ``king`` field and the
-        # ``contenders`` partitioning need a post-dethrone rewrite.
-        leaderboard = getattr(state, "top4_leaderboard", None) or {}
-        rows = list(leaderboard.get("rows") or [])
-        cs_map = getattr(state, "composite_scores", None) or {}
-        new_king_row: dict | None = None
-        for r in rows:
-            if r.get("uid") == int(new_king_uid):
-                new_king_row = r
-                break
-        if new_king_row is None:
-            kc = cs_map.get(str(int(new_king_uid))) or {}
-            if kc:
-                model = kc.get("model")
-                revision = kc.get("revision")
-                new_king_row = {
-                    "rank": None,
-                    "uid": int(new_king_uid),
-                    "name": f"{model}@{revision}" if model and revision else model,
-                    "model": model,
-                    "final": kc.get("final"),
-                    "worst_3_mean": kc.get("worst_3_mean"),
-                    "weighted": kc.get("weighted"),
-                    "present_count": kc.get("present_count"),
-                }
-        if new_king_row is not None:
-            state.top4_leaderboard = {
-                **leaderboard,
-                "updated_at": time.time(),
-                "king": new_king_row,
-                "contenders": [r for r in rows if r is not new_king_row],
+        _rewrite_record_for_dethrone(
+            state=state,
+            record=record,
+            new_king_uid=int(new_king_uid),
+            commitments=commitments,
+        )
+    return king_uid, king_name, prev_king_uid, new_king_uid, king_changed, why
+
+
+def _rewrite_record_for_dethrone(
+    *,
+    state: ValidatorState,
+    record: dict,
+    new_king_uid: int,
+    commitments: dict,
+) -> None:
+    """When dethrone fires, point ``record`` + ``top4_leaderboard`` at the new king.
+
+    Rewriting ``record["king_uid"]`` (and the matching name + model
+    fields) is critical for next-round resolution: the seated-king
+    resolver reads ``state.h2h_latest.king_uid`` first, so if we leave
+    the deposed king's UID there the next round re-seats them despite
+    the dethrone decision. Without this rewrite, three successive
+    rounds (blocks 8198615 / 8199086 / 8199665) recorded
+    ``king_changed=True`` with ``king_after`` set to 52, 92, and 35
+    respectively — but each next round read ``king_uid=47`` and
+    re-seated UID 47 anyway. ``king_after`` and ``new_king_uid``
+    become PURELY informational (post-gate audit fields) while
+    ``king_uid`` is the canonical seated-king field that drives the
+    next round.
+
+    The top4 leaderboard rewrite handles the second half: ``_refresh_top4``
+    inside ``process_round`` runs BEFORE the dethrone gate, so its
+    ``king`` field still names the deposed UID, and
+    ``/api/miner/<deposed>`` returns ``is_king: true`` while
+    ``/api/miner/<new_king>`` returns ``is_king: false`` until we fix
+    it here (confirmed in #distil 2026-05-17). The contender rows
+    ranked by composite ``final`` are still valid (dethrone doesn't
+    move any composite scores) so only the ``king`` field and the
+    ``contenders`` partitioning need a post-dethrone rewrite.
+    """
+    record["king_uid"] = int(new_king_uid)
+    record["king_name"] = str(new_king_uid)
+    new_king_commit = commitments.get(int(new_king_uid))
+    if new_king_commit is not None:
+        record["king_model"] = new_king_commit.model
+
+    leaderboard = getattr(state, "top4_leaderboard", None) or {}
+    rows = list(leaderboard.get("rows") or [])
+    cs_map = getattr(state, "composite_scores", None) or {}
+    new_king_row: dict | None = None
+    for r in rows:
+        if r.get("uid") == int(new_king_uid):
+            new_king_row = r
+            break
+    if new_king_row is None:
+        kc = cs_map.get(str(int(new_king_uid))) or {}
+        if kc:
+            model = kc.get("model")
+            revision = kc.get("revision")
+            new_king_row = {
+                "rank": None,
+                "uid": int(new_king_uid),
+                "name": f"{model}@{revision}" if model and revision else model,
+                "model": model,
+                "final": kc.get("final"),
+                "worst_3_mean": kc.get("worst_3_mean"),
+                "weighted": kc.get("weighted"),
+                "present_count": kc.get("present_count"),
             }
-    # The record was already appended by process_round; rewrite the
-    # last h2h_history row + h2h_latest with the dethrone-context
-    # fields so the dashboard reads the same payload the validator
-    # used to set weights.
-    if state.h2h_history:
-        state.h2h_history[-1] = record
-    state.h2h_latest = record
-    state.save()
-
-    # Dethrone announcement — fire AFTER state.save() so the dashboard
-    # banner (``GET /api/announcement``) and the state-file-derived
-    # claim endpoint both see a consistent view, and so a Discord-side
-    # outage can never roll back the round bookkeeping. See
-    # ``distil/eval/announce.py`` for why this is best-effort: a
-    # network hiccup or a missing bot token must never crash the
-    # round or block ``set_weights`` from firing.
-    if king_changed and new_king_uid is not None:
-        try:
-            from distil.eval.announce import announce_new_king
-            cs = state.composite_scores or {}
-            new_cs = cs.get(str(int(new_king_uid))) or {}
-            prev_cs = (
-                cs.get(str(int(prev_king_uid)))
-                if prev_king_uid is not None else {}
-            ) or {}
-            prev_model: str | None = None
-            if prev_king_uid is not None:
-                prev_commit = commitments.get(int(prev_king_uid))
-                if prev_commit is not None:
-                    prev_model = getattr(prev_commit, "model", None)
-                if not prev_model:
-                    prev_model = prev_cs.get("model")
-            new_model: str | None = record.get("king_model")
-            if not new_model:
-                new_commit = commitments.get(int(new_king_uid))
-                if new_commit is not None:
-                    new_model = getattr(new_commit, "model", None)
-            announce_new_king(
-                new_uid=int(new_king_uid),
-                new_model=new_model,
-                prev_uid=int(prev_king_uid) if prev_king_uid is not None else None,
-                prev_model=prev_model,
-                new_composite_final=new_cs.get("final"),
-                prev_composite_final=prev_cs.get("final"),
-                dethrone_method=why,
-                block=record.get("block"),
-                state_dir=settings.state_dir,
-            )
-        except Exception as exc:
-            # Defensive: announce must never propagate. Log only.
-            logger.warning(f"announce_new_king failed (non-fatal): {exc}")
-
-    _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
+    if new_king_row is not None:
+        state.top4_leaderboard = {
+            **leaderboard,
+            "updated_at": time.time(),
+            "king": new_king_row,
+            "contenders": [r for r in rows if r is not new_king_row],
+        }
 
 
 def _publish_weights(
