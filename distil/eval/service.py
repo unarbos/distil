@@ -243,8 +243,35 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
                 king_uid = None
 
     challengers = select_challengers(commitments, state, king_uid=king_uid)
-    if not challengers and king_commitment is None:
-        logger.info("no challengers and no king; skipping round")
+    if not challengers:
+        # No fresh commits to evaluate. A king-only re-eval round
+        # cannot produce a meaningful dethrone (the same-round-only
+        # filter in the end-of-round gate would just keep the seated
+        # king on the throne) and would burn ~17 min of pod/teacher
+        # tokens for zero scoring signal. Skip the eval entirely.
+        #
+        # Two sub-cases:
+        #   1. No king either — there's nothing to set weights for;
+        #      return immediately and try again next cycle.
+        #   2. King is seated — we still want to keep emission flowing
+        #      to the seated king + recent_kings, so refresh on-chain
+        #      weights from current state and return. The chain's
+        #      ``WeightsRateLimit`` is handled by ``set_weights``
+        #      itself; spurious "too-soon" attempts are caught and
+        #      logged, not raised.
+        if king_commitment is None:
+            logger.info("no challengers and no king; skipping round entirely")
+            log_event("idle: no challengers, no king", level="info")
+            return
+        logger.info(
+            f"no fresh challengers in commitments (king_uid={king_uid}); "
+            f"skipping eval, refreshing on-chain weights only"
+        )
+        log_event(
+            f"weights-only refresh: no fresh challengers; king_uid={king_uid}",
+            level="info",
+        )
+        _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
         return
 
     # Resume-on-attach: if we have an in-progress round and the chain block
@@ -625,6 +652,34 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
             # Defensive: announce must never propagate. Log only.
             logger.warning(f"announce_new_king failed (non-fatal): {exc}")
 
+    _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
+
+
+def _publish_weights(
+    state: ValidatorState,
+    mg: Any,
+    sub: Any,
+    king_uid: int | None,
+    *,
+    dry_run: bool,
+) -> None:
+    """Build emission weights from current state and push them on-chain.
+
+    Called from two places in :func:`_round`:
+
+    1. End of a full eval round, after dethrone gate + state.save().
+    2. The no-challenger short-circuit near the top of ``_round``,
+       which skips the GPU/teacher spend but still wants to keep
+       emission flowing to the seated king + recent_kings.
+
+    Both paths need the same weights-build + set_weights logic; this
+    helper deduplicates it so the no-challenger path can't drift from
+    the full-round path (e.g. forget to pass ``state`` for the DQ
+    filter or use the wrong ``n_uids``).
+
+    All exceptions are handled here so the caller is never blocked on
+    a network glitch with the Bittensor chain.
+    """
     weights = build_emission_weights(
         n_uids=len(mg.hotkeys),
         king_uid=king_uid,
@@ -633,7 +688,10 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         uid_hotkey_map=state.uid_hotkey_map,
     )
     if dry_run:
-        logger.info(f"[dry-run] weights would be: max={max(weights):.3f} king_uid={king_uid}")
+        logger.info(
+            f"[dry-run] weights would be: max={max(weights) if weights else 0:.3f} "
+            f"king_uid={king_uid}"
+        )
         return
     if not weights or sum(weights) == 0:
         logger.info("no weights to set; skipping set_weights")
