@@ -275,6 +275,12 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         uid_index=uid_index,
         timings=results.get("__per_bench_timing__"),
     )
+    # Stamp the round wall-clock so ``/api/eval-stats`` can report
+    # avg/min/max round timing — the legacy validator populated this
+    # via ``state_manager.append_h2h_history`` and the rewrite-v2
+    # process_round path dropped it. Without this the dashboard's
+    # round-timing widget shows ``null`` for every fresh round.
+    record["elapsed_seconds"] = round(time.time() - t_round_start, 1)
     state.current_round = {**state.current_round, "completed": True, "completed_at": time.time()}
     state.save()
 
