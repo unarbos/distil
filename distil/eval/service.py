@@ -43,6 +43,72 @@ from distil.state.files import ValidatorState, log_event
 
 logger = logging.getLogger("distil.eval.service")
 
+
+def _resolve_king_hf_repo(king_uid: int | None, commitments: dict) -> str | None:
+    """Look up the king's raw HF repo path from the round's commitment map.
+
+    The chat-pod bootstrap (``scripts/chat_pod/chat_server.py``) takes a
+    bare HF-style ``user/repo`` path. Inside ``_round`` we mostly track
+    the king by ``str(king_uid)`` as ``king_name`` for log/dashboard
+    purposes, so the chat-pod sync needs a second pass to pull the
+    actual model path out of the commitment map. Returns ``None`` when
+    the king is unseated or the commitment is missing (cold-start /
+    deregistered-king edge case) so the sync call short-circuits.
+    """
+    if king_uid is None:
+        return None
+    commit = commitments.get(king_uid) if isinstance(commitments, dict) else None
+    if commit is None:
+        return None
+    model = getattr(commit, "model", None)
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return model.strip()
+
+
+def _sync_chat_pod_runtime(king_uid: int | None, king_model: str | None, *, king_changed: bool) -> None:
+    """Bring the chat-king pod in line with the freshly-resolved king.
+
+    Three responsibilities, lifted from the legacy
+    ``scripts/validator/side_effects.sync_king_runtime`` helper that
+    used to fire from ``scripts/validator/service.py`` after every
+    round but was never ported to the rewrite-v2 ``_round`` flow
+    (see 2026-05-19 audit — chat.arbos.life was serving a stale king
+    for >16h because nothing was triggering the chat-pod redeploy):
+
+    1. **King changed** — restart the chat pod's ``chat_server.py``
+       so vLLM warm-loads the new king's weights, then trigger
+       ``auto_benchmark.sh`` on the eval pod so the dashboard's
+       held-out canary picks up a fresh ``state/benchmarks/uid_*.json``
+       within the hour.
+    2. **King unchanged** — call ``ensure_chat_server_running`` so a
+       chat-pod crash / SSH key rotation / Lium re-provision gets
+       healed within one round instead of waiting for the chat-keeper
+       3-min poll (which only catches local-tunnel + tool-call wiring
+       breakage, not "vLLM serving the wrong model").
+    3. **Missing king info** — silent no-op. The legacy contract
+       skips when ``king_model`` is falsy and we keep that so
+       cold-start rounds (king_commitment=None) don't crash.
+
+    Best-effort: any chat-pod or eval-pod transport failure is logged
+    and swallowed so a stuck SSH connection can't crash the validator
+    or block ``set_weights`` from firing.
+    """
+    if not king_model:
+        return
+    try:
+        from scripts.validator.side_effects import sync_king_runtime
+    except ImportError as exc:
+        logger.warning(f"chat-pod sync skipped (legacy module missing): {exc}")
+        return
+    try:
+        sync_king_runtime(king_changed, king_model, king_uid)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"chat-pod sync failed (king_uid={king_uid}, "
+            f"changed={king_changed}): {type(exc).__name__}: {exc}"
+        )
+
 # Legacy fallback only. Real value comes from ``settings.round_interval_s``
 # (env: ``DISTIL_ROUND_INTERVAL_S``) and defaults to 0 → back-to-back rounds.
 # Historically 4200s (~70 min / one Bittensor super-block) to pace
@@ -125,6 +191,16 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
             level="info",
         )
         _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
+        # Chat-pod heal even on idle rounds: the king didn't change, but
+        # ``ensure_chat_server_running`` will redeploy the chat pod if it
+        # crashed / drifted to a stale model while no new commits were
+        # landing. The seated king's HF repo is on the commitment we
+        # already have in hand.
+        _sync_chat_pod_runtime(
+            king_uid,
+            getattr(king_commitment, "model", None),
+            king_changed=False,
+        )
         return
 
     spec = _resolve_round_spec(
@@ -232,6 +308,18 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     )
 
     _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
+
+    # Chat-pod side effects (ported from legacy ``sync_king_runtime``):
+    # on king change, redeploy vLLM with the new king's weights and
+    # trigger ``auto_benchmark.sh`` so the dashboard's held-out canary
+    # refreshes. On no change, just ensure vLLM is still healthy and
+    # serving the right model. Must be best-effort — see
+    # ``_sync_chat_pod_runtime`` for the failure semantics.
+    _sync_chat_pod_runtime(
+        king_uid,
+        _resolve_king_hf_repo(king_uid, commitments),
+        king_changed=king_changed,
+    )
 
 
 def _emit_dethrone_announcement(
