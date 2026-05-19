@@ -423,6 +423,107 @@ def _inject_python_fence_tool_calls(
     return new_items
 
 
+def _strip_tools_for_vllm(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """Strip ``tools`` / ``tool_choice`` / ``parallel_tool_calls`` from the
+    SDK call before it reaches vLLM.
+
+    Why: the current SN97 king is **not** fine-tuned to emit native
+    OpenAI-format ``tool_calls`` against a JSON-schema tools array.
+    When the SDK forwards ``tools=[python_exec]`` to vLLM, the model
+    sees a tool schema in its system prompt, tries to use it for
+    EVERYTHING (even trivial prompts like "who are you"), and collapses
+    into pathological loops -- e.g.::
+
+        "I:\\n\\n---\\n\\n---\\n\\n---..."
+        "I am not you,\\n\\nI am not you,..."
+        " ```python\\n ```python\\n ```python..."
+
+    All three of those failure modes were observed live on 2026-05-19
+    against the king (UID 68 / arboskiller/arbosv23) on the same
+    "who are you" prompt — and all three disappeared when the same
+    payload was sent to vLLM directly **without** the tools array.
+
+    The SDK's ``get_response`` / ``stream_response`` signatures pass
+    ``tools`` as the 4th positional argument and ``model_settings`` as
+    the 3rd, but the SDK has shifted these around between versions; we
+    walk both ``args`` and ``kwargs`` defensively so a future SDK bump
+    doesn't silently regress to the broken behaviour.
+
+    The python_exec sandbox keeps working because the model triggers
+    it via ```python``` fences -- ``_inject_python_fence_tool_calls``
+    synthesizes ``ResponseFunctionToolCall`` items at the SDK boundary
+    AFTER the model has produced its text, so the multi-turn sandbox
+    loop runs identically without the tools array being visible to the
+    raw chat-completions request.
+    """
+    from agents.models.openai_chatcompletions import (
+        OpenAIChatCompletionsModel as _Parent,
+    )
+    import inspect
+    sig = inspect.signature(_Parent.get_response)
+    params = list(sig.parameters.keys())  # includes 'self' at index 0
+
+    # Locate positional indices for the things we want to scrub.
+    try:
+        tools_idx = params.index("tools") - 1
+    except ValueError:
+        tools_idx = -1
+    try:
+        model_settings_idx = params.index("model_settings") - 1
+    except ValueError:
+        model_settings_idx = -1
+
+    args = list(args)
+    # Scrub the positional ``tools`` slot if present.
+    if 0 <= tools_idx < len(args):
+        args[tools_idx] = []
+    # Scrub the positional ``model_settings`` slot if present.
+    if 0 <= model_settings_idx < len(args):
+        ms = args[model_settings_idx]
+        ms = _scrub_tool_choice(ms)
+        args[model_settings_idx] = ms
+
+    # Same scrub on the kwarg path.
+    if "tools" in kwargs:
+        kwargs["tools"] = []
+    if "model_settings" in kwargs:
+        kwargs["model_settings"] = _scrub_tool_choice(kwargs["model_settings"])
+
+    return tuple(args), kwargs
+
+
+def _scrub_tool_choice(ms):
+    """Strip ``tool_choice`` and ``parallel_tool_calls`` from a
+    ``ModelSettings`` so vLLM doesn't echo them back as part of the
+    chat-template's tool-use scaffolding. We return a NEW instance
+    (or modify in place if it's a dataclass) to avoid mutating shared
+    state — the Agent's settings object is shared across turns.
+    """
+    if ms is None:
+        return ms
+    # Dataclass path: dataclasses.replace if available.
+    try:
+        import dataclasses
+        if dataclasses.is_dataclass(ms):
+            kwargs = {}
+            for f in dataclasses.fields(ms):
+                if f.name in ("tool_choice", "parallel_tool_calls"):
+                    kwargs[f.name] = None
+            if kwargs:
+                return dataclasses.replace(ms, **kwargs)
+            return ms
+    except Exception:
+        pass
+    # Generic attribute mutation path.
+    for attr in ("tool_choice", "parallel_tool_calls"):
+        if hasattr(ms, attr):
+            try:
+                setattr(ms, attr, None)
+            except Exception:
+                pass
+    return ms
+
+
 class _SN97ChatCompletionsModel(OpenAIChatCompletionsModel):
     """Chat-completions model wrapper that converts the king's
     ``\u0060\u0060\u0060python`` fences into ``python_exec`` tool calls so the SDK's
@@ -434,6 +535,10 @@ class _SN97ChatCompletionsModel(OpenAIChatCompletionsModel):
     A per-instance ``_seen_codes`` set deduplicates injections across the
     whole agent run so the model recapping its prior code doesn't trigger
     an infinite tool-call loop. Build a fresh model per request.
+
+    The wrapper also scrubs ``tools`` / ``tool_choice`` /
+    ``parallel_tool_calls`` from the outgoing request before it reaches
+    vLLM — see :func:`_strip_tools_for_vllm` for why.
     """
 
     def __init__(self, *args, **kwargs):
@@ -441,6 +546,7 @@ class _SN97ChatCompletionsModel(OpenAIChatCompletionsModel):
         self._seen_codes: set[str] = set()
 
     async def get_response(self, *args, **kwargs) -> ModelResponse:
+        args, kwargs = _strip_tools_for_vllm(args, kwargs)
         response = await super().get_response(*args, **kwargs)
         new_items = _inject_python_fence_tool_calls(list(response.output), self._seen_codes)
         if len(new_items) != len(response.output):
@@ -448,6 +554,7 @@ class _SN97ChatCompletionsModel(OpenAIChatCompletionsModel):
         return response
 
     async def stream_response(self, *args, **kwargs):
+        args, kwargs = _strip_tools_for_vllm(args, kwargs)
         async for event in super().stream_response(*args, **kwargs):
             if isinstance(event, ResponseCompletedEvent) and event.response is not None:
                 merged = _inject_python_fence_tool_calls(
@@ -644,19 +751,40 @@ def _build_agent(king_uid: int | None, king_model: str | None, max_tokens: int) 
             #
             # * ``repetition_penalty=1.05`` — enough to break adversarial
             #   loops without hurting normal prose generation.
-            # * ``chat_template_kwargs.enable_thinking=True`` — turns ON
-            #   the king's <think>...</think> chain. The reasoning
-            #   parser splits the <think> block out into the
-            #   ``reasoning_content`` channel that the streaming bridge
-            #   surfaces in the dashboard's "Thinking" pane. Without
-            #   this flag, vLLM uses the chat template's default
-            #   (which most reasoning-tuned templates set to OFF for
-            #   API compatibility) and the king answers from short
-            #   prose with no chain — exactly the no-think regime the
-            #   v32 think-budget bump is trying to fix.
+            # * ``chat_template_kwargs.enable_thinking=False`` —
+            #   forces the king to answer directly in the content
+            #   channel. We previously toggled this ON so the
+            #   ``distil_kimi`` reasoning parser would split the
+            #   ``<think>…</think>`` chain into a separate
+            #   ``reasoning_content`` field, but: (a) the current king
+            #   isn't fine-tuned on that template and produced
+            #   degenerate "I:\n\n---\n\n---..." filler loops with
+            #   thinking forced ON; (b) the reasoning parser didn't
+            #   recognise the king's actual ``◁/think▷`` Kimi triangle
+            #   tags anyway, so the "Thinking" pane stayed empty.
+            #   Direct content output is the lesser of two evils until
+            #   the chat pod re-deploys to a king whose template
+            #   matches the parser. See also ``_THINK_BLOCK_RE`` below,
+            #   which still strips any inline ``<think>`` block the
+            #   model emits voluntarily.
+            # * ``stop=["\\n```\\n"]`` + ``include_stop_str_in_output=True`` —
+            #   closes the model off once it finishes a fenced code
+            #   block. Without it the king regularly free-types
+            #   "Tool Output: 17891344..." after the closing ``` and
+            #   the SDK has to chase down the fake-tool-result text
+            #   with a sanitizer pass. ``include_stop_str_in_output``
+            #   is CRITICAL — without it vLLM swallows the closing
+            #   ``` and ``_inject_python_fence_tool_calls`` can no
+            #   longer match the fence (the dedup regex requires both
+            #   opening and closing ```), so the synthetic
+            #   ``python_exec`` call is never created and the SDK
+            #   returns the code-only message to the user instead of
+            #   looping back with the sandbox stdout.
             extra_body={
                 "repetition_penalty": 1.05,
-                "chat_template_kwargs": {"enable_thinking": True},
+                "chat_template_kwargs": {"enable_thinking": False},
+                "stop": ["\n```\n"],
+                "include_stop_str_in_output": True,
             },
         ),
         tools=[python_exec],

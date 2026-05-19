@@ -547,6 +547,49 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
     state.h2h_latest = record
     state.save()
 
+    # Dethrone announcement — fire AFTER state.save() so the dashboard
+    # banner (``GET /api/announcement``) and the state-file-derived
+    # claim endpoint both see a consistent view, and so a Discord-side
+    # outage can never roll back the round bookkeeping. See
+    # ``distil/eval/announce.py`` for why this is best-effort: a
+    # network hiccup or a missing bot token must never crash the
+    # round or block ``set_weights`` from firing.
+    if king_changed and new_king_uid is not None:
+        try:
+            from distil.eval.announce import announce_new_king
+            cs = state.composite_scores or {}
+            new_cs = cs.get(str(int(new_king_uid))) or {}
+            prev_cs = (
+                cs.get(str(int(prev_king_uid)))
+                if prev_king_uid is not None else {}
+            ) or {}
+            prev_model: str | None = None
+            if prev_king_uid is not None:
+                prev_commit = commitments.get(int(prev_king_uid))
+                if prev_commit is not None:
+                    prev_model = getattr(prev_commit, "model", None)
+                if not prev_model:
+                    prev_model = prev_cs.get("model")
+            new_model: str | None = record.get("king_model")
+            if not new_model:
+                new_commit = commitments.get(int(new_king_uid))
+                if new_commit is not None:
+                    new_model = getattr(new_commit, "model", None)
+            announce_new_king(
+                new_uid=int(new_king_uid),
+                new_model=new_model,
+                prev_uid=int(prev_king_uid) if prev_king_uid is not None else None,
+                prev_model=prev_model,
+                new_composite_final=new_cs.get("final"),
+                prev_composite_final=prev_cs.get("final"),
+                dethrone_method=why,
+                block=record.get("block"),
+                state_dir=settings.state_dir,
+            )
+        except Exception as exc:
+            # Defensive: announce must never propagate. Log only.
+            logger.warning(f"announce_new_king failed (non-fatal): {exc}")
+
     weights = build_emission_weights(
         n_uids=len(mg.hotkeys),
         king_uid=king_uid,
