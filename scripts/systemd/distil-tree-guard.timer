@@ -1,0 +1,21 @@
+[Unit]
+Description=Run distil-tree-guard every 3 minutes
+# Belt-and-suspenders against the working-tree wipe pattern observed on
+# 2026-05-18 and 2026-05-19. The validator service holds Python imports
+# in memory and keeps running after a wipe, but the *next* restart
+# would crash silently — this watchdog catches mass deletion within
+# one tick and pulls files back from HEAD before anyone notices.
+#
+# Cadence is more aggressive than sn97-healthcheck.timer (5min)
+# because the failure mode here is silent + only surfaces at the next
+# service restart; we want to close that window fast.
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=180s
+AccuracySec=10s
+Persistent=true
+Unit=distil-tree-guard.service
+
+[Install]
+WantedBy=timers.target

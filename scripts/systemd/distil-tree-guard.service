@@ -1,0 +1,19 @@
+[Unit]
+Description=Tripwire + WIP auto-checkpoint for /opt/distil/repo working tree
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# One-shot per timer tick. The script is itself rate-limited:
+#   * Tripwire restore — cooldown 1h between restores
+#   * WIP checkpoint   — cooldown 30min between auto-commits + only
+#                         commits when files have been stable >5min
+# So even on a flapping wipe loop this can't self-DoS.
+Type=oneshot
+User=root
+WorkingDirectory=/opt/distil/repo
+Environment=DISTIL_REPO_ROOT=/opt/distil/repo
+ExecStart=/opt/distil/venv/bin/python /opt/distil/repo/scripts/tree_guard.py --mode all
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=240
