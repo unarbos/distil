@@ -270,7 +270,10 @@ def select_challengers(
       * it isn't disqualified,
       * it isn't already in ``state.composite_scores`` (UID-keyed),
       * it isn't already in ``state.evaluated_uids`` (str-set of UIDs
-        whose single-eval slot is spent).
+        whose single-eval slot is spent),
+      * its ``model@revision`` doesn't collide with the king or another
+        already-accepted challenger in this round (the older committer
+        wins, FIFO).
 
     Eligible UIDs are sorted FIFO by ``commit_block`` (oldest first) and
     capped at ``n``. We deliberately DO NOT pad the round with already-
@@ -282,6 +285,21 @@ def select_challengers(
     new commits existed; that produced phantom "10 challengers per
     round" output and silently re-scored UIDs that had already taken
     their one shot — see the dashboard regression flagged on 2026-05-15.
+
+    Same-``model@revision`` dedup (added 2026-05-19) closes the
+    uid_index collision exploit: when two miners commit the exact same
+    repo@revision, the pod produces a single result row keyed by name
+    and ``uid_index[name]`` resolves to one of the two UIDs (the king-
+    first pass keeps the king authoritative for the king's row, but
+    challenger-vs-challenger collisions still attribute the result to
+    whichever student was iterated first in the spec). The cleaner
+    answer is to not let both UIDs into the round at all — the FIFO
+    seeded with the king's key keeps the seated king's identity intact
+    and only the OLDEST committer of any duplicate model gets the
+    eval slot. Same-model challengers committed AFTER the FIFO winner
+    keep their on-chain commitment but stay queued until they either
+    push a genuinely-new commit or the FIFO winner gets re-evaluated
+    and drops out.
     """
     evaluated = {str(u) for u in (state.evaluated_uids or [])}
     candidates: list[Commitment] = []
@@ -297,24 +315,62 @@ def select_challengers(
             continue
         candidates.append(c)
     candidates.sort(key=lambda c: (int(getattr(c, "block", 0) or 0), int(c.uid)))
+
+    # Reserve the seated king's ``model@revision`` so a copycat that
+    # committed the same repo can't enter the round as a challenger
+    # and clobber the king's uid_index row. Without this guard the
+    # bug observed live on 2026-05-19 (blocks 8219156 / 8219553 /
+    # 8220027) fires every time a fresh copycat commitment lands —
+    # the dethrone gate uses ``state.king`` so the LIVE seat is
+    # fine, but the END-of-round writeback stamps the colliding
+    # UID into ``h2h_latest.king_uid`` and the next round resolves
+    # the seat to that UID. See the king-first pass in
+    # ``service._build_uid_index`` for the secondary safety net.
+    seen_keys: set[str] = set()
+    king_c = commitments.get(int(king_uid)) if king_uid is not None else None
+    if king_c is not None and getattr(king_c, "key", None):
+        seen_keys.add(king_c.key)
+
+    if skip_hf_check:
+        # Test-mode shortcut: still dedup by ``model@revision`` so the
+        # selection contract is identical under tests + production.
+        accepted_fast: list[Commitment] = []
+        for c in candidates:
+            if len(accepted_fast) >= n:
+                break
+            key = getattr(c, "key", None)
+            if key and key in seen_keys:
+                logger.info(
+                    f"select_challengers: skipping uid={c.uid} — duplicate "
+                    f"model@revision {key!r} already in round"
+                )
+                continue
+            if key:
+                seen_keys.add(key)
+            accepted_fast.append(c)
+        return accepted_fast
+
     # HF preflight: walk the FIFO list HEAD-checking config.json on each
     # candidate's repo@revision. Skip any that 404 — they're ghost
     # commitments (deleted repo, typo, never uploaded) and would burn a
     # full round's teacher tokens + GPU time to find out the same thing.
     # The 3-strikes counter in ``process_round`` is the long-term gate
     # for transient blips; this is the cheap up-front gate for
-    # permanently-missing models. ``skip_hf_check`` is provided as an
-    # escape hatch for offline tests and the unit suite (where HF
-    # network calls would be wrong to make).
-    if skip_hf_check:
-        return candidates[:n]
+    # permanently-missing models.
     accepted: list[Commitment] = []
     skipped: list[tuple[int, str, str]] = []
+    duplicates: list[tuple[int, str]] = []
     for c in candidates:
         if len(accepted) >= n:
             break
+        key = getattr(c, "key", None)
+        if key and key in seen_keys:
+            duplicates.append((int(c.uid), key))
+            continue
         ok, reason = _hf_repo_reachable(c.model, getattr(c, "revision", None))
         if ok:
+            if key:
+                seen_keys.add(key)
             accepted.append(c)
             continue
         # Permanent-failure surface (404 or auth-locked). Record a
@@ -329,6 +385,12 @@ def select_challengers(
         except Exception:  # pragma: no cover — state always provides record_failure
             n_strikes = 0
         skipped.append((uid, c.model, f"{reason}/strike={n_strikes}"))
+    if duplicates:
+        logger.warning(
+            f"select_challengers: skipped {len(duplicates)} duplicate-model "
+            f"candidate(s) (same model@revision as king or earlier accepted "
+            f"challenger): {duplicates}"
+        )
     if skipped:
         logger.warning(
             f"select_challengers: skipped {len(skipped)} candidate(s) failing "

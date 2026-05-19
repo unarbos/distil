@@ -274,6 +274,11 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         block_hash=block_hash,
         uid_index=uid_index,
         timings=results.get("__per_bench_timing__"),
+        # Pass the pre-round seated king UID so process_round can stamp
+        # the right uid on the record even when a colliding challenger
+        # shares the king's model@revision. Belt-and-suspenders with
+        # the king-first pass in ``_build_uid_index`` above.
+        seated_king_uid=king_uid,
     )
     # Stamp the round wall-clock so ``/api/eval-stats`` can report
     # avg/min/max round timing — the legacy validator populated this
@@ -663,21 +668,58 @@ def _build_uid_index(
     (king/reference/teacher).
     """
     uid_index: dict[str, dict] = {}
+
+    def _entry(uid_val: int, hotkey: str | None, revision: str | None) -> dict:
+        c = commitments.get(int(uid_val))
+        return {
+            "uid": int(uid_val),
+            "hotkey": hotkey or uid_to_hotkey.get(int(uid_val)),
+            "coldkey": getattr(c, "coldkey", None) if c else None,
+            "commit_block": getattr(c, "commit_block", None) if c else None,
+            "revision": revision or (getattr(c, "revision", "main") if c else "main"),
+        }
+
+    # Pass 1: seat the KING first and lock the row in. A separate pass
+    # is required because two miners can commit the same model@revision
+    # (the activation_fingerprint sweeper eventually DQs the copycat,
+    # but until that fires both UIDs share a single ``name`` key in
+    # ``uid_index``). If we loop in spec order with naive overwrite,
+    # the king's row gets clobbered by whichever non-king student is
+    # iterated last — observed live on 2026-05-19 between blocks
+    # 8219156–8220027, where 3 separate rounds silently shifted the
+    # crown from king→colliding-challenger UID via the
+    # ``h2h_latest.king_uid = king_uid_resolved`` writeback. The
+    # gate read h2h_latest.king_uid as it stood at the START of the
+    # round (so the in-round dethrone decision used the right king),
+    # but the END-of-round writeback updated h2h_latest with the
+    # colliding UID — and the NEXT round's ``_resolve_seated_king``
+    # then read h2h_latest and treated the colliding UID as the
+    # seated king. UID 100 → UID 101 (block 8219156), then UID 101
+    # was promptly dethroned by UID 253 (block 8219408) on the
+    # colliding UID's behalf.
     for s in spec.get("students", []) or []:
+        if not s.get("is_king"):
+            continue
         name = s.get("name")
         uid_val = s.get("uid")
         if not name or uid_val is None:
             continue
-        # spec entries carry uid/hotkey/revision/is_king but not
-        # commit_block / coldkey — fetch those from commitments[uid].
-        c = commitments.get(int(uid_val))
-        uid_index[name] = {
-            "uid": int(uid_val),
-            "hotkey": s.get("hotkey") or uid_to_hotkey.get(int(uid_val)),
-            "coldkey": getattr(c, "coldkey", None) if c else None,
-            "commit_block": getattr(c, "commit_block", None) if c else None,
-            "revision": s.get("revision") or (getattr(c, "revision", "main") if c else "main"),
-        }
+        uid_index[name] = _entry(uid_val, s.get("hotkey"), s.get("revision"))
+
+    # Pass 2: non-king students with ``setdefault`` so the king's row
+    # wins any same-model collision. Non-king-vs-non-king collisions
+    # still go to whichever student was iterated first (typically the
+    # one with the older commit_block, since ``select_challengers``
+    # builds the spec FIFO).
+    for s in spec.get("students", []) or []:
+        if s.get("is_king"):
+            continue
+        name = s.get("name")
+        uid_val = s.get("uid")
+        if not name or uid_val is None:
+            continue
+        uid_index.setdefault(name, _entry(uid_val, s.get("hotkey"), s.get("revision")))
+
     # Fallback: include any chain commitment NOT in the spec, but use
     # ``setdefault`` so the spec winners stay authoritative.
     for c in commitments.values():

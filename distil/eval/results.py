@@ -262,6 +262,7 @@ def process_round(
     block_hash: str | None,
     uid_index: dict[str, dict] | None = None,
     timings: list[dict] | None = None,
+    seated_king_uid: int | None = None,
 ) -> dict[str, Any]:
     """Mutate ``state`` in place; return the round record.
 
@@ -281,6 +282,17 @@ def process_round(
         history dedup falls open (no DQ).
     timings
         Optional per-bench timing list to record in h2h.
+    seated_king_uid
+        Optional UID of the seated king as resolved by the validator
+        BEFORE this round (i.e. ``state.king``). Used as a defence-in-
+        depth override when two miners commit the same ``model@revision``
+        and ``uid_index`` would otherwise resolve the king's row to the
+        colliding challenger UID. If provided, the record's
+        ``king_uid`` / ``h2h_latest["king_uid"]`` are stamped from this
+        value rather than the index lookup — preventing the silent
+        crown-shift bug observed on 2026-05-19 blocks 8219156/8219553/
+        8220027 (king UID 100 / 253 / 254 each silently lost the crown
+        to a colliding-model challenger via the index writeback).
     """
     # Drop meta-keys (``__finished_at__`` etc.) that the pod orchestrator
     # mixes into results.json alongside per-student records — they
@@ -443,11 +455,21 @@ def process_round(
     king_uid_resolved: int | None = None
     king_model_resolved: str | None = None
     if king_name:
-        idx = uid_index.get(king_name) or {}
-        if idx.get("uid") is not None:
-            king_uid_resolved = int(idx["uid"])
-        elif (students.get(king_name) or {}).get("uid") is not None:
-            king_uid_resolved = int(students[king_name]["uid"])
+        # Prefer the caller-supplied seated UID (the validator's
+        # ``state.king`` snapshot from BEFORE this round) over the
+        # uid_index lookup. The lookup is unreliable when two UIDs
+        # commit the same model@revision — the index loop overwrites
+        # to whichever colliding UID was iterated last, and we'd then
+        # write h2h_latest.king_uid = colliding_uid, silently shifting
+        # the crown. See ``seated_king_uid`` docstring above.
+        if seated_king_uid is not None:
+            king_uid_resolved = int(seated_king_uid)
+        else:
+            idx = uid_index.get(king_name) or {}
+            if idx.get("uid") is not None:
+                king_uid_resolved = int(idx["uid"])
+            elif (students.get(king_name) or {}).get("uid") is not None:
+                king_uid_resolved = int(students[king_name]["uid"])
         # Strip the @revision suffix to get the bare model id for
         # the dashboard's "king_model" widget.
         king_model_resolved = king_name.split("@", 1)[0]
