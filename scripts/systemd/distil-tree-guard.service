@@ -13,6 +13,9 @@ Type=oneshot
 User=root
 WorkingDirectory=/opt/distil/repo
 Environment=DISTIL_REPO_ROOT=/opt/distil/repo
+# Suppress Discord alerts on tripwire fires — incidents still go to
+# the journal + ``state/tree_guard.json`` for operator review.
+Environment=DISTIL_TREE_GUARD_QUIET=1
 ExecStart=/opt/distil/venv/bin/python /opt/distil/repo/scripts/tree_guard.py --mode all
 StandardOutput=journal
 StandardError=journal
