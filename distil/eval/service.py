@@ -318,6 +318,19 @@ def _round(state: ValidatorState, *, dry_run: bool) -> None:
         why=why,
     )
 
+    # When the king held the throne against real challengers, announce
+    # the defense. Quieter than the dethrone announcement (no role
+    # ping) and skipped entirely when there were no scored challengers
+    # this round (king-only re-eval / everyone DQ'd). See the
+    # ``_emit_defense_announcement`` docstring for the gating logic.
+    _emit_defense_announcement(
+        state=state,
+        record=record,
+        king_changed=king_changed,
+        king_uid=king_uid,
+        commitments=commitments,
+    )
+
     _publish_weights(state, mg, sub, king_uid, dry_run=dry_run)
 
     # Chat-pod side effects (ported from legacy ``sync_king_runtime``):
@@ -387,6 +400,108 @@ def _emit_dethrone_announcement(
     except Exception as exc:
         # Defensive: announce must never propagate. Log only.
         logger.warning(f"announce_new_king failed (non-fatal): {exc}")
+
+
+def _emit_defense_announcement(
+    *,
+    state: ValidatorState,
+    record: dict,
+    king_changed: bool,
+    king_uid: int | None,
+    commitments: dict,
+) -> None:
+    """Post a king-defense announcement when the king holds against challengers.
+
+    Fires when:
+      * ``king_changed`` is False (no dethrone this round), AND
+      * the round had at least one student row that's not the king
+        (so a real challenger was scored), AND
+      * the king's composite was actually written by ``process_round``
+        (so the defense message can quote real numbers).
+
+    Best-effort, never raises, never blocks weights. Public Discord
+    post is unpinged (defense is the boring case — one per round on
+    average — we don't want to spam the role).
+    """
+    if king_changed or king_uid is None:
+        return
+    students = record.get("students") or record.get("results") or []
+    if not isinstance(students, list):
+        return
+    king_uid_int = int(king_uid)
+    # Build (uid, composite_final, model) tuples for non-king students
+    # that successfully scored this round.
+    challengers: list[tuple[int, float | None, str | None]] = []
+    king_final: float | None = None
+    king_model: str | None = None
+    for s in students:
+        if not isinstance(s, dict):
+            continue
+        s_uid = s.get("uid")
+        if s_uid is None:
+            continue
+        try:
+            s_uid_int = int(s_uid)
+        except (TypeError, ValueError):
+            continue
+        s_final = (s.get("composite") or {}).get("final")
+        if s_final is None:
+            s_final = s.get("composite_final")
+        s_model = s.get("model")
+        if s_uid_int == king_uid_int:
+            try:
+                king_final = float(s_final) if s_final is not None else None
+            except (TypeError, ValueError):
+                king_final = None
+            king_model = s_model or king_model
+            continue
+        # Skip DQ'd / failed students — they're not real challengers.
+        if s.get("disqualified") or s.get("status") in {"dq", "failed", "load_failed"}:
+            continue
+        try:
+            s_final_f = float(s_final) if s_final is not None else None
+        except (TypeError, ValueError):
+            s_final_f = None
+        if s_final_f is None:
+            continue
+        challengers.append((s_uid_int, s_final_f, s_model))
+    if not challengers:
+        # No scored challengers this round (e.g. all DQ'd, or a
+        # king-only re-eval round). Nothing to announce.
+        return
+    # Pick the strongest challenger (highest composite_final) as the
+    # representative "top contender" the king beat.
+    challengers.sort(key=lambda t: (t[1] is None, -(t[1] or 0.0)))
+    top_uid, top_final, top_model = challengers[0]
+    if king_model is None:
+        # Fall back to the record's king_model (always set by
+        # process_round and re-written by _rewrite_record_for_dethrone)
+        # so we still ping the right HF link.
+        king_model = record.get("king_model")
+    if king_final is None:
+        # Compositee lookup: try the persisted ``composite_scores``
+        # rather than failing closed.
+        cs = state.composite_scores or {}
+        kc = cs.get(str(king_uid_int)) or {}
+        try:
+            king_final = float(kc.get("final")) if kc.get("final") is not None else None
+        except (TypeError, ValueError):
+            king_final = None
+    try:
+        from distil.eval.announce import announce_king_defense
+        announce_king_defense(
+            king_uid=king_uid_int,
+            king_model=king_model,
+            top_challenger_uid=top_uid,
+            top_challenger_model=top_model,
+            king_composite_final=king_final,
+            top_challenger_final=top_final,
+            block=record.get("block"),
+            n_challengers=len(challengers),
+            state_dir=settings.state_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"announce_king_defense failed (non-fatal): {exc}")
 
 
 def _maintain_state_at_round_start(state: ValidatorState, commitments: dict) -> None:
@@ -877,10 +992,39 @@ def _rewrite_record_for_dethrone(
     ``contenders`` partitioning need a post-dethrone rewrite.
     """
     record["king_uid"] = int(new_king_uid)
-    record["king_name"] = str(new_king_uid)
+    # ``king_name`` is the canonical ``model@revision`` identifier the
+    # dashboard reads to display the king. Pre-fix this was set to
+    # ``str(new_king_uid)`` (just the UID as a string), so every
+    # dethrone round wrote ``king_name: "104"`` instead of
+    # ``king_name: "best26/sn97-ms-v14@cf5d1a3d..."`` — the v2
+    # dashboard then fell back to showing the UID where the model
+    # name should have been, and Arbos summarised it as "king_name /
+    # king_model inheriting from previous king". The PRE-dethrone
+    # ``process_round`` path writes the proper ``model@revision``
+    # form (results.py:673 ``"king_name": king_name``), so we mirror
+    # that schema here to keep both code paths consistent.
     new_king_commit = commitments.get(int(new_king_uid))
     if new_king_commit is not None:
         record["king_model"] = new_king_commit.model
+        # ``key`` is ``f"{model}@{revision}"`` per
+        # ``distil.chain.commitments.Commitment.key``. Fall back to
+        # the bare model when revision is missing (cold-start /
+        # mis-recorded commitment) so we never write a UID-string.
+        record["king_name"] = (
+            getattr(new_king_commit, "key", None)
+            or f"{new_king_commit.model}@{getattr(new_king_commit, 'revision', 'main') or 'main'}"
+        )
+    else:
+        # Commitment lookup failed (shouldn't happen — the dethrone
+        # gate already checked ``new_king_uid in commitments`` — but
+        # keep a defensive fallback that at least doesn't lie about
+        # who's seated). Prefer the existing ``king_model`` row if
+        # ``process_round`` already stamped one for this UID.
+        record["king_name"] = str(new_king_uid)
+        logger.warning(
+            f"dethrone-rewrite: no commitment for new_king_uid={new_king_uid}; "
+            f"king_name fell back to UID-string"
+        )
 
     leaderboard = getattr(state, "top4_leaderboard", None) or {}
     rows = list(leaderboard.get("rows") or [])

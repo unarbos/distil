@@ -299,4 +299,157 @@ def announce_new_king(
         )
 
 
-__all__ = ["announce_new_king"]
+def _format_defense_message(
+    *,
+    king_uid: int,
+    king_model: str | None,
+    top_challenger_uid: int | None,
+    top_challenger_model: str | None,
+    king_composite_final: float | None,
+    top_challenger_final: float | None,
+    block: int | None,
+    n_challengers: int,
+) -> str:
+    """Build the king-defense message body.
+
+    Quieter than the dethrone announcement — no role-ping by default,
+    and the prose makes clear that nothing changed, just that the king
+    successfully defended their crown. The dashboard link is included
+    so people can verify in one click.
+    """
+    title = "## 🛡️ King Defends the Crown"
+    line_king = ""
+    if king_model:
+        line_king = (
+            f"👑 **UID {king_uid}** ([{king_model}]"
+            f"(<https://huggingface.co/{king_model}>)) held off "
+        )
+    else:
+        line_king = f"👑 **UID {king_uid}** held off "
+    if top_challenger_uid is not None:
+        if top_challenger_model:
+            line_king += (
+                f"**{n_challengers} challenger"
+                f"{'s' if n_challengers != 1 else ''}** — top contender: "
+                f"**UID {top_challenger_uid}** "
+                f"([{top_challenger_model}]"
+                f"(<https://huggingface.co/{top_challenger_model}>))."
+            )
+        else:
+            line_king += (
+                f"**{n_challengers} challenger"
+                f"{'s' if n_challengers != 1 else ''}** — top contender: "
+                f"**UID {top_challenger_uid}**."
+            )
+    else:
+        line_king += (
+            f"**{n_challengers} challenger"
+            f"{'s' if n_challengers != 1 else ''}**."
+        )
+
+    score_line = ""
+    if king_composite_final is not None:
+        score_line = f"📊 King: **{king_composite_final:.3f}**"
+        if top_challenger_final is not None:
+            score_line += f" vs top challenger {top_challenger_final:.3f}"
+            try:
+                gap = king_composite_final - top_challenger_final
+                score_line += f" (gap +{gap:.3f})"
+            except Exception:  # noqa: BLE001
+                pass
+        score_line += "\n"
+
+    block_line = f"📦 Block: ``{block}``\n" if block is not None else ""
+
+    return (
+        f"{title}\n\n"
+        f"{line_king}\n\n"
+        f"{score_line}"
+        f"{block_line}"
+        f"\n"
+        f"📈 [Live Dashboard](<{_DASHBOARD_URL}>)"
+    )
+
+
+def announce_king_defense(
+    *,
+    king_uid: int,
+    king_model: str | None,
+    top_challenger_uid: int | None,
+    top_challenger_model: str | None,
+    king_composite_final: float | None = None,
+    top_challenger_final: float | None = None,
+    block: int | None = None,
+    n_challengers: int = 0,
+    state_dir: str | None = None,
+) -> None:
+    """Publish a king-defense announcement (king held the crown).
+
+    Called by :func:`distil.eval.service._emit_round_announcement` when
+    a round closes with ``king_changed=False`` AND there was at least
+    one real challenger that finished scoring. Per-round, never raises,
+    never blocks ``set_weights``.
+
+    ``state/announcement.json`` is overwritten with the defense payload
+    just like ``announce_new_king`` does for dethrones; the dashboard
+    banner reads the same field and renders either flavour based on
+    ``type``.
+    """
+    if _is_disabled():
+        logger.info("announce: DISTIL_ANNOUNCE_DISABLED=1; skipping defense")
+        return
+    if n_challengers <= 0:
+        # No real challengers (king-re-eval-only round, or all
+        # challengers DQ'd before scoring). No defense to announce.
+        return
+
+    msg = _format_defense_message(
+        king_uid=king_uid,
+        king_model=king_model,
+        top_challenger_uid=top_challenger_uid,
+        top_challenger_model=top_challenger_model,
+        king_composite_final=king_composite_final,
+        top_challenger_final=top_challenger_final,
+        block=block,
+        n_challengers=n_challengers,
+    )
+
+    discord_id = _post_to_discord(msg)
+
+    payload: dict[str, Any] = {
+        "type": "king_defense",
+        "timestamp": time.time(),
+        "posted": bool(discord_id),
+        "message": msg,
+        "data": {
+            "king_uid": king_uid,
+            "king_model": king_model,
+            "top_challenger_uid": top_challenger_uid,
+            "top_challenger_model": top_challenger_model,
+            "king_composite_final": king_composite_final,
+            "top_challenger_final": top_challenger_final,
+            "block": block,
+            "n_challengers": n_challengers,
+        },
+    }
+    if discord_id:
+        payload["posted_at"] = time.time()
+        payload["posted_via"] = "validator-direct"
+        payload["discord_message_id"] = discord_id
+
+    if state_dir:
+        _write_state_announcement(state_dir, payload)
+
+    if discord_id:
+        logger.info(
+            "announce: posted king-defense to Discord (msg_id=%s, uid=%s, n=%d)",
+            discord_id, king_uid, n_challengers,
+        )
+    else:
+        logger.info(
+            "announce: king-defense queued to state file only (uid=%s, n=%d)",
+            king_uid, n_challengers,
+        )
+
+
+__all__ = ["announce_new_king", "announce_king_defense"]

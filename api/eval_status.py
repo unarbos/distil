@@ -30,6 +30,47 @@ def backlog_rows_by_uid(backlog: dict) -> dict:
     }
 
 
+def _hotkey_eval_matches_current_commitment(
+    hotkey_entry: dict | None, commitment: dict | None
+) -> bool:
+    """True iff the prior eval recorded in ``evaluated_hotkeys[hk]`` was
+    on the *exact* (model, revision) the miner currently has committed.
+
+    ``evaluated_hotkeys`` is the authoritative one-eval-per-commit
+    ledger introduced by the 2026-05-18 fix. A hotkey appears in it as
+    soon as the validator finishes scoring that hotkey's commit; the
+    entry is keyed by ``{model, revision}`` so a NEW commit creates a
+    fresh-eval candidacy automatically. This helper is what lets the
+    dashboard distinguish:
+
+      * "queued" — never evaluated OR committed something new since
+                   their last eval (genuine re-eval candidate)
+      * "evaluated_no_composite" — evaluated on the current commit but
+                   ``composite_scores`` row got evicted by a schema bump
+                   (no re-eval needed; the slot is consumed)
+
+    Pre-fix the dashboard only consulted ``evaluated_uids.json`` (a
+    list of UID-strings). That list gets cleared whenever a UID's
+    composite is evicted, so previously-evaluated miners flipped back
+    to ``queued`` on every schema bump — observed live as 73 UIDs
+    flagged queued while ~60 of them had already been evaluated on
+    their current commit.
+    """
+    if not isinstance(hotkey_entry, dict) or not isinstance(commitment, dict):
+        return False
+    entry_model = hotkey_entry.get("model")
+    entry_rev = hotkey_entry.get("revision")
+    cur_model = commitment.get("model")
+    cur_rev = commitment.get("revision")
+    if not entry_model or not cur_model:
+        return False
+    if entry_model != cur_model:
+        return False
+    if entry_rev and cur_rev and entry_rev != cur_rev:
+        return False
+    return True
+
+
 def build_eval_statuses(
     *,
     scores_data: dict,
@@ -46,11 +87,13 @@ def build_eval_statuses(
     backlog: dict,
     epoch_blocks: int,
     dq_reason_for_commitment,
+    evaluated_hotkeys: dict | None = None,
 ) -> tuple[int | None, int, dict]:
     current_king_uid = latest.get("king_uid")
     current_block = latest.get("block", 0)
     evaluated = {str(uid) for uid in (evaluated_uids or [])}
     composite_scores = composite_scores if isinstance(composite_scores, dict) else {}
+    evaluated_hotkeys = evaluated_hotkeys if isinstance(evaluated_hotkeys, dict) else {}
     active_slots = active_slots_by_uid(progress)
     backlog_rows = backlog_rows_by_uid(backlog)
     current_model = current_model_from_progress(progress)
@@ -100,6 +143,21 @@ def build_eval_statuses(
                 "scored_at": comp.get("ts") if isinstance(comp, dict) else None,
             }
         elif uid_str in evaluated:
+            result[uid_str] = {"status": "evaluated_no_composite"}
+        elif (
+            hotkey is not None
+            and _hotkey_eval_matches_current_commitment(
+                evaluated_hotkeys.get(hotkey), commitment
+            )
+        ):
+            # Honestly evaluated on the CURRENT (model, revision) but
+            # their composite_scores row was evicted by a schema bump.
+            # Do NOT classify as "queued" — the one-eval-per-commit
+            # slot has already been consumed. Surface as
+            # ``evaluated_no_composite`` so the dashboard can render
+            # "scored (evicted)" without re-queueing the miner for a
+            # second eval on the same commit (which would burn API
+            # spend and break the per-commit invariant).
             result[uid_str] = {"status": "evaluated_no_composite"}
         else:
             tracker_entry = h2h_tracker.get(uid_str, {})

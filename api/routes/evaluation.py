@@ -510,6 +510,14 @@ def get_eval_status():
     failures_map = read_state("failures.json", {}) or {}
     failure_models_map = read_state("failure_models.json", {}) or {}
     evaluated_uids = read_state("evaluated_uids.json", []) or []
+    # ``evaluated_hotkeys.json`` is the authoritative one-eval-per-
+    # commit ledger (introduced 2026-05-18). Pass it through so the
+    # status classifier can distinguish "honestly evaluated, composite
+    # row got evicted by a schema bump" (status: evaluated_no_composite)
+    # from "never evaluated" (status: queued). Without this, ~60 UIDs
+    # flip back to queued on every schema bump even though they've
+    # already consumed their eval slot on the current commit.
+    evaluated_hotkeys = read_state("evaluated_hotkeys.json", {}) or {}
     uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
@@ -533,6 +541,7 @@ def get_eval_status():
         backlog=backlog,
         epoch_blocks=EPOCH_BLOCKS,
         dq_reason_for_commitment=_dq_reason_for_commitment,
+        evaluated_hotkeys=evaluated_hotkeys,
     )
     return JSONResponse(
         content={"king_uid": current_king_uid, "block": current_block, "statuses": result},
