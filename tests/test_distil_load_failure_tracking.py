@@ -174,16 +174,10 @@ def test_success_resets_strike_counter():
     )
 
 
-def test_recommit_evicts_failure_counter():
-    """Re-commitment after a 3-strikes load failure MUST clear the
-    failure counter so the corrected repo gets a clean budget.
-
-    The 3-strikes path produces ``composite_final=None`` in the
-    ``evaluated_hotkeys`` ledger (no real composite was computed), so
-    ``evict_stale_evaluated_uids`` correctly treats it as a load-
-    failure retry slot — distinct from a successful eval which is
-    permanently locked under the spam-proof one-eval-per-registration
-    policy (2026-05-20 togetherness exploit closure).
+def test_recommit_after_3strikes_does_NOT_evict():
+    """STRICT one-registration-one-eval (2026-05-20): even a 3-strikes
+    load failure on a typo'd repo does NOT earn a re-commit retry.
+    Register a new hotkey to retry — that's the cost gate.
     """
     from distil.eval.round import Commitment
 
@@ -199,8 +193,6 @@ def test_recommit_evicts_failure_counter():
             "final": None,
         }
     }
-    # The 3-strikes path writes the hotkey ledger with composite_final
-    # = None so the retry branch in evict_stale_evaluated_uids fires.
     state.evaluated_hotkeys = {
         "5E6tg8LEux": {
             "uid": 124, "model": "slowsnake/kimi-43043",
@@ -218,21 +210,18 @@ def test_recommit_evicts_failure_counter():
         ),
     }
     evicted = evict_stale_evaluated_uids(state, commitments)
-    assert "124" in evicted, f"re-commitment must evict; got {evicted}"
-    assert state.failures.get("124", 0) == 0, (
-        f"re-commitment must reset failures counter so the new repo "
-        f"has a fresh 3-strikes budget; got failures={state.failures}"
-    )
-    # And the stale ledger entry is gone (new commit gets a clean
-    # eval slot).
-    assert "5E6tg8LEux" not in state.evaluated_hotkeys
+    assert evicted == [], f"strict policy: no re-commit retry; got {evicted}"
+    assert "124" in state.evaluated_uids
+    assert "5E6tg8LEux" in state.evaluated_hotkeys
+    # Failure counter intact (no fresh budget granted)
+    assert state.failures.get("124", 0) == settings.max_load_failures
 
 
 def test_recommit_after_successful_eval_does_NOT_evict():
-    """SPAM-PROOF: re-committing on a hotkey that ALREADY produced a
-    real composite does NOT earn a retry. This is what blocks the
-    togetherness exploit cycling working checkpoints to claim N+1
-    evals."""
+    """STRICT: re-committing on a hotkey that ALREADY produced a real
+    composite does NOT earn a retry. This is the core invariant that
+    blocks the togetherness exploit cycling working checkpoints to
+    claim N+1 evals."""
     from distil.eval.round import Commitment
 
     state = _state()

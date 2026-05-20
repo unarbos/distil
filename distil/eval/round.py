@@ -102,54 +102,47 @@ def _commitment_changed(stored: dict | None, current: Commitment) -> bool:
 def evict_stale_evaluated_uids(
     state: ValidatorState, commitments: dict[int, Commitment]
 ) -> list[str]:
-    """Drop ``evaluated_uids`` + ``composite_scores`` rows when the HOTKEY
-    owning a UID-position has rotated. Returns the list of evicted UID
-    strings.
+    """Drop ``evaluated_uids`` + ``composite_scores`` rows ONLY when the
+    HOTKEY owning a UID-position has rotated. Returns the list of
+    evicted UID strings.
 
-    Strict **one-eval-per-hotkey-registration** invariant (the policy
-    bittensor SN97 advertises to miners and #distil-97 has repeatedly
-    asked for, most recently 2026-05-20 — togetherness exploit cycling
-    13 model checkpoints across hotkeys to trigger N+1 evals each):
+    **STRICT one-registration-one-eval invariant** (operator policy,
+    2026-05-20):
 
-        A hotkey gets exactly ONE eval per on-chain registration.
-        Re-committing a different model OR revision on the same
-        hotkey does NOT earn another eval. The slot is owned by the
-        hotkey, not by the (hotkey, model@revision) tuple.
+        Each on-chain registration gets EXACTLY ONE eval. A hotkey is
+        a registration. Re-committing on the same hotkey — for any
+        reason, including typo'd repos, force-pushes, model swaps,
+        revision bumps, mid-eval pod crashes — does NOT earn another
+        eval. The slot is owned by the hotkey, period.
 
-    Eviction is therefore restricted to two scenarios:
+        To get a second eval: deregister, re-register with a new
+        hotkey, pay the bond again. That's the cost gate.
 
-      1. The UID has a stale ``evaluated_uids`` row but the CURRENT
-         chain hotkey at that UID-position has NO entry in
-         ``evaluated_hotkeys``. This is the genuine hotkey-rotation
-         case (the prior miner deregistered, a new hotkey now owns
-         the UID slot — fair to give the new hotkey its eval slot).
+    The function therefore ONLY evicts in one scenario:
 
-      2. ``stored`` (composite_scores row) exists AND the current
-         chain hotkey at that UID-position has NO entry in
-         ``evaluated_hotkeys``. Same scenario as (1) but the prior
-         eval also left a composite row behind.
+        The chain hotkey at this UID-position has NO entry in
+        ``evaluated_hotkeys`` AND no composite_scores row. This is
+        genuine hotkey rotation (the prior miner deregistered, a
+        new hotkey now owns the UID-slot; the new hotkey gets its
+        one fair eval).
 
-    What we explicitly DO NOT evict on (pre-fix the function did all
-    of these and that's exactly how the togetherness exploit worked):
+    What we explicitly do NOT evict on (each of these was an exploit
+    or operator-policy concession we've now rolled back):
 
       * Model name change on the same hotkey
-        (e.g. ``togetherness/ckp2100`` → ``togetherness/ckp2200``)
+        (togetherness ckp2100 → ckp2200 — observed 2026-05-20)
       * Revision change on the same hotkey
-        (e.g. force-push to a new sha while keeping the repo)
+        (force-push to a new sha while keeping the repo)
       * commit_block delta on the same hotkey
-        (same as above — bittensor stamps a new commit_block on
-        every commitment regardless of content change)
+      * composite_final is None (3-strikes load failure / typo'd repo /
+        mid-eval crash). Operator policy: typo your repo, you eat the
+        DQ. Register again to retry. This was previously rule 2b and
+        is now removed.
 
-    Miners who want a second eval must REGISTER a new hotkey (pay
-    the bond again). That's the cost gate the design always intended.
-
-    Recovery: a hotkey whose first eval ended in ``evaluated_no_
-    composite`` (orchestrator crash mid-eval, OpenRouter teacher
-    failure, etc.) is currently stuck. They must re-register — by
-    policy. If we ever decide to let them retry, the right fix is a
-    SEPARATE admin path that clears ``evaluated_hotkeys[hk]`` AND
-    ``evaluated_uids`` for a specific UID, NOT a re-commit shortcut
-    that the spam loop can also use.
+    Pre-ledger composites (``composite_scores`` row exists but no
+    ``evaluated_hotkeys`` entry — written before 2026-05-18 when the
+    ledger started being maintained) are auto-backfilled to lock the
+    slot going forward, NOT evicted.
     """
     evicted: list[str] = []
     composite_scores = state.composite_scores or {}
@@ -163,74 +156,17 @@ def evict_stale_evaluated_uids(
         hk = getattr(c, "hotkey", None)
         eh_entry = evaluated_hotkeys.get(hk) if hk else None
 
-        # Decision tree (in order):
-        #
-        #   1. chain hotkey HAS a ledger entry with a REAL composite_
-        #      final → slot is permanently locked. Re-commits on the
-        #      same hotkey do not earn a retry. This closes the
-        #      togetherness exploit (cycling checkpoint variants of a
-        #      working model to claim N+1 evals).
-        #
-        #   2. chain hotkey HAS a ledger entry but composite_final is
-        #      ``None`` → the prior eval consumed the slot WITHOUT
-        #      producing a composite (3-strikes load failure, mid-eval
-        #      pod crash, precheck failure). Treat re-commit as a
-        #      retry opportunity — clear the row, reset failure
-        #      counter, requeue. This rescues miners whose first eval
-        #      crashed on a typo'd repo or transient infra issue
-        #      without giving the spam loop a free pass.
-        #
-        #   3. chain hotkey has NO ledger entry but ``composite_scores
-        #      `` row exists → pre-ledger composite (written before
-        #      ``evaluated_hotkeys`` started being maintained on
-        #      2026-05-18). Backfill the ledger from the composite
-        #      and lock the slot.
-        #
-        #   4. chain hotkey has NO ledger entry and NO composite row →
-        #      genuine hotkey rotation. The prior owner deregistered
-        #      and a new hotkey took the UID. Clear the stale
-        #      evaluated_uids row so the new hotkey can be queued.
+        # rule 1: chain hotkey is in the ledger → slot is locked
+        # REGARDLESS of the composite_final value. Successful eval, DQ,
+        # load-failure exhaustion, mid-eval crash — they all consume
+        # the one-and-only eval slot for this hotkey-registration.
         if eh_entry is not None:
-            prior_final = eh_entry.get("composite_final")
-            if prior_final is not None:
-                continue  # rule 1: locked
-            # composite_final is None: prior eval consumed slot without
-            # producing a real score. Two sub-paths to distinguish:
-            #
-            #   2a. Hotkey is on the DQ list. DQ is the authoritative
-            #       gate (``state.is_disqualified`` filters them in
-            #       ``select_challengers``). This function should NOT
-            #       quietly re-queue a DQ'd hotkey — that would let a
-            #       protocol-violation DQ get reset by a re-commit,
-            #       reopening abuse paths. Leave bookkeeping intact;
-            #       the explicit DQ-clear admin path is the only way
-            #       to revive a DQ'd hotkey.
-            #
-            #   2b. Hotkey is NOT DQ'd → 3-strikes load failure /
-            #       mid-eval crash / typo'd repo. Re-commit IS a fair
-            #       retry; clear the row + reset failures so the new
-            #       commit gets a clean 3-strikes budget.
-            if hk and state.is_disqualified(hk, uid=int(uid)):
-                continue  # rule 2a: DQ-locked
-            logger.info(
-                f"evicting UID {uid_str}: prior eval on hotkey "
-                f"{(hk or '?')[:14]}… consumed slot WITHOUT a composite "
-                f"(load failure / mid-eval crash, NOT DQ'd). "
-                f"Re-commit is allowed to retry."
-            )
-            try:
-                state.evaluated_uids.remove(uid_str)
-            except ValueError:
-                pass
-            state.composite_scores.pop(uid_str, None)
-            evaluated_hotkeys.pop(hk, None)
-            state.reset_failures(int(uid))
-            evicted.append(uid_str)
             continue
 
         stored = composite_scores.get(uid_str)
         if stored is not None:
-            # rule 3: pre-ledger composite — backfill + lock
+            # rule 2: pre-ledger composite — backfill so the slot is
+            # properly locked going forward; do NOT evict.
             if hk:
                 state.evaluated_hotkeys[hk] = {
                     "uid": int(uid),
@@ -245,7 +181,10 @@ def evict_stale_evaluated_uids(
                 }
             continue
 
-        # rule 4: genuine rotation
+        # rule 3: no ledger entry AND no composite — genuine hotkey
+        # rotation (prior miner deregistered, new hotkey took the UID).
+        # Clear the stale evaluated_uids row so select_challengers can
+        # queue the new hotkey for its single eval.
         logger.info(
             f"evicting UID {uid_str}: chain hotkey "
             f"{(hk or '?')[:14]}… has no evaluated_hotkeys entry and "
@@ -259,7 +198,8 @@ def evict_stale_evaluated_uids(
         evicted.append(uid_str)
     if evicted:
         logger.info(
-            f"evicted {len(evicted)} UIDs: {evicted}"
+            f"evicted {len(evicted)} UIDs (hotkey rotation, no prior eval): "
+            f"{evicted}"
         )
     return evicted
 

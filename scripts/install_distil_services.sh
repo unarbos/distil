@@ -37,13 +37,15 @@ install -m 0644 "$LEGACY_DIR/distil-benchmark-sync.service" "$UNIT_DST_DIR/disti
 install -m 0644 "$LEGACY_DIR/distil-benchmark-sync.timer" "$UNIT_DST_DIR/distil-benchmark-sync.timer"
 install -m 0644 "$LEGACY_DIR/distil-tree-guard.service" "$UNIT_DST_DIR/distil-tree-guard.service"
 install -m 0644 "$LEGACY_DIR/distil-tree-guard.timer" "$UNIT_DST_DIR/distil-tree-guard.timer"
-# CRITICAL: the tripwire script must survive a wipe of /opt/distil/repo
-# (otherwise the watchdog dies exactly when it's needed). Copy the
-# in-repo source to /usr/local/sbin/ so the systemd ExecStart can
-# point at a stable out-of-repo path. install -C only writes if the
-# bytes differ, so re-running this script after a code update is a
-# no-op when there's nothing new to deploy.
+install -m 0644 "$LEGACY_DIR/distil-wipe-watch.service" "$UNIT_DST_DIR/distil-wipe-watch.service"
+# CRITICAL: both the tripwire and the wipe watcher must survive a
+# wipe of /opt/distil/repo (otherwise the watchdog dies exactly when
+# it's needed). Copy the in-repo sources to /usr/local/sbin/ so the
+# systemd ExecStarts can point at stable out-of-repo paths. install
+# -C only writes if the bytes differ, so re-running this script
+# after a code update is a no-op when there's nothing new to deploy.
 install -C -m 0755 "$REPO_ROOT/scripts/tree_guard.py" /usr/local/sbin/distil-tree-guard
+install -C -m 0755 "$REPO_ROOT/scripts/distil-wipe-watch.sh" /usr/local/sbin/distil-wipe-watch
 if [[ -f "$LEGACY_DIR/openclaw.service" ]]; then
   install -m 0644 "$LEGACY_DIR/openclaw.service" "$UNIT_DST_DIR/openclaw.service"
 fi

@@ -205,13 +205,8 @@ def test_bootstrapped_legacy_composite_not_evicted() -> None:
 
 
 def test_dq_only_uid_not_re_evicted() -> None:
-    """A UID consumed by PRECHECK DQ (composite_final=None + DQ list
-    entry) is left alone — the DQ list is the authoritative gate and
-    re-commit must not silently revive a protocol-violation DQ.
-
-    Distinct from the load-failure path which DOES allow retry on
-    re-commit (see ``test_load_failure_uid_evicts_on_recommit`` below).
-    """
+    """STRICT (2026-05-20): a UID consumed by PRECHECK DQ is locked.
+    The hotkey already used its one eval slot."""
     state = _FakeState(
         evaluated_uids=["55"],
         composite_scores={},
@@ -226,17 +221,20 @@ def test_dq_only_uid_not_re_evicted() -> None:
     commitments = {55: _commit(55, model="alice/v3")}
     assert evict_stale_evaluated_uids(state, commitments) == []
     assert "55" in state.evaluated_uids
-    assert "hk55" in state.evaluated_hotkeys  # ledger preserved
+    assert "hk55" in state.evaluated_hotkeys
 
 
-def test_load_failure_uid_evicts_on_recommit() -> None:
-    """A UID consumed by 3-strikes load failure (composite_final=None
-    + NOT on DQ list) DOES evict on re-commit — fair retry path.
+def test_load_failure_uid_NOT_evicted_on_recommit() -> None:
+    """STRICT (2026-05-20): the one-registration-one-eval policy is
+    absolute. A miner who burned their slot on a typo'd repo / 3-
+    strikes load failure / mid-eval crash does NOT get a re-commit
+    retry. They must register a new hotkey.
 
-    This is the typo'd-repo rescue. Closes the bot's promise to
-    itorgov (UID 171, 2026-05-20) without giving spam loops an out:
-    the DQ list still blocks any actual cheating, and successful
-    evals (composite_final≠None) still lock the slot via rule 1.
+    Previously (~12:45 UTC same day) we tried to be lenient and let
+    composite_final=None slots re-trigger on re-commit. Operator
+    decision: that's too soft — the cost gate has to be the hotkey
+    registration itself, no exceptions. Typo your repo, you eat the
+    DQ; register again to retry.
     """
     state = _FakeState(
         evaluated_uids=["77"],
@@ -249,14 +247,14 @@ def test_load_failure_uid_evicts_on_recommit() -> None:
                 "load_failures": 3,
             }
         },
-        # NOT on DQ list — pure load failure
     )
     commitments = {77: _commit(77, model="miner/correct-repo")}
     evicted = evict_stale_evaluated_uids(state, commitments)
-    assert evicted == ["77"]
-    assert "77" not in state.evaluated_uids
-    assert "hk77" not in state.evaluated_hotkeys
-    assert state.failures.get("77", 0) == 0  # fresh budget
+    assert evicted == []
+    assert "77" in state.evaluated_uids
+    assert "hk77" in state.evaluated_hotkeys
+    # failure counter intact (no fresh budget granted)
+    assert state.failures.get("77", 0) == 3
 
 
 def test_commit_signature_helpers() -> None:

@@ -1,0 +1,25 @@
+[Unit]
+Description=Distil wipe watch — real-time forensics for /opt/distil/repo deletions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/distil/repo
+Environment=DISTIL_REPO_ROOT=/opt/distil/repo
+# CRITICAL: ExecStart points at the OUT-OF-REPO copy at
+# /usr/local/sbin/distil-wipe-watch (same survival-of-wipe rationale
+# as distil-tree-guard.service). The whole point of this watcher is
+# to catch wipes — if its own script lives inside the wipe target,
+# the watcher dies right when it's needed and we lose the forensics.
+ExecStart=/usr/local/sbin/distil-wipe-watch
+StandardOutput=journal
+StandardError=journal
+# Restart if inotifywait dies (e.g. all watched dirs got
+# rmdir'd-then-mkdir'd by the wipe itself).
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
