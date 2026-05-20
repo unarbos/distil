@@ -153,7 +153,14 @@ def test_hotkey_rotation_evicts_stale_row() -> None:
 def test_pre_ledger_composite_backfills_evaluated_hotkeys() -> None:
     """Composites written before ``evaluated_hotkeys`` started being
     maintained (pre-2026-05-18) lock the slot by backfilling the
-    ledger from the composite, NOT by evicting and re-evaluating."""
+    ledger from the composite, NOT by evicting and re-evaluating.
+
+    Backfill is gated on the stored composite's ``model@revision``
+    matching the current chain commitment — that's the signal that
+    the composite belongs to the SAME hotkey that's still on chain
+    (vs. a prior holder of a recycled UID-slot, which goes through
+    ``test_uid_rotation_evicts_pre_ledger_composite_when_commit_differs``).
+    """
     state = _FakeState(
         evaluated_uids=["12"],
         composite_scores={
@@ -173,6 +180,187 @@ def test_pre_ledger_composite_backfills_evaluated_hotkeys() -> None:
     assert eh is not None
     assert eh.get("model") == "legacy/repo"
     assert eh.get("backfilled_from_composite") is True
+
+
+def test_uid_rotation_evicts_when_chain_hotkey_differs_from_ledger() -> None:
+    """P0 BUG-FIX (2026-05-20 night): when a UID gets recycled in
+    bittensor (prior hotkey deregistered, new hotkey claims the
+    UID-slot), the new hotkey MUST become eligible for its single
+    eval. Detected via the reverse index over ``evaluated_hotkeys``:
+    if ANY hotkey other than the chain hotkey has a ledger entry
+    pointing at this UID, that's UID rotation.
+
+    Live reproduction (caught by @hotshot9411 in #distil-97 at
+    20:22 UTC): UID 159 had been evaluated by some prior hotkey
+    H_OLD with composite 0.222 at block 8196797. H_OLD deregistered,
+    new hotkey ``5Hath...`` claimed UID 159 at block ~8227428 and
+    committed ``dashi0x83/will_king_vv3``. The strict-policy code
+    shipped that morning (2320310) saw the new hotkey, found no
+    ``evaluated_hotkeys`` entry for it, and proceeded to BACKFILL
+    H_OLD's composite into ``evaluated_hotkeys[5Hath...]`` —
+    locking the new hotkey out of challenger selection. Bot
+    correctly diagnosed at 20:23 UTC ("UID-keyed tracking was fine
+    when hotkey rotation wasn't common, but it clearly needs the
+    hotkey-match guard now").
+    """
+    state = _FakeState(
+        evaluated_uids=["159"],
+        composite_scores={
+            "159": {
+                "model": "prior_holder/old_model",
+                "revision": "abc",
+                "block": 8196797,
+                "final": 0.222,
+            }
+        },
+        evaluated_hotkeys={
+            # H_OLD's ledger entry still pinned to UID 159 — bittensor
+            # doesn't tell us when a hotkey deregisters, the entry
+            # stays as historical record.
+            "hk_prior_holder": {
+                "uid": 159,
+                "model": "prior_holder/old_model",
+                "revision": "abc",
+                "composite_final": 0.222,
+                "composite_worst": 0.1,
+            }
+        },
+    )
+    # Chain commitment now has the NEW hotkey at UID 159.
+    new_commit = Commitment(
+        uid=159,
+        hotkey="hk_new_holder",
+        block=8227428,
+        model="new_holder/fresh_model",
+        revision="def",
+        coldkey="ck_new",
+    )
+    evicted = evict_stale_evaluated_uids(state, {159: new_commit})
+    assert evicted == ["159"], "new hotkey at recycled UID must trigger eviction"
+    assert "159" not in state.evaluated_uids, "stale evaluated_uids row dropped"
+    assert "159" not in state.composite_scores, "stale composite_scores row dropped"
+    # New hotkey's ledger entry was NOT poisoned with the prior holder's score:
+    assert "hk_new_holder" not in state.evaluated_hotkeys
+    # Prior hotkey's ledger entry kept as historical record (so a re-
+    # registration of the SAME hotkey stays permanently locked out):
+    assert "hk_prior_holder" in state.evaluated_hotkeys
+
+
+def test_uid_rotation_evicts_pre_ledger_composite_when_commit_differs() -> None:
+    """Pre-ledger UID rotation: composite_scores has a row from before
+    the ledger started being maintained, no ``evaluated_hotkeys``
+    entry exists for this UID at all, and the chain commitment's
+    ``model@revision`` doesn't match the stored composite. This
+    strongly implies the composite belongs to a prior holder (a
+    same-hotkey re-commit on the same UID would have produced an
+    ``evaluated_hotkeys`` entry under the post-2026-05-18 code).
+    Treat as UID rotation and evict.
+    """
+    state = _FakeState(
+        evaluated_uids=["88"],
+        composite_scores={
+            "88": {
+                "model": "old/legacy_repo",
+                "revision": "abc",
+                "block": 80,
+                "final": 0.4,
+            }
+        },
+        evaluated_hotkeys={},  # ledger empty for this UID
+    )
+    # Chain hotkey + commitment differ from the stored composite.
+    new_commit = Commitment(
+        uid=88,
+        hotkey="hk88",
+        block=200,
+        model="new_miner/fresh_repo",
+        revision="def",
+        coldkey="ck88",
+    )
+    evicted = evict_stale_evaluated_uids(state, {88: new_commit})
+    assert evicted == ["88"]
+    assert "88" not in state.evaluated_uids
+    assert "88" not in state.composite_scores
+    assert "hk88" not in state.evaluated_hotkeys, (
+        "must NOT backfill an unrelated composite into the new hotkey's slot"
+    )
+
+
+def test_pre_ledger_composite_matching_chain_commit_still_backfills() -> None:
+    """Defense for ``test_pre_ledger_composite_backfills_evaluated_hotkeys``
+    against the new commit-signature guard: when the stored composite's
+    model@revision matches the chain commitment, backfill (don't evict),
+    because that's a pre-ledger SAME-hotkey case rather than rotation.
+    """
+    state = _FakeState(
+        evaluated_uids=["42"],
+        composite_scores={
+            "42": {
+                "model": "same_miner/same_repo",
+                "revision": "same_rev",
+                "block": 50,
+                "final": 0.66,
+            }
+        },
+        evaluated_hotkeys={},
+    )
+    commit = Commitment(
+        uid=42,
+        hotkey="hk42",
+        block=51,
+        model="same_miner/same_repo",
+        revision="same_rev",
+        coldkey="ck42",
+    )
+    evicted = evict_stale_evaluated_uids(state, {42: commit})
+    assert evicted == []
+    assert "42" in state.evaluated_uids
+    assert "42" in state.composite_scores  # backfill, no eviction
+    eh = state.evaluated_hotkeys.get("hk42")
+    assert eh is not None
+    assert eh.get("backfilled_from_composite") is True
+
+
+def test_uid_rotation_with_chain_hotkey_matching_prior_ledger_is_locked() -> None:
+    """If the chain hotkey at a UID matches an ``evaluated_hotkeys``
+    entry already pinned to that UID, rule 1 still locks the slot —
+    the prior reverse-index lookup MUST not fire here. This is the
+    standard same-hotkey re-commit case after the ledger started
+    being maintained.
+    """
+    state = _FakeState(
+        evaluated_uids=["100"],
+        composite_scores={
+            "100": {
+                "model": "miner/v1",
+                "revision": "main",
+                "block": 100,
+                "final": 0.5,
+            }
+        },
+        evaluated_hotkeys={
+            "hk100": {
+                "uid": 100,
+                "model": "miner/v1",
+                "revision": "main",
+                "composite_final": 0.5,
+            }
+        },
+    )
+    # Same hotkey re-commits with a new model — should stay locked
+    # (strict policy), no rotation eviction.
+    commit = Commitment(
+        uid=100,
+        hotkey="hk100",
+        block=200,
+        model="miner/v2",
+        revision="main",
+        coldkey="ck100",
+    )
+    evicted = evict_stale_evaluated_uids(state, {100: commit})
+    assert evicted == []
+    assert "100" in state.evaluated_uids
+    assert "100" in state.composite_scores
 
 
 def test_same_commit_no_eviction() -> None:

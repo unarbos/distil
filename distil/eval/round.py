@@ -239,48 +239,65 @@ def evict_stale_evaluated_uids(
         stored = composite_scores.get(uid_str)
         if stored is not None:
             # rule 2b vs 2c: composite exists, ledger has no entry for
-            # this UID at all. Distinguish "pre-ledger same hotkey
-            # (backfill)" from "pre-ledger UID rotation (evict)" using
-            # the commitment signature: if stored model@revision
-            # matches the chain commitment, the composite belongs to
-            # the current hotkey and we backfill the ledger; if it
-            # doesn't match, the composite is from a prior holder of
-            # this UID-slot and we evict.
+            # this UID at all. Distinguish "pre-ledger UID rotation
+            # (evict)" from "pre-ledger same hotkey / bootstrap
+            # (backfill)" using the commitment signature.
+            #
+            # Eviction fires ONLY when the stored composite carries a
+            # ``model`` field AND that field differs from the chain
+            # commitment's model@revision. That's clear evidence the
+            # composite belongs to a prior holder of this UID-slot
+            # (the post-2026-05-18 code wouldn't have left a same-
+            # hotkey row without a ledger entry).
+            #
+            # When the stored composite has no ``model`` field at all
+            # (bootstrap composites recovered from h2h_history before
+            # the commitment signature port — see
+            # ``test_bootstrapped_legacy_composite_not_evicted``), we
+            # CANNOT prove rotation, so we fall through to backfill
+            # (same as if the chain commitment matched). Backfilling
+            # an unknown-provenance composite into the chain hotkey
+            # is mildly unfair if rotation actually occurred, but
+            # erroneously evicting a real historical record would
+            # silently regrant evals — strict policy errs toward
+            # locking. Bootstrap composites are rare and predate the
+            # current eviction logic by months.
             stored_model = stored.get("model")
             stored_rev = stored.get("revision") or "main"
             chain_model = getattr(c, "model", None)
             chain_rev = getattr(c, "revision", None) or "main"
-            same_commit = (
+            commit_differs = (
                 stored_model is not None
-                and stored_model == chain_model
-                and stored_rev == chain_rev
+                and (stored_model != chain_model or stored_rev != chain_rev)
             )
-            if same_commit:
-                # rule 2b: pre-ledger composite from the same hotkey —
-                # backfill so the slot is properly locked going forward.
-                if hk:
-                    state.evaluated_hotkeys[hk] = {
-                        "uid": int(uid),
-                        "model": stored.get("model"),
-                        "revision": stored.get("revision") or "main",
-                        "coldkey": getattr(c, "coldkey", None),
-                        "evaluated_at_block": stored.get("block"),
-                        "evaluated_at_ts": stored.get("evaluated_at"),
-                        "composite_final": stored.get("final"),
-                        "composite_worst": stored.get("worst"),
-                        "backfilled_from_composite": True,
-                    }
+            if commit_differs:
+                # rule 2c: stored commitment differs from chain
+                # commitment AND no ledger entry — pre-ledger UID
+                # rotation. Evict.
+                logger.info(
+                    f"evicting UID {uid_str}: chain commitment "
+                    f"({chain_model}@{chain_rev[:12]}) doesn't match stored "
+                    f"composite ({stored_model}@{stored_rev[:12]}) and ledger "
+                    f"has no entry for this UID — pre-ledger UID rotation"
+                )
+                _evict_stale_rows(uid_str, int(uid))
+                evicted.append(uid_str)
                 continue
-            # rule 2c: stored commitment differs from chain commitment
-            # AND no ledger entry — pre-ledger UID rotation. Evict.
-            logger.info(
-                f"evicting UID {uid_str}: chain commitment "
-                f"({chain_model}@{chain_rev[:12]}) doesn't match stored "
-                f"composite ({stored_model}@{stored_rev[:12]}) and ledger "
-                f"has no entry for this UID — pre-ledger UID rotation"
-            )
-            _evict_stale_rows(uid_str, int(uid))
-            evicted.append(uid_str)
+            # rule 2b: same-hotkey pre-ledger composite OR bootstrap
+            # composite with no commit signature — backfill so the
+            # slot is properly locked going forward.
+            if hk:
+                state.evaluated_hotkeys[hk] = {
+                    "uid": int(uid),
+                    "model": stored.get("model"),
+                    "revision": stored.get("revision") or "main",
+                    "coldkey": getattr(c, "coldkey", None),
+                    "evaluated_at_block": stored.get("block"),
+                    "evaluated_at_ts": stored.get("evaluated_at"),
+                    "composite_final": stored.get("final"),
+                    "composite_worst": stored.get("worst"),
+                    "backfilled_from_composite": True,
+                }
             continue
 
         # rule 3: no ledger entry AND no composite — orphan
