@@ -312,20 +312,45 @@ def _format_defense_message(
 ) -> str:
     """Build the king-defense message body.
 
-    Quieter than the dethrone announcement — no role-ping by default,
-    and the prose makes clear that nothing changed, just that the king
-    successfully defended their crown. The dashboard link is included
-    so people can verify in one click.
+    Title + framing adapt to the score relationship:
+
+      * king > challenger  →  "🛡️ King Defends the Crown" + positive gap
+        (clean victory: king is genuinely the strongest model this round)
+      * king < challenger  →  "⚖️ King Holds via 5% Margin Gate"
+        (narrow hold: challenger scored higher but didn't clear the
+         5% dethrone margin, so the seated king stays. We surface this
+         honestly rather than claiming victory.)
+      * king == challenger →  same as the clean-win path (tie goes to
+        the king under the gate)
+
+    Pre-fix the message always read "King Defends the Crown" with a
+    ``(gap +-0.014)`` rendering when the challenger actually scored
+    higher — observed live on 2026-05-20 12:20 UTC for UID 21 vs UID
+    231 (msg_id 1506627609977684111). The negative-gap rendering came
+    from ``f" (gap +{gap:.3f})"`` always prepending ``+``; semantically
+    the message was misleading because it framed a narrow margin-gate
+    hold as a clean defense.
     """
-    title = "## 🛡️ King Defends the Crown"
+    is_clean_win = (
+        king_composite_final is not None
+        and top_challenger_final is not None
+        and king_composite_final >= top_challenger_final
+    )
+    if is_clean_win:
+        title = "## 🛡️ King Defends the Crown"
+        verb = "held off"
+    else:
+        title = "## ⚖️ King Holds via 5% Margin Gate"
+        verb = "narrowly held off"
+
     line_king = ""
     if king_model:
         line_king = (
             f"👑 **UID {king_uid}** ([{king_model}]"
-            f"(<https://huggingface.co/{king_model}>)) held off "
+            f"(<https://huggingface.co/{king_model}>)) {verb} "
         )
     else:
-        line_king = f"👑 **UID {king_uid}** held off "
+        line_king = f"👑 **UID {king_uid}** {verb} "
     if top_challenger_uid is not None:
         if top_challenger_model:
             line_king += (
@@ -354,7 +379,15 @@ def _format_defense_message(
             score_line += f" vs top challenger {top_challenger_final:.3f}"
             try:
                 gap = king_composite_final - top_challenger_final
-                score_line += f" (gap +{gap:.3f})"
+                # ``{gap:+.3f}`` renders a signed format (``+0.014`` or
+                # ``-0.014``) so we never produce a malformed ``+-0.014``.
+                # Label the gap as "lead" when positive, "deficit" when
+                # negative — gives the reader an immediate read on
+                # whether the king is actually winning.
+                if gap >= 0:
+                    score_line += f" (lead {gap:+.3f})"
+                else:
+                    score_line += f" (deficit {gap:+.3f}; held by margin gate)"
             except Exception:  # noqa: BLE001
                 pass
         score_line += "\n"

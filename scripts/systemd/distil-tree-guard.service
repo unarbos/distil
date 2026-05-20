@@ -16,7 +16,18 @@ Environment=DISTIL_REPO_ROOT=/opt/distil/repo
 # Suppress Discord alerts on tripwire fires — incidents still go to
 # the journal + ``state/tree_guard.json`` for operator review.
 Environment=DISTIL_TREE_GUARD_QUIET=1
-ExecStart=/opt/distil/venv/bin/python /opt/distil/repo/scripts/tree_guard.py --mode all
+# CRITICAL: ExecStart points at the OUT-OF-REPO copy at
+# /usr/local/sbin/distil-tree-guard, NOT at the in-repo
+# scripts/tree_guard.py. The whole point of the tripwire is to detect
+# + recover from wipes of /opt/distil/repo — but if the executable
+# itself lives inside the repo, the wipe takes the executable too
+# and the service goes dead exactly when it's needed (observed live
+# 2026-05-20 12:21 UTC: tree-guard ran cleanly at 12:16 and 12:19,
+# then at 12:22 the script was missing and the service failed; only
+# manual intervention restored the repo). install_distil_services.sh
+# copies the in-repo source to /usr/local/sbin/ so a fresh install
+# picks up the same code, but RUNTIME points at the stable copy.
+ExecStart=/opt/distil/venv/bin/python /usr/local/sbin/distil-tree-guard --mode all
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=240

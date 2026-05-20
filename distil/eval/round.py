@@ -102,30 +102,54 @@ def _commitment_changed(stored: dict | None, current: Commitment) -> bool:
 def evict_stale_evaluated_uids(
     state: ValidatorState, commitments: dict[int, Commitment]
 ) -> list[str]:
-    """Drop ``evaluated_uids`` + ``composite_scores`` rows whose on-chain
-    commitment has moved since the last eval. Returns the list of evicted
-    UID strings.
+    """Drop ``evaluated_uids`` + ``composite_scores`` rows when the HOTKEY
+    owning a UID-position has rotated. Returns the list of evicted UID
+    strings.
 
-    This is the legacy ``scripts/validator/single_eval.evict_stale_
-    evaluated_uids`` invariant ported into distil — without it, a miner
-    who pushes v2 of their model on the same UID is starved forever
-    because :func:`select_challengers` short-circuits on
-    ``uid in state.evaluated_uids``.
+    Strict **one-eval-per-hotkey-registration** invariant (the policy
+    bittensor SN97 advertises to miners and #distil-97 has repeatedly
+    asked for, most recently 2026-05-20 — togetherness exploit cycling
+    13 model checkpoints across hotkeys to trigger N+1 evals each):
 
-    The implementation matches legacy behavior for the three observed
-    cases:
+        A hotkey gets exactly ONE eval per on-chain registration.
+        Re-committing a different model OR revision on the same
+        hotkey does NOT earn another eval. The slot is owned by the
+        hotkey, not by the (hotkey, model@revision) tuple.
 
-    * **honest re-commit** — stored composite has ``model``/``revision``/
-      ``block`` fields, all three set; new commitment differs on any
-      one of them ⇒ evict.
-    * **DQ-only row** — UID is in ``evaluated_uids`` but ``composite_
-      scores`` lookup is ``None`` (precheck DQ wrote the DQ row but no
-      composite). The DQ row's commit_block is the source of truth for
-      retry; we leave the UID consumed here and let the DQ-clear path
-      handle re-eval.
-    * **bootstrapped legacy row** — pre-2026-05-16 composites recovered
-      from ``h2h_history`` (no commit signature). Stay sticky; model-
-      name-only compare so a same-UID model-name change still evicts.
+    Eviction is therefore restricted to two scenarios:
+
+      1. The UID has a stale ``evaluated_uids`` row but the CURRENT
+         chain hotkey at that UID-position has NO entry in
+         ``evaluated_hotkeys``. This is the genuine hotkey-rotation
+         case (the prior miner deregistered, a new hotkey now owns
+         the UID slot — fair to give the new hotkey its eval slot).
+
+      2. ``stored`` (composite_scores row) exists AND the current
+         chain hotkey at that UID-position has NO entry in
+         ``evaluated_hotkeys``. Same scenario as (1) but the prior
+         eval also left a composite row behind.
+
+    What we explicitly DO NOT evict on (pre-fix the function did all
+    of these and that's exactly how the togetherness exploit worked):
+
+      * Model name change on the same hotkey
+        (e.g. ``togetherness/ckp2100`` → ``togetherness/ckp2200``)
+      * Revision change on the same hotkey
+        (e.g. force-push to a new sha while keeping the repo)
+      * commit_block delta on the same hotkey
+        (same as above — bittensor stamps a new commit_block on
+        every commitment regardless of content change)
+
+    Miners who want a second eval must REGISTER a new hotkey (pay
+    the bond again). That's the cost gate the design always intended.
+
+    Recovery: a hotkey whose first eval ended in ``evaluated_no_
+    composite`` (orchestrator crash mid-eval, OpenRouter teacher
+    failure, etc.) is currently stuck. They must re-register — by
+    policy. If we ever decide to let them retry, the right fix is a
+    SEPARATE admin path that clears ``evaluated_hotkeys[hk]`` AND
+    ``evaluated_uids`` for a specific UID, NOT a re-commit shortcut
+    that the spam loop can also use.
     """
     evicted: list[str] = []
     composite_scores = state.composite_scores or {}
@@ -136,84 +160,106 @@ def evict_stale_evaluated_uids(
         in_cs = uid_str in composite_scores
         if not (in_eu or in_cs):
             continue
-        stored = composite_scores.get(uid_str)
-        if stored is None:
-            # In ``evaluated_uids`` but no composite row. STRICT
-            # one-eval-per-commit invariant: only evict when the
-            # CURRENT chain commit has NOT been evaluated against this
-            # hotkey before. Use ``evaluated_hotkeys[hk]`` as the
-            # source of truth — it persists across composite-schema
-            # bumps (which ``evict_stale_composites`` blew away).
+        hk = getattr(c, "hotkey", None)
+        eh_entry = evaluated_hotkeys.get(hk) if hk else None
+
+        # Decision tree (in order):
+        #
+        #   1. chain hotkey HAS a ledger entry with a REAL composite_
+        #      final → slot is permanently locked. Re-commits on the
+        #      same hotkey do not earn a retry. This closes the
+        #      togetherness exploit (cycling checkpoint variants of a
+        #      working model to claim N+1 evals).
+        #
+        #   2. chain hotkey HAS a ledger entry but composite_final is
+        #      ``None`` → the prior eval consumed the slot WITHOUT
+        #      producing a composite (3-strikes load failure, mid-eval
+        #      pod crash, precheck failure). Treat re-commit as a
+        #      retry opportunity — clear the row, reset failure
+        #      counter, requeue. This rescues miners whose first eval
+        #      crashed on a typo'd repo or transient infra issue
+        #      without giving the spam loop a free pass.
+        #
+        #   3. chain hotkey has NO ledger entry but ``composite_scores
+        #      `` row exists → pre-ledger composite (written before
+        #      ``evaluated_hotkeys`` started being maintained on
+        #      2026-05-18). Backfill the ledger from the composite
+        #      and lock the slot.
+        #
+        #   4. chain hotkey has NO ledger entry and NO composite row →
+        #      genuine hotkey rotation. The prior owner deregistered
+        #      and a new hotkey took the UID. Clear the stale
+        #      evaluated_uids row so the new hotkey can be queued.
+        if eh_entry is not None:
+            prior_final = eh_entry.get("composite_final")
+            if prior_final is not None:
+                continue  # rule 1: locked
+            # composite_final is None: prior eval consumed slot without
+            # producing a real score. Two sub-paths to distinguish:
             #
-            # Two branches eligible for eviction:
-            #   1. No ``evaluated_hotkeys`` entry for this hotkey at
-            #      all — brand-new hotkey / hotkey rotation; the
-            #      ``evaluated_uids`` row is stale book-keeping from
-            #      whoever held this UID before.
-            #   2. Entry exists but ``(model, revision)`` differs from
-            #      the current chain commit — same hotkey pushed a
-            #      new model and the composite row was lost to a
-            #      schema bump or never written (e.g. orchestrator
-            #      crashed between the slot consume and composite
-            #      write).
+            #   2a. Hotkey is on the DQ list. DQ is the authoritative
+            #       gate (``state.is_disqualified`` filters them in
+            #       ``select_challengers``). This function should NOT
+            #       quietly re-queue a DQ'd hotkey — that would let a
+            #       protocol-violation DQ get reset by a re-commit,
+            #       reopening abuse paths. Leave bookkeeping intact;
+            #       the explicit DQ-clear admin path is the only way
+            #       to revive a DQ'd hotkey.
             #
-            # Earlier revisions of this function were too aggressive
-            # and evicted any ``in_eu && composite=None`` UID
-            # regardless of whether the same commit had already been
-            # evaluated. That re-queued 41 miners on commits they had
-            # already taken their fair eval against and burned ~10x
-            # OpenRouter teacher-API spend for no scoring change. See
-            # the 2026-05-18 #distil-97 post-mortem.
-            hk = getattr(c, "hotkey", None)
-            eh_entry = evaluated_hotkeys.get(hk) if hk else None
-            if eh_entry:
-                eh_model = (eh_entry.get("model") or "").strip().lower()
-                eh_rev = (eh_entry.get("revision") or "main").strip().lower()
-                cur_model = (getattr(c, "model", "") or "").strip().lower()
-                cur_rev = (getattr(c, "revision", "main") or "main").strip().lower()
-                # Same commit if model matches and revisions agree on
-                # at least their 7-char short SHA prefix (mirrors how
-                # bittensor commitments report revisions).
-                rev_match = (
-                    eh_rev[:7] == cur_rev[:7]
-                    or (eh_rev in ("", "main") and cur_rev in ("", "main"))
-                )
-                if eh_model == cur_model and rev_match:
-                    continue  # SAME commit; one-eval-per-commit holds.
-                logger.info(
-                    f"evicting UID {uid_str} (hotkey {hk!r}): same hotkey "
-                    f"pushed new commit {cur_model}@{cur_rev[:7]} "
-                    f"(prev was {eh_model}@{eh_rev[:7]})"
-                )
-            else:
-                logger.info(
-                    f"evicting UID {uid_str} (hotkey {hk!r}): no prior "
-                    f"evaluated_hotkeys entry — new miner / hotkey rotation"
-                )
+            #   2b. Hotkey is NOT DQ'd → 3-strikes load failure /
+            #       mid-eval crash / typo'd repo. Re-commit IS a fair
+            #       retry; clear the row + reset failures so the new
+            #       commit gets a clean 3-strikes budget.
+            if hk and state.is_disqualified(hk, uid=int(uid)):
+                continue  # rule 2a: DQ-locked
+            logger.info(
+                f"evicting UID {uid_str}: prior eval on hotkey "
+                f"{(hk or '?')[:14]}… consumed slot WITHOUT a composite "
+                f"(load failure / mid-eval crash, NOT DQ'd). "
+                f"Re-commit is allowed to retry."
+            )
             try:
                 state.evaluated_uids.remove(uid_str)
             except ValueError:
                 pass
+            state.composite_scores.pop(uid_str, None)
+            evaluated_hotkeys.pop(hk, None)
+            state.reset_failures(int(uid))
             evicted.append(uid_str)
             continue
-        if not _commitment_changed(stored, c):
+
+        stored = composite_scores.get(uid_str)
+        if stored is not None:
+            # rule 3: pre-ledger composite — backfill + lock
+            if hk:
+                state.evaluated_hotkeys[hk] = {
+                    "uid": int(uid),
+                    "model": stored.get("model"),
+                    "revision": stored.get("revision") or "main",
+                    "coldkey": getattr(c, "coldkey", None),
+                    "evaluated_at_block": stored.get("block"),
+                    "evaluated_at_ts": stored.get("evaluated_at"),
+                    "composite_final": stored.get("final"),
+                    "composite_worst": stored.get("worst"),
+                    "backfilled_from_composite": True,
+                }
             continue
+
+        # rule 4: genuine rotation
+        logger.info(
+            f"evicting UID {uid_str}: chain hotkey "
+            f"{(hk or '?')[:14]}… has no evaluated_hotkeys entry and "
+            f"no composite row — treating as fresh hotkey rotation"
+        )
         try:
             state.evaluated_uids.remove(uid_str)
         except ValueError:
             pass
-        state.composite_scores.pop(uid_str, None)
-        # Also reset the load-failure counter: when the miner pushes a
-        # fresh commitment they get a clean 3-strikes budget against
-        # the new repo. Without this reset a UID that hit 3 strikes on
-        # a typo'd repo (e.g. ``slowsnake/kimi-43043`` deleted from HF)
-        # would inherit the 3-strike state to their corrected repo and
-        # burn their slot on the very first transient HF blip.
         state.reset_failures(int(uid))
         evicted.append(uid_str)
     if evicted:
         logger.info(
-            f"evicted {len(evicted)} stale evaluated UIDs (re-committed): {evicted}"
+            f"evicted {len(evicted)} UIDs: {evicted}"
         )
     return evicted
 
@@ -331,9 +377,28 @@ def select_challengers(
     if king_c is not None and getattr(king_c, "key", None):
         seen_keys.add(king_c.key)
 
+    # Per-coldkey cap (added 2026-05-20 in response to the togetherness
+    # sybil swarm — 13 hotkeys all under the same coldkey filling every
+    # challenger slot for a round with checkpoint variants of the same
+    # base model). Hard ceiling of ``MAX_PER_COLDKEY`` distinct UIDs
+    # from any one coldkey in any single round. Doesn't block
+    # registration (that's bittensor's gate) — only stops one
+    # coldkey from monopolizing scoring bandwidth.
+    MAX_PER_COLDKEY = 2
+    coldkey_counts: dict[str, int] = {}
+    if king_c is not None and getattr(king_c, "coldkey", None):
+        coldkey_counts[king_c.coldkey] = coldkey_counts.get(king_c.coldkey, 0) + 1
+
+    def _coldkey_cap_blocks(c: "Commitment") -> bool:
+        ck = getattr(c, "coldkey", None)
+        if not ck:
+            return False
+        return coldkey_counts.get(ck, 0) >= MAX_PER_COLDKEY
+
     if skip_hf_check:
-        # Test-mode shortcut: still dedup by ``model@revision`` so the
-        # selection contract is identical under tests + production.
+        # Test-mode shortcut: still dedup by ``model@revision`` AND
+        # apply the per-coldkey cap so the selection contract is
+        # identical under tests + production.
         accepted_fast: list[Commitment] = []
         for c in candidates:
             if len(accepted_fast) >= n:
@@ -345,8 +410,17 @@ def select_challengers(
                     f"model@revision {key!r} already in round"
                 )
                 continue
+            if _coldkey_cap_blocks(c):
+                logger.info(
+                    f"select_challengers: skipping uid={c.uid} — per-coldkey "
+                    f"cap reached for coldkey {(c.coldkey or '?')[:14]}…"
+                )
+                continue
             if key:
                 seen_keys.add(key)
+            ck = getattr(c, "coldkey", None)
+            if ck:
+                coldkey_counts[ck] = coldkey_counts.get(ck, 0) + 1
             accepted_fast.append(c)
         return accepted_fast
 
@@ -360,6 +434,7 @@ def select_challengers(
     accepted: list[Commitment] = []
     skipped: list[tuple[int, str, str]] = []
     duplicates: list[tuple[int, str]] = []
+    coldkey_capped: list[tuple[int, str]] = []
     for c in candidates:
         if len(accepted) >= n:
             break
@@ -367,10 +442,16 @@ def select_challengers(
         if key and key in seen_keys:
             duplicates.append((int(c.uid), key))
             continue
+        if _coldkey_cap_blocks(c):
+            coldkey_capped.append((int(c.uid), getattr(c, "coldkey", "?") or "?"))
+            continue
         ok, reason = _hf_repo_reachable(c.model, getattr(c, "revision", None))
         if ok:
             if key:
                 seen_keys.add(key)
+            ck = getattr(c, "coldkey", None)
+            if ck:
+                coldkey_counts[ck] = coldkey_counts.get(ck, 0) + 1
             accepted.append(c)
             continue
         # Permanent-failure surface (404 or auth-locked). Record a
@@ -390,6 +471,12 @@ def select_challengers(
             f"select_challengers: skipped {len(duplicates)} duplicate-model "
             f"candidate(s) (same model@revision as king or earlier accepted "
             f"challenger): {duplicates}"
+        )
+    if coldkey_capped:
+        logger.warning(
+            f"select_challengers: skipped {len(coldkey_capped)} candidate(s) "
+            f"at per-coldkey cap (max {MAX_PER_COLDKEY} per coldkey/round): "
+            f"{coldkey_capped}"
         )
     if skipped:
         logger.warning(

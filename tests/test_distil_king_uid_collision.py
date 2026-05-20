@@ -287,5 +287,97 @@ class TestSelectChallengersDedup(unittest.TestCase):
         self.assertEqual(sorted(c.uid for c in chosen), [6, 8])
 
 
+def _mk_commitment_ck(uid: int, coldkey: str, model: str, block: int = 1000):
+    """Like ``_mk_commitment`` but lets the caller pin the coldkey."""
+    return SimpleNamespace(
+        uid=uid,
+        model=model,
+        revision=f"r{uid}",
+        key=f"{model}@r{uid}",
+        hotkey=f"5HK{uid:03d}",
+        coldkey=coldkey,
+        block=block,
+        commit_block=block,
+    )
+
+
+class TestSelectChallengersColdkeyCap(unittest.TestCase):
+    """Regression: per-coldkey cap (2026-05-20, togetherness exploit).
+
+    A single coldkey running 13+ hotkeys with checkpoint variants must
+    NOT monopolize a round's 10 challenger slots. The cap is
+    ``MAX_PER_COLDKEY = 2`` distinct UIDs from any one coldkey in any
+    single round.
+    """
+
+    def test_coldkey_capped_at_2_per_round(self):
+        # 5 candidates all under coldkey ``5CK_TG`` (the togetherness
+        # sybil pattern), plus 3 legit unrelated coldkeys.
+        commits = {
+            10: _mk_commitment_ck(10, "5CK_TG", "tg/ckp_1", block=100),
+            11: _mk_commitment_ck(11, "5CK_TG", "tg/ckp_2", block=110),
+            12: _mk_commitment_ck(12, "5CK_TG", "tg/ckp_3", block=120),
+            13: _mk_commitment_ck(13, "5CK_TG", "tg/ckp_4", block=130),
+            14: _mk_commitment_ck(14, "5CK_TG", "tg/ckp_5", block=140),
+            20: _mk_commitment_ck(20, "5CK_A",  "a/m",      block=200),
+            21: _mk_commitment_ck(21, "5CK_B",  "b/m",      block=210),
+            22: _mk_commitment_ck(22, "5CK_C",  "c/m",      block=220),
+        }
+        state = _FakeState()
+        chosen = select_challengers(
+            commits, state, king_uid=None, n=10, skip_hf_check=True
+        )
+        coldkeys = [c.coldkey for c in chosen]
+        from collections import Counter
+        counts = Counter(coldkeys)
+        # togetherness coldkey capped at 2 UIDs
+        self.assertEqual(counts.get("5CK_TG", 0), 2,
+                         f"per-coldkey cap should keep togetherness at 2 "
+                         f"UIDs, got {counts.get('5CK_TG', 0)}")
+        # The legit coldkeys (1 UID each) all get in
+        for ck in ("5CK_A", "5CK_B", "5CK_C"):
+            self.assertEqual(counts.get(ck, 0), 1)
+        # And the older/lower-block ckp_1 + ckp_2 win the 2 togetherness
+        # slots via FIFO (per the docstring contract).
+        uids = sorted(c.uid for c in chosen if c.coldkey == "5CK_TG")
+        self.assertEqual(uids, [10, 11],
+                         "FIFO should keep the two oldest togetherness "
+                         "UIDs (10, 11), not 12/13/14")
+
+    def test_king_coldkey_counts_toward_cap(self):
+        """The seated king consumes one slot of their coldkey's cap.
+        Prevents a coldkey with the king + 2 more from getting 3 slots."""
+        commits = {
+            5:  _mk_commitment_ck(5,  "5CK_K", "king/k", block=50),  # king
+            6:  _mk_commitment_ck(6,  "5CK_K", "k/m2",   block=100),  # same ck
+            7:  _mk_commitment_ck(7,  "5CK_K", "k/m3",   block=110),  # same ck
+            8:  _mk_commitment_ck(8,  "5CK_O", "o/m",    block=200),
+        }
+        state = _FakeState()
+        chosen = select_challengers(
+            commits, state, king_uid=5, n=5, skip_hf_check=True
+        )
+        coldkeys = [c.coldkey for c in chosen]
+        from collections import Counter
+        counts = Counter(coldkeys)
+        self.assertEqual(counts.get("5CK_K", 0), 1,
+                         "king + 1 challenger = 2 (the cap); the second "
+                         "same-coldkey challenger must be excluded")
+        self.assertEqual(counts.get("5CK_O", 0), 1)
+
+    def test_no_coldkey_no_cap(self):
+        """Commitments missing the ``coldkey`` field (legacy / synthetic)
+        don't trigger the cap — graceful fallback."""
+        c1 = SimpleNamespace(uid=6, model="x/m", revision="r", key="x/m@r",
+                             hotkey="hk6", coldkey=None, block=100)
+        c2 = SimpleNamespace(uid=7, model="y/m", revision="r", key="y/m@r",
+                             hotkey="hk7", coldkey=None, block=200)
+        state = _FakeState()
+        chosen = select_challengers(
+            {6: c1, 7: c2}, state, king_uid=None, n=5, skip_hf_check=True
+        )
+        self.assertEqual(sorted(c.uid for c in chosen), [6, 7])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

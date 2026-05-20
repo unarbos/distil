@@ -31,6 +31,7 @@ class _FakeState:
         composite_scores=None,
         failures=None,
         evaluated_hotkeys=None,
+        disqualified=None,
     ):
         self.evaluated_uids = list(evaluated_uids or [])
         self.composite_scores = dict(composite_scores or {})
@@ -41,9 +42,17 @@ class _FakeState:
         # this map next to ``evaluated_uids`` whenever a slot is consumed
         # (composite landed OR precheck DQ OR load-failure exhaustion).
         self.evaluated_hotkeys = dict(evaluated_hotkeys or {})
+        # ``disqualified[hk] = reason`` mirrors ``ValidatorState.disqualified``
+        # so the DQ-gate in ``evict_stale_evaluated_uids`` (rule 2a) is
+        # exercisable in tests.
+        self.disqualified = dict(disqualified or {})
         self.scores = {}
 
-    def is_disqualified(self, *_a, **_k):
+    def is_disqualified(self, hotkey=None, *, uid=None):
+        if hotkey and hotkey in self.disqualified:
+            return True
+        if uid is not None and str(uid) in self.disqualified:
+            return True
         return False
 
     def reset_failures(self, uid: int) -> None:
@@ -66,32 +75,104 @@ def _commit(uid: int, model: str, revision: str = "main", block: int = 100) -> C
     )
 
 
-def test_recommit_evicts_evaluated_slot() -> None:
-    """v2 of the same model on the same UID drops the prior eval slot."""
+def test_recommit_does_not_evict_evaluated_slot() -> None:
+    """SPAM-PROOF (2026-05-20): a miner re-committing v2 of their model on
+    the same hotkey does NOT earn a re-eval. The slot is keyed by the
+    HOTKEY, not by ``(hotkey, model@revision)`` — so re-commits are
+    pure no-ops as far as the eval-slot ledger is concerned.
+
+    Pre-fix, ``evict_stale_evaluated_uids`` would clear the row on any
+    ``_commitment_changed`` signal (model OR revision OR block delta),
+    which let the togetherness exploit (observed live 2026-05-20 in
+    #distil-97) cycle 13 checkpoint variants of the same base model
+    on 13 hotkeys to claim 13× the eval budget the gate intended.
+
+    Recovery for a hotkey that wants a real re-eval: REGISTER a new
+    hotkey (pay the bond). That's the cost gate.
+    """
     state = _FakeState(
         evaluated_uids=["7"],
         composite_scores={
             "7": {"model": "alice/v1", "revision": "main", "block": 100, "final": 0.5}
         },
+        evaluated_hotkeys={
+            "hk7": {
+                "uid": 7, "model": "alice/v1", "revision": "main",
+                "composite_final": 0.5, "composite_worst": None,
+            }
+        },
     )
     commitments = {7: _commit(7, model="alice/v2", revision="main", block=200)}
     evicted = evict_stale_evaluated_uids(state, commitments)
-    assert evicted == ["7"]
-    assert "7" not in state.evaluated_uids
-    assert "7" not in state.composite_scores
+    assert evicted == []
+    assert "7" in state.evaluated_uids
+    assert "7" in state.composite_scores  # old composite untouched until the
+    # next round's process_round writes the same slot — re-eval doesn't run.
 
 
-def test_revision_change_evicts() -> None:
-    """Same model id but new revision is also an eviction trigger."""
+def test_revision_change_does_not_evict() -> None:
+    """SPAM-PROOF (2026-05-20): force-pushing a new revision on the same
+    repo+hotkey is just a different re-commit — same closure as
+    ``test_recommit_does_not_evict_evaluated_slot``. The prior eval
+    produced a real composite so the slot is permanently locked."""
     state = _FakeState(
         evaluated_uids=["3"],
         composite_scores={
             "3": {"model": "bob/foo", "revision": "abc123", "block": 100, "final": 0.4}
         },
+        evaluated_hotkeys={
+            "hk3": {
+                "uid": 3, "model": "bob/foo", "revision": "abc123",
+                "composite_final": 0.4, "composite_worst": 0.2,
+            }
+        },
     )
     commitments = {3: _commit(3, model="bob/foo", revision="def456", block=100)}
     evicted = evict_stale_evaluated_uids(state, commitments)
-    assert evicted == ["3"]
+    assert evicted == []
+    assert "3" in state.evaluated_uids
+
+
+def test_hotkey_rotation_evicts_stale_row() -> None:
+    """Genuine hotkey rotation (the prior miner deregistered, a new
+    hotkey now owns the UID slot) DOES trigger eviction so the new
+    hotkey can take its one fair eval. Detected via the chain hotkey
+    being absent from ``evaluated_hotkeys`` AND no composite row
+    backing it."""
+    state = _FakeState(
+        evaluated_uids=["5"],
+        composite_scores={},  # no composite — pure stale evaluated_uids row
+        evaluated_hotkeys={},  # the prior owner's hotkey already pruned
+    )
+    commitments = {5: _commit(5, model="newminer/first", revision="main")}
+    evicted = evict_stale_evaluated_uids(state, commitments)
+    assert evicted == ["5"]
+    assert "5" not in state.evaluated_uids
+
+
+def test_pre_ledger_composite_backfills_evaluated_hotkeys() -> None:
+    """Composites written before ``evaluated_hotkeys`` started being
+    maintained (pre-2026-05-18) lock the slot by backfilling the
+    ledger from the composite, NOT by evicting and re-evaluating."""
+    state = _FakeState(
+        evaluated_uids=["12"],
+        composite_scores={
+            "12": {
+                "model": "legacy/repo", "revision": "abc",
+                "block": 80, "final": 0.55,
+            }
+        },
+        evaluated_hotkeys={},  # ledger not yet populated for this hotkey
+    )
+    commitments = {12: _commit(12, model="legacy/repo", revision="abc")}
+    evicted = evict_stale_evaluated_uids(state, commitments)
+    assert evicted == []
+    assert "12" in state.evaluated_uids
+    # Backfill happened:
+    eh = state.evaluated_hotkeys.get("hk12")
+    assert eh is not None
+    assert eh.get("model") == "legacy/repo"
+    assert eh.get("backfilled_from_composite") is True
 
 
 def test_same_commit_no_eviction() -> None:
@@ -124,13 +205,12 @@ def test_bootstrapped_legacy_composite_not_evicted() -> None:
 
 
 def test_dq_only_uid_not_re_evicted() -> None:
-    """A UID in evaluated_uids but not composite_scores (precheck DQ) is left alone.
+    """A UID consumed by PRECHECK DQ (composite_final=None + DQ list
+    entry) is left alone — the DQ list is the authoritative gate and
+    re-commit must not silently revive a protocol-violation DQ.
 
-    In production ``process_round`` writes ``evaluated_uids`` AND
-    ``evaluated_hotkeys[hk]`` atomically whenever a slot is consumed
-    (composite landed OR precheck DQ OR load-failure exhaustion).
-    The fake state mirrors that invariant so the eviction logic sees
-    a hotkey record matching the current commit and short-circuits.
+    Distinct from the load-failure path which DOES allow retry on
+    re-commit (see ``test_load_failure_uid_evicts_on_recommit`` below).
     """
     state = _FakeState(
         evaluated_uids=["55"],
@@ -141,10 +221,42 @@ def test_dq_only_uid_not_re_evicted() -> None:
                 "composite_final": None, "composite_worst": None,
             }
         },
+        disqualified={"hk55": "precheck:vocab_size_mismatch"},
     )
     commitments = {55: _commit(55, model="alice/v3")}
     assert evict_stale_evaluated_uids(state, commitments) == []
     assert "55" in state.evaluated_uids
+    assert "hk55" in state.evaluated_hotkeys  # ledger preserved
+
+
+def test_load_failure_uid_evicts_on_recommit() -> None:
+    """A UID consumed by 3-strikes load failure (composite_final=None
+    + NOT on DQ list) DOES evict on re-commit — fair retry path.
+
+    This is the typo'd-repo rescue. Closes the bot's promise to
+    itorgov (UID 171, 2026-05-20) without giving spam loops an out:
+    the DQ list still blocks any actual cheating, and successful
+    evals (composite_final≠None) still lock the slot via rule 1.
+    """
+    state = _FakeState(
+        evaluated_uids=["77"],
+        composite_scores={},
+        failures={"77": 3},
+        evaluated_hotkeys={
+            "hk77": {
+                "uid": 77, "model": "miner/typo-repo", "revision": "main",
+                "composite_final": None, "composite_worst": None,
+                "load_failures": 3,
+            }
+        },
+        # NOT on DQ list — pure load failure
+    )
+    commitments = {77: _commit(77, model="miner/correct-repo")}
+    evicted = evict_stale_evaluated_uids(state, commitments)
+    assert evicted == ["77"]
+    assert "77" not in state.evaluated_uids
+    assert "hk77" not in state.evaluated_hotkeys
+    assert state.failures.get("77", 0) == 0  # fresh budget
 
 
 def test_commit_signature_helpers() -> None:

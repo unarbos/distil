@@ -158,6 +158,65 @@ def test_defense_skips_when_all_challengers_lack_final():
     m.assert_not_called()
 
 
+def test_defense_message_renders_positive_lead_with_clean_title():
+    """Happy path: king >= challenger → clean defense title + ``(lead +X)``."""
+    from distil.eval.announce import _format_defense_message
+    msg = _format_defense_message(
+        king_uid=104,
+        king_model="best26/sn97-ms-v14",
+        top_challenger_uid=231,
+        top_challenger_model="const0312/arbossmart",
+        king_composite_final=0.480,
+        top_challenger_final=0.450,
+        block=8220000,
+        n_challengers=10,
+    )
+    assert "King Defends the Crown" in msg
+    assert "held off" in msg
+    assert "narrowly held off" not in msg
+    assert "(lead +0.030)" in msg
+    assert "+-" not in msg  # the original bug rendering
+
+
+def test_defense_message_renders_deficit_and_switches_to_margin_gate_title():
+    """Reproduces 2026-05-20 12:20 UTC bug: challenger scored higher
+    than king. Title must switch + gap must read as deficit."""
+    from distil.eval.announce import _format_defense_message
+    msg = _format_defense_message(
+        king_uid=21,
+        king_model="power612/trainking-v1",
+        top_challenger_uid=231,
+        top_challenger_model="const0312/arbossmart",
+        king_composite_final=0.423,
+        top_challenger_final=0.436,
+        block=8224758,
+        n_challengers=10,
+    )
+    assert "King Holds via 5% Margin Gate" in msg
+    assert "narrowly held off" in msg
+    # Original bug: ``(gap +-0.014)``. Must NEVER appear again.
+    assert "+-" not in msg
+    # New rendering should label the deficit explicitly.
+    assert "(deficit -0.013; held by margin gate)" in msg
+
+
+def test_defense_message_renders_tie_as_clean_defense():
+    """Ties (very rare in practice) go to the seated king — clean title."""
+    from distil.eval.announce import _format_defense_message
+    msg = _format_defense_message(
+        king_uid=1,
+        king_model=None,
+        top_challenger_uid=2,
+        top_challenger_model=None,
+        king_composite_final=0.500,
+        top_challenger_final=0.500,
+        block=None,
+        n_challengers=1,
+    )
+    assert "King Defends the Crown" in msg
+    assert "(lead +0.000)" in msg
+
+
 def test_defense_falls_back_to_composite_scores_for_king_final():
     """If the round record doesn't surface the king's composite, the
     defense announcer pulls it from ``state.composite_scores``."""

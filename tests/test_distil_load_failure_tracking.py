@@ -175,8 +175,15 @@ def test_success_resets_strike_counter():
 
 
 def test_recommit_evicts_failure_counter():
-    """``evict_stale_evaluated_uids`` MUST clear the failure counter
-    so a re-commitment to a working repo gets a clean budget.
+    """Re-commitment after a 3-strikes load failure MUST clear the
+    failure counter so the corrected repo gets a clean budget.
+
+    The 3-strikes path produces ``composite_final=None`` in the
+    ``evaluated_hotkeys`` ledger (no real composite was computed), so
+    ``evict_stale_evaluated_uids`` correctly treats it as a load-
+    failure retry slot — distinct from a successful eval which is
+    permanently locked under the spam-proof one-eval-per-registration
+    policy (2026-05-20 togetherness exploit closure).
     """
     from distil.eval.round import Commitment
 
@@ -190,6 +197,15 @@ def test_recommit_evicts_failure_counter():
             "block": 100,
             "worst": None,
             "final": None,
+        }
+    }
+    # The 3-strikes path writes the hotkey ledger with composite_final
+    # = None so the retry branch in evict_stale_evaluated_uids fires.
+    state.evaluated_hotkeys = {
+        "5E6tg8LEux": {
+            "uid": 124, "model": "slowsnake/kimi-43043",
+            "revision": "rev1", "composite_final": None,
+            "composite_worst": None, "load_failures": 3,
         }
     }
     commitments = {
@@ -207,6 +223,43 @@ def test_recommit_evicts_failure_counter():
         f"re-commitment must reset failures counter so the new repo "
         f"has a fresh 3-strikes budget; got failures={state.failures}"
     )
+    # And the stale ledger entry is gone (new commit gets a clean
+    # eval slot).
+    assert "5E6tg8LEux" not in state.evaluated_hotkeys
+
+
+def test_recommit_after_successful_eval_does_NOT_evict():
+    """SPAM-PROOF: re-committing on a hotkey that ALREADY produced a
+    real composite does NOT earn a retry. This is what blocks the
+    togetherness exploit cycling working checkpoints to claim N+1
+    evals."""
+    from distil.eval.round import Commitment
+
+    state = _state()
+    state.evaluated_uids = ["50"]
+    state.composite_scores = {
+        "50": {
+            "model": "tg/ckp1", "revision": "main", "block": 100,
+            "final": 0.45, "worst": 0.30,
+        }
+    }
+    state.evaluated_hotkeys = {
+        "5HK_TG": {
+            "uid": 50, "model": "tg/ckp1", "revision": "main",
+            "composite_final": 0.45, "composite_worst": 0.30,
+        }
+    }
+    commitments = {
+        50: Commitment(uid=50, hotkey="5HK_TG", model="tg/ckp2",
+                       revision="main", block=200),
+    }
+    evicted = evict_stale_evaluated_uids(state, commitments)
+    assert evicted == [], (
+        f"successful eval must lock the slot — re-commit gives no "
+        f"retry. Got evicted={evicted}"
+    )
+    assert "50" in state.evaluated_uids
+    assert "5HK_TG" in state.evaluated_hotkeys
 
 
 def test_select_challengers_skips_hf_404_candidates(monkeypatch):

@@ -37,6 +37,13 @@ install -m 0644 "$LEGACY_DIR/distil-benchmark-sync.service" "$UNIT_DST_DIR/disti
 install -m 0644 "$LEGACY_DIR/distil-benchmark-sync.timer" "$UNIT_DST_DIR/distil-benchmark-sync.timer"
 install -m 0644 "$LEGACY_DIR/distil-tree-guard.service" "$UNIT_DST_DIR/distil-tree-guard.service"
 install -m 0644 "$LEGACY_DIR/distil-tree-guard.timer" "$UNIT_DST_DIR/distil-tree-guard.timer"
+# CRITICAL: the tripwire script must survive a wipe of /opt/distil/repo
+# (otherwise the watchdog dies exactly when it's needed). Copy the
+# in-repo source to /usr/local/sbin/ so the systemd ExecStart can
+# point at a stable out-of-repo path. install -C only writes if the
+# bytes differ, so re-running this script after a code update is a
+# no-op when there's nothing new to deploy.
+install -C -m 0755 "$REPO_ROOT/scripts/tree_guard.py" /usr/local/sbin/distil-tree-guard
 if [[ -f "$LEGACY_DIR/openclaw.service" ]]; then
   install -m 0644 "$LEGACY_DIR/openclaw.service" "$UNIT_DST_DIR/openclaw.service"
 fi
