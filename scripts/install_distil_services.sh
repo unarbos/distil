@@ -1,19 +1,44 @@
 #!/bin/bash
 set -euo pipefail
 
+# Unit-file source layout (post 2026-05 rewrite-v2 cutover):
+#
+#   deploy/systemd/distil-{api,validator}.service
+#       — the LIVE rewrite-v2 units (``distil`` CLI entrypoint,
+#         vLLM-aware ExecStart). These are what production runs.
+#   scripts/systemd/distil-{api,validator}.service
+#       — the LEGACY pre-cutover units. Kept for reference but NOT
+#         installed; they reference ``scripts/run_validator.sh`` which
+#         was retired in the rewrite-v2 cutover.
+#   scripts/systemd/distil-{dashboard,benchmark-sync,tree-guard,
+#                            openclaw-config-guard,owui-patches}.*
+#       — the smaller cron-style units; same in legacy + rewrite-v2.
+#
+# This footgun bit production on 2026-05-20 when ``install_distil_services.sh``
+# was re-run after a working-tree wipe: the script was sourcing
+# ``scripts/systemd/`` for ALL units, including the validator, which
+# crashed on startup with ``run_validator.sh: No such file or directory``.
+# Fix: pull the two cutover units from ``deploy/systemd/`` and everything
+# else from ``scripts/systemd/``.
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-UNIT_SRC_DIR="$SCRIPT_DIR/systemd"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+LEGACY_DIR="$SCRIPT_DIR/systemd"            # pre-cutover units (dashboard, sync, etc.)
+CUTOVER_DIR="$REPO_ROOT/deploy/systemd"     # rewrite-v2 (api, validator)
 UNIT_DST_DIR="/etc/systemd/system"
 
-install -m 0644 "$UNIT_SRC_DIR/distil-api.service" "$UNIT_DST_DIR/distil-api.service"
-install -m 0644 "$UNIT_SRC_DIR/distil-dashboard.service" "$UNIT_DST_DIR/distil-dashboard.service"
-install -m 0644 "$UNIT_SRC_DIR/distil-validator.service" "$UNIT_DST_DIR/distil-validator.service"
-install -m 0644 "$UNIT_SRC_DIR/distil-benchmark-sync.service" "$UNIT_DST_DIR/distil-benchmark-sync.service"
-install -m 0644 "$UNIT_SRC_DIR/distil-benchmark-sync.timer" "$UNIT_DST_DIR/distil-benchmark-sync.timer"
-install -m 0644 "$UNIT_SRC_DIR/distil-tree-guard.service" "$UNIT_DST_DIR/distil-tree-guard.service"
-install -m 0644 "$UNIT_SRC_DIR/distil-tree-guard.timer" "$UNIT_DST_DIR/distil-tree-guard.timer"
-if [[ -f "$UNIT_SRC_DIR/openclaw.service" ]]; then
-  install -m 0644 "$UNIT_SRC_DIR/openclaw.service" "$UNIT_DST_DIR/openclaw.service"
+# Rewrite-v2 services — MUST come from deploy/systemd/.
+install -m 0644 "$CUTOVER_DIR/distil-api.service" "$UNIT_DST_DIR/distil-api.service"
+install -m 0644 "$CUTOVER_DIR/distil-validator.service" "$UNIT_DST_DIR/distil-validator.service"
+
+# Cron-style + dashboard units — same across legacy + cutover, live in scripts/systemd/.
+install -m 0644 "$LEGACY_DIR/distil-dashboard.service" "$UNIT_DST_DIR/distil-dashboard.service"
+install -m 0644 "$LEGACY_DIR/distil-benchmark-sync.service" "$UNIT_DST_DIR/distil-benchmark-sync.service"
+install -m 0644 "$LEGACY_DIR/distil-benchmark-sync.timer" "$UNIT_DST_DIR/distil-benchmark-sync.timer"
+install -m 0644 "$LEGACY_DIR/distil-tree-guard.service" "$UNIT_DST_DIR/distil-tree-guard.service"
+install -m 0644 "$LEGACY_DIR/distil-tree-guard.timer" "$UNIT_DST_DIR/distil-tree-guard.timer"
+if [[ -f "$LEGACY_DIR/openclaw.service" ]]; then
+  install -m 0644 "$LEGACY_DIR/openclaw.service" "$UNIT_DST_DIR/openclaw.service"
 fi
 
 systemctl daemon-reload
