@@ -118,13 +118,32 @@ def evict_stale_evaluated_uids(
         To get a second eval: deregister, re-register with a new
         hotkey, pay the bond again. That's the cost gate.
 
-    The function therefore ONLY evicts in one scenario:
+    The function evicts in two scenarios:
 
-        The chain hotkey at this UID-position has NO entry in
-        ``evaluated_hotkeys`` AND no composite_scores row. This is
-        genuine hotkey rotation (the prior miner deregistered, a
-        new hotkey now owns the UID-slot; the new hotkey gets its
-        one fair eval).
+      1. **UID-rotation, ledger present** — the chain hotkey at this
+         UID-slot differs from the hotkey recorded in
+         ``evaluated_hotkeys`` under the same UID. The prior holder
+         deregistered, a new hotkey claimed the slot, and that new
+         hotkey is entitled to its own one fair eval. We drop the
+         stale ``composite_scores`` row + ``evaluated_uids`` flag so
+         ``select_challengers`` can queue the new commitment. The old
+         hotkey's ``evaluated_hotkeys`` entry is kept (with its uid
+         field now stale) as a historical record — if the old hotkey
+         ever re-registers, it stays permanently locked out per the
+         one-eval-per-hotkey rule.
+
+      2. **UID-rotation, pre-ledger** — composite row exists but its
+         stored ``model@revision`` doesn't match the chain
+         commitment, and no ``evaluated_hotkeys`` entry exists for
+         THIS UID at all. The composite was written before ledger
+         maintenance started AND belongs to a different commitment,
+         which strongly implies the prior hotkey holder. Treat as
+         rotation and evict.
+
+    Pre-ledger composites where the stored ``model@revision`` DOES
+    match the chain commitment (same hotkey, no rotation, just
+    written before the ledger was maintained) auto-backfill the
+    ledger so the slot is properly locked going forward.
 
     What we explicitly do NOT evict on (each of these was an exploit
     or operator-policy concession we've now rolled back):
@@ -136,17 +155,51 @@ def evict_stale_evaluated_uids(
       * commit_block delta on the same hotkey
       * composite_final is None (3-strikes load failure / typo'd repo /
         mid-eval crash). Operator policy: typo your repo, you eat the
-        DQ. Register again to retry. This was previously rule 2b and
-        is now removed.
+        DQ. Register again to retry.
 
-    Pre-ledger composites (``composite_scores`` row exists but no
-    ``evaluated_hotkeys`` entry — written before 2026-05-18 when the
-    ledger started being maintained) are auto-backfilled to lock the
-    slot going forward, NOT evicted.
+    History
+    -------
+    2026-05-20 evening (commit 2320310) — the strict policy shipped
+    WITHOUT the UID-rotation detection branch. Backfill rule 2 wrote
+    ``evaluated_hotkeys[new_hotkey] = stored_composite`` whenever the
+    chain hotkey at a recycled UID was new but composite_scores had
+    a row from the prior holder — poisoning the ledger for the new
+    hotkey and locking it out of challenger selection. Caught in
+    Discord by @hotshot9411 / @justesting0996 within ~3h. Fixed by
+    adding the prior-hotkey reverse index lookup below.
     """
     evicted: list[str] = []
     composite_scores = state.composite_scores or {}
     evaluated_hotkeys = getattr(state, "evaluated_hotkeys", {}) or {}
+
+    # Reverse index: uid -> [hotkeys in evaluated_hotkeys whose entry
+    # carries that uid]. Used to detect UID rotation: if the chain
+    # hotkey at a UID is NOT in the ledger but some OTHER hotkey is
+    # logged against the same UID, the slot's prior holder
+    # deregistered and a new hotkey took over.
+    uid_to_prior_hks: dict[int, list[str]] = {}
+    for h, e in evaluated_hotkeys.items():
+        if not isinstance(e, dict):
+            continue
+        u = e.get("uid")
+        if u is None:
+            continue
+        try:
+            uid_to_prior_hks.setdefault(int(u), []).append(h)
+        except (TypeError, ValueError):
+            continue
+
+    def _evict_stale_rows(uid_str: str, uid_int: int) -> None:
+        try:
+            state.evaluated_uids.remove(uid_str)
+        except ValueError:
+            pass
+        try:
+            state.composite_scores.pop(uid_str, None)
+        except Exception:  # noqa: BLE001 — pop on a non-dict is a logic bug, not a runtime
+            pass
+        state.reset_failures(uid_int)
+
     for uid, c in commitments.items():
         uid_str = str(uid)
         in_eu = uid_str in (state.evaluated_uids or [])
@@ -163,43 +216,87 @@ def evict_stale_evaluated_uids(
         if eh_entry is not None:
             continue
 
-        stored = composite_scores.get(uid_str)
-        if stored is not None:
-            # rule 2: pre-ledger composite — backfill so the slot is
-            # properly locked going forward; do NOT evict.
-            if hk:
-                state.evaluated_hotkeys[hk] = {
-                    "uid": int(uid),
-                    "model": stored.get("model"),
-                    "revision": stored.get("revision") or "main",
-                    "coldkey": getattr(c, "coldkey", None),
-                    "evaluated_at_block": stored.get("block"),
-                    "evaluated_at_ts": stored.get("evaluated_at"),
-                    "composite_final": stored.get("final"),
-                    "composite_worst": stored.get("worst"),
-                    "backfilled_from_composite": True,
-                }
+        # rule 2a: UID rotation detected via ledger. Some OTHER hotkey
+        # (different from chain_hk) has an evaluated_hotkeys entry
+        # pointing at this UID-slot — the prior holder used their
+        # slot, the slot now belongs to chain_hk, and chain_hk has
+        # never been evaluated. Evict the stale composite/uid rows so
+        # the new hotkey enters the queue. Keep the old hotkey's
+        # ledger entry intact so it stays locked if it ever
+        # re-registers.
+        prior_hks = [h for h in uid_to_prior_hks.get(int(uid), []) if h != hk]
+        if prior_hks:
+            logger.info(
+                f"evicting UID {uid_str}: chain hotkey "
+                f"{(hk or '?')[:14]}… is new; prior ledger holder(s) "
+                f"{[(h or '?')[:14] + '…' for h in prior_hks]} consumed their slot — "
+                f"UID rotation"
+            )
+            _evict_stale_rows(uid_str, int(uid))
+            evicted.append(uid_str)
             continue
 
-        # rule 3: no ledger entry AND no composite — genuine hotkey
-        # rotation (prior miner deregistered, new hotkey took the UID).
-        # Clear the stale evaluated_uids row so select_challengers can
-        # queue the new hotkey for its single eval.
+        stored = composite_scores.get(uid_str)
+        if stored is not None:
+            # rule 2b vs 2c: composite exists, ledger has no entry for
+            # this UID at all. Distinguish "pre-ledger same hotkey
+            # (backfill)" from "pre-ledger UID rotation (evict)" using
+            # the commitment signature: if stored model@revision
+            # matches the chain commitment, the composite belongs to
+            # the current hotkey and we backfill the ledger; if it
+            # doesn't match, the composite is from a prior holder of
+            # this UID-slot and we evict.
+            stored_model = stored.get("model")
+            stored_rev = stored.get("revision") or "main"
+            chain_model = getattr(c, "model", None)
+            chain_rev = getattr(c, "revision", None) or "main"
+            same_commit = (
+                stored_model is not None
+                and stored_model == chain_model
+                and stored_rev == chain_rev
+            )
+            if same_commit:
+                # rule 2b: pre-ledger composite from the same hotkey —
+                # backfill so the slot is properly locked going forward.
+                if hk:
+                    state.evaluated_hotkeys[hk] = {
+                        "uid": int(uid),
+                        "model": stored.get("model"),
+                        "revision": stored.get("revision") or "main",
+                        "coldkey": getattr(c, "coldkey", None),
+                        "evaluated_at_block": stored.get("block"),
+                        "evaluated_at_ts": stored.get("evaluated_at"),
+                        "composite_final": stored.get("final"),
+                        "composite_worst": stored.get("worst"),
+                        "backfilled_from_composite": True,
+                    }
+                continue
+            # rule 2c: stored commitment differs from chain commitment
+            # AND no ledger entry — pre-ledger UID rotation. Evict.
+            logger.info(
+                f"evicting UID {uid_str}: chain commitment "
+                f"({chain_model}@{chain_rev[:12]}) doesn't match stored "
+                f"composite ({stored_model}@{stored_rev[:12]}) and ledger "
+                f"has no entry for this UID — pre-ledger UID rotation"
+            )
+            _evict_stale_rows(uid_str, int(uid))
+            evicted.append(uid_str)
+            continue
+
+        # rule 3: no ledger entry AND no composite — orphan
+        # evaluated_uids row (composite was deleted but the flag
+        # wasn't). Genuine hotkey rotation with no scoring history.
+        # Drop the orphan flag so the new hotkey gets queued.
         logger.info(
             f"evicting UID {uid_str}: chain hotkey "
             f"{(hk or '?')[:14]}… has no evaluated_hotkeys entry and "
-            f"no composite row — treating as fresh hotkey rotation"
+            f"no composite row — orphan evaluated_uids flag"
         )
-        try:
-            state.evaluated_uids.remove(uid_str)
-        except ValueError:
-            pass
-        state.reset_failures(int(uid))
+        _evict_stale_rows(uid_str, int(uid))
         evicted.append(uid_str)
     if evicted:
         logger.info(
-            f"evicted {len(evicted)} UIDs (hotkey rotation, no prior eval): "
-            f"{evicted}"
+            f"evicted {len(evicted)} UIDs (hotkey rotation): {evicted}"
         )
     return evicted
 
